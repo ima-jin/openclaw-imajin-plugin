@@ -1,0 +1,1 @@
+node_modules/\ndist/\n*.js\n*.js.map\n*.d.ts\n!src/**\n.DS_Store
