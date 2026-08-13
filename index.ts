@@ -31,6 +31,10 @@ import {
   createInferTool,
   createChatTool,
 } from "./src/tools.js";
+import {
+  createTurnUsageAttestationHandler,
+  type TurnUsageAttestationConfig,
+} from "./src/turn-usage-attestation.js";
 
 /** `plugins.entries.imajin.config.wsNotifications` (openclaw.json). */
 interface WsNotificationsConfig {
@@ -247,6 +251,7 @@ export default definePluginEntry({
       keypairPath?: string;
       actAs?: string;
       wsNotifications?: WsNotificationsConfig;
+      attestation?: TurnUsageAttestationConfig;
     };
 
     if (!config?.nodeUrl) {
@@ -334,8 +339,19 @@ export default definePluginEntry({
       });
     }
 
+    // agent_end → agent.turn.usage attestation (#1843). Self-signed, fire-
+    // and-forget; never registered at all when unconfigured, so a plugin
+    // install with no attestation config behaves exactly as before.
+    const turnUsageHandler = createTurnUsageAttestationHandler(config.did, {
+      serviceUrl: config.attestation?.serviceUrl ?? config.nodeUrl,
+      internalApiKey: config.attestation?.internalApiKey,
+      enabled: config.attestation?.enabled,
+    });
+    if (turnUsageHandler) {
+      api.registerHook("agent_end", turnUsageHandler);
+    }
+
     // TODO: registerMemoryCorpusSupplement — agent's chain as searchable memory
-    // TODO: registerHook("before_tool_call") — entity context decorator
     // TODO: registerHttpRoute — webhook receiver for Imajin events
     // TODO: registerChannel — Imajin chat as a full messaging channel (receive + send)
   },

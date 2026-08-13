@@ -36,6 +36,16 @@
       "label": "Default Acting-For DID",
       "help": "Default principal the agent acts on behalf of (X-Acting-For). Delegated writes (media/attest/transact/chat) default to this DID unless a call passes an explicit onBehalfOf. The agent must have role:agent membership on this DID.",
       "placeholder": "did:imajin:..."
+    },
+    "attestation.serviceUrl": {
+      "label": "Attestation Service URL",
+      "help": "Base URL of the Imajin kernel's internal attestations endpoint. Defaults to nodeUrl when omitted.",
+      "placeholder": "https://jin.imajin.ai"
+    },
+    "attestation.internalApiKey": {
+      "label": "Attestation Internal API Key",
+      "help": "Bearer token for POST /auth/api/attestations/internal. Falls back to the ATTESTATION_INTERNAL_API_KEY env var when omitted.",
+      "sensitive": true
     }
   },
   "configSchema": {
@@ -70,6 +80,25 @@
           "targetSession": {
             "type": "string",
             "description": "Session key to inject notifications into"
+          }
+        }
+      },
+      "attestation": {
+        "type": "object",
+        "description": "Configure the agent_end \u2192 agent.turn.usage attestation hook (#1843)",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Explicit opt-out. Defaults to true when serviceUrl + internalApiKey both resolve."
+          },
+          "serviceUrl": {
+            "type": "string",
+            "description": "Base URL of the attestation service. Defaults to nodeUrl."
+          },
+          "internalApiKey": {
+            "type": "string",
+            "description": "Bearer token for POST /auth/api/attestations/internal. Falls back to the ATTESTATION_INTERNAL_API_KEY env var."
           }
         }
       }
