@@ -4,10 +4,19 @@
   "private": true,
   "description": "OpenClaw plugin for Imajin network — identity, attestation, attribution, settlement, discovery",
   "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
   "dependencies": {
     "@noble/ed25519": "^2.3.0",
     "@noble/hashes": "^1.8.0",
     "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5",
+    "vitest": "^2.1.9"
   },
   "openclaw": {
     "extensions": [

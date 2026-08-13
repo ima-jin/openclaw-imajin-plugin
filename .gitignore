@@ -1,1 +1,7 @@
-node_modules/\ndist/\n*.js\n*.js.map\n*.d.ts\n!src/**\n.DS_Store
+node_modules/
+dist/
+*.js
+*.js.map
+*.d.ts
+!src/**
+.DS_Store

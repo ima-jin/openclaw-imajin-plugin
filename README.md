@@ -38,6 +38,18 @@ In `openclaw.json`:
 - **`nodeUrl`** (required) — URL of the Imajin node
 - **`did`** (optional) — Agent's DID for authenticated requests
 - **`keypairPath`** (optional) — Path to Ed25519 keypair for signing attestations
+- **`attestation`** (optional) — configures the `agent_end` → `agent.turn.usage` hook (#1843):
+  - **`attestation.enabled`** — explicit opt-out; defaults to `true` when `serviceUrl` + the key both resolve
+  - **`attestation.serviceUrl`** — base URL for `POST /auth/api/attestations/internal`; defaults to `nodeUrl`
+  - **`attestation.internalApiKey`** — Bearer token for that endpoint; falls back to the `ATTESTATION_INTERNAL_API_KEY` env var
+
+### Turn-usage attestation
+
+After every agent turn, the plugin emits a self-signed, unilateral `agent.turn.usage`
+attestation (issuer == subject == the agent's own DID) to the Imajin kernel, recording
+per-turn token usage, cost, and context usage — including $0 turns from local models.
+This is fire-and-forget: it never blocks, retries, or fails the turn, and any error is
+logged and dropped.
 
 ## Roadmap
 
