@@ -348,7 +348,7 @@ export default definePluginEntry({
       enabled: config.attestation?.enabled,
     });
     if (turnUsageHandler) {
-      api.registerHook("agent_end", turnUsageHandler, { name: "turn-usage-attestation" });
+      api.on("agent_end", turnUsageHandler, { name: "turn-usage-attestation" });
     }
 
     // TODO: registerMemoryCorpusSupplement — agent's chain as searchable memory
