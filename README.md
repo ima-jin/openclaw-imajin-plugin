@@ -51,6 +51,13 @@ per-turn token usage, cost, and context usage — including $0 turns from local 
 This is fire-and-forget: it never blocks, retries, or fails the turn, and any error is
 logged and dropped.
 
+The claim also carries a `transcript` pointer + hash (#1865): `sessionId` / `path` /
+`messageIds` / `lineRange` point at the turn's lines in the OpenClaw session JSONL
+(`agents/<agent>/sessions/<sessionId>.jsonl`), and `contentSha256` is a SHA-256 hash of
+the turn's message batch. The transcript content itself is never uploaded or embedded —
+only a pointer plus a tamper-evident hash, so a later disclosure can be verified against
+the signed claim without the content ever leaving the agent's own machine.
+
 ## Roadmap
 
 - [ ] Memory corpus supplement — agent's attestation chain as searchable memory

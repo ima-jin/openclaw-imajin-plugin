@@ -1,7 +1,12 @@
+import { createHash } from "node:crypto";
 import { describe, it, expect, vi, afterEach } from "vitest";
 import {
   findFinalAssistantMessage,
   extractTurnUsage,
+  extractMessageIds,
+  computeTurnContentHash,
+  buildTranscriptPath,
+  buildTranscriptPointer,
   buildTurnUsagePayload,
   buildTurnUsageClaim,
   postTurnUsageAttestation,
@@ -83,6 +88,113 @@ describe("extractTurnUsage", () => {
   });
 });
 
+describe("extractMessageIds", () => {
+  it("collects string ids off the turn's message batch, in order", () => {
+    const messages: AgentMessage[] = [
+      { id: "msg_1", role: "user" },
+      { id: "msg_2", role: "assistant" },
+    ];
+    expect(extractMessageIds(messages)).toEqual(["msg_1", "msg_2"]);
+  });
+
+  it("skips messages without a string id rather than padding with undefined", () => {
+    const messages = [
+      { id: "msg_1", role: "user" },
+      { role: "tool" },
+      { id: 42, role: "assistant" },
+      { id: "", role: "assistant" },
+    ] as unknown as AgentMessage[];
+    expect(extractMessageIds(messages)).toEqual(["msg_1"]);
+  });
+
+  it("returns an empty array for empty/undefined messages", () => {
+    expect(extractMessageIds([])).toEqual([]);
+    expect(extractMessageIds(undefined)).toEqual([]);
+  });
+});
+
+describe("computeTurnContentHash", () => {
+  it("hashes the full message batch as sha256(JSON.stringify(messages))", () => {
+    const messages: AgentMessage[] = [
+      { id: "msg_1", role: "user" },
+      { id: "msg_2", role: "assistant", usage: { totalTokens: 10 } },
+    ];
+    const expected = createHash("sha256").update(JSON.stringify(messages)).digest("hex");
+    expect(computeTurnContentHash(messages)).toBe(expected);
+  });
+
+  it("is deterministic for the same input", () => {
+    const messages: AgentMessage[] = [{ id: "msg_1", role: "assistant" }];
+    expect(computeTurnContentHash(messages)).toBe(computeTurnContentHash(messages));
+  });
+
+  it("changes when the message batch changes", () => {
+    const a = computeTurnContentHash([{ id: "msg_1", role: "assistant" }]);
+    const b = computeTurnContentHash([{ id: "msg_2", role: "assistant" }]);
+    expect(a).not.toBe(b);
+  });
+
+  it("is always computable — never throws for an empty/undefined batch", () => {
+    expect(computeTurnContentHash([])).toMatch(/^[0-9a-f]{64}$/);
+    expect(computeTurnContentHash(undefined)).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe("buildTranscriptPath", () => {
+  it("builds agents/<agent>/sessions/<sessionId>.jsonl from agentName + sessionId", () => {
+    expect(buildTranscriptPath("main", "11111111-1111-1111-1111-111111111111")).toBe(
+      "agents/main/sessions/11111111-1111-1111-1111-111111111111.jsonl",
+    );
+  });
+
+  it("returns undefined rather than guessing when agentName is missing", () => {
+    expect(buildTranscriptPath(undefined, "session-1")).toBeUndefined();
+  });
+
+  it("returns undefined rather than guessing when sessionId is missing", () => {
+    expect(buildTranscriptPath("main", undefined)).toBeUndefined();
+  });
+});
+
+describe("buildTranscriptPointer", () => {
+  it("assembles sessionId/path/messageIds/lineRange/contentSha256 from run metadata", () => {
+    const event: AgentEndEvent = {
+      sessionId: "11111111-1111-1111-1111-111111111111",
+      agentName: "main",
+      lineRange: [10, 14],
+      messages: [
+        { id: "msg_1", role: "user" },
+        { id: "msg_2", role: "assistant" },
+      ],
+    };
+    const pointer = buildTranscriptPointer(event);
+    expect(pointer.sessionId).toBe("11111111-1111-1111-1111-111111111111");
+    expect(pointer.path).toBe("agents/main/sessions/11111111-1111-1111-1111-111111111111.jsonl");
+    expect(pointer.messageIds).toEqual(["msg_1", "msg_2"]);
+    expect(pointer.lineRange).toEqual([10, 14]);
+    expect(pointer.contentSha256).toBe(computeTurnContentHash(event.messages));
+  });
+
+  it("prefers an explicit transcriptPath over the derived agentName/sessionId path", () => {
+    const event: AgentEndEvent = {
+      sessionId: "session-1",
+      agentName: "main",
+      transcriptPath: "agents/main/sessions/session-1.jsonl",
+    };
+    expect(buildTranscriptPointer(event).path).toBe("agents/main/sessions/session-1.jsonl");
+  });
+
+  it("leaves pointer fields undefined rather than throwing when run metadata is absent", () => {
+    const pointer = buildTranscriptPointer({});
+    expect(pointer.sessionId).toBeUndefined();
+    expect(pointer.path).toBeUndefined();
+    expect(pointer.lineRange).toBeUndefined();
+    expect(pointer.messageIds).toEqual([]);
+    // contentSha256 is always present, even with nothing else to point at.
+    expect(pointer.contentSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
 describe("buildTurnUsagePayload", () => {
   it("assembles the payload from event metadata + the final assistant message", () => {
     const event: AgentEndEvent = {
@@ -122,6 +234,34 @@ describe("buildTurnUsagePayload", () => {
     expect(payload.sessionKey).toBeUndefined();
     expect(payload.runId).toBeUndefined();
     expect(payload.usage).toEqual({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 });
+  });
+
+  it("carries a transcript pointer + content hash (#1865)", () => {
+    const event: AgentEndEvent = {
+      sessionId: "session-uuid",
+      agentName: "main",
+      lineRange: [1, 2],
+      messages: [
+        { id: "msg_1", role: "user" },
+        { id: "msg_2", role: "assistant", usage: { totalTokens: 10 } },
+      ],
+    };
+    const finalMessage = findFinalAssistantMessage(event.messages);
+    const payload = buildTurnUsagePayload(event, finalMessage);
+
+    expect(payload.transcript.sessionId).toBe("session-uuid");
+    expect(payload.transcript.path).toBe("agents/main/sessions/session-uuid.jsonl");
+    expect(payload.transcript.messageIds).toEqual(["msg_1", "msg_2"]);
+    expect(payload.transcript.lineRange).toEqual([1, 2]);
+    expect(payload.transcript.contentSha256).toBe(computeTurnContentHash(event.messages));
+  });
+
+  it("still carries a transcript.contentSha256 even with no session/message metadata", () => {
+    const payload = buildTurnUsagePayload({}, undefined);
+    expect(payload.transcript.sessionId).toBeUndefined();
+    expect(payload.transcript.path).toBeUndefined();
+    expect(payload.transcript.messageIds).toEqual([]);
+    expect(payload.transcript.contentSha256).toMatch(/^[0-9a-f]{64}$/);
   });
 });
 
@@ -264,7 +404,10 @@ describe("createTurnUsageAttestationHandler", () => {
     const event: AgentEndEvent = {
       type: "agent_end",
       sessionKey: "s1",
-      messages: [{ role: "assistant", usage: { totalTokens: 5 }, cost: { total: 0 } }],
+      sessionId: "session-uuid",
+      agentName: "main",
+      lineRange: [3, 5],
+      messages: [{ id: "msg_1", role: "assistant", usage: { totalTokens: 5 }, cost: { total: 0 } }],
     };
 
     // The handler returns synchronously — it must not return a Promise the
@@ -278,6 +421,11 @@ describe("createTurnUsageAttestationHandler", () => {
     expect(body.subject_did).toBe(DID);
     expect(body.type).toBe("agent.turn.usage");
     expect(body.payload.usage.totalTokens).toBe(5);
+    expect(body.payload.transcript.sessionId).toBe("session-uuid");
+    expect(body.payload.transcript.path).toBe("agents/main/sessions/session-uuid.jsonl");
+    expect(body.payload.transcript.messageIds).toEqual(["msg_1"]);
+    expect(body.payload.transcript.lineRange).toEqual([3, 5]);
+    expect(body.payload.transcript.contentSha256).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it("attests $0-cost turns too — no filtering (#1843)", async () => {
