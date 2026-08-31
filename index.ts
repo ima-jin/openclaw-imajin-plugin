@@ -42,6 +42,15 @@ interface WsNotificationsConfig {
   injectScopes?: string[];
   /** Exact session key to inject into, e.g. `agent:main:telegram:direct:8321865723`. */
   targetSession?: string;
+  /** Direct channel ping via the OpenClaw CLI — deterministic, no model turn. */
+  directSend?: {
+    /** Channel id, default `telegram`. */
+    channel?: string;
+    /** Chat/recipient target, e.g. `8321865723`. */
+    target?: string;
+    /** Absolute path to the openclaw CLI binary; default `openclaw` (PATH). */
+    cliPath?: string;
+  };
 }
 
 // A queued notification is stale once the run it describes is old news; the
@@ -83,6 +92,15 @@ function buildNotificationText(nf: NotificationFrame): string {
   return truncate(text, MAX_INJECTED_CHARS);
 }
 
+/** Compact human-facing line for the direct channel ping (no model in the loop). */
+function buildDirectMessage(nf: NotificationFrame): string {
+  const emoji =
+    nf.scope === "warp.run.timeout" ? "⏰" : /FAILED|ERROR|CANCEL/i.test(nf.title ?? "") ? "❌" : "✅";
+  const parts = [`${emoji} ${nf.title ?? nf.scope}`];
+  if (nf.body) parts.push(nf.body);
+  return truncate(parts.join("\n"), 900);
+}
+
 /**
  * Builds the WS-notification → agent-session injector (#1672).
  *
@@ -118,17 +136,6 @@ function createNotificationInjector(
   const injectScopes = new Set(wsNotifications?.injectScopes ?? []);
   const targetSession = wsNotifications?.targetSession?.trim();
 
-  // Prefer the grouped session facade; `api.enqueueNextTurnInjection` is the
-  // deprecated flat alias kept for hosts that predate the `api.session` group.
-  const enqueueNextTurnInjection:
-    | ((injection: {
-        sessionKey: string;
-        text: string;
-        idempotencyKey?: string;
-        placement?: "prepend_context" | "append_context";
-        ttlMs?: number;
-      }) => Promise<{ enqueued: boolean; id: string; sessionKey: string }>)
-    | undefined = api.session?.workflow?.enqueueNextTurnInjection ?? api.enqueueNextTurnInjection;
   const enqueueSystemEvent:
     | ((text: string, options: { sessionKey: string; contextKey?: string }) => boolean)
     | undefined = api.runtime?.system?.enqueueSystemEvent;
@@ -140,8 +147,8 @@ function createNotificationInjector(
     | undefined = api.runtime?.system?.runHeartbeatOnce;
 
   console.log(
-    `[imajin-ws] injection APIs: enqueueNextTurnInjection=${!!enqueueNextTurnInjection}, ` +
-      `enqueueSystemEvent=${!!enqueueSystemEvent}, runHeartbeatOnce=${!!runHeartbeatOnce}`,
+    `[imajin-ws] injection APIs: enqueueSystemEvent=${!!enqueueSystemEvent}, runHeartbeatOnce=${!!runHeartbeatOnce}, ` +
+      `directSend=${!!wsNotifications?.directSend?.target}`,
   );
   if (injectScopes.size === 0) {
     console.log("[imajin-ws] no wsNotifications.injectScopes configured — notifications are log-only");
@@ -162,38 +169,9 @@ function createNotificationInjector(
     }
 
     const text = buildNotificationText(nf);
-    let queuedVia: "next-turn-injection" | "system-event" | undefined;
+    let queuedVia: "system-event" | undefined;
 
-    if (enqueueNextTurnInjection) {
-      try {
-        const result = await enqueueNextTurnInjection({
-          sessionKey: targetSession,
-          text,
-          // The kernel notification id is already unique per event, so a
-          // reconnect that replays the frame cannot double-inject.
-          idempotencyKey: `imajin-ws:${nf.id}`,
-          placement: "prepend_context",
-          ttlMs: INJECTION_TTL_MS,
-        });
-        if (result?.enqueued) {
-          queuedVia = "next-turn-injection";
-        } else {
-          // Reached when the session row does not exist yet, the queue is full,
-          // or `hooks.allowPromptInjection` is false for this plugin.
-          console.warn(
-            `[imajin-ws] next-turn injection refused for ${nf.scope} (session ${targetSession}) — ` +
-              "falling back to the system-event queue",
-          );
-        }
-      } catch (err: any) {
-        console.error(
-          `[imajin-ws] enqueueNextTurnInjection failed for ${nf.scope}:`,
-          err?.message ?? err,
-        );
-      }
-    }
-
-    if (!queuedVia && enqueueSystemEvent) {
+    if (enqueueSystemEvent) {
       try {
         enqueueSystemEvent(text, {
           sessionKey: targetSession,
@@ -207,8 +185,44 @@ function createNotificationInjector(
 
     if (!queuedVia) {
       console.error(
-        `[imajin-ws] dropped ${nf.scope} — no injection API accepted the payload for ${targetSession}`,
+        `[imajin-ws] system-event queue rejected ${nf.scope} for ${targetSession} — direct send still attempted`,
       );
+    }
+
+    // Direct channel ping (2026-08-31): deterministic delivery with no model
+    // turn. The session event above keeps the agent's context complete; this
+    // is what actually reaches the human. `openclaw message send` is a plain
+    // gateway client, so calling it from inside the gateway process is safe.
+    const ds = wsNotifications?.directSend;
+    if (ds?.target) {
+      try {
+        const { execFile } = await import("node:child_process");
+        const cli = ds.cliPath ?? "openclaw";
+        const args = [
+          "message",
+          "send",
+          "--channel",
+          ds.channel ?? "telegram",
+          "--target",
+          ds.target,
+          "-m",
+          buildDirectMessage(nf),
+        ];
+        await new Promise<void>((resolve, reject) => {
+          execFile(cli, args, { timeout: 20_000 }, (err) => (err ? reject(err) : resolve()));
+        });
+        console.log(
+          `[imajin-ws] direct-sent ${nf.scope} → ${ds.channel ?? "telegram"}:${ds.target}` +
+            (queuedVia ? ` (context queued via ${queuedVia})` : ""),
+        );
+        return;
+      } catch (err: any) {
+        console.error(`[imajin-ws] direct send failed for ${nf.scope}:`, err?.message ?? err);
+        // Fall through to the heartbeat wake as a best-effort backup.
+      }
+    }
+
+    if (!queuedVia) {
       return;
     }
 
