@@ -312,3 +312,107 @@ describe("ImajinClient Warp dispatch (#1428 / #1619)", () => {
     await expect(client.dispatchWarp({ prompt: "x" })).rejects.toThrow(/403/);
   });
 });
+
+describe("ImajinClient Warp post-dispatch run control (#1639, plugin surface #1)", () => {
+  let client: ImajinClient;
+  const ACTING = "did:imajin:owner";
+
+  beforeEach(() => {
+    client = new ImajinClient({ nodeUrl: BASE_URL, did: "did:imajin:agent", actAs: ACTING });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("cancelWarpRun POSTs to /warp/api/runs/:runId/cancel with no body fields", async () => {
+    const ack = { runId: "r1", cancelled: true as const };
+    global.fetch = mockFetch(ack);
+    const result = await client.cancelWarpRun("r1");
+    expect(result).toEqual(ack);
+
+    const [req, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(req).toBe(`${BASE_URL}/warp/api/runs/r1/cancel`);
+    expect(init.method).toBe("POST");
+    expect((init.headers as Record<string, string>)["X-Acting-For"]).toBe(ACTING);
+  });
+
+  it("cancelWarpRun URL-encodes the runId", async () => {
+    global.fetch = mockFetch({ runId: "r/1", cancelled: true });
+    await client.cancelWarpRun("r/1");
+    const [req] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(req).toBe(`${BASE_URL}/warp/api/runs/r%2F1/cancel`);
+  });
+
+  it("cancelWarpRun propagates a kernel 409 (still PENDING) as a thrown error", async () => {
+    global.fetch = mockFetch({ error: "pending" }, 409);
+    await expect(client.cancelWarpRun("r1")).rejects.toThrow(/409/);
+  });
+
+  it("sendWarpFollowup POSTs { message } to /warp/api/runs/:runId/followups", async () => {
+    const ack = { runId: "r1", accepted: true as const };
+    global.fetch = mockFetch(ack, 202);
+    const result = await client.sendWarpFollowup("r1", { message: "keep going" });
+    expect(result).toEqual(ack);
+
+    const [req, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(req).toBe(`${BASE_URL}/warp/api/runs/r1/followups`);
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(init.body as string)).toEqual({ message: "keep going" });
+  });
+
+  it("sendWarpFollowup includes mode when provided", async () => {
+    global.fetch = mockFetch({ runId: "r1", accepted: true }, 202);
+    await client.sendWarpFollowup("r1", { message: "switch to plan", mode: "plan" });
+    const [, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({ message: "switch to plan", mode: "plan" });
+  });
+
+  it("listWarpRuns GETs /warp/api/runs with no query when no filters given", async () => {
+    const page = { runs: [], hasNextPage: false, nextCursor: null };
+    global.fetch = mockFetch(page);
+    const result = await client.listWarpRuns();
+    expect(result).toEqual(page);
+    const [req, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(req).toBe(`${BASE_URL}/warp/api/runs`);
+    expect(init?.method ?? "GET").toBe("GET");
+  });
+
+  it("listWarpRuns encodes filters as query params, repeating state per entry", async () => {
+    global.fetch = mockFetch({ runs: [], hasNextPage: false, nextCursor: null });
+    await client.listWarpRuns({
+      name: "owner-jin",
+      states: ["QUEUED", "INPROGRESS"],
+      environmentId: "env_1",
+      createdAfter: "2026-08-01T00:00:00Z",
+      limit: 50,
+      cursor: "cur_1",
+    });
+    const [req] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const url = new URL(req as string);
+    expect(url.pathname).toBe("/warp/api/runs");
+    expect(url.searchParams.get("name")).toBe("owner-jin");
+    expect(url.searchParams.getAll("state")).toEqual(["QUEUED", "INPROGRESS"]);
+    expect(url.searchParams.get("environmentId")).toBe("env_1");
+    expect(url.searchParams.get("createdAfter")).toBe("2026-08-01T00:00:00Z");
+    expect(url.searchParams.get("limit")).toBe("50");
+    expect(url.searchParams.get("cursor")).toBe("cur_1");
+  });
+
+  it("getWarpRunTranscript GETs /warp/api/runs/:runId/transcript", async () => {
+    const transcript = { runId: "r1", content: "hello", contentType: "text/plain", truncated: false };
+    global.fetch = mockFetch(transcript);
+    const result = await client.getWarpRunTranscript("r1");
+    expect(result).toEqual(transcript);
+    const [req, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(req).toBe(`${BASE_URL}/warp/api/runs/r1/transcript`);
+    expect(init?.method ?? "GET").toBe("GET");
+  });
+
+  it("getWarpRunTranscript appends maxChars when provided", async () => {
+    global.fetch = mockFetch({ runId: "r1", content: "", contentType: null, truncated: false });
+    await client.getWarpRunTranscript("r1", { maxChars: 500 });
+    const [req] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(req).toBe(`${BASE_URL}/warp/api/runs/r1/transcript?maxChars=500`);
+  });
+});

@@ -2,7 +2,7 @@ import { writeFileSync, unlinkSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ImajinChat } from "./chat.js";
 import type { ImajinClient } from "./client.js";
-import { createMediaTool, createAttestTool, createChatTool } from "./tools.js";
+import { createMediaTool, createAttestTool, createChatTool, createWarpTool } from "./tools.js";
 
 function makeMockClient(): ImajinClient {
   return {
@@ -265,6 +265,126 @@ describe("imajin_attest tool with onBehalfOf", () => {
       expect.objectContaining({ subject: "did:imajin:target" }),
       "did:imajin:principal",
     );
+  });
+});
+
+describe("imajin_warp tool post-dispatch control (#1639, plugin surface #1)", () => {
+  function makeMockWarpClient(): ImajinClient {
+    return {
+      dispatchWarp: vi.fn(),
+      getWarpRun: vi.fn(),
+      cancelWarpRun: vi.fn(),
+      sendWarpFollowup: vi.fn(),
+      listWarpRuns: vi.fn(),
+      getWarpRunTranscript: vi.fn(),
+      sealWarpKey: vi.fn(),
+    } as unknown as ImajinClient;
+  }
+
+  let client: ReturnType<typeof makeMockWarpClient>;
+  let tool: ReturnType<typeof createWarpTool>;
+
+  beforeEach(() => {
+    client = makeMockWarpClient();
+    tool = createWarpTool(client as unknown as ImajinClient);
+  });
+
+  it("exposes the new actions in the schema enum", () => {
+    const actionProp = tool.parameters.properties.action as { enum: string[] };
+    expect(actionProp.enum).toEqual(
+      expect.arrayContaining(["cancel_run", "send_followup", "list_runs", "get_transcript"]),
+    );
+  });
+
+  it("cancel_run calls client.cancelWarpRun with runId and onBehalfOf", async () => {
+    vi.mocked(client.cancelWarpRun).mockResolvedValue({ runId: "r1", cancelled: true });
+    const result = await tool.execute("1", {
+      action: "cancel_run",
+      runId: "r1",
+      onBehalfOf: "did:imajin:principal",
+    });
+    expect(client.cancelWarpRun).toHaveBeenCalledWith("r1", "did:imajin:principal");
+    expect(JSON.parse(result.content[0].text)).toEqual({ runId: "r1", cancelled: true });
+  });
+
+  it("cancel_run requires runId", async () => {
+    const result = await tool.execute("1", { action: "cancel_run" } as never);
+    expect(result.content[0].text).toMatch(/runId.*required|requires 'runId'/i);
+    expect(client.cancelWarpRun).not.toHaveBeenCalled();
+  });
+
+  it("send_followup calls client.sendWarpFollowup with message and optional mode", async () => {
+    vi.mocked(client.sendWarpFollowup).mockResolvedValue({ runId: "r1", accepted: true });
+    const result = await tool.execute("1", {
+      action: "send_followup",
+      runId: "r1",
+      message: "keep going",
+      mode: "plan",
+    });
+    expect(client.sendWarpFollowup).toHaveBeenCalledWith(
+      "r1",
+      { message: "keep going", mode: "plan" },
+      undefined,
+    );
+    expect(JSON.parse(result.content[0].text)).toEqual({ runId: "r1", accepted: true });
+  });
+
+  it("send_followup omits mode when not provided", async () => {
+    vi.mocked(client.sendWarpFollowup).mockResolvedValue({ runId: "r1", accepted: true });
+    await tool.execute("1", { action: "send_followup", runId: "r1", message: "hi" });
+    expect(client.sendWarpFollowup).toHaveBeenCalledWith("r1", { message: "hi" }, undefined);
+  });
+
+  it("send_followup requires runId and message", async () => {
+    const r1 = await tool.execute("1", { action: "send_followup" } as never);
+    expect(r1.content[0].text).toMatch(/runId/i);
+
+    const r2 = await tool.execute("1", { action: "send_followup", runId: "r1" } as never);
+    expect(r2.content[0].text).toMatch(/message/i);
+    expect(client.sendWarpFollowup).not.toHaveBeenCalled();
+  });
+
+  it("list_runs calls client.listWarpRuns with the given filters", async () => {
+    vi.mocked(client.listWarpRuns).mockResolvedValue({
+      runs: [{ runId: "r1", state: "SUCCEEDED", sessionLink: null, title: null, configName: "o-jin" }],
+      hasNextPage: false,
+      nextCursor: null,
+    });
+    const result = await tool.execute("1", {
+      action: "list_runs",
+      name: "o-jin",
+      states: ["SUCCEEDED"],
+      limit: 10,
+    });
+    expect(client.listWarpRuns).toHaveBeenCalledWith(
+      { name: "o-jin", states: ["SUCCEEDED"], limit: 10 },
+      undefined,
+    );
+    expect(JSON.parse(result.content[0].text).runs).toHaveLength(1);
+  });
+
+  it("list_runs reports when there are no runs", async () => {
+    vi.mocked(client.listWarpRuns).mockResolvedValue({ runs: [], hasNextPage: false, nextCursor: null });
+    const result = await tool.execute("1", { action: "list_runs" });
+    expect(result.content[0].text).toMatch(/No Warp runs found/);
+  });
+
+  it("get_transcript calls client.getWarpRunTranscript with runId and maxChars", async () => {
+    vi.mocked(client.getWarpRunTranscript).mockResolvedValue({
+      runId: "r1",
+      content: "log output",
+      contentType: "text/plain",
+      truncated: false,
+    });
+    const result = await tool.execute("1", { action: "get_transcript", runId: "r1", maxChars: 100 });
+    expect(client.getWarpRunTranscript).toHaveBeenCalledWith("r1", { maxChars: 100 }, undefined);
+    expect(JSON.parse(result.content[0].text).content).toBe("log output");
+  });
+
+  it("get_transcript requires runId", async () => {
+    const result = await tool.execute("1", { action: "get_transcript" } as never);
+    expect(result.content[0].text).toMatch(/runId/i);
+    expect(client.getWarpRunTranscript).not.toHaveBeenCalled();
   });
 });
 

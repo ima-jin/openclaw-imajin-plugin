@@ -129,6 +129,61 @@ export interface WarpAgentRun {
   configName: string | null;
 }
 
+// --- Warp post-dispatch run control (#1639, plugin surface #1) ---
+
+/** Query mode for a follow-up — Warp does not infer this, so it must be stated. */
+export type WarpFollowupMode = "normal" | "plan" | "orchestrate";
+
+/** Acknowledgement that the kernel accepted a cancellation request. */
+export interface WarpRunCancellation {
+  runId: string;
+  cancelled: true;
+}
+
+/** Input for {@link ImajinClient.sendWarpFollowup}. */
+export interface SendWarpFollowupInput {
+  /** The message to deliver to the run. Required and non-empty. */
+  message: string;
+  /** Defaults to the kernel's own default (`normal`) when omitted. */
+  mode?: WarpFollowupMode;
+}
+
+/** Acknowledgement that the kernel accepted a follow-up — not the resulting run state. */
+export interface WarpFollowupAck {
+  runId: string;
+  accepted: true;
+}
+
+/** Filters for {@link ImajinClient.listWarpRuns}. Every field is optional. */
+export interface ListWarpRunsInput {
+  /** Warp `config.name` — the `{username}-jin` tag a dispatch was stamped with. */
+  name?: string;
+  /** Match any of these run states (`QUEUED`, `INPROGRESS`, `SUCCEEDED`, …). */
+  states?: string[];
+  environmentId?: string;
+  /** RFC-3339 lower bound on `created_at`. */
+  createdAfter?: string;
+  /** 1–500; the kernel defaults to 20. */
+  limit?: number;
+  /** `nextCursor` from a previous page. */
+  cursor?: string;
+}
+
+/** One page of {@link ImajinClient.listWarpRuns} results. */
+export interface WarpRunListPage {
+  runs: WarpAgentRun[];
+  hasNextPage: boolean;
+  nextCursor: string | null;
+}
+
+/** A run's raw transcript, as surfaced by the kernel. */
+export interface WarpRunTranscript {
+  runId: string;
+  content: string;
+  contentType: string | null;
+  truncated: boolean;
+}
+
 export class ImajinClient {
   private baseUrl: string;
   private did?: string;
@@ -654,6 +709,77 @@ export class ImajinClient {
     return this.get(`/warp/api/runs/${encodeURIComponent(runId)}`, {
       onBehalfOf,
     }) as Promise<WarpAgentRun>;
+  }
+
+  /**
+   * List the Warp cloud-agent runs the acting principal's own sealed key can
+   * see (`GET /warp/api/runs`, #1639/#1682). Gated by the same grant as
+   * dispatch — the key *is* the scope, so this is naturally per-jin history.
+   */
+  async listWarpRuns(filters: ListWarpRunsInput = {}, onBehalfOf?: string): Promise<WarpRunListPage> {
+    const params = new URLSearchParams();
+    if (filters.name !== undefined) params.set("name", filters.name);
+    for (const state of filters.states ?? []) params.append("state", state);
+    if (filters.environmentId !== undefined) params.set("environmentId", filters.environmentId);
+    if (filters.createdAfter !== undefined) params.set("createdAfter", filters.createdAfter);
+    if (filters.cursor !== undefined) params.set("cursor", filters.cursor);
+    if (filters.limit !== undefined) params.set("limit", String(filters.limit));
+
+    const query = params.toString();
+    return this.get(`/warp/api/runs${query.length === 0 ? "" : `?${query}`}`, {
+      onBehalfOf,
+    }) as Promise<WarpRunListPage>;
+  }
+
+  /**
+   * Cancel a queued or in-progress Warp run as the acting principal
+   * (`POST /warp/api/runs/{runId}/cancel`, #1639). Gated by the same grant as
+   * dispatch — cancellation needs no extra scope, the key can only reach runs
+   * it created. The kernel's refusals (400 already terminal, 409 still
+   * PENDING/retryable, 422 not cancellable) surface as thrown errors.
+   */
+  async cancelWarpRun(runId: string, onBehalfOf?: string): Promise<WarpRunCancellation> {
+    return this.post(`/warp/api/runs/${encodeURIComponent(runId)}/cancel`, {}, {
+      onBehalfOf,
+    }) as Promise<WarpRunCancellation>;
+  }
+
+  /**
+   * Send a follow-up message to a run that is already going
+   * (`POST /warp/api/runs/{runId}/followups`, #1639) — mid-run course
+   * correction instead of cancel-and-redispatch. A 202 means "accepted", not
+   * "applied"; observe the effect through {@link getWarpRun}.
+   */
+  async sendWarpFollowup(
+    runId: string,
+    input: SendWarpFollowupInput,
+    onBehalfOf?: string,
+  ): Promise<WarpFollowupAck> {
+    return this.post(
+      `/warp/api/runs/${encodeURIComponent(runId)}/followups`,
+      {
+        message: input.message,
+        ...(input.mode === undefined ? {} : { mode: input.mode }),
+      },
+      { onBehalfOf },
+    ) as Promise<WarpFollowupAck>;
+  }
+
+  /**
+   * Read a Warp run's raw transcript as the acting principal
+   * (`GET /warp/api/runs/{runId}/transcript`, #1639) — the self-diagnosis path
+   * for a failed run. `maxChars` caps the returned text; the kernel applies
+   * its own default when omitted.
+   */
+  async getWarpRunTranscript(
+    runId: string,
+    opts: { maxChars?: number } = {},
+    onBehalfOf?: string,
+  ): Promise<WarpRunTranscript> {
+    const query = opts.maxChars === undefined ? "" : `?maxChars=${opts.maxChars}`;
+    return this.get(`/warp/api/runs/${encodeURIComponent(runId)}/transcript${query}`, {
+      onBehalfOf,
+    }) as Promise<WarpRunTranscript>;
   }
 
   /**

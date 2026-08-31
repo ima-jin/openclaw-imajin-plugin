@@ -303,21 +303,40 @@ export function createWarpTool(client: ImajinClient) {
     name: "imajin_warp",
     label: "Imajin Warp",
     description:
-      "Dispatch and inspect Warp cloud agents through the Imajin kernel (#1428). " +
+      "Dispatch and control Warp cloud agents through the Imajin kernel (#1428, #1639). " +
       "Attribution follows the acting principal's sealed Warp key (run stamped {username}-jin), " +
       "never the human. Actions: " +
       "dispatch (fire a cloud agent with a prompt; optional skillSpec 'owner/repo:skill' and " +
       "mcpServers map to compose skills + scoped MCP servers), " +
       "get_run (read a run's lifecycle state + session link by runId), " +
+      "cancel_run (kill a queued or in-progress run by runId — the revocation half of dispatch; " +
+      "the kernel's 400/409/422 refusals for an already-terminal, still-PENDING, or " +
+      "non-cancellable run surface as errors), " +
+      "send_followup (deliver a mid-run message to a run by runId + message, optional mode " +
+      "'normal'|'plan'|'orchestrate'; acceptance is not application — check get_run for the effect), " +
+      "list_runs (list the principal's own runs, newest-updated first, with optional name/states/ " +
+      "environmentId/createdAfter/limit/cursor filters), " +
+      "get_transcript (read a run's raw transcript by runId — the self-diagnosis path for a failed run; " +
+      "optional maxChars caps the returned text), " +
       "seal_key (seal a Warp Agent API key for the principal as a delegation-grant vault field — " +
       "owner-authored; the key is never logged or echoed). " +
-      "Authority is enforced kernel-side: a missing warp:dispatch grant fails 403, an unsealed key fails 409.",
+      "Authority is enforced kernel-side: a missing warp:dispatch grant fails 403, an unsealed key fails 409. " +
+      "Every action reaches only runs the acting principal's own sealed key created — there is no " +
+      "cross-DID surface to grant separately.",
     parameters: {
       type: "object" as const,
       properties: {
         action: {
           type: "string" as const,
-          enum: ["dispatch", "get_run", "seal_key"],
+          enum: [
+            "dispatch",
+            "get_run",
+            "cancel_run",
+            "send_followup",
+            "list_runs",
+            "get_transcript",
+            "seal_key",
+          ],
           description: "Action to perform",
         },
         prompt: {
@@ -363,7 +382,39 @@ export function createWarpTool(client: ImajinClient) {
         },
         runId: {
           type: "string" as const,
-          description: "The run id returned by dispatch (for get_run)",
+          description:
+            "The run id returned by dispatch (for get_run, cancel_run, send_followup, get_transcript)",
+        },
+        message: {
+          type: "string" as const,
+          description: "The follow-up message to deliver to the run (for send_followup)",
+        },
+        mode: {
+          type: "string" as const,
+          enum: ["normal", "plan", "orchestrate"],
+          description: "Optional follow-up routing mode, defaults to 'normal' (for send_followup)",
+        },
+        states: {
+          type: "array" as const,
+          items: { type: "string" as const },
+          description:
+            "Filter by run state(s), e.g. QUEUED, INPROGRESS, SUCCEEDED, FAILED, CANCELLED (for list_runs)",
+        },
+        createdAfter: {
+          type: "string" as const,
+          description: "RFC-3339 lower bound on created_at (for list_runs)",
+        },
+        limit: {
+          type: "number" as const,
+          description: "Max runs to return, 1-500, clamped kernel-side (for list_runs)",
+        },
+        cursor: {
+          type: "string" as const,
+          description: "Pagination cursor from a previous list_runs page's nextCursor (for list_runs)",
+        },
+        maxChars: {
+          type: "number" as const,
+          description: "Optional cap on transcript characters returned (for get_transcript)",
         },
         agentKey: {
           type: "string" as const,
@@ -395,6 +446,13 @@ export function createWarpTool(client: ImajinClient) {
         attachImajinMcp?: boolean;
         computerUseEnabled?: boolean;
         runId?: string;
+        message?: string;
+        mode?: string;
+        states?: string[];
+        createdAfter?: string;
+        limit?: number;
+        cursor?: string;
+        maxChars?: number;
         agentKey?: string;
         onBehalfOf?: string;
       },
@@ -430,6 +488,52 @@ export function createWarpTool(client: ImajinClient) {
             if (!params.runId) return errorResult("get_run requires 'runId'");
             const run = await client.getWarpRun(params.runId, params.onBehalfOf);
             return jsonResult(run);
+          }
+          case "cancel_run": {
+            if (!params.runId) return errorResult("cancel_run requires 'runId'");
+            const result = await client.cancelWarpRun(params.runId, params.onBehalfOf);
+            return jsonResult(result);
+          }
+          case "send_followup": {
+            if (!params.runId) return errorResult("send_followup requires 'runId'");
+            if (!params.message) return errorResult("send_followup requires 'message'");
+            const result = await client.sendWarpFollowup(
+              params.runId,
+              {
+                message: params.message,
+                ...(params.mode === undefined
+                  ? {}
+                  : { mode: params.mode as "normal" | "plan" | "orchestrate" }),
+              },
+              params.onBehalfOf,
+            );
+            return jsonResult(result);
+          }
+          case "list_runs": {
+            const page = await client.listWarpRuns(
+              {
+                ...(params.name === undefined ? {} : { name: params.name }),
+                ...(params.states === undefined ? {} : { states: params.states }),
+                ...(params.environmentId === undefined
+                  ? {}
+                  : { environmentId: params.environmentId }),
+                ...(params.createdAfter === undefined ? {} : { createdAfter: params.createdAfter }),
+                ...(params.limit === undefined ? {} : { limit: params.limit }),
+                ...(params.cursor === undefined ? {} : { cursor: params.cursor }),
+              },
+              params.onBehalfOf,
+            );
+            if (!page.runs.length) return textResult("No Warp runs found");
+            return jsonResult({ ...page, runs: truncateResults(page.runs) });
+          }
+          case "get_transcript": {
+            if (!params.runId) return errorResult("get_transcript requires 'runId'");
+            const transcript = await client.getWarpRunTranscript(
+              params.runId,
+              params.maxChars === undefined ? {} : { maxChars: params.maxChars },
+              params.onBehalfOf,
+            );
+            return jsonResult(transcript);
           }
           case "seal_key": {
             if (!params.agentKey) return errorResult("seal_key requires 'agentKey'");
