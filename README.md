@@ -55,9 +55,28 @@ logged and dropped.
 
 - [ ] Memory corpus supplement — agent's attestation chain as searchable memory
 - [ ] Entity context hook — auto-decorate prompts with Imajin identity context
-- [ ] Background service — persistent node connection, auth refresh
+- [x] Background service — persistent node connection, auth refresh (#1904)
 - [ ] Webhook receiver — push Imajin events (messages, transactions) into agent sessions
 - [ ] Chat bridge — send/receive messages as a DID via Imajin chat
+
+### Real-time notifications (#1904)
+
+When `keypairPath` is configured, the plugin opens a persistent, authenticated
+WebSocket to the kernel's `/chat/ws` endpoint (`src/ws-service.ts`), registered
+via `api.registerService` so it starts and stops with the plugin lifecycle:
+
+- **Auth:** the same Ed25519 challenge-response flow as `client.ts`. Prefers
+  the `ws` package (`Cookie` header on the upgrade request); falls back to
+  native WebSocket + the kernel's short-lived WS token exchange
+  (`GET /chat/api/ws-token`) when `ws` isn't resolvable in the host sandbox.
+- **Reconnect:** exponential backoff (2s → 60s cap) on any drop.
+- **Auth refresh:** re-authenticates ahead of the kernel's 24h session expiry,
+  and immediately on an `auth_required`/auth `error` frame from the kernel.
+- **Notifications:** `{ type: "notification" }` frames (see #1645) are
+  validated and handed to registered frame handlers; `wsNotifications` in
+  `openclaw.json` controls which scopes (e.g. `warp.run.completed`) wake the
+  agent session (#1672). Unrecognized scopes and malformed frames are logged
+  and dropped — they never crash the socket.
 
 ## About Imajin
 
