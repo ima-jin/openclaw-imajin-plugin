@@ -100,14 +100,14 @@ function buildNotificationText(nf: NotificationFrame): string {
  *   parameter was `undefined` and `requireSessionKey(options.sessionKey)` threw
  *   `Cannot read properties of undefined (reading 'sessionKey')`. The API was
  *   never session-scoped — it just needs the session key passed explicitly.
- * - `api.runtime.system.requestHeartbeat({ source: "notifications-event",
- *   intent: "immediate", reason: "wake", sessionKey })` is what actually wakes
- *   the agent. That exact quadruple is the host's "targeted immediate system
- *   event wake": it is the only combination that bypasses the heartbeat
- *   enrolment, quiet-hours and empty-`HEARTBEAT.md` gates for a specific
- *   session. The previous `{ source: "other", intent: "event" }` call was
- *   treated as an ordinary heartbeat tick with no session target, which is why
- *   it fired without ever waking this session or carrying the payload.
+ * - `api.runtime.system.runHeartbeatOnce({ reason, heartbeat: { target: "last" } })`
+ *   is what actually wakes the agent NOW: per plugins/sdk-runtime.md it "runs a
+ *   single heartbeat cycle immediately, bypassing the normal coalesce timer".
+ *   `requestHeartbeat(...)` — used until 2026-08-31 — only feeds the coalesce
+ *   timer; `intent: "immediate"` is an ordinary hint string, not a bypass. On
+ *   2026-08-31 eight warp.run.completed events were queued via system events
+ *   but produced zero agent turns until the next user message 11+ minutes
+ *   later, which is how this was caught.
  *   `heartbeat: { target: "last" }` routes the reply to the session's last
  *   active channel instead of the default `target: "none"` suppression.
  */
@@ -132,19 +132,16 @@ function createNotificationInjector(
   const enqueueSystemEvent:
     | ((text: string, options: { sessionKey: string; contextKey?: string }) => boolean)
     | undefined = api.runtime?.system?.enqueueSystemEvent;
-  const requestHeartbeat:
+  const runHeartbeatOnce:
     | ((opts: {
-        source: string;
-        intent: string;
         reason?: string;
-        sessionKey?: string;
         heartbeat?: { target?: string };
-      }) => void)
-    | undefined = api.runtime?.system?.requestHeartbeat;
+      }) => Promise<unknown>)
+    | undefined = api.runtime?.system?.runHeartbeatOnce;
 
   console.log(
     `[imajin-ws] injection APIs: enqueueNextTurnInjection=${!!enqueueNextTurnInjection}, ` +
-      `enqueueSystemEvent=${!!enqueueSystemEvent}, requestHeartbeat=${!!requestHeartbeat}`,
+      `enqueueSystemEvent=${!!enqueueSystemEvent}, runHeartbeatOnce=${!!runHeartbeatOnce}`,
   );
   if (injectScopes.size === 0) {
     console.log("[imajin-ws] no wsNotifications.injectScopes configured — notifications are log-only");
@@ -215,24 +212,27 @@ function createNotificationInjector(
       return;
     }
 
-    if (!requestHeartbeat) {
+    if (!runHeartbeatOnce) {
       // The payload is queued and will be picked up by the session's next turn,
       // but nothing will start that turn on its own.
       console.warn(
-        `[imajin-ws] queued ${nf.scope} via ${queuedVia} but requestHeartbeat is unavailable — ` +
+        `[imajin-ws] queued ${nf.scope} via ${queuedVia} but runHeartbeatOnce is unavailable — ` +
           "the agent will only see it on its next turn",
       );
       return;
     }
 
-    requestHeartbeat({
-      source: "notifications-event",
-      intent: "immediate",
-      reason: "wake",
-      sessionKey: targetSession,
-      heartbeat: { target: "last" },
-    });
-    console.log(`[imajin-ws] injected ${nf.scope} → ${targetSession} via ${queuedVia}, woke session`);
+    try {
+      await runHeartbeatOnce({
+        reason: "warp-notification-wake",
+        heartbeat: { target: "last" },
+      });
+      console.log(
+        `[imajin-ws] injected ${nf.scope} → ${targetSession} via ${queuedVia}, ran immediate heartbeat`,
+      );
+    } catch (err: any) {
+      console.error(`[imajin-ws] runHeartbeatOnce failed for ${nf.scope}:`, err?.message ?? err);
+    }
   };
 }
 
