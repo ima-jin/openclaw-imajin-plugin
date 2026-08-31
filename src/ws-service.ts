@@ -3,11 +3,19 @@
  *
  * Background service that maintains a persistent WebSocket connection to the
  * kernel's chat/notification endpoint. Authenticates via Ed25519 challenge-response
- * (same flow as ImajinClient), handles heartbeat/reconnect, and parses inbound
- * frames (chat messages + notification pushes from #1645).
+ * (same flow as ImajinClient), handles heartbeat/reconnect/auth-refresh, and parses
+ * inbound frames (chat messages + notification pushes from #1645).
  *
- * Uses native WebSocket (Node 22+) — no external `ws` dependency needed.
- * Auth cookie is passed via query param since native WS doesn't support headers.
+ * Prefers the `ws` package (supports a `Cookie` header on the upgrade request, which
+ * is how `apps/kernel/ws-server.js`'s `authenticateWithCookie` authenticates before
+ * the socket ever opens). When `ws` isn't resolvable in the host's plugin sandbox, it
+ * falls back to native WebSocket (Node 22+, no header support) and authenticates
+ * post-connect via the kernel's short-lived WS token exchange instead:
+ *   1. `GET /chat/api/ws-token` with the session cookie → `{ token }` (30s TTL, one-time use)
+ *   2. send `{ type: "auth", token }` — matches `authenticateWsToken` in ws-server.js
+ * A prior version of this fallback sent `{ type: "auth", cookie, did }`, which the
+ * kernel's deferred-auth branch never recognizes (it only looks at `msg.token`) — that
+ * path silently never authenticated. See PR description for details.
  *
  * Registered via api.registerService() in the plugin entry.
  */
@@ -28,7 +36,8 @@ export interface NotificationFrame {
   id: string;
   scope: string;
   title: string;
-  body: string;
+  /** The kernel's `notifications.body` column allows null (see `ws-push.ts`). */
+  body: string | null;
   data?: Record<string, unknown>;
   createdAt: string;
 }
@@ -61,12 +70,77 @@ interface Logger {
   error: (msg: string, ...args: unknown[]) => void;
 }
 
+/**
+ * `ws.addEventListener("close", …)` is typed against `CloseEvent`, which lib.dom
+ * provides but this project's `lib: ["ES2022"]` tsconfig does not. Both the `ws`
+ * package's close event and the native one carry `code`/`reason`, so a small
+ * structural type covers both without pulling in DOM lib globals.
+ */
+interface WsCloseEvent {
+  code?: number;
+  reason?: string;
+}
+
+// --- Pure helpers (exported for unit testing) ---
+
+/**
+ * Parse one inbound WS frame. Returns `null` for the heartbeat `pong`/empty
+ * frames and anything that isn't a JSON object carrying a string `type` —
+ * callers should log-and-ignore on `null` rather than throw, so a malformed
+ * frame can never crash the socket.
+ */
+export function parseFrame(raw: string): InboundFrame | null {
+  if (raw === "" || raw === "pong") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    typeof (parsed as { type?: unknown }).type !== "string"
+  ) {
+    return null;
+  }
+  return parsed as InboundFrame;
+}
+
+/** Narrows a `notification`-typed frame down to one carrying the required fields. */
+export function isNotificationFrame(frame: InboundFrame): frame is NotificationFrame {
+  const f = frame as Partial<NotificationFrame>;
+  return (
+    frame.type === "notification" &&
+    typeof f.id === "string" &&
+    typeof f.scope === "string" &&
+    typeof f.title === "string"
+  );
+}
+
+/** True for the kernel's `auth_required` control frame or an auth-flavored `error` frame. */
+export function isAuthFailureFrame(frame: InboundFrame): boolean {
+  if (frame.type === "auth_required") return true;
+  if (frame.type !== "error") return false;
+  const message = (frame as { message?: unknown }).message;
+  return typeof message === "string" && /auth/i.test(message);
+}
+
 // --- Service ---
 
 const RECONNECT_BASE_MS = 2_000;
 const RECONNECT_MAX_MS = 60_000;
 const HEARTBEAT_INTERVAL_MS = 30_000;
 const HEARTBEAT_TIMEOUT_MS = 10_000;
+// The kernel's session JWT is valid for 24h (`JWT_EXPIRY` in `apps/kernel/src/lib/auth/jwt.ts`).
+// Refresh well before that so a long-lived connection never rides a cookie all the way to
+// expiry and has to discover it's stale only after the kernel rejects it.
+export const AUTH_REFRESH_INTERVAL_MS = 20 * 60 * 60_000; // 20h
+
+/** Exponential backoff, capped, for WS reconnect attempts. Exported for unit tests. */
+export function computeReconnectDelayMs(attempt: number): number {
+  return Math.min(RECONNECT_BASE_MS * Math.pow(2, attempt), RECONNECT_MAX_MS);
+}
 
 export class ImajinWsService {
   private ws: WebSocket | null = null;
@@ -76,6 +150,7 @@ export class ImajinWsService {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimeout: ReturnType<typeof setTimeout> | null = null;
+  private authRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private handlers: FrameHandler[] = [];
   private logger: Logger;
@@ -196,6 +271,27 @@ export class ImajinWsService {
     return this.sessionCookie;
   }
 
+  /**
+   * Exchange the session cookie for a short-lived, one-time WS auth token
+   * (`GET /chat/api/ws-token`, `apps/kernel/app/chat/api/ws-token/route.ts`).
+   * Only needed on the native-WebSocket fallback, which cannot send a `Cookie`
+   * header on the initial upgrade the way the `ws` package can.
+   */
+  private async fetchWsToken(cookie: string): Promise<string> {
+    const baseUrl = this.config.nodeUrl.replace(/\/$/, "");
+    const res = await fetch(`${baseUrl}/chat/api/ws-token`, {
+      headers: { Cookie: cookie },
+    });
+    if (!res.ok) {
+      throw new Error(`WS token fetch failed (${res.status})`);
+    }
+    const { token } = (await res.json()) as { token?: string };
+    if (!token) {
+      throw new Error("WS token fetch: empty token in response");
+    }
+    return token;
+  }
+
   // --- WebSocket lifecycle ---
 
   private async connect(): Promise<void> {
@@ -210,16 +306,18 @@ export class ImajinWsService {
 
       this.logger.info(`connecting to ${wsUrl}`);
 
-      // Native WebSocket (Node 22+) doesn't support custom headers.
-      // The kernel WS handler reads the session from the upgrade request.
-      // We pass the session cookie via a protocol header that the ws
-      // upgrade can read, or fall back to post-connect auth message.
-      //
-      // Strategy: try ws package first (supports headers), fall back to
-      // native WebSocket with post-connect auth.
+      // Strategy: try the `ws` package first — it supports a `Cookie` header on
+      // the upgrade request, which `ws-server.js`'s `authenticateWithCookie`
+      // reads before the socket even opens. When `ws` can't be resolved (some
+      // plugin sandboxes don't hoist it), fall back to native WebSocket
+      // (Node 22+) and authenticate post-connect with a short-lived WS token
+      // instead — native WebSocket cannot set a `Cookie` header at all, so
+      // sending the raw session cookie in a post-connect message (as a prior
+      // version of this file did) is never recognized by the kernel's
+      // deferred-auth branch, which only accepts `{ type: "auth", token }`.
       let ws: WebSocket;
+      let wsToken: string | null = null;
       try {
-        // Try importing ws (available if OpenClaw hoists it)
         const { default: WsClient } = await import("ws" as string);
         ws = new WsClient(wsUrl, {
           headers: {
@@ -228,7 +326,7 @@ export class ImajinWsService {
           },
         }) as unknown as WebSocket;
       } catch {
-        // Fall back to native WebSocket — authenticate post-connect
+        wsToken = await this.fetchWsToken(cookie);
         ws = new WebSocket(wsUrl);
       }
 
@@ -236,13 +334,10 @@ export class ImajinWsService {
         this.logger.info("connected");
         this.reconnectAttempt = 0;
 
-        // If using native WebSocket (no cookie header), send auth message
-        if (!("_socket" in ws)) {
-          ws.send(JSON.stringify({
-            type: "auth",
-            cookie,
-            did: this.config.did,
-          }));
+        // Native fallback: exchange the short-lived token for an authenticated
+        // session on this socket (see fetchWsToken above for why).
+        if (wsToken) {
+          ws.send(JSON.stringify({ type: "auth", token: wsToken }));
         }
 
         // Register for actAs DID notifications too (#1545 pattern).
@@ -257,28 +352,44 @@ export class ImajinWsService {
         }
 
         this.startHeartbeat(ws);
+        this.scheduleAuthRefresh();
       });
 
       ws.addEventListener("message", (event: MessageEvent | { data: unknown }) => {
         this.resetHeartbeatTimeout();
-        try {
-          const raw = typeof event === "object" && "data" in event
-            ? String(event.data)
-            : String(event);
+        const raw = typeof event === "object" && "data" in event
+          ? String(event.data)
+          : String(event);
 
-          // Ignore pong/heartbeat responses
-          if (raw === "pong" || raw === "") return;
-
-          const frame = JSON.parse(raw) as InboundFrame;
-          this.dispatchFrame(frame);
-        } catch (err) {
-          this.logger.warn(`failed to parse WS frame: ${err}`);
+        const frame = parseFrame(raw);
+        if (!frame) {
+          if (raw !== "" && raw !== "pong") {
+            this.logger.warn(`failed to parse WS frame: ${raw.slice(0, 200)}`);
+          }
+          return;
         }
+
+        if (frame.type === "connected") {
+          this.logger.info("auth ok");
+          return;
+        }
+
+        if (isAuthFailureFrame(frame)) {
+          const reason = (frame as { message?: string }).message ?? frame.type;
+          this.logger.warn(`auth rejected by kernel (${reason}) — refreshing session and reconnecting`);
+          // Force a fresh challenge-response on the next connect() rather than
+          // retrying with a cookie the kernel just told us is no longer valid.
+          this.sessionCookie = null;
+          ws.close(4001, "auth refresh");
+          return;
+        }
+
+        this.dispatchFrame(frame);
       });
 
-      ws.addEventListener("close", (event: CloseEvent | { code?: number; reason?: string }) => {
-        const code = "code" in event ? event.code : 0;
-        const reason = "reason" in event ? event.reason : "";
+      ws.addEventListener("close", (event: WsCloseEvent) => {
+        const code = event.code ?? 0;
+        const reason = event.reason ?? "";
         this.logger.warn(`disconnected (code=${code}, reason=${reason})`);
         this.clearTimers();
         this.ws = null;
@@ -300,6 +411,13 @@ export class ImajinWsService {
   }
 
   private dispatchFrame(frame: InboundFrame): void {
+    // A malformed notification frame (missing id/scope/title) must never reach
+    // a handler that assumes the full shape — log-and-drop instead of crashing
+    // the socket or a downstream injector.
+    if (frame.type === "notification" && !isNotificationFrame(frame)) {
+      this.logger.warn(`dropped malformed notification frame: ${JSON.stringify(frame).slice(0, 200)}`);
+      return;
+    }
     for (const handler of this.handlers) {
       try {
         handler(frame);
@@ -336,10 +454,7 @@ export class ImajinWsService {
   private scheduleReconnect(): void {
     if (this.stopped) return;
 
-    const delay = Math.min(
-      RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempt),
-      RECONNECT_MAX_MS,
-    );
+    const delay = computeReconnectDelayMs(this.reconnectAttempt);
     this.reconnectAttempt++;
 
     this.logger.info(`reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
@@ -348,6 +463,25 @@ export class ImajinWsService {
       this.reconnectTimer = null;
       this.connect();
     }, delay);
+  }
+
+  // --- Auth refresh ---
+
+  /**
+   * Proactively re-authenticate before the kernel's 24h session JWT expires,
+   * rather than only discovering it's stale when the kernel closes the socket
+   * or rejects a reconnect. Clearing `sessionCookie` and closing forces the
+   * existing reconnect path to run a fresh challenge-response.
+   */
+  private scheduleAuthRefresh(): void {
+    if (this.authRefreshTimer) {
+      clearTimeout(this.authRefreshTimer);
+    }
+    this.authRefreshTimer = setTimeout(() => {
+      this.logger.info("refreshing session ahead of expiry");
+      this.sessionCookie = null;
+      this.ws?.close(4000, "auth refresh");
+    }, AUTH_REFRESH_INTERVAL_MS);
   }
 
   private clearTimers(): void {
@@ -362,6 +496,10 @@ export class ImajinWsService {
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
+    }
+    if (this.authRefreshTimer) {
+      clearTimeout(this.authRefreshTimer);
+      this.authRefreshTimer = null;
     }
   }
 }
