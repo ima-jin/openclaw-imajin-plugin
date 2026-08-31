@@ -1,5 +1,5 @@
 /**
- * agent_end → agent.turn.usage attestation (#1843)
+ * agent_end → agent.turn.usage attestation (#1843, #1865)
  *
  * Registers an OpenClaw `agent_end` lifecycle hook that emits a self-signed,
  * UNILATERAL `agent.turn.usage` attestation to the Imajin kernel after every
@@ -28,7 +28,24 @@
  * apps/kernel/app/api/cron/attestation-cleanup in ima-jin/imajin-ai). This
  * module only sets `expires_at` at creation time to opt in to that sweep —
  * it does not implement retention/deletion itself.
+ *
+ * Transcript pointer + content hash (#1865): the turn's content already
+ * lives in the OpenClaw transcript JSONL
+ * (`~/.openclaw/agents/<agent>/sessions/<sessionId>.jsonl`, one message per
+ * line). Rather than embedding the content in the claim, the payload carries
+ * a `transcript` pointer — `sessionId` / `path` / `messageIds` / `lineRange`
+ * — plus `contentSha256`, a hash of the turn's message batch. The pointer
+ * lets an operator jump to the exact lines; the hash lets a later disclosure
+ * be verified against the signed claim without the content ever leaving the
+ * agent's own machine (match-without-disclosure applied to transcripts).
+ * Content upload is explicitly out of scope here. All pointer fields are
+ * read defensively off `agent_end` run metadata (same as `sessionKey` /
+ * `runId` above) — a host that omits one simply yields `undefined` for that
+ * field; only `contentSha256` is always computable, since it only needs the
+ * message batch OpenClaw already hands the hook.
  */
+
+import { createHash } from "node:crypto";
 
 const AGENT_TURN_USAGE_TYPE = "agent.turn.usage";
 const AGENT_RUN_CONTEXT_TYPE = "agent_run";
@@ -52,6 +69,8 @@ export interface AgentTurnCost {
 
 /** Shape of a single OpenClaw agent message, as far as this hook cares. */
 export interface AgentMessage {
+  /** Transcript-JSONL message id (#1865) — collected into `transcript.messageIds`. */
+  id?: string;
   role?: string;
   usage?: AgentTokenUsage;
   cost?: AgentTurnCost;
@@ -66,17 +85,42 @@ export interface AgentMessage {
  * messages }` per #1843, plus whatever session/run metadata the host
  * attaches alongside it. All metadata fields are read defensively — a host
  * that omits one simply yields `undefined` for that field in the payload.
+ *
+ * `sessionId` (a UUID, distinct from the composite `sessionKey`),
+ * `agentName`, `transcriptPath`, and `lineRange` are the run-metadata fields
+ * #1865 reads to build `transcript` (log-line pointer into the OpenClaw
+ * session JSONL). `transcriptPath`, when the host provides it directly, is
+ * preferred verbatim over deriving one from `agentName` + `sessionId`.
  */
 export interface AgentEndEvent {
   type?: string;
   messages?: AgentMessage[];
   sessionKey?: string;
+  sessionId?: string;
+  agentName?: string;
+  transcriptPath?: string;
+  lineRange?: [number, number];
   runId?: string;
   model?: string;
   provider?: string;
   channel?: string;
   durationMs?: number;
   [key: string]: unknown;
+}
+
+/**
+ * Transcript pointer + content hash (#1865). `sessionId` / `path` /
+ * `messageIds` / `lineRange` are the "where this turn is captured" pointer
+ * (each individually may be `undefined` when the host doesn't supply it);
+ * `contentSha256` is the tamper-evident commitment to the turn's message
+ * batch and is always present.
+ */
+export interface TranscriptPointer {
+  sessionId?: string;
+  path?: string;
+  messageIds: string[];
+  lineRange?: [number, number];
+  contentSha256: string;
 }
 
 export interface TurnUsagePayload {
@@ -96,6 +140,7 @@ export interface TurnUsagePayload {
   };
   cost: { input: number; output: number; total: number };
   contextUsage: unknown;
+  transcript: TranscriptPointer;
 }
 
 export interface AttestationClaim {
@@ -166,6 +211,60 @@ export function extractTurnUsage(
   };
 }
 
+/**
+ * Collects transcript-JSONL message ids off the turn's message batch
+ * (#1865). Messages without a string `id` are skipped rather than yielding
+ * a hole in the array — a partial pointer is more useful than one padded
+ * with `undefined` entries.
+ */
+export function extractMessageIds(messages: AgentMessage[] | undefined): string[] {
+  if (!messages) return [];
+  return messages
+    .map((message) => message?.id)
+    .filter((id): id is string => typeof id === "string" && id.length > 0);
+}
+
+/**
+ * Hashes the turn's full message batch (not just the final assistant
+ * message) as the tamper-evident commitment carried in the claim. Always
+ * computable — an empty/undefined batch still hashes deterministically —
+ * so `transcript.contentSha256` is never omitted, mirroring the "never
+ * omitted, always present" numeric-field convention used for usage/cost
+ * above.
+ */
+export function computeTurnContentHash(messages: AgentMessage[] | undefined): string {
+  const serialized = JSON.stringify(messages ?? []);
+  return createHash("sha256").update(serialized).digest("hex");
+}
+
+/**
+ * Builds the `agents/<agent>/sessions/<sessionId>.jsonl` transcript path
+ * from run metadata. Returns `undefined` rather than guessing when either
+ * segment is missing — a wrong pointer is worse than an absent one.
+ */
+export function buildTranscriptPath(
+  agentName: string | undefined,
+  sessionId: string | undefined,
+): string | undefined {
+  if (!agentName || !sessionId) return undefined;
+  return `agents/${agentName}/sessions/${sessionId}.jsonl`;
+}
+
+/**
+ * Assembles the `transcript` pointer + hash carried on `TurnUsagePayload`
+ * (#1865). `path` prefers the host-supplied `event.transcriptPath`
+ * verbatim, falling back to deriving one from `agentName` + `sessionId`.
+ */
+export function buildTranscriptPointer(event: AgentEndEvent): TranscriptPointer {
+  return {
+    sessionId: event.sessionId,
+    path: event.transcriptPath ?? buildTranscriptPath(event.agentName, event.sessionId),
+    messageIds: extractMessageIds(event.messages),
+    lineRange: event.lineRange,
+    contentSha256: computeTurnContentHash(event.messages),
+  };
+}
+
 /** Builds the `agent.turn.usage` attestation payload from the `agent_end` event. */
 export function buildTurnUsagePayload(
   event: AgentEndEvent,
@@ -183,6 +282,7 @@ export function buildTurnUsagePayload(
     usage,
     cost,
     contextUsage,
+    transcript: buildTranscriptPointer(event),
   };
 }
 
