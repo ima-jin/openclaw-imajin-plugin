@@ -46,6 +46,10 @@
       "label": "Attestation Internal API Key",
       "help": "Bearer token for POST /auth/api/attestations/internal. Falls back to the ATTESTATION_INTERNAL_API_KEY env var when omitted.",
       "sensitive": true
+    },
+    "approvalBridge.pinnedApproverPublicKeyHex": {
+      "label": "Approval Bridge: Pinned Approver Public Key",
+      "help": "Ed25519 public key (hex) of the sole trusted human approver for OpenClaw gateway approval decisions signed on /jin (#1816). Channel/WS auth alone never resolves an approval — only a signature from this key does."
     }
   },
   "configSchema": {
@@ -99,6 +103,17 @@
           "internalApiKey": {
             "type": "string",
             "description": "Bearer token for POST /auth/api/attestations/internal. Falls back to the ATTESTATION_INTERNAL_API_KEY env var."
+          }
+        }
+      },
+      "approvalBridge": {
+        "type": "object",
+        "description": "Route OpenClaw gateway approval requests (exec elevation, Skill Workshop lifecycle) to /jin and resolve them from signed decisions (#1816). Requires did + keypairPath.",
+        "additionalProperties": false,
+        "properties": {
+          "pinnedApproverPublicKeyHex": {
+            "type": "string",
+            "description": "Ed25519 public key (hex) of the sole trusted human approver. A decision is resolved only when it carries a valid signature from this exact key, references the matching request id, and arrives before the request's expiry."
           }
         }
       }
