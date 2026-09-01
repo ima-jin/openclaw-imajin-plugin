@@ -311,6 +311,23 @@ describe("ImajinClient Warp dispatch (#1428 / #1619)", () => {
     global.fetch = mockFetch({ error: "forbidden" }, 403);
     await expect(client.dispatchWarp({ prompt: "x" })).rejects.toThrow(/403/);
   });
+
+  it("dispatchWarp forwards conversationId/parentRunId (#1939)", async () => {
+    const run = { runId: "r1", state: "QUEUED", sessionLink: null, title: null, configName: "owner-jin" };
+    global.fetch = mockFetch(run, 201);
+    await client.dispatchWarp({
+      prompt: "do the thing",
+      conversationId: "conv-123",
+      parentRunId: "run-parent-1",
+    });
+
+    const [, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({
+      prompt: "do the thing",
+      conversationId: "conv-123",
+      parentRunId: "run-parent-1",
+    });
+  });
 });
 
 describe("ImajinClient Warp post-dispatch run control (#1639, plugin surface #1)", () => {
@@ -368,6 +385,20 @@ describe("ImajinClient Warp post-dispatch run control (#1639, plugin surface #1)
     expect(JSON.parse(init.body as string)).toEqual({ message: "switch to plan", mode: "plan" });
   });
 
+  it("sendWarpFollowup includes resume when provided (#1939)", async () => {
+    global.fetch = mockFetch({ runId: "r1", accepted: true }, 202);
+    await client.sendWarpFollowup("r1", { message: "keep going", resume: true });
+    const [, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({ message: "keep going", resume: true });
+  });
+
+  it("sendWarpFollowup omits resume entirely when not provided", async () => {
+    global.fetch = mockFetch({ runId: "r1", accepted: true }, 202);
+    await client.sendWarpFollowup("r1", { message: "keep going" });
+    const [, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(JSON.parse(init.body as string)).toEqual({ message: "keep going" });
+  });
+
   it("listWarpRuns GETs /warp/api/runs with no query when no filters given", async () => {
     const page = { runs: [], hasNextPage: false, nextCursor: null };
     global.fetch = mockFetch(page);
@@ -414,5 +445,13 @@ describe("ImajinClient Warp post-dispatch run control (#1639, plugin surface #1)
     await client.getWarpRunTranscript("r1", { maxChars: 500 });
     const [req] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
     expect(req).toBe(`${BASE_URL}/warp/api/runs/r1/transcript?maxChars=500`);
+  });
+
+  it("listWarpRuns encodes ancestorRunId as a query param (#1939)", async () => {
+    global.fetch = mockFetch({ runs: [], hasNextPage: false, nextCursor: null });
+    await client.listWarpRuns({ ancestorRunId: "run-ancestor-1" });
+    const [req] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const url = new URL(req as string);
+    expect(url.searchParams.get("ancestorRunId")).toBe("run-ancestor-1");
   });
 });

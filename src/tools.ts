@@ -307,15 +307,19 @@ export function createWarpTool(client: ImajinClient) {
       "Attribution follows the acting principal's sealed Warp key (run stamped {username}-jin), " +
       "never the human. Actions: " +
       "dispatch (fire a cloud agent with a prompt; optional skillSpec 'owner/repo:skill' and " +
-      "mcpServers map to compose skills + scoped MCP servers), " +
+      "mcpServers map to compose skills + scoped MCP servers; optional conversationId to continue " +
+      "an existing conversation and parentRunId for an orchestration hierarchy (#1939)), " +
       "get_run (read a run's lifecycle state + session link by runId), " +
       "cancel_run (kill a queued or in-progress run by runId — the revocation half of dispatch; " +
       "the kernel's 400/409/422 refusals for an already-terminal, still-PENDING, or " +
       "non-cancellable run surface as errors), " +
       "send_followup (deliver a mid-run message to a run by runId + message, optional mode " +
-      "'normal'|'plan'|'orchestrate'; acceptance is not application — check get_run for the effect), " +
+      "'normal'|'plan'|'orchestrate'; acceptance is not application — check get_run for the effect. " +
+      "A terminal run is refused with 409 unless resume: true is also given (#1939), which " +
+      "continues it via Warp's cloud-to-cloud handoff), " +
       "list_runs (list the principal's own runs, newest-updated first, with optional name/states/ " +
-      "environmentId/createdAfter/limit/cursor filters), " +
+      "environmentId/createdAfter/limit/cursor/ancestorRunId filters — ancestorRunId lists every " +
+      "run spawned, directly or transitively, from that run's parentRunId lineage (#1939)), " +
       "get_transcript (read a run's raw transcript by runId — the self-diagnosis path for a failed run; " +
       "optional maxChars caps the returned text), " +
       "seal_key (seal a Warp Agent API key for the principal as a delegation-grant vault field — " +
@@ -363,6 +367,18 @@ export function createWarpTool(client: ImajinClient) {
           type: "string" as const,
           description: "Optional Warp cloud environment UID to run in (for dispatch)",
         },
+        conversationId: {
+          type: "string" as const,
+          description:
+            "Optional conversation id to continue (#1939) — Warp resumes from where a prior run " +
+            "under this conversation left off (for dispatch)",
+        },
+        parentRunId: {
+          type: "string" as const,
+          description:
+            "Optional parent run id for an orchestration hierarchy (#1939). The parent run must " +
+            "exist and be visible to the acting principal's own sealed key (for dispatch)",
+        },
         skillSpec: {
           type: "string" as const,
           description: "Optional versioned SKILL.md as payload, 'owner/repo:skill' (for dispatch)",
@@ -394,6 +410,12 @@ export function createWarpTool(client: ImajinClient) {
           enum: ["normal", "plan", "orchestrate"],
           description: "Optional follow-up routing mode, defaults to 'normal' (for send_followup)",
         },
+        resume: {
+          type: "boolean" as const,
+          description:
+            "Continue a run that has already ended, via cloud-to-cloud handoff (#1939). Defaults " +
+            "to false — a terminal run is refused unless this is explicitly true (for send_followup)",
+        },
         states: {
           type: "array" as const,
           items: { type: "string" as const },
@@ -411,6 +433,12 @@ export function createWarpTool(client: ImajinClient) {
         cursor: {
           type: "string" as const,
           description: "Pagination cursor from a previous list_runs page's nextCursor (for list_runs)",
+        },
+        ancestorRunId: {
+          type: "string" as const,
+          description:
+            "Optional run id (#1939) — lists every run spawned, directly or transitively, from " +
+            "this ancestor's parentRunId lineage (for list_runs)",
         },
         maxChars: {
           type: "number" as const,
@@ -441,6 +469,8 @@ export function createWarpTool(client: ImajinClient) {
         modelId?: string;
         basePrompt?: string;
         environmentId?: string;
+        conversationId?: string;
+        parentRunId?: string;
         skillSpec?: string;
         mcpServers?: Record<string, { url: string; headers?: Record<string, string> }>;
         attachImajinMcp?: boolean;
@@ -448,10 +478,12 @@ export function createWarpTool(client: ImajinClient) {
         runId?: string;
         message?: string;
         mode?: string;
+        resume?: boolean;
         states?: string[];
         createdAfter?: string;
         limit?: number;
         cursor?: string;
+        ancestorRunId?: string;
         maxChars?: number;
         agentKey?: string;
         onBehalfOf?: string;
@@ -471,6 +503,10 @@ export function createWarpTool(client: ImajinClient) {
                 ...(params.environmentId === undefined
                   ? {}
                   : { environmentId: params.environmentId }),
+                ...(params.conversationId === undefined
+                  ? {}
+                  : { conversationId: params.conversationId }),
+                ...(params.parentRunId === undefined ? {} : { parentRunId: params.parentRunId }),
                 ...(params.skillSpec === undefined ? {} : { skillSpec: params.skillSpec }),
                 ...(params.mcpServers === undefined ? {} : { mcpServers: params.mcpServers }),
                 ...(params.attachImajinMcp === undefined
@@ -504,6 +540,7 @@ export function createWarpTool(client: ImajinClient) {
                 ...(params.mode === undefined
                   ? {}
                   : { mode: params.mode as "normal" | "plan" | "orchestrate" }),
+                ...(params.resume === undefined ? {} : { resume: params.resume }),
               },
               params.onBehalfOf,
             );
@@ -520,6 +557,9 @@ export function createWarpTool(client: ImajinClient) {
                 ...(params.createdAfter === undefined ? {} : { createdAfter: params.createdAfter }),
                 ...(params.limit === undefined ? {} : { limit: params.limit }),
                 ...(params.cursor === undefined ? {} : { cursor: params.cursor }),
+                ...(params.ancestorRunId === undefined
+                  ? {}
+                  : { ancestorRunId: params.ancestorRunId }),
               },
               params.onBehalfOf,
             );
