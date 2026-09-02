@@ -42,6 +42,8 @@ In `openclaw.json`:
   - **`attestation.enabled`** — explicit opt-out; defaults to `true` when `serviceUrl` + the key both resolve
   - **`attestation.serviceUrl`** — base URL for `POST /auth/api/attestations/internal`; defaults to `nodeUrl`
   - **`attestation.internalApiKey`** — Bearer token for that endpoint; falls back to the `ATTESTATION_INTERNAL_API_KEY` env var
+- **`approvalBridge`** (optional, requires `did` + `keypairPath`) — routes OpenClaw gateway approvals to /jin (#1816):
+  - **`approvalBridge.pinnedApproverPublicKeyHex`** — Ed25519 public key (hex) of the sole trusted human approver; see "Approval bridge" below
 
 ### Turn-usage attestation
 
@@ -65,6 +67,35 @@ the signed claim without the content ever leaving the agent's own machine.
 - [x] Background service — persistent node connection, auth refresh (#1904)
 - [ ] Webhook receiver — push Imajin events (messages, transactions) into agent sessions
 - [ ] Chat bridge — send/receive messages as a DID via Imajin chat
+- [x] Approval bridge — route OpenClaw gateway approvals to /jin, resolve from signed decisions (#1816)
+
+### Approval bridge (#1816)
+
+When `approvalBridge.pinnedApproverPublicKeyHex` is configured (alongside `did` +
+`keypairPath`), the plugin can act as a signed bridge between OpenClaw gateway
+approvals (exec elevation, Skill Workshop proposals) and a human approver on /jin:
+
+- **Request leg** (`ApprovalBridge.publishRequest`, `src/approval-bridge.ts`): signs
+  `{ requestId, kind, summary, requesterDid, expiresAt }` as this agent's DID and
+  publishes it as an `openclaw.approval.requested` bus event over the plugin's
+  existing authenticated WS (`ImajinWsService.send`).
+- **Decision leg**: an inbound `approval.decision` WS frame is verified — in this
+  order — against (a) the pinned approver's Ed25519 public key, (b) the *signed*
+  request id (not just the frame's outer routing field), and (c) the original
+  request's expiry. Only then is `resolveApprovalOverGateway`
+  (`openclaw/plugin-sdk/approval-gateway-runtime`) called to resolve the gateway's
+  pending approval (`approve` → `allow-once`, `reject` → `deny`). Expired,
+  mismatched, or unsigned decisions are rejected and logged, never resolved.
+- **Trust model**: the authenticated WS session (channel-trust) is never sufficient
+  on its own to resolve an approval — every decision must carry the approver's
+  signature. Standing/auto-approval (`allow-always`) is intentionally unreachable
+  from this bridge; that is a separate delegation-grant feature.
+- **Known gap**: nothing yet calls `publishRequest` automatically. OpenClaw has no
+  generic, non-channel plugin hook for "a new exec/plugin approval was raised" —
+  the supported path is registering as a full `ChannelPlugin` with an
+  `approvalCapability.nativeRuntime` (see the `TODO(#1816 request leg)` comment in
+  `index.ts`), which is a larger lift tracked as follow-up alongside the existing
+  "Imajin chat as a full messaging channel" TODO.
 
 ### Real-time notifications (#1904)
 

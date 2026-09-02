@@ -171,6 +171,20 @@ export class ImajinWsService {
     this.handlers.push(handler);
   }
 
+  /**
+   * Send an arbitrary JSON-serializable frame over the live, authenticated WS
+   * connection (e.g. the signed `openclaw.approval.requested` bus event, #1816).
+   * Best-effort: when the socket isn't open the frame is dropped and logged
+   * rather than queued, matching the heartbeat ping's fire-and-forget send.
+   */
+  send(frame: unknown): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.logger.warn(`dropped outbound frame — WS not open: ${JSON.stringify(frame).slice(0, 200)}`);
+      return;
+    }
+    this.ws.send(JSON.stringify(frame));
+  }
+
   /** Start the WebSocket connection (called by plugin service lifecycle). */
   async start(): Promise<void> {
     this.stopped = false;

@@ -304,6 +304,28 @@ describe("ImajinWsService frame routing", () => {
   });
 });
 
+describe("ImajinWsService.send", () => {
+  it("sends a JSON-serialized frame when the socket is open", () => {
+    const service = new ImajinWsService({ nodeUrl: NODE_URL, keypairPath: KEYPAIR_PATH }, silentLogger());
+    const socket = new FakeSocket("wss://test.imajin.ai/chat/ws");
+    socket.readyState = FakeSocket.OPEN;
+    (service as unknown as { ws: WebSocket }).ws = socket as unknown as WebSocket;
+
+    service.send({ type: "openclaw.approval.requested", requestId: "appr_1" });
+
+    expect(socket.sent).toEqual([JSON.stringify({ type: "openclaw.approval.requested", requestId: "appr_1" })]);
+  });
+
+  it("drops the frame and logs a warning when there is no open socket", () => {
+    const logger = silentLogger();
+    const service = new ImajinWsService({ nodeUrl: NODE_URL, keypairPath: KEYPAIR_PATH }, logger);
+
+    service.send({ type: "openclaw.approval.requested" });
+
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("dropped outbound frame"));
+  });
+});
+
 describe("ImajinWsService reconnect and shutdown", () => {
   it("uses increasing delays when reconnects repeatedly fail", () => {
     vi.useFakeTimers();
