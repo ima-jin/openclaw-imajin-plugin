@@ -335,6 +335,39 @@ describe("imajin_warp tool post-dispatch control (#1639, plugin surface #1)", ()
     expect(client.sendWarpFollowup).toHaveBeenCalledWith("r1", { message: "hi" }, undefined);
   });
 
+  it("send_followup forwards resume: true (#1939)", async () => {
+    vi.mocked(client.sendWarpFollowup).mockResolvedValue({ runId: "r1", accepted: true });
+    await tool.execute("1", {
+      action: "send_followup",
+      runId: "r1",
+      message: "keep going",
+      resume: true,
+    });
+    expect(client.sendWarpFollowup).toHaveBeenCalledWith(
+      "r1",
+      { message: "keep going", resume: true },
+      undefined,
+    );
+  });
+
+  it("send_followup omits resume when not provided", async () => {
+    vi.mocked(client.sendWarpFollowup).mockResolvedValue({ runId: "r1", accepted: true });
+    await tool.execute("1", { action: "send_followup", runId: "r1", message: "hi" });
+    expect(client.sendWarpFollowup).toHaveBeenCalledWith("r1", { message: "hi" }, undefined);
+  });
+
+  it("surfaces a terminal-run refusal from the kernel (#1939)", async () => {
+    vi.mocked(client.sendWarpFollowup).mockRejectedValue(
+      new Error("warp_run_terminal: run has already ended"),
+    );
+    const result = await tool.execute("1", {
+      action: "send_followup",
+      runId: "r1",
+      message: "keep going",
+    });
+    expect(result.content[0].text).toMatch(/warp_run_terminal/);
+  });
+
   it("send_followup requires runId and message", async () => {
     const r1 = await tool.execute("1", { action: "send_followup" } as never);
     expect(r1.content[0].text).toMatch(/runId/i);
@@ -369,6 +402,15 @@ describe("imajin_warp tool post-dispatch control (#1639, plugin surface #1)", ()
     expect(result.content[0].text).toMatch(/No Warp runs found/);
   });
 
+  it("list_runs forwards ancestorRunId (#1939)", async () => {
+    vi.mocked(client.listWarpRuns).mockResolvedValue({ runs: [], hasNextPage: false, nextCursor: null });
+    await tool.execute("1", { action: "list_runs", ancestorRunId: "run-ancestor-1" });
+    expect(client.listWarpRuns).toHaveBeenCalledWith(
+      { ancestorRunId: "run-ancestor-1" },
+      undefined,
+    );
+  });
+
   it("get_transcript calls client.getWarpRunTranscript with runId and maxChars", async () => {
     vi.mocked(client.getWarpRunTranscript).mockResolvedValue({
       runId: "r1",
@@ -385,6 +427,26 @@ describe("imajin_warp tool post-dispatch control (#1639, plugin surface #1)", ()
     const result = await tool.execute("1", { action: "get_transcript" } as never);
     expect(result.content[0].text).toMatch(/runId/i);
     expect(client.getWarpRunTranscript).not.toHaveBeenCalled();
+  });
+
+  it("dispatch forwards conversationId/parentRunId (#1939)", async () => {
+    vi.mocked(client.dispatchWarp).mockResolvedValue({
+      runId: "r1",
+      state: "QUEUED",
+      sessionLink: null,
+      title: null,
+      configName: "o-jin",
+    });
+    await tool.execute("1", {
+      action: "dispatch",
+      prompt: "go",
+      conversationId: "conv-123",
+      parentRunId: "run-parent-1",
+    });
+    expect(client.dispatchWarp).toHaveBeenCalledWith(
+      { prompt: "go", conversationId: "conv-123", parentRunId: "run-parent-1" },
+      undefined,
+    );
   });
 });
 

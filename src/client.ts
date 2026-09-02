@@ -111,6 +111,16 @@ export interface WarpDispatchInput {
   modelId?: string;
   basePrompt?: string;
   environmentId?: string;
+  /**
+   * Continue an existing conversation (#1939). Warp resumes from where a
+   * prior run under this conversation left off.
+   */
+  conversationId?: string;
+  /**
+   * Parent run id for an orchestration hierarchy (#1939). The parent run
+   * must exist and be visible to the acting principal's own key.
+   */
+  parentRunId?: string;
   /** Versioned SKILL.md as the agent payload, e.g. "owner/repo:skill". */
   skillSpec?: string;
   /** Map keyed by server name (NOT an array), per Warp's schema. */
@@ -146,6 +156,12 @@ export interface SendWarpFollowupInput {
   message: string;
   /** Defaults to the kernel's own default (`normal`) when omitted. */
   mode?: WarpFollowupMode;
+  /**
+   * Resume a terminal run via Warp's cloud-to-cloud handoff (#1939). Defaults
+   * to false — the kernel refuses a terminal run unless this is explicitly
+   * true, so a follow-up cannot accidentally wake a finished run back up.
+   */
+  resume?: boolean;
 }
 
 /** Acknowledgement that the kernel accepted a follow-up — not the resulting run state. */
@@ -167,6 +183,11 @@ export interface ListWarpRunsInput {
   limit?: number;
   /** `nextCursor` from a previous page. */
   cursor?: string;
+  /**
+   * Filter to descendants of this run id (#1939) — the kernel's own
+   * `ancestorRunId` lineage passthrough to Warp's `?ancestor_run_id=`.
+   */
+  ancestorRunId?: string;
 }
 
 /** One page of {@link ImajinClient.listWarpRuns} results. */
@@ -723,6 +744,7 @@ export class ImajinClient {
     if (filters.environmentId !== undefined) params.set("environmentId", filters.environmentId);
     if (filters.createdAfter !== undefined) params.set("createdAfter", filters.createdAfter);
     if (filters.cursor !== undefined) params.set("cursor", filters.cursor);
+    if (filters.ancestorRunId !== undefined) params.set("ancestorRunId", filters.ancestorRunId);
     if (filters.limit !== undefined) params.set("limit", String(filters.limit));
 
     const query = params.toString();
@@ -760,6 +782,7 @@ export class ImajinClient {
       {
         message: input.message,
         ...(input.mode === undefined ? {} : { mode: input.mode }),
+        ...(input.resume === undefined ? {} : { resume: input.resume }),
       },
       { onBehalfOf },
     ) as Promise<WarpFollowupAck>;
