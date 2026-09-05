@@ -1,7 +1,11 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { execFile } from "node:child_process";
 import type { NotificationFrame } from "./ws-service.js";
-import { createNotificationInjector, type WsNotificationsConfig } from "./notification-injector.js";
+import {
+  createNotificationInjector,
+  WAKE_CONFIRM_TIMEOUT_MS,
+  type WsNotificationsConfig,
+} from "./notification-injector.js";
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 const execFileMock = vi.mocked(execFile);
@@ -246,6 +250,238 @@ describe("createNotificationInjector.inject — direct send AND wake turn", () =
     expect(execFileMock).not.toHaveBeenCalled();
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
     expect(scheduleSessionTurn).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("keeps the newest notification when coalescing three completions", async () => {
+    stubExecFile("ok");
+    const { api, waitForSchedule } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1", "Warp run 1 SUCCEEDED"));
+    await inject(frame("2", "Warp run 2 SUCCEEDED"));
+    const pending = waitForSchedule();
+    await inject(frame("3", "Warp run 3 SUCCEEDED"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    const params = await pending;
+
+    // The 5-minute coalesce buffer must retain every frame pushed into it,
+    // including the last one — a naive "replace, don't append" batcher would
+    // silently drop the newest notification (hypothesis (d) in #13).
+    expect(String(params.message)).toContain("Warp run 1 SUCCEEDED");
+    expect(String(params.message)).toContain("Warp run 2 SUCCEEDED");
+    expect(String(params.message)).toContain("Warp run 3 SUCCEEDED");
+    dispose();
+  });
+
+  it("does not dedupe a resumed run's completion (same runId, new sessionId)", async () => {
+    stubExecFile("ok");
+    const { api, waitForSchedule } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    const segment1: NotificationFrame = {
+      ...frame("1", "Warp run X SUCCEEDED"),
+      data: { runId: "run-x", sessionId: "session-a" },
+    } as NotificationFrame;
+    const segment2: NotificationFrame = {
+      ...frame("2", "Warp run X SUCCEEDED (resumed)"),
+      data: { runId: "run-x", sessionId: "session-b" },
+    } as NotificationFrame;
+
+    const pending = waitForSchedule();
+    await inject(segment1);
+    await inject(segment2);
+
+    // Same runId, different sessionId (a resumed segment) — both notifications
+    // must reach the human and both must be coalesced into the wake turn.
+    // Nothing in ws-service/notification-injector may key off `runId` alone.
+    expect(execFileMock).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    const params = await pending;
+    expect(String(params.message)).toContain("Warp runs completed (2)");
+    expect(String(params.message)).toContain("Warp run X SUCCEEDED");
+    expect(String(params.message)).toContain("Warp run X SUCCEEDED (resumed)");
+    dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #13: a missing/empty job id from `scheduleSessionTurn` must be treated as a
+// failure (warn + fallback retry + escalation message), never logged as if it
+// were a successful schedule. Also covers the post-schedule confirmation
+// watchdog (`agent_end` correlation).
+// ---------------------------------------------------------------------------
+
+/** Configurable `scheduleSessionTurn` mock: pops one scripted response per call. */
+function makeConfigurableApi(scheduleResponses: Array<{ id: string } | null | undefined | Record<string, never> | Error>) {
+  const responses = [...scheduleResponses];
+  const enqueueSystemEvent = vi.fn((_text: string, _opts: { sessionKey: string; contextKey?: string }) => true);
+  const unscheduleSessionTurnsByTag = vi.fn(async () => ({ removed: 0, failed: 0 }));
+  const calls: Array<Record<string, unknown>> = [];
+  const scheduleSessionTurn = vi.fn(async (params: Record<string, unknown>) => {
+    calls.push(params);
+    const next = responses.shift();
+    if (next instanceof Error) throw next;
+    return next;
+  });
+  const hookHandlers: Record<string, (event: unknown) => void> = {};
+  const on = vi.fn((hookName: string, handler: (event: unknown) => void) => {
+    hookHandlers[hookName] = handler;
+  });
+  const api = {
+    runtime: { system: { enqueueSystemEvent } },
+    session: { workflow: { scheduleSessionTurn, unscheduleSessionTurnsByTag } },
+    on,
+  };
+  return {
+    api,
+    scheduleSessionTurn,
+    calls,
+    emitAgentEnd: (sessionKey: string) => hookHandlers.agent_end?.({ sessionKey }),
+  };
+}
+
+function wakeFailureCalls() {
+  return execFileMock.mock.calls.filter((call) => String((call[1] as string[])[7] ?? "").includes("automatic wake failed"));
+}
+
+describe("createNotificationInjector — #13 missing wake id is a failure", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("warns, retries, and escalates to a channel message when the wake call returns {}", async () => {
+    const { api, scheduleSessionTurn } = makeConfigurableApi([{}, {}]);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(scheduleSessionTurn).toHaveBeenCalledTimes(2); // primary + fallback
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("no job id"));
+    expect(wakeFailureCalls()).toHaveLength(1);
+    expect(String(wakeFailureCalls()[0][1])).toContain("automatic wake failed");
+    dispose();
+  });
+
+  it("treats a null response identically to {}", async () => {
+    const { api, scheduleSessionTurn } = makeConfigurableApi([null, null]);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(scheduleSessionTurn).toHaveBeenCalledTimes(2);
+    expect(wakeFailureCalls()).toHaveLength(1);
+    dispose();
+  });
+
+  it("treats a thrown error identically to a missing id, then escalates", async () => {
+    const { api, scheduleSessionTurn } = makeConfigurableApi([new Error("automations unavailable"), new Error("automations unavailable")]);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(scheduleSessionTurn).toHaveBeenCalledTimes(2);
+    expect(console.error).toHaveBeenCalledWith(
+      expect.stringContaining("scheduleSessionTurn threw"),
+      "automations unavailable",
+    );
+    expect(wakeFailureCalls()).toHaveLength(1);
+    dispose();
+  });
+
+  it("does not escalate when the fallback attempt succeeds with a real id", async () => {
+    const { api, scheduleSessionTurn } = makeConfigurableApi([{}, { id: "turn-fallback" }]);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(scheduleSessionTurn).toHaveBeenCalledTimes(2);
+    expect(wakeFailureCalls()).toHaveLength(0);
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("scheduled wake turn turn-fallback"));
+    dispose();
+  });
+
+  it("never retries when the primary attempt returns a real id", async () => {
+    const { api, scheduleSessionTurn } = makeConfigurableApi([{ id: "turn-1" }]);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(scheduleSessionTurn).toHaveBeenCalledTimes(1);
+    expect(wakeFailureCalls()).toHaveLength(0);
+    dispose();
+  });
+});
+
+describe("createNotificationInjector — #13 wake confirmation watchdog", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  it("logs confirmation when agent_end fires for the wake session before the timeout", async () => {
+    const { api, emitAgentEnd } = makeConfigurableApi([{ id: "turn-1" }]);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    emitAgentEnd(SESSION);
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("wake turn confirmed turn-1"));
+    expect(wakeFailureCalls()).toHaveLength(0);
+
+    // Confirmed already — the watchdog must not still fire an escalation later.
+    await vi.advanceTimersByTimeAsync(WAKE_CONFIRM_TIMEOUT_MS);
+    expect(wakeFailureCalls()).toHaveLength(0);
+    dispose();
+  });
+
+  it("escalates to a channel message when no agent_end arrives within the confirmation window", async () => {
+    const { api } = makeConfigurableApi([{ id: "turn-1" }]);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    await vi.advanceTimersByTimeAsync(WAKE_CONFIRM_TIMEOUT_MS);
+
+    expect(wakeFailureCalls()).toHaveLength(1);
+    expect(String(wakeFailureCalls()[0][1])).toContain("never ran");
+    dispose();
+  });
+
+  it("ignores agent_end events from unrelated sessions", async () => {
+    const { api, emitAgentEnd } = makeConfigurableApi([{ id: "turn-1" }]);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    emitAgentEnd("agent:main:telegram:direct:someone-else");
+    await vi.advanceTimersByTimeAsync(WAKE_CONFIRM_TIMEOUT_MS);
+
+    expect(wakeFailureCalls()).toHaveLength(1); // still escalates — never confirmed
     dispose();
   });
 });
