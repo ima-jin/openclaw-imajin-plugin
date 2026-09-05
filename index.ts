@@ -49,6 +49,13 @@ interface WsNotificationsConfig {
   injectScopes?: string[];
   /** Exact session key to inject into, e.g. `agent:main:telegram:direct:8321865723`. */
   targetSession?: string;
+  /**
+   * Session key to schedule a real agent turn into when a Warp run completes/fails.
+   * Falls back to `targetSession` when omitted.
+   */
+  wakeSessionKey?: string;
+  /** Coalesce window for Warp wake turns (ms). Default 300000 (5 min). */
+  wakeCoalesceMs?: number;
   /** Direct channel ping via the OpenClaw CLI — deterministic, no model turn. */
   directSend?: {
     /** Channel id, default `telegram`. */
@@ -86,6 +93,8 @@ const INJECTION_TTL_MS = 15 * 60_000;
 // refuses anything larger, which would look like a lost notification.
 const MAX_INJECTED_CHARS = 4_000;
 const MAX_DATA_JSON_CHARS = 2_000;
+// Default coalesce window for Warp wake turns.
+const DEFAULT_WAKE_COALESCE_MS = 300_000;
 
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated ${value.length - max} chars]`;
@@ -131,48 +140,61 @@ function buildDirectMessage(nf: NotificationFrame): string {
  *
  * The returned function is called from the WebSocket frame callback, which runs
  * on the socket's event loop turn and **not** inside an agent turn. Every host
- * API it touches therefore has to be told which session to act on:
+ * API it touches therefore has to be told which session to act on.
  *
- * - `api.session.workflow.enqueueNextTurnInjection({ sessionKey, text, … })` is
- *   the durable, session-keyed plugin seam. The host persists the record on the
- *   session entry and drains it while building the next turn's prompt, so it
- *   survives a gateway restart and `idempotencyKey` makes redelivery a no-op.
- * - `api.runtime.system.enqueueSystemEvent(text, { sessionKey })` is the
- *   in-memory fallback. Note the **two-argument** signature: the previous code
- *   passed a single `{ type, source, text }` object, so the host's `options`
- *   parameter was `undefined` and `requireSessionKey(options.sessionKey)` threw
- *   `Cannot read properties of undefined (reading 'sessionKey')`. The API was
- *   never session-scoped — it just needs the session key passed explicitly.
- * - `api.runtime.system.runHeartbeatOnce({ reason, heartbeat: { target: "last" } })`
- *   is what actually wakes the agent NOW: per plugins/sdk-runtime.md it "runs a
- *   single heartbeat cycle immediately, bypassing the normal coalesce timer".
- *   `requestHeartbeat(...)` — used until 2026-08-31 — only feeds the coalesce
- *   timer; `intent: "immediate"` is an ordinary hint string, not a bypass. On
- *   2026-08-31 eight warp.run.completed events were queued via system events
- *   but produced zero agent turns until the next user message 11+ minutes
- *   later, which is how this was caught.
- *   `heartbeat: { target: "last" }` routes the reply to the session's last
- *   active channel instead of the default `target: "none"` suppression.
+ * Flow:
+ * 1. Durable context injection (`enqueueNextTurnInjection` or fallback
+ *    `enqueueSystemEvent`) so the event survives restarts.
+ * 2. Schedule a real agent turn into the owner's conversation via
+ *    `api.session.workflow.scheduleSessionTurn({ delayMs: 0, sessionKey, message, tag, deliveryMode: "announce" })`.
+ *    This is a bundled-only Cron-backed seam that creates a background task
+ *    record and runs it immediately (delayMs: 0). It targets an exact session
+ *    key, so the turn runs in the owner's DM — not the heartbeat lane.
+ * 3. Coalesce: multiple completions within the coalesce window unschedule the
+ *    previous pending turn by tag and reschedule a combined one.
+ *
+ * Evidence (2026-09-05):
+ * - `runHeartbeatOnce` wakes the heartbeat lane, which is isolated+lightContext
+ *   on a local model and cannot see the owner's session → no turn ever runs.
+ * - A one-shot automations job {schedule at-now, sessionTarget "current",
+ *   payload agentTurn, delivery announce} DID produce a real turn in the DM.
+ * - `automations wake mode:now sessionKey:<key>` did NOT (injection only).
  */
 function createNotificationInjector(
   api: any,
   wsNotifications: WsNotificationsConfig | undefined,
-): (nf: NotificationFrame) => Promise<void> {
+): { inject: (nf: NotificationFrame) => Promise<void>; dispose: () => void } {
   const injectScopes = new Set(wsNotifications?.injectScopes ?? []);
   const targetSession = wsNotifications?.targetSession?.trim();
+  const wakeSessionKey = wsNotifications?.wakeSessionKey?.trim() ?? targetSession;
+  const wakeCoalesceMs = wsNotifications?.wakeCoalesceMs ?? DEFAULT_WAKE_COALESCE_MS;
 
   const enqueueSystemEvent:
     | ((text: string, options: { sessionKey: string; contextKey?: string }) => boolean)
     | undefined = api.runtime?.system?.enqueueSystemEvent;
-  const runHeartbeatOnce:
-    | ((opts: {
-        reason?: string;
-        heartbeat?: { target?: string };
-      }) => Promise<unknown>)
-    | undefined = api.runtime?.system?.runHeartbeatOnce;
+
+  const scheduleSessionTurn:
+    | ((params: {
+        sessionKey: string;
+        message: string;
+        delayMs: number;
+        tag?: string;
+        deliveryMode?: "none" | "announce";
+        deleteAfterRun?: boolean;
+      }) => Promise<{ id: string } | undefined>)
+    | undefined = api.session?.workflow?.scheduleSessionTurn;
+  const unscheduleSessionTurnsByTag:
+    | ((params: { sessionKey: string; tag: string }) => Promise<{ removed: number; failed: number }>)
+    | undefined = api.session?.workflow?.unscheduleSessionTurnsByTag;
+
+  let warnedMissingWakeKey = false;
+  let warnedMissingScheduler = false;
+
+  // In-memory coalesce buffer: { timeout, frames: NotificationFrame[] }
+  const coalesceByScope = new Map<string, { timeout: ReturnType<typeof setTimeout>; frames: NotificationFrame[] }>();
 
   console.log(
-    `[imajin-ws] injection APIs: enqueueSystemEvent=${!!enqueueSystemEvent}, runHeartbeatOnce=${!!runHeartbeatOnce}, ` +
+    `[imajin-ws] injection APIs: enqueueSystemEvent=${!!enqueueSystemEvent}, scheduleSessionTurn=${!!scheduleSessionTurn}, ` +
       `directSend=${!!wsNotifications?.directSend?.target}`,
   );
   if (injectScopes.size === 0) {
@@ -187,8 +209,99 @@ function createNotificationInjector(
       `[imajin-ws] injecting [${[...injectScopes].join(", ")}] → session ${targetSession}`,
     );
   }
+  if (wakeSessionKey) {
+    console.log(`[imajin-ws] wake turns → session ${wakeSessionKey} (coalesce ${wakeCoalesceMs}ms)`);
+  }
 
-  return async (nf: NotificationFrame): Promise<void> => {
+  async function flushWakeTurn(scope: string, frames: NotificationFrame[]) {
+    coalesceByScope.delete(scope);
+
+    if (!wakeSessionKey) {
+      if (!warnedMissingWakeKey) {
+        warnedMissingWakeKey = true;
+        console.warn(
+          "[imajin-ws] cannot schedule wake turn: no wakeSessionKey (or targetSession) configured",
+        );
+      }
+      return;
+    }
+
+    if (!scheduleSessionTurn) {
+      if (!warnedMissingScheduler) {
+        warnedMissingScheduler = true;
+        console.warn(
+          "[imajin-ws] scheduleSessionTurn unavailable — wake turn will not be scheduled. " +
+            "Is this a bundled/trusted plugin installation?",
+        );
+      }
+      return;
+    }
+
+    const tag = `imajin-wake:${scope}`;
+
+    // Unschedule any previous pending turn for this scope so we coalesce.
+    if (unscheduleSessionTurnsByTag) {
+      try {
+        await unscheduleSessionTurnsByTag({ sessionKey: wakeSessionKey, tag });
+      } catch (err: any) {
+        console.warn(`[imajin-ws] unscheduleSessionTurnsByTag failed for ${tag}:`, err?.message ?? err);
+      }
+    }
+
+    // Sort: FAILED/CANCELLED first, then SUCCEEDED
+    const severity = (f: NotificationFrame) => {
+      if (/FAILED|ERROR|CANCEL/i.test(f.title ?? "")) return 0;
+      return 1;
+    };
+    const sorted = [...frames].sort((a, b) => severity(a) - severity(b));
+
+    const lines = sorted.map((f) => {
+      const state = /FAILED|ERROR|CANCEL/i.test(f.title ?? "") ? "⚠️" : "✅";
+      const link = f.data && typeof f.data === "object"
+        ? (f.data.prUrl || f.data.commentUrl || f.data.sessionUrl || "")
+        : "";
+      return `${state} ${f.title ?? f.scope}${link ? ` — ${link}` : ""}`;
+    });
+
+    const failedCount = sorted.filter((f) => /FAILED|ERROR|CANCEL/i.test(f.title ?? "")).length;
+    const header = failedCount > 0
+      ? `Warp runs completed (${frames.length}) — ${failedCount} need attention`
+      : `Warp runs completed (${frames.length})`;
+
+    const message = [
+      header,
+      "",
+      ...lines,
+      "",
+      "React now: review, merge or send back per the review rules, then report to Ryan.",
+    ].join("\n");
+
+    try {
+      const handle = await scheduleSessionTurn({
+        sessionKey: wakeSessionKey,
+        message,
+        delayMs: 0,
+        tag,
+        deliveryMode: "announce",
+        deleteAfterRun: true,
+      });
+      console.log(
+        `[imajin-ws] scheduled wake turn ${handle?.id ?? "(no id)"} for ${scope} → ${wakeSessionKey} ` +
+          `(${frames.length} notification(s) coalesced)`,
+      );
+    } catch (err: any) {
+      console.error(`[imajin-ws] scheduleSessionTurn failed for ${scope}:`, err?.message ?? err);
+    }
+  }
+
+  function dispose() {
+    for (const [scope, buf] of coalesceByScope) {
+      clearTimeout(buf.timeout);
+      coalesceByScope.delete(scope);
+    }
+  }
+
+  async function inject(nf: NotificationFrame): Promise<void> {
     if (!injectScopes.has(nf.scope) || !targetSession) {
       return;
     }
@@ -243,7 +356,7 @@ function createNotificationInjector(
         return;
       } catch (err: any) {
         console.error(`[imajin-ws] direct send failed for ${nf.scope}:`, err?.message ?? err);
-        // Fall through to the heartbeat wake as a best-effort backup.
+        // Fall through to wake-turn scheduling.
       }
     }
 
@@ -251,28 +364,25 @@ function createNotificationInjector(
       return;
     }
 
-    if (!runHeartbeatOnce) {
-      // The payload is queued and will be picked up by the session's next turn,
-      // but nothing will start that turn on its own.
-      console.warn(
-        `[imajin-ws] queued ${nf.scope} via ${queuedVia} but runHeartbeatOnce is unavailable — ` +
-          "the agent will only see it on its next turn",
-      );
+    // Schedule a real agent turn into the owner's DM instead of poking the
+    // heartbeat lane (which is isolated and cannot see the owner's session).
+    const existing = coalesceByScope.get(nf.scope);
+    if (existing) {
+      existing.frames.push(nf);
+      console.log(`[imajin-ws] warp wake: batched ${nf.id} (n=${existing.frames.length}, fires in ${wakeCoalesceMs}ms)`);
       return;
     }
 
-    try {
-      await runHeartbeatOnce({
-        reason: "warp-notification-wake",
-        heartbeat: { target: "last" },
-      });
-      console.log(
-        `[imajin-ws] injected ${nf.scope} → ${targetSession} via ${queuedVia}, ran immediate heartbeat`,
-      );
-    } catch (err: any) {
-      console.error(`[imajin-ws] runHeartbeatOnce failed for ${nf.scope}:`, err?.message ?? err);
-    }
-  };
+    const timeout = setTimeout(() => {
+      const buf = coalesceByScope.get(nf.scope);
+      if (buf) void flushWakeTurn(nf.scope, buf.frames);
+    }, wakeCoalesceMs);
+
+    coalesceByScope.set(nf.scope, { timeout, frames: [nf] });
+    console.log(`[imajin-ws] warp wake: batched ${nf.id} (n=1, fires in ${wakeCoalesceMs}ms)`);
+  }
+
+  return { inject, dispose };
 }
 
 export default definePluginEntry({
@@ -343,7 +453,7 @@ export default definePluginEntry({
       );
 
       // WS notification → agent session injection (#1672)
-      const injector = createNotificationInjector(api, config.wsNotifications);
+      const { inject: injector, dispose: disposeInjector } = createNotificationInjector(api, config.wsNotifications);
 
       // OpenClaw gateway approval bridge (#1816). Registered only when both a
       // signing identity (did + keypairPath, already required above for the WS
@@ -425,6 +535,7 @@ export default definePluginEntry({
         stop: async () => {
           console.log("[imajin-ws] service stop called");
           wsService.stop();
+          disposeInjector();
         },
       });
     }
