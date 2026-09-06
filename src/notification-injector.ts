@@ -302,7 +302,7 @@ export function createNotificationInjector(
       return;
     }
 
-    const tag = `imajin-wake:${scope}`;
+    const tag = `imajin-wake.${scope}`; // no ":" — reserved as the cron-name delimiter in openclaw core (schedulePluginSessionTurn rejects it, returns undefined)
 
     // Unschedule any previous pending turn for this scope so we coalesce.
     if (unscheduleSessionTurnsByTag) {

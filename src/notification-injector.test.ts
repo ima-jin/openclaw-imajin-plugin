@@ -177,7 +177,7 @@ describe("createNotificationInjector.inject — direct send AND wake turn", () =
     expect(scheduleSessionTurn).toHaveBeenCalledTimes(1);
     expect(params).toMatchObject({
       sessionKey: SESSION,
-      tag: "imajin-wake:warp.run.completed",
+      tag: "imajin-wake.warp.run.completed",
       delayMs: 0,
       deliveryMode: "announce",
       deleteAfterRun: true,
@@ -219,7 +219,7 @@ describe("createNotificationInjector.inject — direct send AND wake turn", () =
     const params = await pending;
 
     expect(scheduleSessionTurn).toHaveBeenCalledTimes(1); // one wake for all three
-    expect(unscheduleSessionTurnsByTag).toHaveBeenCalledWith({ sessionKey: SESSION, tag: "imajin-wake:warp.run.completed" });
+    expect(unscheduleSessionTurnsByTag).toHaveBeenCalledWith({ sessionKey: SESSION, tag: "imajin-wake.warp.run.completed" });
     expect(String(params.message)).toContain("Warp runs completed (3) — 1 need attention");
     dispose();
   });
