@@ -1,5 +1,5 @@
 /**
- * WS-notification → agent-session injector (#1672).
+ * WS-notification → agent-session injector (#1672, #18).
  *
  * Lives in its own module (no plugin-sdk imports) so the real `inject()`
  * path can be unit-tested; `index.ts` wires it into the plugin entry.
@@ -14,12 +14,25 @@ export interface WsNotificationsConfig {
   /** Exact session key to inject into, e.g. `agent:main:telegram:direct:8321865723`. */
   targetSession?: string;
   /**
-   * Session key to schedule a real agent turn into when a Warp run completes/fails.
-   * Falls back to `targetSession` when omitted.
+   * Session key to run a real agent turn into when a Warp run completes/fails,
+   * via the Gateway `POST /hooks/agent` wake (#18). Falls back to `targetSession`
+   * when omitted.
    */
   wakeSessionKey?: string;
   /** Coalesce window for Warp wake turns (ms). Default 300000 (5 min). */
   wakeCoalesceMs?: number;
+  /**
+   * Bearer token for the Gateway's `hooks.token` (#18) — required to call
+   * `POST /hooks/agent`. Sourced the same way this plugin sources other
+   * secrets (see `attestation.internalApiKey`): plaintext here, falling back
+   * to the `IMAJIN_WAKE_HOOK_TOKEN` env var when omitted. Never logged or
+   * echoed.
+   */
+  hookToken?: string;
+  /** Gateway hooks base path (`hooks.path` on the Gateway side). Default `/hooks`. */
+  hooksPath?: string;
+  /** Agent id to route the wake hook to (`hooks.allowedAgentIds` must permit it). Default `main`. */
+  hookAgentId?: string;
   /** Direct channel ping via the OpenClaw CLI — deterministic, no model turn. */
   directSend?: {
     /** Channel id, default `telegram`. */
@@ -41,13 +54,19 @@ const MAX_INJECTED_CHARS = 4_000;
 const MAX_DATA_JSON_CHARS = 2_000;
 // Default coalesce window for Warp wake turns.
 export const DEFAULT_WAKE_COALESCE_MS = 300_000;
-// How long to wait for an `agent_end` in the wake session after a
-// successfully-scheduled (real id) wake turn before treating it as a stuck
-// job and escalating (#13). `scheduleSessionTurn` schedules via a Cron `at`
-// job with `wakeMode: "now"` (openclaw core, host-hook-scheduled-turns.ts),
-// which the host fires within a few seconds in practice — 60s leaves ample
-// margin without leaving the human hanging.
-export const WAKE_CONFIRM_TIMEOUT_MS = 60_000;
+// Gateway hooks defaults (#18, docs/automation/webhook.md).
+const DEFAULT_HOOKS_PATH = "/hooks";
+const DEFAULT_HOOK_AGENT_ID = "main";
+// `--port` -> `OPENCLAW_GATEWAY_PORT` -> `gateway.port` -> this default
+// (openclaw core, src/config/paths.ts:resolveGatewayPort / docs/gateway.md).
+const DEFAULT_GATEWAY_PORT = 18789;
+// Generous enough for a cold-started isolated agent turn to be *admitted*
+// (the hook responds once the run is accepted, not once it finishes) while
+// still failing fast to the Telegram fallback on a wedged/unreachable Gateway.
+export const HOOK_REQUEST_TIMEOUT_MS = 10_000;
+// Falls back here when `wsNotifications.hookToken` is omitted — same pattern
+// as `attestation.internalApiKey` / `ATTESTATION_INTERNAL_API_KEY`.
+export const HOOK_TOKEN_ENV = "IMAJIN_WAKE_HOOK_TOKEN";
 
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated ${value.length - max} chars]`;
@@ -103,18 +122,105 @@ export function buildWakeFailureMessage(frames: NotificationFrame[], reason: str
   );
 }
 
-/** Stringifies a host response for a warn log without ever throwing on a weird shape. */
-function safePreview(value: unknown): string {
-  if (value === undefined) return "undefined";
+/**
+ * Resolves the Gateway's listening port the same way the host itself does:
+ * `--port` -> `OPENCLAW_GATEWAY_PORT` -> `gateway.port` -> 18789 (openclaw
+ * core, `src/config/paths.ts:resolveGatewayPort`). This plugin runs inside
+ * the Gateway process, so only the config layer is reachable here; CLI/env
+ * overrides are the host's own concern and already baked into whatever
+ * `runtime.config.current()` returns.
+ */
+function resolveGatewayPort(api: any): number {
   try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
+    const cfg = api?.runtime?.config?.current?.();
+    const port = cfg?.gateway?.port;
+    if (typeof port === "number" && Number.isFinite(port) && port > 0) {
+      return port;
+    }
+  } catch (err: any) {
+    console.warn(
+      `[imajin-ws] failed to read gateway.port from runtime.config.current() — using default ${DEFAULT_GATEWAY_PORT}:`,
+      err?.message ?? err,
+    );
+  }
+  return DEFAULT_GATEWAY_PORT;
+}
+
+interface WakeHookResult {
+  ok: boolean;
+  /** Only present on an admitted (200) response, and only when the body carries one. */
+  runId?: string;
+  /** Only present on a non-ok result — never includes the token. */
+  reason?: string;
+}
+
+/**
+ * POSTs the wake to the local Gateway's `POST /hooks/agent` (#18,
+ * docs/automation/webhook.md) — a first-class, documented, upgrade-safe
+ * surface that runs a real agent turn in an explicit session, replacing the
+ * bundled-only `scheduleSessionTurn` seam this plugin cannot use.
+ *
+ * The Gateway responds 200 once the run is *admitted* (accepted), not once
+ * it finishes — the durable injection queued earlier is what the hook turn
+ * drains. Never logs `hookToken`; it only ever appears in the `Authorization`
+ * header of the outgoing request.
+ */
+async function postWakeHook(params: {
+  gatewayPort: number;
+  hooksPath: string;
+  hookToken: string;
+  agentId: string;
+  sessionKey: string;
+  message: string;
+  idempotencyKey: string;
+}): Promise<WakeHookResult> {
+  const url = `http://127.0.0.1:${params.gatewayPort}${params.hooksPath}/agent`;
+  const controller = new AbortController();
+  const timeoutHandle = setTimeout(() => controller.abort(), HOOK_REQUEST_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${params.hookToken}`,
+        "Content-Type": "application/json",
+        "Idempotency-Key": params.idempotencyKey,
+      },
+      body: JSON.stringify({
+        message: params.message,
+        agentId: params.agentId,
+        sessionMode: "persistent",
+        sessionKey: params.sessionKey,
+        deliver: true,
+        name: "imajin-wake",
+      }),
+      signal: controller.signal,
+    });
+    if (res.status !== 200) {
+      const text = await res.text().catch(() => "");
+      return { ok: false, reason: `gateway returned ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}` };
+    }
+    let runId: string | undefined;
+    try {
+      const body = (await res.json()) as Record<string, unknown> | undefined;
+      const rawId = body?.runId ?? body?.id;
+      runId = typeof rawId === "string" ? rawId : undefined;
+    } catch {
+      // A 200 with no/unparseable JSON body is still an admitted wake.
+    }
+    return { ok: true, runId };
+  } catch (err: any) {
+    const reason =
+      err?.name === "AbortError"
+        ? `timed out after ${HOOK_REQUEST_TIMEOUT_MS}ms`
+        : String(err?.code ?? err?.message ?? err);
+    return { ok: false, reason };
+  } finally {
+    clearTimeout(timeoutHandle);
   }
 }
 
 /**
- * Builds the WS-notification → agent-session injector (#1672).
+ * Builds the WS-notification → agent-session injector (#1672, #18).
  *
  * The returned function is called from the WebSocket frame callback, which runs
  * on the socket's event loop turn and **not** inside an agent turn. Every host
@@ -122,33 +228,30 @@ function safePreview(value: unknown): string {
  *
  * Flow:
  * 1. Durable context injection (`enqueueNextTurnInjection` or fallback
- *    `enqueueSystemEvent`) so the event survives restarts.
- * 2. Schedule a real agent turn into the owner's conversation via
- *    `api.session.workflow.scheduleSessionTurn({ delayMs: 0, sessionKey, message, tag, deliveryMode: "announce" })`.
- *    This is a bundled-only Cron-backed seam that creates a background task
- *    record and runs it immediately (delayMs: 0). It targets an exact session
- *    key, so the turn runs in the owner's DM — not the heartbeat lane.
- * 3. Coalesce: multiple completions within the coalesce window unschedule the
- *    previous pending turn by tag and reschedule a combined one.
+ *    `enqueueSystemEvent`) so the event survives restarts — unchanged by #18.
+ * 2. Coalesce: multiple completions within the coalesce window are batched and
+ *    flushed together, keyed by scope + the coalesce window's start time
+ *    (`Idempotency-Key: imajin-wake:<scope>:<coalesceWindowStart>`) rather than
+ *    the tag-based unschedule/coalesce #13/#17 used — `unschedulePluginSessionTurnsByTag`
+ *    is gated the same bundled-only way as `scheduleSessionTurn` and cannot be
+ *    used by a third-party plugin either way.
+ * 3. Run a real agent turn in the owner's session via the local Gateway's
+ *    `POST /hooks/agent` (`postWakeHook` above) instead of the bundled-only
+ *    `api.session.workflow.scheduleSessionTurn` seam (#13, #17): that seam
+ *    returns `undefined` for any plugin with `origin !== "bundled"`
+ *    (openclaw core, `src/plugins/host-hook-scheduled-turns.ts`), so it never
+ *    worked for this plugin. `/hooks/agent` is first-class, documented, and
+ *    upgrade-safe (docs/automation/webhook.md).
+ * 4. Outcome handling: HTTP 200 → log the admitted runId (never the token) and
+ *    stop. Anything else (non-200, ECONNREFUSED, timeout) → the Telegram
+ *    fallback from #14 (`buildWakeFailureMessage` + `sendChannelMessage`),
+ *    which remains the backstop when the hook is disabled or unreachable.
  *
- * Evidence (2026-09-05):
+ * Evidence (2026-09-05, see docs/warp-wake-chain.md for the historical trace):
  * - `runHeartbeatOnce` wakes the heartbeat lane, which is isolated+lightContext
  *   on a local model and cannot see the owner's session → no turn ever runs.
- * - A one-shot automations job {schedule at-now, sessionTarget "current",
- *   payload agentTurn, delivery announce} DID produce a real turn in the DM.
- * - `automations wake mode:now sessionKey:<key>` did NOT (injection only).
- *
- * #13 (2026-09-05 18:53): `scheduleSessionTurn` resolved successfully but its
- * handle carried no `id` — the host (`schedulePluginSessionTurn`, openclaw
- * core `src/plugins/host-hook-scheduled-turns.ts`) has several paths that
- * resolve to `undefined` with **no warn log at all** (a plugin-liveness gate
- * checked both before `cron.add()` and again after, silently rolling the job
- * back if the plugin looks unloaded at that instant — see
- * `docs/warp-wake-chain.md` for the full trace and the exact source lines).
- * The old code trusted a truthy-looking log line (`handle?.id ?? "(no id)"`)
- * as if it were success. It is not: a missing id must be treated as a
- * failure, retried once, and escalated to a plain channel message if the
- * retry also comes back empty — see `flushWakeTurn` below.
+ * - `scheduleSessionTurn` (bundled-only) and its tag-based coalesce/unschedule
+ *   were the previous approach (#11-#17); #18 replaces all of it.
  */
 export function createNotificationInjector(
   api: any,
@@ -158,26 +261,13 @@ export function createNotificationInjector(
   const targetSession = wsNotifications?.targetSession?.trim();
   const wakeSessionKey = wsNotifications?.wakeSessionKey?.trim() ?? targetSession;
   const wakeCoalesceMs = wsNotifications?.wakeCoalesceMs ?? DEFAULT_WAKE_COALESCE_MS;
+  const hookToken = wsNotifications?.hookToken?.trim() || process.env[HOOK_TOKEN_ENV]?.trim();
+  const hooksPath = (wsNotifications?.hooksPath?.trim() || DEFAULT_HOOKS_PATH).replace(/\/+$/, "") || DEFAULT_HOOKS_PATH;
+  const hookAgentId = wsNotifications?.hookAgentId?.trim() || DEFAULT_HOOK_AGENT_ID;
 
   const enqueueSystemEvent:
     | ((text: string, options: { sessionKey: string; contextKey?: string }) => boolean)
     | undefined = api.runtime?.system?.enqueueSystemEvent;
-
-  const scheduleSessionTurn:
-    | ((params: {
-        sessionKey: string;
-        message: string;
-        delayMs: number;
-        tag?: string;
-        deliveryMode?: "none" | "announce";
-        deleteAfterRun?: boolean;
-      }) => Promise<{ id: string } | undefined>)
-    | undefined = api.session?.workflow?.scheduleSessionTurn;
-  const unscheduleSessionTurnsByTag:
-    | ((params: { sessionKey: string; tag: string }) => Promise<{ removed: number; failed: number }>)
-    | undefined = api.session?.workflow?.unscheduleSessionTurnsByTag;
-  const onHook: ((hookName: string, handler: (event: any) => void, opts?: { name?: string }) => void) | undefined =
-    typeof api.on === "function" ? api.on.bind(api) : undefined;
 
   const ds = wsNotifications?.directSend;
 
@@ -201,65 +291,21 @@ export function createNotificationInjector(
   }
 
   let warnedMissingWakeKey = false;
-  let warnedMissingScheduler = false;
+  let warnedMissingHookToken = false;
 
-  // In-memory coalesce buffer: { timeout, frames: NotificationFrame[] }
-  const coalesceByScope = new Map<string, { timeout: ReturnType<typeof setTimeout>; frames: NotificationFrame[] }>();
-
-  // #13 determinism check: a wake schedule that returned a real id is not
-  // proof the turn ran — the host creates the Cron task record synchronously
-  // but runs it asynchronously. Track scheduled ids and confirm them via the
-  // `agent_end` hook (fires with the same `sessionKey` the turn ran in,
-  // openclaw core `src/plugins/hook-message.types.ts`); escalate if none
-  // arrives within WAKE_CONFIRM_TIMEOUT_MS. Session-key-only correlation
-  // means an unrelated human message in the same window can also confirm a
-  // pending wake — acceptable: it proves the session is not stuck, which is
-  // the thing we actually can't otherwise observe (no job-status query is
-  // exposed to plugins; see docs/warp-wake-chain.md).
-  const pendingWakeConfirmations = new Map<
+  // In-memory coalesce buffer, keyed by scope. `windowStart` is the wall-clock
+  // time the buffer opened — it becomes the `Idempotency-Key`'s window
+  // component so repeated flushes of the same window (there should only ever
+  // be one) collide instead of double-waking, while a new window after the
+  // previous one fires gets a fresh key (#18: coalesce by window + idempotency
+  // key, replacing the tag-based unschedule/coalesce from #13/#17).
+  const coalesceByScope = new Map<
     string,
-    { scope: string; frames: NotificationFrame[]; timeout: ReturnType<typeof setTimeout> }
+    { timeout: ReturnType<typeof setTimeout>; frames: NotificationFrame[]; windowStart: number }
   >();
 
-  function confirmWakeTurn(id: string) {
-    const pending = pendingWakeConfirmations.get(id);
-    if (!pending) return;
-    clearTimeout(pending.timeout);
-    pendingWakeConfirmations.delete(id);
-    console.log(`[imajin-ws] wake turn confirmed ${id} (${pending.scope})`);
-  }
-
-  function watchWakeTurn(id: string, scope: string, frames: NotificationFrame[]) {
-    const timeout = setTimeout(() => {
-      pendingWakeConfirmations.delete(id);
-      const reason = `scheduled wake turn ${id} never ran (no agent_end within ${Math.round(WAKE_CONFIRM_TIMEOUT_MS / 1000)}s)`;
-      console.warn(`[imajin-ws] ${reason} — escalating for ${scope}`);
-      sendChannelMessage(buildWakeFailureMessage(frames, reason))
-        .then(() => console.log(`[imajin-ws] wake-confirmation-timeout fallback message sent for ${scope}`))
-        .catch((err: any) =>
-          console.error(`[imajin-ws] wake-confirmation-timeout fallback message FAILED for ${scope}:`, err?.message ?? err),
-        );
-    }, WAKE_CONFIRM_TIMEOUT_MS);
-    pendingWakeConfirmations.set(id, { scope, frames, timeout });
-  }
-
-  if (onHook && wakeSessionKey) {
-    onHook(
-      "agent_end",
-      (event: { sessionKey?: string }) => {
-        if (event?.sessionKey !== wakeSessionKey || pendingWakeConfirmations.size === 0) {
-          return;
-        }
-        // FIFO: confirm the oldest still-pending wake for this session.
-        const oldest = pendingWakeConfirmations.keys().next();
-        if (!oldest.done) confirmWakeTurn(oldest.value);
-      },
-      { name: "imajin-wake-confirm" },
-    );
-  }
-
   console.log(
-    `[imajin-ws] injection APIs: enqueueSystemEvent=${!!enqueueSystemEvent}, scheduleSessionTurn=${!!scheduleSessionTurn}, ` +
+    `[imajin-ws] injection APIs: enqueueSystemEvent=${!!enqueueSystemEvent}, wakeHookConfigured=${!!hookToken}, ` +
       `directSend=${!!ds?.target}`,
   );
   if (injectScopes.size === 0) {
@@ -278,39 +324,27 @@ export function createNotificationInjector(
     console.log(`[imajin-ws] wake turns → session ${wakeSessionKey} (coalesce ${wakeCoalesceMs}ms)`);
   }
 
-  async function flushWakeTurn(scope: string, frames: NotificationFrame[]) {
+  /** The #14 Telegram fallback — unchanged backstop for a disabled/unreachable hook. */
+  async function escalateWakeFailure(scope: string, frames: NotificationFrame[], reason: string): Promise<void> {
+    try {
+      await sendChannelMessage(buildWakeFailureMessage(frames, reason));
+      console.log(`[imajin-ws] wake-failure fallback message sent for ${scope}`);
+    } catch (err: any) {
+      console.error(`[imajin-ws] wake-failure fallback message FAILED for ${scope}:`, err?.message ?? err);
+    }
+  }
+
+  async function flushWakeTurn(scope: string, frames: NotificationFrame[], windowStart: number) {
     coalesceByScope.delete(scope);
 
     if (!wakeSessionKey) {
       if (!warnedMissingWakeKey) {
         warnedMissingWakeKey = true;
         console.warn(
-          "[imajin-ws] cannot schedule wake turn: no wakeSessionKey (or targetSession) configured",
+          "[imajin-ws] cannot run wake turn: no wakeSessionKey (or targetSession) configured",
         );
       }
       return;
-    }
-
-    if (!scheduleSessionTurn) {
-      if (!warnedMissingScheduler) {
-        warnedMissingScheduler = true;
-        console.warn(
-          "[imajin-ws] scheduleSessionTurn unavailable — wake turn will not be scheduled. " +
-            "Is this a bundled/trusted plugin installation?",
-        );
-      }
-      return;
-    }
-
-    const tag = `imajin-wake.${scope}`; // no ":" — reserved as the cron-name delimiter in openclaw core (schedulePluginSessionTurn rejects it, returns undefined)
-
-    // Unschedule any previous pending turn for this scope so we coalesce.
-    if (unscheduleSessionTurnsByTag) {
-      try {
-        await unscheduleSessionTurnsByTag({ sessionKey: wakeSessionKey, tag });
-      } catch (err: any) {
-        console.warn(`[imajin-ws] unscheduleSessionTurnsByTag failed for ${tag}:`, err?.message ?? err);
-      }
     }
 
     // Sort: FAILED/CANCELLED first, then SUCCEEDED
@@ -341,70 +375,48 @@ export function createNotificationInjector(
       "React now: review, merge or send back per the review rules, then report to Ryan.",
     ].join("\n");
 
-    async function attemptSchedule(attemptTag: string): Promise<{ id: string } | undefined> {
-      try {
-        return await scheduleSessionTurn!({
-          sessionKey: wakeSessionKey!,
-          message,
-          delayMs: 0,
-          tag: attemptTag,
-          deliveryMode: "announce",
-          deleteAfterRun: true,
-        });
-      } catch (err: any) {
-        console.error(`[imajin-ws] scheduleSessionTurn threw for ${scope} (tag=${attemptTag}):`, err?.message ?? err);
-        return undefined;
-      }
-    }
-
-    // #13: a missing/empty id is a FAILURE, never success — never log a
-    // "(no id)" placeholder as if the turn were scheduled. Warn with the raw
-    // response so the refusal reason is visible, then retry once before
-    // escalating to a plain channel message (deliverable 2/3 of #13).
-    let handle = await attemptSchedule(tag);
-    let usedFallback = false;
-    if (!handle?.id) {
-      console.warn(
-        `[imajin-ws] wake schedule returned no job id for ${scope} → ${wakeSessionKey} — raw response: ${safePreview(handle)}`,
-      );
-      handle = await attemptSchedule(tag);
-      usedFallback = true;
-      if (!handle?.id) {
+    if (!hookToken) {
+      if (!warnedMissingHookToken) {
+        warnedMissingHookToken = true;
         console.warn(
-          `[imajin-ws] wake fallback ALSO returned no job id for ${scope} → ${wakeSessionKey} — raw response: ${safePreview(handle)}`,
+          `[imajin-ws] wsNotifications.hookToken not configured (and ${HOOK_TOKEN_ENV} unset) — ` +
+            "cannot call the Gateway wake hook, falling back to the channel message",
         );
       }
-    }
-
-    if (!handle?.id) {
-      const reason = "no job id from automations wake (primary + fallback attempts)";
-      console.error(
-        `[imajin-ws] wake turn FAILED for ${scope} → ${wakeSessionKey} after ${reason} (${frames.length} notification(s) coalesced)`,
-      );
-      try {
-        await sendChannelMessage(buildWakeFailureMessage(frames, reason));
-        console.log(`[imajin-ws] wake-failure fallback message sent for ${scope}`);
-      } catch (err: any) {
-        console.error(`[imajin-ws] wake-failure fallback message FAILED for ${scope}:`, err?.message ?? err);
-      }
+      await escalateWakeFailure(scope, frames, "no hook token configured");
       return;
     }
 
-    console.log(
-      `[imajin-ws] scheduled wake turn ${handle.id} for ${scope} → ${wakeSessionKey} ` +
-        `(${frames.length} notification(s) coalesced)${usedFallback ? " [fallback attempt]" : ""}`,
+    const idempotencyKey = `imajin-wake:${scope}:${windowStart}`;
+    const gatewayPort = resolveGatewayPort(api);
+    const result = await postWakeHook({
+      gatewayPort,
+      hooksPath,
+      hookToken,
+      agentId: hookAgentId,
+      sessionKey: wakeSessionKey,
+      message,
+      idempotencyKey,
+    });
+
+    if (result.ok) {
+      console.log(
+        `[imajin-ws] wake admitted${result.runId ? ` runId=${result.runId}` : ""} for ${scope} → ${wakeSessionKey} ` +
+          `(${frames.length} notification(s) coalesced)`,
+      );
+      return;
+    }
+
+    console.error(
+      `[imajin-ws] wake hook FAILED for ${scope} → ${wakeSessionKey}: ${result.reason} (${frames.length} notification(s) coalesced)`,
     );
-    watchWakeTurn(handle.id, scope, frames);
+    await escalateWakeFailure(scope, frames, result.reason ?? "unknown wake hook failure");
   }
 
   function dispose() {
     for (const [scope, buf] of coalesceByScope) {
       clearTimeout(buf.timeout);
       coalesceByScope.delete(scope);
-    }
-    for (const [id, pending] of pendingWakeConfirmations) {
-      clearTimeout(pending.timeout);
-      pendingWakeConfirmations.delete(id);
     }
   }
 
@@ -459,8 +471,10 @@ export function createNotificationInjector(
       return;
     }
 
-    // Schedule a real agent turn into the owner's DM instead of poking the
-    // heartbeat lane (which is isolated and cannot see the owner's session).
+    // Run a real agent turn in the owner's DM (via the Gateway wake hook)
+    // instead of poking the heartbeat lane (isolated, cannot see the owner's
+    // session). Coalesce by scope; the window's start time becomes part of
+    // the Idempotency-Key sent with the eventual hook request.
     const existing = coalesceByScope.get(nf.scope);
     if (existing) {
       existing.frames.push(nf);
@@ -468,12 +482,13 @@ export function createNotificationInjector(
       return;
     }
 
+    const windowStart = Date.now();
     const timeout = setTimeout(() => {
       const buf = coalesceByScope.get(nf.scope);
-      if (buf) void flushWakeTurn(nf.scope, buf.frames);
+      if (buf) void flushWakeTurn(nf.scope, buf.frames, buf.windowStart);
     }, wakeCoalesceMs);
 
-    coalesceByScope.set(nf.scope, { timeout, frames: [nf] });
+    coalesceByScope.set(nf.scope, { timeout, frames: [nf], windowStart });
     console.log(`[imajin-ws] warp wake: batched ${nf.id} (n=1, fires in ${wakeCoalesceMs}ms)`);
   }
 

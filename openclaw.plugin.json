@@ -47,6 +47,11 @@
       "help": "Bearer token for POST /auth/api/attestations/internal. Falls back to the ATTESTATION_INTERNAL_API_KEY env var when omitted.",
       "sensitive": true
     },
+    "wsNotifications.hookToken": {
+      "label": "Wake Hook Token",
+      "help": "Bearer token for the Gateway's POST /hooks/agent (#18), matching that Gateway's hooks.token. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var when omitted. Never logged.",
+      "sensitive": true
+    },
     "approvalBridge.pinnedApproverPublicKeyHex": {
       "label": "Approval Bridge: Pinned Approver Public Key",
       "help": "Ed25519 public key (hex) of the sole trusted human approver for OpenClaw gateway approval decisions signed on /jin (#1816). Channel/WS auth alone never resolves an approval — only a signature from this key does."
@@ -84,6 +89,35 @@
           "targetSession": {
             "type": "string",
             "description": "Session key to inject notifications into"
+          },
+          "wakeSessionKey": {
+            "type": "string",
+            "description": "Session key to wake with a real agent turn via the Gateway's POST /hooks/agent (#18). Defaults to targetSession."
+          },
+          "wakeCoalesceMs": {
+            "type": "number",
+            "description": "Coalesce window for Warp wake turns, in ms. Default 300000 (5 min)."
+          },
+          "hookToken": {
+            "type": "string",
+            "description": "Bearer token for the Gateway's POST /hooks/agent, matching that Gateway's hooks.token. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var."
+          },
+          "hooksPath": {
+            "type": "string",
+            "description": "Gateway hooks base path (matching that Gateway's hooks.path). Default /hooks."
+          },
+          "hookAgentId": {
+            "type": "string",
+            "description": "Agent id to route the wake hook to (must be permitted by that Gateway's hooks.allowedAgentIds). Default main."
+          },
+          "directSend": {
+            "type": "object",
+            "description": "Direct channel ping via the OpenClaw CLI \u2014 deterministic, no model turn. Also the #14 fallback destination when the wake hook is disabled or unreachable.",
+            "properties": {
+              "channel": { "type": "string", "description": "Channel id, default telegram." },
+              "target": { "type": "string", "description": "Chat/recipient target." },
+              "cliPath": { "type": "string", "description": "Absolute path to the openclaw CLI binary; default openclaw (PATH)." }
+            }
           }
         }
       },
