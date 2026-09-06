@@ -116,6 +116,9 @@ via `api.registerService` so it starts and stops with the plugin lifecycle:
   agent session (#1672). Unrecognized scopes and malformed frames are logged
   and dropped — they never crash the socket.
 
+## Development
+Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the two `openclaw/plugin-sdk/*` imports in `index.ts` are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
+
 ## About Imajin
 
 Imajin (今人) is sovereign technology infrastructure — federated identity, .fair attribution, MJN/MJNx settlement, and discovery. No subscriptions, no cloud dependency, no vendor lock-in.
