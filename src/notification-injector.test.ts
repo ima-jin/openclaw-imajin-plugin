@@ -11,6 +11,27 @@ import {
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 const execFileMock = vi.mocked(execFile);
 
+// #20: `resolveHookToken`'s SecretRef branch dynamically `import()`s these two
+// plugin-sdk specifiers — mocked here so the SecretRef-shaped `hookToken`
+// tests below never need the real (unpublished-in-this-repo) `openclaw`
+// package resolvable on disk. Every other test in this file configures
+// `hookToken` as a plain string, so it never touches these mocks at all.
+const isSecretRefMock = vi.hoisted(() =>
+  vi.fn(
+    (value: unknown) =>
+      !!value &&
+      typeof value === "object" &&
+      typeof (value as Record<string, unknown>).source === "string" &&
+      typeof (value as Record<string, unknown>).provider === "string" &&
+      typeof (value as Record<string, unknown>).id === "string",
+  ),
+);
+const resolveSecretRefValuesMock = vi.hoisted(() => vi.fn());
+vi.mock("openclaw/plugin-sdk/secret-input-runtime", () => ({ isSecretRef: isSecretRefMock }));
+vi.mock("openclaw/plugin-sdk/secret-ref-runtime", () => ({
+  resolveSecretRefValues: resolveSecretRefValuesMock,
+}));
+
 // We test the batching logic by re-implementing the coalesce behaviour
 // in plain JS to avoid needing the full plugin SDK types.
 
@@ -652,6 +673,141 @@ describe("createNotificationInjector — hook token is never logged (#18)", () =
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
     expect(allLoggedText()).not.toContain(HOOK_TOKEN);
+    dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #20: `wsNotifications.hookToken` as a SecretRef, resolved via
+// `openclaw/plugin-sdk/secret-input-runtime`'s `isSecretRef` +
+// `openclaw/plugin-sdk/secret-ref-runtime`'s `resolveSecretRefValues`.
+// Resolution order: config SecretRef -> config plain string -> the
+// IMAJIN_WAKE_HOOK_TOKEN env var -> none (single startup warning).
+// ---------------------------------------------------------------------------
+
+const SECRET_REF = { source: "env", provider: "default", id: "WAKE_HOOK_TOKEN" } as const;
+const SECRET_REF_RESOLVED_TOKEN = "secret-ref-resolved-token-do-not-log";
+
+describe("createNotificationInjector — wsNotifications.hookToken as a SecretRef (#20)", () => {
+  let fetchMock: ReturnType<typeof makeFetchMock>["fetchMock"];
+  let calls: ReturnType<typeof makeFetchMock>["calls"];
+  let setImpl: ReturnType<typeof makeFetchMock>["setImpl"];
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let warnSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  function allLoggedText(): string {
+    const all = [...logSpy.mock.calls, ...warnSpy.mock.calls, ...errorSpy.mock.calls];
+    return all.map((call) => call.map((arg) => String(arg)).join(" ")).join("\n");
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    isSecretRefMock.mockClear();
+    resolveSecretRefValuesMock.mockReset();
+    ({ fetchMock, calls, setImpl } = makeFetchMock());
+    vi.stubGlobal("fetch", fetchMock);
+    logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("resolves a SecretRef hookToken via resolveSecretRefValues and uses it as the Bearer token", async () => {
+    resolveSecretRefValuesMock.mockResolvedValue(new Map([["env:default:WAKE_HOOK_TOKEN", SECRET_REF_RESOLVED_TOKEN]]));
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, { ...CONFIG, hookToken: SECRET_REF });
+    // The SecretRef branch dynamically `import()`s two plugin-sdk specifiers;
+    // fake timers don't advance that real module-loader promise on their own.
+    await vi.dynamicImportSettled();
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(resolveSecretRefValuesMock).toHaveBeenCalledTimes(1);
+    expect(resolveSecretRefValuesMock.mock.calls[0][0]).toEqual([SECRET_REF]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [, init] = calls[0];
+    expect(init.headers.Authorization).toBe(`Bearer ${SECRET_REF_RESOLVED_TOKEN}`);
+    dispose();
+  });
+
+  it("resolves the SecretRef only once for injector construction, not once per wake", async () => {
+    resolveSecretRefValuesMock.mockResolvedValue(new Map([["k", SECRET_REF_RESOLVED_TOKEN]]));
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, { ...CONFIG, hookToken: SECRET_REF });
+    await vi.dynamicImportSettled();
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await inject(frame("2"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    // Two separate wake hook calls, but the SecretRef was only resolved once.
+    expect(resolveSecretRefValuesMock).toHaveBeenCalledTimes(1);
+    dispose();
+  });
+
+  it("an unresolvable SecretRef warns, falls back to the env var, and never throws", async () => {
+    resolveSecretRefValuesMock.mockRejectedValue(new Error("SECRET_PROVIDER_NOT_CONFIGURED"));
+    process.env[HOOK_TOKEN_ENV] = "env-fallback-after-secretref-failure";
+    try {
+      setImpl(async () => jsonResponse(200, {}));
+      const { api } = makeApi();
+      const { inject, dispose } = createNotificationInjector(api, { ...CONFIG, hookToken: SECRET_REF });
+      await vi.dynamicImportSettled();
+
+      await expect(inject(frame("1"))).resolves.toBeUndefined();
+      await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [, init] = calls[0];
+      expect(init.headers.Authorization).toBe("Bearer env-fallback-after-secretref-failure");
+      expect(allLoggedText()).toContain("SecretRef failed to resolve");
+      dispose();
+    } finally {
+      delete process.env[HOOK_TOKEN_ENV];
+    }
+  });
+
+  it("an unresolvable SecretRef with no env fallback logs the single startup warning and still falls back to the direct-send escalation (no throw)", async () => {
+    resolveSecretRefValuesMock.mockRejectedValue(new Error("SECRET_PROVIDER_NOT_CONFIGURED"));
+    setImpl(async () => jsonResponse(200, {}));
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, { ...CONFIG, hookToken: SECRET_REF });
+    await vi.dynamicImportSettled();
+
+    await expect(inject(frame("1"))).resolves.toBeUndefined();
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(wakeFailureCalls()).toHaveLength(1);
+    expect(allLoggedText()).toContain("wake hook token not configured; wake disabled, fallback only");
+    dispose();
+  });
+
+  it("never logs the SecretRef-resolved token", async () => {
+    resolveSecretRefValuesMock.mockResolvedValue(new Map([["k", SECRET_REF_RESOLVED_TOKEN]]));
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, { ...CONFIG, hookToken: SECRET_REF });
+    await vi.dynamicImportSettled();
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(allLoggedText()).not.toContain(SECRET_REF_RESOLVED_TOKEN);
     dispose();
   });
 });

@@ -45,7 +45,7 @@ In `openclaw.json`:
 - **`approvalBridge`** (optional, requires `did` + `keypairPath`) — routes OpenClaw gateway approvals to /jin (#1816):
   - **`approvalBridge.pinnedApproverPublicKeyHex`** — Ed25519 public key (hex) of the sole trusted human approver; see "Approval bridge" below
 - **`wsNotifications`** (optional) — WS notification → agent session wiring (#1672); see "Wake on Warp completion" below:
-  - **`wsNotifications.hookToken`** — Bearer token for the Gateway's `POST /hooks/agent`; falls back to the `IMAJIN_WAKE_HOOK_TOKEN` env var
+  - **`wsNotifications.hookToken`** — Bearer token for the Gateway's `POST /hooks/agent`; a plain string, or (recommended, #20) a SecretRef object resolved via the plugin SDK; falls back to the `IMAJIN_WAKE_HOOK_TOKEN` env var
   - **`wsNotifications.hooksPath`** — Gateway hooks base path; defaults to `/hooks`
   - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
 
@@ -124,7 +124,12 @@ repo). This replaces an earlier bundled-only `scheduleSessionTurn` approach
 }
 ```
 
-**2. Configure this plugin** with the matching token and the session to wake:
+**2. Configure this plugin** with the matching token and the session to wake.
+
+The recommended form (#20) points `hookToken` at the *same* secrets-store
+entry the Gateway's own `hooks.token` references, via a SecretRef object —
+so the token is stored exactly once, not duplicated between the Gateway's
+config and this plugin's config:
 
 ```json
 {
@@ -135,7 +140,7 @@ repo). This replaces an earlier bundled-only `scheduleSessionTurn` approach
           "wsNotifications": {
             "injectScopes": ["warp.run.completed"],
             "wakeSessionKey": "agent:main:telegram:direct:8321865723",
-            "hookToken": "${OPENCLAW_HOOKS_TOKEN}"
+            "hookToken": { "source": "store", "provider": "default", "id": "OPENCLAW_HOOKS_TOKEN" }
           }
         }
       }
@@ -144,9 +149,22 @@ repo). This replaces an earlier bundled-only `scheduleSessionTurn` approach
 }
 ```
 
-`hookToken` can also be sourced from the `IMAJIN_WAKE_HOOK_TOKEN` env var
-(same pattern as `attestation.internalApiKey`) instead of inline config —
-it is never logged or echoed either way.
+This is resolved once (at plugin startup / config reload, never per
+request) via the OpenClaw plugin SDK's `openclaw/plugin-sdk/secret-ref-runtime`
+(`resolveSecretRefValues`) — the same secret-resolution mechanism the
+Gateway itself uses for `hooks.token`. A plain string also still works
+unchanged:
+
+```json
+"hookToken": "${OPENCLAW_HOOKS_TOKEN}"
+```
+
+Resolution order is config SecretRef → config plain string → the
+`IMAJIN_WAKE_HOOK_TOKEN` env var (same pattern as
+`attestation.internalApiKey`) → none, in which case a single startup
+warning is logged and the wake hook is disabled (the `directSend` fallback
+still works). The token is never logged or echoed at any point, including
+when a SecretRef fails to resolve.
 
 **3. Validate and restart the Gateway** so both config changes take effect:
 
@@ -196,7 +214,7 @@ via `api.registerService` so it starts and stops with the plugin lifecycle:
   and dropped — they never crash the socket.
 
 ## Development
-Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the two `openclaw/plugin-sdk/*` imports in `index.ts` are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
+Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` (dynamic, only on the SecretRef `hookToken` path, #20) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
 
 ## About Imajin
 

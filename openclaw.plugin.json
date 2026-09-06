@@ -49,7 +49,7 @@
     },
     "wsNotifications.hookToken": {
       "label": "Wake Hook Token",
-      "help": "Bearer token for the Gateway's POST /hooks/agent (#18), matching that Gateway's hooks.token. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var when omitted. Never logged.",
+      "help": "Bearer token for the Gateway's POST /hooks/agent (#18), matching that Gateway's hooks.token. Accepts a plain string or a SecretRef object ({ source, provider, id }, #20) resolved via the plugin SDK — recommended so the same secrets-store entry backs both this plugin and the Gateway's hooks.token. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var when omitted or unresolvable. Never logged.",
       "sensitive": true
     },
     "approvalBridge.pinnedApproverPublicKeyHex": {
@@ -99,8 +99,20 @@
             "description": "Coalesce window for Warp wake turns, in ms. Default 300000 (5 min)."
           },
           "hookToken": {
-            "type": "string",
-            "description": "Bearer token for the Gateway's POST /hooks/agent, matching that Gateway's hooks.token. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var."
+            "description": "Bearer token for the Gateway's POST /hooks/agent, matching that Gateway's hooks.token. Accepts a plain string or a SecretRef object (#20), resolved once via the plugin SDK. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var when omitted or unresolvable.",
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source", "provider", "id"],
+                "properties": {
+                  "source": { "type": "string", "enum": ["env", "file", "exec", "store"] },
+                  "provider": { "type": "string" },
+                  "id": { "type": "string" }
+                }
+              }
+            ]
           },
           "hooksPath": {
             "type": "string",

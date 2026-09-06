@@ -1,11 +1,19 @@
 /**
- * WS-notification → agent-session injector (#1672, #18).
+ * WS-notification → agent-session injector (#1672, #18, #20).
  *
- * Lives in its own module (no plugin-sdk imports) so the real `inject()`
- * path can be unit-tested; `index.ts` wires it into the plugin entry.
+ * Lives in its own module (no *top-level* plugin-sdk imports) so the real
+ * `inject()` path can be unit-tested; `index.ts` wires it into the plugin
+ * entry. `resolveHookToken` below dynamically `import()`s
+ * `openclaw/plugin-sdk/secret-input-runtime` and
+ * `openclaw/plugin-sdk/secret-ref-runtime` — but only when
+ * `wsNotifications.hookToken` is actually configured as a SecretRef object
+ * (#20) — so the plain-string/env-fallback paths (and every existing test)
+ * stay entirely free of the plugin SDK, and tests that *do* exercise the
+ * SecretRef path can `vi.mock(...)` those two specifiers.
  */
 
 import type { NotificationFrame } from "./ws-service.js";
+import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
 
 /** `plugins.entries.imajin.config.wsNotifications` (openclaw.json). */
 export interface WsNotificationsConfig {
@@ -23,12 +31,18 @@ export interface WsNotificationsConfig {
   wakeCoalesceMs?: number;
   /**
    * Bearer token for the Gateway's `hooks.token` (#18) — required to call
-   * `POST /hooks/agent`. Sourced the same way this plugin sources other
-   * secrets (see `attestation.internalApiKey`): plaintext here, falling back
-   * to the `IMAJIN_WAKE_HOOK_TOKEN` env var when omitted. Never logged or
-   * echoed.
+   * `POST /hooks/agent`. Accepts either a plain string (unchanged) or a
+   * SecretRef object (`{ source, provider, id }`, see
+   * `openclaw/plugin-sdk/secret-input-runtime`), resolved once at injector
+   * construction via `openclaw/plugin-sdk/secret-ref-runtime`'s
+   * `resolveSecretRefValues` (#20) — the same shape the Gateway's own
+   * `hooks.token` (`$secretRef`) can reference, so both sides can point at
+   * one secrets-store entry. Resolution order: config SecretRef → config
+   * plain string → the `IMAJIN_WAKE_HOOK_TOKEN` env var → none (a single
+   * startup warning, wake disabled, direct-send fallback only). Never
+   * logged or echoed.
    */
-  hookToken?: string;
+  hookToken?: SecretInput;
   /** Gateway hooks base path (`hooks.path` on the Gateway side). Default `/hooks`. */
   hooksPath?: string;
   /** Agent id to route the wake hook to (`hooks.allowedAgentIds` must permit it). Default `main`. */
@@ -146,6 +160,61 @@ function resolveGatewayPort(api: any): number {
   return DEFAULT_GATEWAY_PORT;
 }
 
+type HookTokenSource = "secretRef" | "config" | "env" | "none";
+
+/**
+ * Resolves `wsNotifications.hookToken` (#20). Resolution order: config
+ * SecretRef -> config plain string -> the `IMAJIN_WAKE_HOOK_TOKEN` env var
+ * -> none. Only the SecretRef branch ever touches the plugin SDK, and it
+ * does so via a dynamic `import()` so the plain-string/env paths (and every
+ * test that doesn't configure a SecretRef) never need those two specifiers
+ * to resolve on disk — see the module doc at the top of this file.
+ */
+async function resolveHookToken(
+  api: any,
+  raw: SecretInput | undefined,
+): Promise<{ token: string | undefined; source: HookTokenSource }> {
+  if (raw && typeof raw === "object") {
+    try {
+      const { isSecretRef } = await import("openclaw/plugin-sdk/secret-input-runtime");
+      if (isSecretRef(raw)) {
+        const { resolveSecretRefValues } = await import("openclaw/plugin-sdk/secret-ref-runtime");
+        const config = api?.runtime?.config?.current?.() ?? {};
+        const resolved = await resolveSecretRefValues([raw], { config, env: process.env });
+        // Exactly one ref went in, so at most one resolved value comes back —
+        // the resolver keys its Map by an internal ref-key we don't have a
+        // public accessor for, so grab the (sole) value directly.
+        const value = resolved.values().next().value;
+        const trimmed = typeof value === "string" ? value.trim() : "";
+        if (trimmed) {
+          return { token: trimmed, source: "secretRef" };
+        }
+        console.warn(
+          "[imajin-ws] wsNotifications.hookToken SecretRef resolved to an empty/non-string value — falling back",
+        );
+      } else {
+        console.warn(
+          "[imajin-ws] wsNotifications.hookToken is an object but not a recognized SecretRef — falling back",
+        );
+      }
+    } catch (err: any) {
+      // Never resolves to a throw: an unresolvable ref degrades to the next
+      // tier (env, then none) rather than crashing the WS service (#20).
+      console.warn(
+        `[imajin-ws] wsNotifications.hookToken SecretRef failed to resolve: ${err?.message ?? err} — falling back`,
+      );
+    }
+  } else if (typeof raw === "string" && raw.trim()) {
+    return { token: raw.trim(), source: "config" };
+  }
+
+  const envToken = process.env[HOOK_TOKEN_ENV]?.trim();
+  if (envToken) {
+    return { token: envToken, source: "env" };
+  }
+  return { token: undefined, source: "none" };
+}
+
 interface WakeHookResult {
   ok: boolean;
   /** Only present on an admitted (200) response, and only when the body carries one. */
@@ -261,7 +330,21 @@ export function createNotificationInjector(
   const targetSession = wsNotifications?.targetSession?.trim();
   const wakeSessionKey = wsNotifications?.wakeSessionKey?.trim() ?? targetSession;
   const wakeCoalesceMs = wsNotifications?.wakeCoalesceMs ?? DEFAULT_WAKE_COALESCE_MS;
-  const hookToken = wsNotifications?.hookToken?.trim() || process.env[HOOK_TOKEN_ENV]?.trim();
+  // Resolved once here (not per request, #20) — `flushWakeTurn` awaits
+  // `hookTokenReady` before reading `hookToken`.
+  let hookToken: string | undefined;
+  const hookTokenReady: Promise<void> = resolveHookToken(api, wsNotifications?.hookToken)
+    .then((result) => {
+      hookToken = result.token;
+      if (result.source === "none") {
+        console.warn("[imajin-ws] wake hook token not configured; wake disabled, fallback only");
+      } else {
+        console.log(`[imajin-ws] wake hook token resolved from ${result.source}`);
+      }
+    })
+    .catch((err: any) => {
+      console.error("[imajin-ws] unexpected error resolving wsNotifications.hookToken:", err?.message ?? err);
+    });
   const hooksPath = (wsNotifications?.hooksPath?.trim() || DEFAULT_HOOKS_PATH).replace(/\/+$/, "") || DEFAULT_HOOKS_PATH;
   const hookAgentId = wsNotifications?.hookAgentId?.trim() || DEFAULT_HOOK_AGENT_ID;
 
@@ -291,7 +374,6 @@ export function createNotificationInjector(
   }
 
   let warnedMissingWakeKey = false;
-  let warnedMissingHookToken = false;
 
   // In-memory coalesce buffer, keyed by scope. `windowStart` is the wall-clock
   // time the buffer opened — it becomes the `Idempotency-Key`'s window
@@ -305,8 +387,7 @@ export function createNotificationInjector(
   >();
 
   console.log(
-    `[imajin-ws] injection APIs: enqueueSystemEvent=${!!enqueueSystemEvent}, wakeHookConfigured=${!!hookToken}, ` +
-      `directSend=${!!ds?.target}`,
+    `[imajin-ws] injection APIs: enqueueSystemEvent=${!!enqueueSystemEvent}, directSend=${!!ds?.target}`,
   );
   if (injectScopes.size === 0) {
     console.log("[imajin-ws] no wsNotifications.injectScopes configured — notifications are log-only");
@@ -336,6 +417,7 @@ export function createNotificationInjector(
 
   async function flushWakeTurn(scope: string, frames: NotificationFrame[], windowStart: number) {
     coalesceByScope.delete(scope);
+    await hookTokenReady;
 
     if (!wakeSessionKey) {
       if (!warnedMissingWakeKey) {
@@ -376,13 +458,8 @@ export function createNotificationInjector(
     ].join("\n");
 
     if (!hookToken) {
-      if (!warnedMissingHookToken) {
-        warnedMissingHookToken = true;
-        console.warn(
-          `[imajin-ws] wsNotifications.hookToken not configured (and ${HOOK_TOKEN_ENV} unset) — ` +
-            "cannot call the Gateway wake hook, falling back to the channel message",
-        );
-      }
+      // The single startup warning already fired in `hookTokenReady`'s
+      // `.then()` above (#20) — nothing new to log per dropped wake.
       await escalateWakeFailure(scope, frames, "no hook token configured");
       return;
     }
