@@ -6,12 +6,20 @@
   "type": "module",
   "scripts": {
     "test": "vitest run",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit -p ."
   },
   "dependencies": {
     "@noble/ed25519": "^2.3.0",
     "@noble/hashes": "^1.8.0",
     "ws": "^8.20.0"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.8.1"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

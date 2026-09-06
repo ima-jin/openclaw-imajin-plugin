@@ -432,9 +432,9 @@ export class ImajinClient {
     attestation: Omit<ImajinAttestation, "id" | "signature" | "timestamp">,
     onBehalfOf?: string,
   ): Promise<ImajinAttestation> {
-    return this.post("/auth/api/attestations", attestation, {
+    return this.post<ImajinAttestation>("/auth/api/attestations", attestation, {
       onBehalfOf,
-    }) as Promise<ImajinAttestation>;
+    });
   }
 
   // --- Settlement ---
@@ -578,9 +578,9 @@ export class ImajinClient {
    * text of an article/essay/document asset, since the base asset route returns HTML.
    */
   async getMediaContent(assetId: string, onBehalfOf?: string): Promise<{ content: string }> {
-    return this.get(`/media/api/assets/${encodeURIComponent(assetId)}/content`, {
+    return this.get<{ content: string }>(`/media/api/assets/${encodeURIComponent(assetId)}/content`, {
       onBehalfOf,
-    }) as Promise<{ content: string }>;
+    });
   }
 
   /**
@@ -598,15 +598,15 @@ export class ImajinClient {
     content: string,
     onBehalfOf?: string,
   ): Promise<{ ok: boolean; id?: string; versionCount?: number; cid?: string; updatedAt?: string }> {
-    return this.put(`/media/api/assets/${encodeURIComponent(assetId)}/content`, { content }, {
-      onBehalfOf,
-    }) as Promise<{
+    return this.put<{
       ok: boolean;
       id?: string;
       versionCount?: number;
       cid?: string;
       updatedAt?: string;
-    }>;
+    }>(`/media/api/assets/${encodeURIComponent(assetId)}/content`, { content }, {
+      onBehalfOf,
+    });
   }
 
   /**
@@ -628,13 +628,13 @@ export class ImajinClient {
     folderId: string,
     onBehalfOf?: string,
   ): Promise<{ assetId: string; folderIds: string[] }> {
-    return this.put(
+    return this.put<{ assetId: string; folderIds: string[] }>(
       `/media/api/assets/${encodeURIComponent(assetId)}/folders`,
       {
         folderIds: [folderId],
       },
       { onBehalfOf },
-    ) as Promise<{ assetId: string; folderIds: string[] }>;
+    );
   }
 
   /**
@@ -646,35 +646,35 @@ export class ImajinClient {
     access: "public" | "private" | "conversation",
     onBehalfOf?: string,
   ): Promise<MediaAsset> {
-    return this.patch(
+    return this.patch<MediaAsset>(
       `/media/api/assets/${encodeURIComponent(assetId)}/access`,
       {
         access,
       },
       { onBehalfOf },
-    ) as Promise<MediaAsset>;
+    );
   }
 
   /**
    * Grant access to a specific DID on an asset (adds to .fair manifest allowedDids).
    */
   async grantMediaAccess(assetId: string, did: string, onBehalfOf?: string): Promise<MediaAsset> {
-    return this.patch(
+    return this.patch<MediaAsset>(
       `/media/api/assets/${encodeURIComponent(assetId)}/grants`,
       { add: [did] },
       { onBehalfOf },
-    ) as Promise<MediaAsset>;
+    );
   }
 
   /**
    * Revoke access from a specific DID on an asset (removes from .fair manifest allowedDids).
    */
   async revokeMediaAccess(assetId: string, did: string, onBehalfOf?: string): Promise<MediaAsset> {
-    return this.patch(
+    return this.patch<MediaAsset>(
       `/media/api/assets/${encodeURIComponent(assetId)}/grants`,
       { remove: [did] },
       { onBehalfOf },
-    ) as Promise<MediaAsset>;
+    );
   }
 
   /**
@@ -692,9 +692,9 @@ export class ImajinClient {
     },
     onBehalfOf?: string,
   ): Promise<MediaAsset> {
-    return this.patch(`/media/api/assets/${encodeURIComponent(assetId)}/article`, articleMeta, {
+    return this.patch<MediaAsset>(`/media/api/assets/${encodeURIComponent(assetId)}/article`, articleMeta, {
       onBehalfOf,
-    }) as Promise<MediaAsset>;
+    });
   }
 
   // --- HTTP helpers (public for chat/other modules) ---
@@ -722,14 +722,14 @@ export class ImajinClient {
    * fails 403, a missing/revoked key fails 409 — surfaced as thrown errors.
    */
   async dispatchWarp(input: WarpDispatchInput, onBehalfOf?: string): Promise<WarpAgentRun> {
-    return this.post(`/warp/api/dispatch`, input, { onBehalfOf }) as Promise<WarpAgentRun>;
+    return this.post<WarpAgentRun>(`/warp/api/dispatch`, input, { onBehalfOf });
   }
 
   /** Read a Warp run's lifecycle state + session link. Gated by the same grant as dispatch. */
   async getWarpRun(runId: string, onBehalfOf?: string): Promise<WarpAgentRun> {
-    return this.get(`/warp/api/runs/${encodeURIComponent(runId)}`, {
+    return this.get<WarpAgentRun>(`/warp/api/runs/${encodeURIComponent(runId)}`, {
       onBehalfOf,
-    }) as Promise<WarpAgentRun>;
+    });
   }
 
   /**
@@ -748,9 +748,9 @@ export class ImajinClient {
     if (filters.limit !== undefined) params.set("limit", String(filters.limit));
 
     const query = params.toString();
-    return this.get(`/warp/api/runs${query.length === 0 ? "" : `?${query}`}`, {
+    return this.get<WarpRunListPage>(`/warp/api/runs${query.length === 0 ? "" : `?${query}`}`, {
       onBehalfOf,
-    }) as Promise<WarpRunListPage>;
+    });
   }
 
   /**
@@ -761,9 +761,9 @@ export class ImajinClient {
    * PENDING/retryable, 422 not cancellable) surface as thrown errors.
    */
   async cancelWarpRun(runId: string, onBehalfOf?: string): Promise<WarpRunCancellation> {
-    return this.post(`/warp/api/runs/${encodeURIComponent(runId)}/cancel`, {}, {
+    return this.post<WarpRunCancellation>(`/warp/api/runs/${encodeURIComponent(runId)}/cancel`, {}, {
       onBehalfOf,
-    }) as Promise<WarpRunCancellation>;
+    });
   }
 
   /**
@@ -777,7 +777,7 @@ export class ImajinClient {
     input: SendWarpFollowupInput,
     onBehalfOf?: string,
   ): Promise<WarpFollowupAck> {
-    return this.post(
+    return this.post<WarpFollowupAck>(
       `/warp/api/runs/${encodeURIComponent(runId)}/followups`,
       {
         message: input.message,
@@ -785,7 +785,7 @@ export class ImajinClient {
         ...(input.resume === undefined ? {} : { resume: input.resume }),
       },
       { onBehalfOf },
-    ) as Promise<WarpFollowupAck>;
+    );
   }
 
   /**
@@ -800,9 +800,9 @@ export class ImajinClient {
     onBehalfOf?: string,
   ): Promise<WarpRunTranscript> {
     const query = opts.maxChars === undefined ? "" : `?maxChars=${opts.maxChars}`;
-    return this.get(`/warp/api/runs/${encodeURIComponent(runId)}/transcript${query}`, {
+    return this.get<WarpRunTranscript>(`/warp/api/runs/${encodeURIComponent(runId)}/transcript${query}`, {
       onBehalfOf,
-    }) as Promise<WarpRunTranscript>;
+    });
   }
 
   /**
@@ -812,7 +812,7 @@ export class ImajinClient {
    * exists so the flow is scriptable end-to-end when the owner delegates it.
    */
   async sealWarpKey(agentKey: string, onBehalfOf?: string): Promise<Record<string, unknown>> {
-    return this.post(`/warp/api/seal`, { secret: agentKey }, { onBehalfOf });
+    return this.post(`/warp/api/seal`, { agentKey }, { onBehalfOf });
   }
 
   // --- Intention inference (#1620 / the app-as-inference-engine primitive) ---
@@ -887,16 +887,16 @@ export class ImajinClient {
     return this.get(`/api/inference/sessions`, { onBehalfOf });
   }
 
-  private async get(
+  private async get<T = Record<string, unknown>>(
     path: string,
     opts?: { onBehalfOf?: string },
-  ): Promise<Record<string, unknown>> {
+  ): Promise<T> {
     const headers = await this.authHeaders(opts);
     const res = await fetch(`${this.baseUrl}${path}`, { headers });
     if (!res.ok) {
       throw new Error(`Imajin API ${res.status}: ${await res.text()}`);
     }
-    return (await res.json()) as Record<string, unknown>;
+    return (await res.json()) as T;
   }
 
   /**
@@ -922,11 +922,11 @@ export class ImajinClient {
     };
   }
 
-  private async post(
+  private async post<T = Record<string, unknown>>(
     path: string,
     body: unknown,
     opts?: { onBehalfOf?: string },
-  ): Promise<Record<string, unknown>> {
+  ): Promise<T> {
     const headers = await this.authHeaders(opts);
     headers["Content-Type"] = "application/json";
     const res = await fetch(`${this.baseUrl}${path}`, {
@@ -937,14 +937,14 @@ export class ImajinClient {
     if (!res.ok) {
       throw new Error(`Imajin API ${res.status}: ${await res.text()}`);
     }
-    return (await res.json()) as Record<string, unknown>;
+    return (await res.json()) as T;
   }
 
-  private async put(
+  private async put<T = Record<string, unknown>>(
     path: string,
     body: unknown,
     opts?: { onBehalfOf?: string },
-  ): Promise<Record<string, unknown>> {
+  ): Promise<T> {
     const headers = await this.authHeaders(opts);
     headers["Content-Type"] = "application/json";
     const res = await fetch(`${this.baseUrl}${path}`, {
@@ -955,14 +955,14 @@ export class ImajinClient {
     if (!res.ok) {
       throw new Error(`Imajin API ${res.status}: ${await res.text()}`);
     }
-    return (await res.json()) as Record<string, unknown>;
+    return (await res.json()) as T;
   }
 
-  private async patch(
+  private async patch<T = Record<string, unknown>>(
     path: string,
     body: unknown,
     opts?: { onBehalfOf?: string },
-  ): Promise<Record<string, unknown>> {
+  ): Promise<T> {
     const headers = await this.authHeaders(opts);
     headers["Content-Type"] = "application/json";
     const res = await fetch(`${this.baseUrl}${path}`, {
@@ -973,7 +973,7 @@ export class ImajinClient {
     if (!res.ok) {
       throw new Error(`Imajin API ${res.status}: ${await res.text()}`);
     }
-    return (await res.json()) as Record<string, unknown>;
+    return (await res.json()) as T;
   }
 }
 
