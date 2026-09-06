@@ -905,6 +905,55 @@ describe("buildWakeTurnMessage — evidence, not instructions (#22)", () => {
     expect(message.indexOf("runId: run-b")).toBeLessThan(message.indexOf("runId: run-a"));
     expect(message).not.toMatch(NO_INSTRUCTIONS_RE);
   });
+
+  // The kernel's actual wire shape (verified in ima-jin/imajin-ai,
+  // apps/kernel/src/lib/warp/dispatch.ts's `WarpRunStatusMessage` +
+  // packages/bus/src/reactors/notify.ts's payload spread): `statusMessage`
+  // arrives as `{ message, errorCode, retryable }`, not a flat string, and
+  // there is no top-level `data.errorCode` from the kernel today.
+  it("renders a FAILED run's errorCode and statusMessage excerpt when statusMessage is an object", () => {
+    const nf = evidenceFrame("ntf-5", "#2033 deploy FAILED", {
+      runId: "run-failed-2",
+      state: "FAILED",
+      statusMessage: { message: "x".repeat(500), errorCode: "BUILD_TIMEOUT", retryable: false },
+    });
+
+    const message = buildWakeTurnMessage("warp.run.completed", [nf]);
+
+    expect(message).toContain("state: FAILED");
+    expect(message).toContain("errorCode: BUILD_TIMEOUT");
+    expect(message).toContain(`statusMessage: ${"x".repeat(300)}`);
+    expect(message).not.toContain("x".repeat(301));
+    expect(message).toContain("notificationId: ntf-5");
+    expect(message).not.toMatch(NO_INSTRUCTIONS_RE);
+  });
+
+  it("prefers a top-level data.errorCode over an object statusMessage's errorCode when both are present", () => {
+    const nf = evidenceFrame("ntf-6", "#2034 deploy FAILED", {
+      runId: "run-failed-3",
+      state: "FAILED",
+      errorCode: "TOP_LEVEL_CODE",
+      statusMessage: { message: "nested message", errorCode: "NESTED_CODE", retryable: true },
+    });
+
+    const message = buildWakeTurnMessage("warp.run.completed", [nf]);
+
+    expect(message).toContain("errorCode: TOP_LEVEL_CODE");
+    expect(message).not.toContain("NESTED_CODE");
+    expect(message).toContain("statusMessage: nested message");
+  });
+
+  it("collapses embedded newlines in a title to a single space", () => {
+    const nf = evidenceFrame("ntf-7", "#2035 multi-line\ntitle here\r\nsecond line", {
+      runId: "run-multiline",
+      state: "SUCCEEDED",
+    });
+
+    const message = buildWakeTurnMessage("warp.run.completed", [nf]);
+
+    expect(message).toContain("title: #2035 multi-line title here second line");
+    expect(message).not.toMatch(/title:.*\n.*here/);
+  });
 });
 
 describe("createNotificationInjector.inject — wake hook message is evidence (#22)", () => {

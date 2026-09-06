@@ -159,6 +159,37 @@ const FAILURE_STATE_RE = /FAILED|ERROR|CANCEL/i;
 const STATUS_MESSAGE_EXCERPT_CHARS = 300;
 
 /**
+ * `data.statusMessage`'s actual wire shape (verified against `imajin-ai`,
+ * the kernel this plugin talks to, 2026-09-06): Warp's `RunStatusMessage` is
+ * an object, `{ message: string, errorCode: string | null, retryable:
+ * boolean | null }` (`apps/kernel/src/lib/warp/dispatch.ts`'s
+ * `WarpRunStatusMessage`, set verbatim as `statusMessage: run.statusMessage`
+ * by both `publishRunCompleted` and `publishRunFailed`), and the bus's
+ * `notify` reactor (`packages/bus/src/reactors/notify.ts`) spreads the
+ * entire event payload — `data: { ...event.payload, … }` — into the
+ * notification's `data` unchanged, so this plugin receives that same nested
+ * object on every path in the kernel source, never a flattened string.
+ * `data.errorCode` is not actually a top-level field the kernel sends
+ * either (its flat scalar for FAILED/BLOCKED is `summary`, not
+ * `errorCode`) — so a bare string `data.statusMessage` or a top-level
+ * `data.errorCode` are accepted here only as forward/backward compatibility
+ * for a future or alternate publisher, not because the current kernel sends
+ * them.
+ */
+function extractStatusMessage(raw: unknown): { text?: string; errorCode?: string } {
+  if (typeof raw === "string") {
+    return { text: raw || undefined };
+  }
+  if (raw && typeof raw === "object") {
+    const sm = raw as Record<string, unknown>;
+    const text = typeof sm.message === "string" && sm.message ? sm.message : undefined;
+    const errorCode = typeof sm.errorCode === "string" && sm.errorCode ? sm.errorCode : undefined;
+    return { text, errorCode };
+  }
+  return {};
+}
+
+/**
  * Projects the fields the wake message needs out of a notification frame's
  * `data` — the same `{ runId, state, title, runTime, statusMessage,
  * artifacts[] }` shape the WS push (`warp.run.completed`) carries (#22). No
@@ -173,13 +204,17 @@ function extractWakeRunData(nf: NotificationFrame): WakeRunData {
     .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
     .map((a) => ({ type: str(a.type) ?? "artifact", url: str(a.url) ?? "", branch: str(a.branch) }))
     .filter((a) => a.url);
+  // A top-level `data.errorCode` (this plugin's original assumption) wins
+  // when present; otherwise fall back to the nested/string statusMessage's
+  // own errorCode. See `extractStatusMessage`'s doc for why both exist.
+  const statusMessage = extractStatusMessage(data.statusMessage);
   return {
     runId: str(data.runId),
     state: str(data.state),
     title: str(data.title),
     runTime: str(data.runTime),
-    statusMessage: str(data.statusMessage),
-    errorCode: str(data.errorCode),
+    statusMessage: statusMessage.text,
+    errorCode: str(data.errorCode) ?? statusMessage.errorCode,
     artifacts,
   };
 }
@@ -202,11 +237,16 @@ function isFailureState(state: string): boolean {
   return FAILURE_STATE_RE.test(state);
 }
 
+/** Collapses embedded newlines to a single space — a title is one line of evidence. */
+function collapseNewlines(value: string): string {
+  return value.replace(/\s*[\r\n]+\s*/g, " ").trim();
+}
+
 /** Renders one run's evidence block (see `buildWakeTurnMessage`). */
 function formatWakeRunEntry(nf: NotificationFrame): string {
   const data = extractWakeRunData(nf);
   const state = deriveWakeState(nf, data.state);
-  const title = data.title ?? nf.title ?? nf.scope;
+  const title = collapseNewlines(data.title ?? nf.title ?? nf.scope);
   const lines = [`- runId: ${data.runId ?? nf.id}`, `  state: ${state}`, `  title: ${title}`];
   if (data.runTime) lines.push(`  runTime: ${data.runTime}`);
   if (data.artifacts.length > 0) {
