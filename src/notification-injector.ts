@@ -136,6 +136,116 @@ export function buildWakeFailureMessage(frames: NotificationFrame[], reason: str
   );
 }
 
+/** One artifact attached to a completed run (`data.artifacts[]`, #22). */
+export interface WakeArtifact {
+  type: string;
+  url: string;
+  branch?: string;
+}
+
+interface WakeRunData {
+  runId?: string;
+  state?: string;
+  title?: string;
+  runTime?: string;
+  statusMessage?: string;
+  errorCode?: string;
+  artifacts: WakeArtifact[];
+}
+
+const FAILURE_STATE_RE = /FAILED|ERROR|CANCEL/i;
+// Kept in sync with `buildNotificationText`'s truncation of a run's status
+// text: an excerpt is evidence, the full (potentially huge) message is not.
+const STATUS_MESSAGE_EXCERPT_CHARS = 300;
+
+/**
+ * Projects the fields the wake message needs out of a notification frame's
+ * `data` — the same `{ runId, state, title, runTime, statusMessage,
+ * artifacts[] }` shape the WS push (`warp.run.completed`) carries (#22). No
+ * Warp/kernel API calls; this is a pure projection of what already arrived
+ * over the WS frame.
+ */
+function extractWakeRunData(nf: NotificationFrame): WakeRunData {
+  const data = (nf.data && typeof nf.data === "object" ? nf.data : {}) as Record<string, unknown>;
+  const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+  const rawArtifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
+  const artifacts: WakeArtifact[] = rawArtifacts
+    .filter((a): a is Record<string, unknown> => !!a && typeof a === "object")
+    .map((a) => ({ type: str(a.type) ?? "artifact", url: str(a.url) ?? "", branch: str(a.branch) }))
+    .filter((a) => a.url);
+  return {
+    runId: str(data.runId),
+    state: str(data.state),
+    title: str(data.title),
+    runTime: str(data.runTime),
+    statusMessage: str(data.statusMessage),
+    errorCode: str(data.errorCode),
+    artifacts,
+  };
+}
+
+/**
+ * Derives a display state (`SUCCEEDED`/`FAILED`/`CANCELLED`/…) when the WS
+ * payload's `data.state` is missing, by scanning the title — how every
+ * notification observed before #22 carried this information.
+ */
+function deriveWakeState(nf: NotificationFrame, dataState: string | undefined): string {
+  if (dataState) return dataState.toUpperCase();
+  const match = /\b(SUCCEEDED|FAILED|CANCELLED|CANCELED|ERRORED?|TIMEOUT|BLOCKED)\b/i.exec(
+    nf.title ?? "",
+  );
+  if (!match) return "UNKNOWN";
+  return match[1].toUpperCase().replace("CANCELED", "CANCELLED").replace(/^ERRORED?$/, "ERROR");
+}
+
+function isFailureState(state: string): boolean {
+  return FAILURE_STATE_RE.test(state);
+}
+
+/** Renders one run's evidence block (see `buildWakeTurnMessage`). */
+function formatWakeRunEntry(nf: NotificationFrame): string {
+  const data = extractWakeRunData(nf);
+  const state = deriveWakeState(nf, data.state);
+  const title = data.title ?? nf.title ?? nf.scope;
+  const lines = [`- runId: ${data.runId ?? nf.id}`, `  state: ${state}`, `  title: ${title}`];
+  if (data.runTime) lines.push(`  runTime: ${data.runTime}`);
+  if (data.artifacts.length > 0) {
+    lines.push("  artifacts:");
+    for (const a of data.artifacts) {
+      lines.push(`    - ${a.type} ${a.url}${a.branch ? ` (${a.branch})` : ""}`);
+    }
+  }
+  if (isFailureState(state)) {
+    if (data.errorCode) lines.push(`  errorCode: ${data.errorCode}`);
+    if (data.statusMessage) {
+      lines.push(`  statusMessage: ${truncate(data.statusMessage, STATUS_MESSAGE_EXCERPT_CHARS)}`);
+    }
+  }
+  lines.push(`  notificationId: ${nf.id}`);
+  return lines.join("\n");
+}
+
+/**
+ * Renders the wake hook's `message` body (#22): evidence, not instructions.
+ * One entry per completed run in the batch — runId, state, title, runTime,
+ * artifacts, and (for FAILED/CANCELLED only) errorCode/a short statusMessage
+ * excerpt — plus notificationId for cross-checking against the WS/backlog
+ * delivery. No imperative sentences: the standing behaviour for what to do
+ * with a completed run lives on the agent side (AGENTS.md / skills), not in
+ * this payload. FAILED/CANCELLED runs sort first. The Gateway's untrusted
+ * wrapping (SECURITY NOTICE / `EXTERNAL_UNTRUSTED_CONTENT` fences) is applied
+ * on top of this by the Gateway itself and is out of scope here.
+ */
+export function buildWakeTurnMessage(scope: string, frames: NotificationFrame[]): string {
+  const sorted = [...frames].sort((a, b) => {
+    const aFail = isFailureState(deriveWakeState(a, extractWakeRunData(a).state)) ? 0 : 1;
+    const bFail = isFailureState(deriveWakeState(b, extractWakeRunData(b).state)) ? 0 : 1;
+    return aFail - bFail;
+  });
+  const header = `${scope} × ${frames.length}`;
+  return [header, "", sorted.map(formatWakeRunEntry).join("\n\n")].join("\n");
+}
+
 /**
  * Resolves the Gateway's listening port the same way the host itself does:
  * `--port` -> `OPENCLAW_GATEWAY_PORT` -> `gateway.port` -> 18789 (openclaw
@@ -429,33 +539,9 @@ export function createNotificationInjector(
       return;
     }
 
-    // Sort: FAILED/CANCELLED first, then SUCCEEDED
-    const severity = (f: NotificationFrame) => {
-      if (/FAILED|ERROR|CANCEL/i.test(f.title ?? "")) return 0;
-      return 1;
-    };
-    const sorted = [...frames].sort((a, b) => severity(a) - severity(b));
-
-    const lines = sorted.map((f) => {
-      const state = /FAILED|ERROR|CANCEL/i.test(f.title ?? "") ? "⚠️" : "✅";
-      const link = f.data && typeof f.data === "object"
-        ? (f.data.prUrl || f.data.commentUrl || f.data.sessionUrl || "")
-        : "";
-      return `${state} ${f.title ?? f.scope}${link ? ` — ${link}` : ""}`;
-    });
-
-    const failedCount = sorted.filter((f) => /FAILED|ERROR|CANCEL/i.test(f.title ?? "")).length;
-    const header = failedCount > 0
-      ? `Warp runs completed (${frames.length}) — ${failedCount} need attention`
-      : `Warp runs completed (${frames.length})`;
-
-    const message = [
-      header,
-      "",
-      ...lines,
-      "",
-      "React now: review, merge or send back per the review rules, then report to Ryan.",
-    ].join("\n");
+    // Evidence, not instructions (#22): one entry per run in the batch, no
+    // imperative sentences — see `buildWakeTurnMessage`.
+    const message = buildWakeTurnMessage(scope, frames);
 
     if (!hookToken) {
       // The single startup warning already fired in `hookTokenReady`'s
