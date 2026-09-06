@@ -44,6 +44,10 @@ In `openclaw.json`:
   - **`attestation.internalApiKey`** — Bearer token for that endpoint; falls back to the `ATTESTATION_INTERNAL_API_KEY` env var
 - **`approvalBridge`** (optional, requires `did` + `keypairPath`) — routes OpenClaw gateway approvals to /jin (#1816):
   - **`approvalBridge.pinnedApproverPublicKeyHex`** — Ed25519 public key (hex) of the sole trusted human approver; see "Approval bridge" below
+- **`wsNotifications`** (optional) — WS notification → agent session wiring (#1672); see "Wake on Warp completion" below:
+  - **`wsNotifications.hookToken`** — Bearer token for the Gateway's `POST /hooks/agent`; falls back to the `IMAJIN_WAKE_HOOK_TOKEN` env var
+  - **`wsNotifications.hooksPath`** — Gateway hooks base path; defaults to `/hooks`
+  - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
 
 ### Turn-usage attestation
 
@@ -96,6 +100,81 @@ approvals (exec elevation, Skill Workshop proposals) and a human approver on /ji
   `approvalCapability.nativeRuntime` (see the `TODO(#1816 request leg)` comment in
   `index.ts`), which is a larger lift tracked as follow-up alongside the existing
   "Imajin chat as a full messaging channel" TODO.
+
+### Wake on Warp completion (#18)
+
+When a Warp run completes (or fails) and the owner is idle, the plugin runs a
+real agent turn in the owner's configured session by calling the local
+OpenClaw Gateway's `POST /hooks/agent` — a first-class, documented,
+upgrade-safe surface (see `docs/automation/webhook.md` in the OpenClaw core
+repo). This replaces an earlier bundled-only `scheduleSessionTurn` approach
+(#11–#17) that silently never worked for a third-party plugin like this one.
+
+**1. Enable the Gateway's webhook ingress.** In the *Gateway's own*
+`openclaw.json` (the operator's config, not this plugin's `config` block):
+
+```json5
+{
+  hooks: {
+    enabled: true,
+    token: "${OPENCLAW_HOOKS_TOKEN}", // shared secret; see "Auth" below
+    path: "/hooks", // optional, this is the default
+    allowedAgentIds: ["main"], // must include wsNotifications.hookAgentId (default "main")
+  },
+}
+```
+
+**2. Configure this plugin** with the matching token and the session to wake:
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "imajin": {
+        "config": {
+          "wsNotifications": {
+            "injectScopes": ["warp.run.completed"],
+            "wakeSessionKey": "agent:main:telegram:direct:8321865723",
+            "hookToken": "${OPENCLAW_HOOKS_TOKEN}"
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+`hookToken` can also be sourced from the `IMAJIN_WAKE_HOOK_TOKEN` env var
+(same pattern as `attestation.internalApiKey`) instead of inline config —
+it is never logged or echoed either way.
+
+**3. Validate and restart the Gateway** so both config changes take effect:
+
+```bash
+openclaw config validate
+openclaw gateway restart
+```
+
+**4. Smoke-test the hook directly** before relying on a real Warp completion:
+
+```bash
+curl -i http://127.0.0.1:<port>/hooks/agent \
+  -H "Authorization: Bearer $HOOK_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: wake-test-001' \
+  --data '{"message":"Wake-path test: reply with exactly WAKE_OK","name":"wake-test","agentId":"main","sessionMode":"persistent","sessionKey":"<owner session key>","deliver":true}'
+```
+
+A `200` response means the run was admitted; the reply should land in the
+target session's transcript shortly after. Anything else (non-200,
+connection refused, or a ~10s timeout) falls back to the deterministic
+Telegram ping from `directSend` (#14) — the same backstop that fires when
+the hook is disabled entirely.
+
+Coalescing (multiple completions within `wakeCoalesceMs`, default 5 min)
+is keyed by scope and by an `Idempotency-Key` derived from the coalesce
+window's start time, so repeated notifications in the same window collapse
+to one hook call.
 
 ### Real-time notifications (#1904)
 

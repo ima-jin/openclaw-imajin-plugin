@@ -1,5 +1,12 @@
 # The Warp wake chain: kernel event → human ping → agent turn
 
+> **Hops 7–8 below are historical.** #18 replaced the bundled-only
+> `scheduleSessionTurn` seam (and its #13/#17 tag-based coalesce/retry logic)
+> with an HTTP POST to the Gateway's `POST /hooks/agent` — see
+> `src/notification-injector.ts` and the README's "Wake on Warp completion"
+> section for the current implementation. Hops 1–6 (kernel → WS push →
+> plugin receive → inject → coalesce) are unchanged.
+
 This is the full path a Warp cloud-agent run's outcome travels before it turns
 into a real agent turn in the owner's DM, hop by hop, with exact source
 locations, what each hop returns on success, every known failure mode
