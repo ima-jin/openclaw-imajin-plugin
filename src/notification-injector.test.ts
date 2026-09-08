@@ -1,13 +1,24 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { execFile } from "node:child_process";
-import type { NotificationFrame } from "./ws-service.js";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { ImajinWsService, type NotificationFrame } from "./ws-service.js";
 import {
   createNotificationInjector,
   buildWakeTurnMessage,
   HOOK_REQUEST_TIMEOUT_MS,
+  HOOK_RETRY_DELAYS_MS,
   HOOK_TOKEN_ENV,
   type WsNotificationsConfig,
 } from "./notification-injector.js";
+
+// Sum of the retry backoff schedule (#26) — enough fake-timer advancement to
+// run every retry attempt (each of which can itself time out after
+// HOOK_REQUEST_TIMEOUT_MS) through to the final Telegram-fallback escalation.
+const TOTAL_RETRY_WINDOW_MS =
+  HOOK_RETRY_DELAYS_MS.reduce((sum, delay) => sum + delay, 0) +
+  (HOOK_RETRY_DELAYS_MS.length + 1) * HOOK_REQUEST_TIMEOUT_MS;
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 const execFileMock = vi.mocked(execFile);
@@ -495,32 +506,55 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
     dispose();
   });
 
-  it("401 → Telegram fallback fires", async () => {
+  it("401 → retries are exhausted, then the Telegram fallback fires (#26)", async () => {
     setImpl(async () => jsonResponse(401, { error: "unauthorized" }));
     const { api } = makeApi();
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    expect(wakeFailureCalls()).toHaveLength(0); // not yet — still retrying
 
+    await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
     expect(wakeFailureCalls()).toHaveLength(1);
     expect(String(wakeFailureCalls()[0][1])).toContain("automatic wake failed");
     dispose();
   });
 
-  it("500 → Telegram fallback fires", async () => {
+  it("500 → retries are exhausted, then the Telegram fallback fires (#26)", async () => {
     setImpl(async () => jsonResponse(500, { error: "boom" }));
     const { api } = makeApi();
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
 
+    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
     expect(wakeFailureCalls()).toHaveLength(1);
     dispose();
   });
 
-  it("ECONNREFUSED → Telegram fallback fires", async () => {
+  it("a retry that returns 200 clears the failure path — no Telegram fallback (#26)", async () => {
+    let call = 0;
+    setImpl(async () => {
+      call += 1;
+      return call <= 2 ? jsonResponse(502, { error: "bad gateway" }) : jsonResponse(200, { runId: "run-ok" });
+    });
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS + HOOK_RETRY_DELAYS_MS[0] + HOOK_RETRY_DELAYS_MS[1]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(wakeFailureCalls()).toHaveLength(0);
+    dispose();
+  });
+
+  it("ECONNREFUSED → retries are exhausted, then the Telegram fallback fires (#26)", async () => {
     setImpl(async () => {
       throw Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:18789"), { code: "ECONNREFUSED" });
     });
@@ -529,13 +563,15 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
 
+    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
     expect(wakeFailureCalls()).toHaveLength(1);
     expect(console.error).toHaveBeenCalledWith(expect.stringContaining("ECONNREFUSED"));
     dispose();
   });
 
-  it("timeout (~10s, no response) → Telegram fallback fires", async () => {
+  it("timeout (~10s, no response) on every attempt → retries are exhausted, then the Telegram fallback fires (#26)", async () => {
     setImpl(
       (_url, init) =>
         new Promise((_resolve, reject) => {
@@ -551,8 +587,9 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    await vi.advanceTimersByTimeAsync(HOOK_REQUEST_TIMEOUT_MS);
+    await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
 
+    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
     expect(wakeFailureCalls()).toHaveLength(1);
     expect(console.error).toHaveBeenCalledWith(expect.stringContaining(`timed out after ${HOOK_REQUEST_TIMEOUT_MS}ms`));
     dispose();
@@ -1042,5 +1079,246 @@ describe("createNotificationInjector.inject — wake hook message is evidence (#
     expect(message).toContain("notificationId: ntf-4");
     expect(message).not.toMatch(NO_INSTRUCTIONS_RE);
     dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #26: `notification_ack` is sent only after the durable enqueue step, a
+// replayed id is re-acked without re-injecting, and an owed wake persists
+// across a simulated restart with a hook retry/backoff before the Telegram
+// fallback.
+// ---------------------------------------------------------------------------
+
+describe("createNotificationInjector — notification_ack (#26)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("sends notification_ack right after the durable enqueue succeeds, before the wake hook ever fires", async () => {
+    const { fetchMock, setImpl } = makeFetchMock();
+    vi.stubGlobal("fetch", fetchMock);
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const sendFrame = vi.fn();
+    const { api, enqueueSystemEvent } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG, { sendFrame });
+
+    await inject(frame("1"));
+
+    expect(enqueueSystemEvent).toHaveBeenCalledTimes(1);
+    expect(sendFrame).toHaveBeenCalledWith({ type: "notification_ack", id: "1" });
+    expect(fetchMock).not.toHaveBeenCalled(); // the wake hook hasn't fired yet — ack precedes it
+    dispose();
+  });
+
+  it("never acks when the durable enqueue throws", async () => {
+    const enqueueSystemEvent = vi.fn(() => {
+      throw new Error("queue full");
+    });
+    const api = { runtime: { system: { enqueueSystemEvent }, config: { current: () => ({}) } } };
+    const sendFrame = vi.fn();
+    const { directSend: _omit, ...noDirect } = CONFIG;
+    const { inject, dispose } = createNotificationInjector(api, noDirect, { sendFrame });
+
+    await inject(frame("1"));
+
+    expect(sendFrame).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("never acks when no enqueueSystemEvent API is available at all", async () => {
+    const api = { runtime: { config: { current: () => ({}) } } };
+    const sendFrame = vi.fn();
+    const { directSend: _omit, ...noDirect } = CONFIG;
+    const { inject, dispose } = createNotificationInjector(api, noDirect, { sendFrame });
+
+    await inject(frame("1"));
+
+    expect(sendFrame).not.toHaveBeenCalled();
+    dispose();
+  });
+
+  it("drops the ack when the socket is not open, via the real ImajinWsService.send", async () => {
+    const service = new ImajinWsService(
+      { nodeUrl: "https://test.imajin.ai", keypairPath: "/fake/.jin-identity.json" },
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    );
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG, {
+      sendFrame: (f) => service.send(f),
+    });
+
+    await expect(inject(frame("1"))).resolves.toBeUndefined(); // no socket assigned — must not throw
+    dispose();
+  });
+});
+
+describe("createNotificationInjector — dedup by id across a kernel replay (#26)", () => {
+  let fetchMock: ReturnType<typeof makeFetchMock>["fetchMock"];
+  let setImpl: ReturnType<typeof makeFetchMock>["setImpl"];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    ({ fetchMock, setImpl } = makeFetchMock());
+    vi.stubGlobal("fetch", fetchMock);
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("re-acks a replayed id without re-injecting, re-pinging, or re-batching it", async () => {
+    const sendFrame = vi.fn();
+    const { api, enqueueSystemEvent } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG, { sendFrame });
+    const f = frame("dup-1");
+
+    await inject(f);
+    expect(enqueueSystemEvent).toHaveBeenCalledTimes(1);
+    expect(execFileMock).toHaveBeenCalledTimes(1);
+    sendFrame.mockClear();
+
+    await inject(f); // the kernel replays the same id (e.g. after a reconnect)
+
+    expect(enqueueSystemEvent).toHaveBeenCalledTimes(1); // still just once
+    expect(execFileMock).toHaveBeenCalledTimes(1); // not re-pinged
+    expect(sendFrame).toHaveBeenCalledWith({ type: "notification_ack", id: "dup-1" });
+
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // not re-batched into a second wake
+    dispose();
+  });
+});
+
+describe("createNotificationInjector — persisted state across a simulated restart (#26)", () => {
+  let tmpDir: string;
+  let fetchMock: ReturnType<typeof makeFetchMock>["fetchMock"];
+  let setImpl: ReturnType<typeof makeFetchMock>["setImpl"];
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "imajin-ws-injector-test-"));
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    ({ fetchMock, setImpl } = makeFetchMock());
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("keeps the owed wake marker after a crash and replays it immediately on the next construction (no fresh coalesce wait)", async () => {
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    const { api } = makeApi();
+
+    const first = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
+    await first.ready;
+    await first.inject(frame("r1"));
+    // Simulated crash: never advance the coalesce timer, never call dispose().
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    const second = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
+    await second.ready;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // replayed immediately on the "next start"
+    second.dispose();
+  });
+
+  it("clears the owed marker once the wake is confirmed delivered — no replay on a later restart", async () => {
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    const { api } = makeApi();
+
+    const first = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
+    await first.ready;
+    await first.inject(frame("r1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS); // flush succeeds, marker cleared
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    first.dispose();
+
+    fetchMock.mockClear();
+    const second = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
+    await second.ready;
+
+    expect(fetchMock).not.toHaveBeenCalled(); // nothing owed anymore
+    second.dispose();
+  });
+
+  it("retries a failing hook with backoff and clears the owed marker once a retry succeeds", async () => {
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    let call = 0;
+    setImpl(async () => {
+      call += 1;
+      return call < 2 ? jsonResponse(502, { error: "bad gateway" }) : jsonResponse(200, { runId: "run-ok" });
+    });
+    const { api } = makeApi();
+    const { inject, ready, dispose } = createNotificationInjector(api, CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await ready;
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS + HOOK_RETRY_DELAYS_MS[0]);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(wakeFailureCalls()).toHaveLength(0);
+    dispose();
+
+    fetchMock.mockClear();
+    const restarted = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
+    await restarted.ready;
+    expect(fetchMock).not.toHaveBeenCalled(); // cleared on success — nothing to replay
+    restarted.dispose();
+  });
+
+  it("retains the owed marker after retries are exhausted, and replays it on the next restart", async () => {
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    setImpl(async () => jsonResponse(500, { error: "boom" }));
+    const { api } = makeApi();
+    const { inject, ready, dispose } = createNotificationInjector(api, CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await ready;
+
+    await inject(frame("1"));
+    const totalRetryMs = HOOK_RETRY_DELAYS_MS.reduce((sum, d) => sum + d, 0);
+    await vi.advanceTimersByTimeAsync(COALESCE_MS + totalRetryMs + 1_000);
+
+    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    expect(wakeFailureCalls()).toHaveLength(1); // Telegram fallback fired
+    dispose();
+
+    fetchMock.mockClear();
+    execFileMock.mockClear();
+    const restarted = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
+    await restarted.ready;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // marker retained -> replayed on the next start
+    restarted.dispose();
   });
 });

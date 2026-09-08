@@ -6,6 +6,15 @@
 > `src/notification-injector.ts` and the README's "Wake on Warp completion"
 > section for the current implementation. Hops 1–6 (kernel → WS push →
 > plugin receive → inject → coalesce) are unchanged.
+>
+> **#26 update (2026-09-08, `#2098` Candidate B):** Hop 4 now sends a
+> `{ "type": "notification_ack", "id": "..." }` frame back to the kernel right
+> after Hop 6's durable enqueue succeeds — see the kernel-side heartbeat +
+> ack-confirmed-delivery half in `ima-jin/imajin-ai#2099`. Hop 6's coalesce
+> buffer and Hop 7's wake hook call are now both persisted/retried across a
+> restart: see the README's "Ack, dedup, and persisted wakes" section and
+> `src/notification-state-store.ts` for the durability mechanics this doc's
+> Hop 6/7 sections don't yet describe in detail.
 
 This is the full path a Warp cloud-agent run's outcome travels before it turns
 into a real agent turn in the owner's DM, hop by hop, with exact source

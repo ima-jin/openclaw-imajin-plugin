@@ -55,6 +55,10 @@
     "approvalBridge.pinnedApproverPublicKeyHex": {
       "label": "Approval Bridge: Pinned Approver Public Key",
       "help": "Ed25519 public key (hex) of the sole trusted human approver for OpenClaw gateway approval decisions signed on /jin (#1816). Channel/WS auth alone never resolves an approval — only a signature from this key does."
+    },
+    "wsNotifications.stateDir": {
+      "label": "Notification State Directory",
+      "help": "Directory for the ack-dedup LRU and pending-wake persistence files (#26). Defaults to a directory colocated with keypairPath."
     }
   },
   "configSchema": {
@@ -121,6 +125,10 @@
           "hookAgentId": {
             "type": "string",
             "description": "Agent id to route the wake hook to (must be permitted by that Gateway's hooks.allowedAgentIds). Default main."
+          },
+          "stateDir": {
+            "type": "string",
+            "description": "Directory for this injector's persisted state (#26): the ack-dedup LRU (notification-ack-dedup.json) and pending-wake markers (pending-wakes.json). Defaults to a directory colocated with keypairPath."
           },
           "directSend": {
             "type": "object",

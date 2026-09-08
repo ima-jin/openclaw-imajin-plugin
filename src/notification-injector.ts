@@ -12,8 +12,17 @@
  * SecretRef path can `vi.mock(...)` those two specifiers.
  */
 
+import * as path from "node:path";
 import type { NotificationFrame } from "./ws-service.js";
 import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
+import {
+  DEDUP_STATE_FILENAME,
+  NotificationDedupStore,
+  PENDING_WAKES_FILENAME,
+  PendingWakeStore,
+  pendingWakeKey,
+  resolveStateDir,
+} from "./notification-state-store.js";
 
 /** `plugins.entries.imajin.config.wsNotifications` (openclaw.json). */
 export interface WsNotificationsConfig {
@@ -47,6 +56,13 @@ export interface WsNotificationsConfig {
   hooksPath?: string;
   /** Agent id to route the wake hook to (`hooks.allowedAgentIds` must permit it). Default `main`. */
   hookAgentId?: string;
+  /**
+   * Directory for this injector's persisted state (#26): the ack-dedup LRU
+   * (last 500 injected notification ids) and "wake owed" markers that
+   * survive a gateway restart. Defaults to a directory colocated with
+   * `keypairPath` (see `resolveStateDir` in `notification-state-store.ts`).
+   */
+  stateDir?: string;
   /** Direct channel ping via the OpenClaw CLI — deterministic, no model turn. */
   directSend?: {
     /** Channel id, default `telegram`. */
@@ -81,6 +97,10 @@ export const HOOK_REQUEST_TIMEOUT_MS = 10_000;
 // Falls back here when `wsNotifications.hookToken` is omitted — same pattern
 // as `attestation.internalApiKey` / `ATTESTATION_INTERNAL_API_KEY`.
 export const HOOK_TOKEN_ENV = "IMAJIN_WAKE_HOOK_TOKEN";
+// Backoff schedule for `POST /hooks/agent` retries (#26): a transient
+// gateway hiccup (5xx, timeout, connection refused) gets these 3 retries
+// before falling back to the Telegram ping. Exported for unit tests.
+export const HOOK_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 45_000];
 
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated ${value.length - max} chars]`;
@@ -438,6 +458,37 @@ async function postWakeHook(params: {
   }
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * Wraps `postWakeHook` with the `HOOK_RETRY_DELAYS_MS` backoff policy (#26):
+ * a non-2xx/network failure is retried up to 3 times before the caller falls
+ * back to the Telegram ping. Callers are responsible for deciding whether
+ * the final outcome clears or retains the persisted "wake owed" marker.
+ */
+export async function postWakeHookWithRetries(
+  params: Parameters<typeof postWakeHook>[0],
+): Promise<WakeHookResult> {
+  let result = await postWakeHook(params);
+  let attempt = 0;
+  for (const delayMs of HOOK_RETRY_DELAYS_MS) {
+    if (result.ok) {
+      return result;
+    }
+    attempt += 1;
+    console.warn(
+      `[imajin-ws] wake hook attempt ${attempt} failed (${result.reason}) — retrying in ${delayMs}ms`,
+    );
+    await sleep(delayMs);
+    result = await postWakeHook(params);
+  }
+  return result;
+}
+
 /**
  * Builds the WS-notification → agent-session injector (#1672, #18).
  *
@@ -472,10 +523,25 @@ async function postWakeHook(params: {
  * - `scheduleSessionTurn` (bundled-only) and its tag-based coalesce/unschedule
  *   were the previous approach (#11-#17); #18 replaces all of it.
  */
+export interface NotificationInjectorDeps {
+  /**
+   * Sends a frame over the authenticated WS connection — pass
+   * `ImajinWsService.send` bound to the live service instance. Used only
+   * for the outbound `notification_ack` frame (#26). Best-effort: when
+   * omitted (e.g. tests that don't exercise the ack path) or when the
+   * socket isn't open, the frame is silently dropped — the kernel replays
+   * un-acked notifications on reconnect, so this is safe.
+   */
+  sendFrame?: (frame: unknown) => void;
+  /** Used only to derive the default `stateDir` (colocated with the keypair file) when `wsNotifications.stateDir` is not set. */
+  keypairPath?: string;
+}
+
 export function createNotificationInjector(
   api: any,
   wsNotifications: WsNotificationsConfig | undefined,
-): { inject: (nf: NotificationFrame) => Promise<void>; dispose: () => void } {
+  deps: NotificationInjectorDeps = {},
+): { inject: (nf: NotificationFrame) => Promise<void>; dispose: () => void; ready: Promise<void> } {
   const injectScopes = new Set(wsNotifications?.injectScopes ?? []);
   const targetSession = wsNotifications?.targetSession?.trim();
   const wakeSessionKey = wsNotifications?.wakeSessionKey?.trim() ?? targetSession;
@@ -497,6 +563,46 @@ export function createNotificationInjector(
     });
   const hooksPath = (wsNotifications?.hooksPath?.trim() || DEFAULT_HOOKS_PATH).replace(/\/+$/, "") || DEFAULT_HOOKS_PATH;
   const hookAgentId = wsNotifications?.hookAgentId?.trim() || DEFAULT_HOOK_AGENT_ID;
+
+  // Persisted state (#26): ack-dedup LRU + "wake owed" markers so a kernel
+  // replay after a gateway restart is acked-but-not-reinjected, and any wake
+  // that was buffered but never confirmed delivered is retried immediately
+  // on the next start rather than silently lost. Best-effort: a missing
+  // `stateDir` degrades to in-memory-only behavior (see `notification-state-store.ts`).
+  const sendFrame = deps.sendFrame ?? (() => {});
+  const stateDir = resolveStateDir(wsNotifications?.stateDir, deps.keypairPath);
+  const dedupStore = new NotificationDedupStore(
+    stateDir ? path.join(stateDir, DEDUP_STATE_FILENAME) : undefined,
+  );
+  const pendingWakeStore = new PendingWakeStore(
+    stateDir ? path.join(stateDir, PENDING_WAKES_FILENAME) : undefined,
+  );
+
+  /**
+   * Sends the kernel-facing `notification_ack` frame (#26). Never called
+   * before the durable-enqueue step succeeds; a best-effort no-op when the
+   * socket isn't open (`ImajinWsService.send` drops + logs it).
+   */
+  function sendAck(id: string): void {
+    sendFrame({ type: "notification_ack", id });
+  }
+
+  // Loaded once at construction (mirrors `hookTokenReady`'s pattern below).
+  // `inject()` awaits this before consulting the dedup store. Once loaded,
+  // immediately replay any wake that was owed but never confirmed delivered
+  // before the last restart (#2098 Candidate B) — no fresh coalesce wait.
+  const stateReady: Promise<void> = Promise.all([dedupStore.load(), pendingWakeStore.load()])
+    .then(() => {
+      for (const [key, owed] of pendingWakeStore.all()) {
+        console.log(
+          `[imajin-ws] replaying owed wake ${key} from persisted state (${owed.frames.length} notification(s))`,
+        );
+        void flushWakeTurn(owed.scope, owed.frames, owed.sinceTs);
+      }
+    })
+    .catch((err: any) => {
+      console.error("[imajin-ws] failed to load persisted notification state:", err?.message ?? err);
+    });
 
   const enqueueSystemEvent:
     | ((text: string, options: { sessionKey: string; contextKey?: string }) => boolean)
@@ -567,6 +673,7 @@ export function createNotificationInjector(
 
   async function flushWakeTurn(scope: string, frames: NotificationFrame[], windowStart: number) {
     coalesceByScope.delete(scope);
+    const pendingKey = pendingWakeKey(scope, windowStart);
     await hookTokenReady;
 
     if (!wakeSessionKey) {
@@ -576,6 +683,9 @@ export function createNotificationInjector(
           "[imajin-ws] cannot run wake turn: no wakeSessionKey (or targetSession) configured",
         );
       }
+      // Static misconfiguration, not a transient failure — retrying on every
+      // future restart would only repeat the same warning forever (#26).
+      await pendingWakeStore.delete(pendingKey);
       return;
     }
 
@@ -585,14 +695,17 @@ export function createNotificationInjector(
 
     if (!hookToken) {
       // The single startup warning already fired in `hookTokenReady`'s
-      // `.then()` above (#20) — nothing new to log per dropped wake.
+      // `.then()` above (#20) — nothing new to log per dropped wake. Same
+      // "static config, don't keep retrying" reasoning as the missing
+      // wakeSessionKey branch above.
       await escalateWakeFailure(scope, frames, "no hook token configured");
+      await pendingWakeStore.delete(pendingKey);
       return;
     }
 
     const idempotencyKey = `imajin-wake:${scope}:${windowStart}`;
     const gatewayPort = resolveGatewayPort(api);
-    const result = await postWakeHook({
+    const result = await postWakeHookWithRetries({
       gatewayPort,
       hooksPath,
       hookToken,
@@ -607,12 +720,16 @@ export function createNotificationInjector(
         `[imajin-ws] wake admitted${result.runId ? ` runId=${result.runId}` : ""} for ${scope} → ${wakeSessionKey} ` +
           `(${frames.length} notification(s) coalesced)`,
       );
+      await pendingWakeStore.delete(pendingKey);
       return;
     }
 
     console.error(
       `[imajin-ws] wake hook FAILED for ${scope} → ${wakeSessionKey}: ${result.reason} (${frames.length} notification(s) coalesced)`,
     );
+    // Marker intentionally retained: a transient hook failure (unlike the two
+    // static-misconfiguration branches above) is worth retrying on the next
+    // restart (#26) — cleared only once `postWakeHookWithRetries` reports 2xx.
     await escalateWakeFailure(scope, frames, result.reason ?? "unknown wake hook failure");
   }
 
@@ -625,6 +742,16 @@ export function createNotificationInjector(
 
   async function inject(nf: NotificationFrame): Promise<void> {
     if (!injectScopes.has(nf.scope) || !targetSession) {
+      return;
+    }
+
+    await stateReady;
+
+    // Kernel-side replay after a reconnect (#2099): already durably injected
+    // once, so re-ack without running enqueue/direct-send/coalesce again.
+    if (dedupStore.has(nf.id)) {
+      console.log(`[imajin-ws] ${nf.id} already injected for ${nf.scope} — re-acking without re-injecting`);
+      sendAck(nf.id);
       return;
     }
 
@@ -643,7 +770,13 @@ export function createNotificationInjector(
       }
     }
 
-    if (!queuedVia) {
+    if (queuedVia) {
+      // Ack only after the durable step succeeded, never before (#26) — a
+      // dropped/failed enqueue must leave the notification un-acked so the
+      // kernel replays it on the next reconnect.
+      await dedupStore.add(nf.id);
+      sendAck(nf.id);
+    } else {
       console.error(
         `[imajin-ws] system-event queue rejected ${nf.scope} for ${targetSession} — direct send still attempted`,
       );
@@ -681,6 +814,11 @@ export function createNotificationInjector(
     const existing = coalesceByScope.get(nf.scope);
     if (existing) {
       existing.frames.push(nf);
+      await pendingWakeStore.set(pendingWakeKey(nf.scope, existing.windowStart), {
+        scope: nf.scope,
+        sinceTs: existing.windowStart,
+        frames: existing.frames,
+      });
       console.log(`[imajin-ws] warp wake: batched ${nf.id} (n=${existing.frames.length}, fires in ${wakeCoalesceMs}ms)`);
       return;
     }
@@ -692,8 +830,13 @@ export function createNotificationInjector(
     }, wakeCoalesceMs);
 
     coalesceByScope.set(nf.scope, { timeout, frames: [nf], windowStart });
+    await pendingWakeStore.set(pendingWakeKey(nf.scope, windowStart), {
+      scope: nf.scope,
+      sinceTs: windowStart,
+      frames: [nf],
+    });
     console.log(`[imajin-ws] warp wake: batched ${nf.id} (n=1, fires in ${wakeCoalesceMs}ms)`);
   }
 
-  return { inject, dispose };
+  return { inject, dispose, ready: stateReady };
 }

@@ -129,8 +129,13 @@ export default definePluginEntry({
         },
       );
 
-      // WS notification → agent session injection (#1672)
-      const { inject: injector, dispose: disposeInjector } = createNotificationInjector(api, config.wsNotifications);
+      // WS notification → agent session injection (#1672), acked after the
+      // durable enqueue step (#26) via `wsService.send` bound below.
+      const { inject: injector, dispose: disposeInjector } = createNotificationInjector(
+        api,
+        config.wsNotifications,
+        { sendFrame: (frame) => wsService.send(frame), keypairPath: config.keypairPath },
+      );
 
       // OpenClaw gateway approval bridge (#1816). Registered only when both a
       // signing identity (did + keypairPath, already required above for the WS
