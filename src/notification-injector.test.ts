@@ -8,12 +8,14 @@ import {
   createNotificationInjector,
   buildWakeTurnMessage,
   DEFAULT_WAKE_COALESCE_MS,
+  DEFAULT_WAKE_OWED_MAX_AGE_MS,
   DEFAULT_WAKE_SETTLE_MS,
   HOOK_REQUEST_TIMEOUT_MS,
   HOOK_RETRY_DELAYS_MS,
   HOOK_TOKEN_ENV,
   type WsNotificationsConfig,
 } from "./notification-injector.js";
+import { PENDING_WAKES_FILENAME, PendingWakeStore, resolveStateDir } from "./notification-state-store.js";
 
 // Sum of the retry backoff schedule (#26) — enough fake-timer advancement to
 // run every retry attempt (each of which can itself time out after
@@ -578,7 +580,7 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
     dispose();
   });
 
-  it("timeout (~10s, no response) on every attempt → retries are exhausted, then the Telegram fallback fires (#26)", async () => {
+  it("timeout (~10s, no response) classifies as wake-pending (#31): a single attempt, no retry ladder, no Telegram fallback", async () => {
     setImpl(
       (_url, init) =>
         new Promise((_resolve, reject) => {
@@ -593,12 +595,17 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
 
     await inject(frame("1"));
-    await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
+    await vi.advanceTimersByTimeAsync(COALESCE_MS + HOOK_REQUEST_TIMEOUT_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
-    expect(wakeFailureCalls()).toHaveLength(1);
-    expect(console.error).toHaveBeenCalledWith(expect.stringContaining(`timed out after ${HOOK_REQUEST_TIMEOUT_MS}ms`));
+    // Exactly one attempt — the retry ladder is never walked for a pending
+    // outcome (#31), unlike every other failure mode above.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(wakeFailureCalls()).toHaveLength(0);
+
+    // Advancing well past the old retry window must not add further attempts.
+    await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(wakeFailureCalls()).toHaveLength(0);
     dispose();
   });
 
@@ -1494,5 +1501,397 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
     await vi.advanceTimersByTimeAsync(100);
     expect(fetchMock).toHaveBeenCalledTimes(2); // trailing wake at exactly wakeCoalesceMs
     dispose();
+  });
+});
+
+function frameWithScope(id: string, scope: string): NotificationFrame {
+  return { id, scope, title: `run ${id}`, body: "", createdAt: "", data: {} } as NotificationFrame;
+}
+
+// ---------------------------------------------------------------------------
+// #31: `wake-pending` classification. A client-side timeout or a 503 whose
+// JSON body carries a `runId` means the gateway already has (or is about to
+// have) a real turn running/queued for this session — not a rejection. These
+// outcomes log one info line, skip the retry ladder entirely, and keep the
+// owed marker so a later 2xx (this run or a replay after restart) clears it.
+// A runId-less 503 (and every other non-2xx/network failure) is unaffected
+// and keeps walking `HOOK_RETRY_DELAYS_MS` exactly as before (#26).
+// ---------------------------------------------------------------------------
+
+describe("createNotificationInjector — wake-pending classification (#31)", () => {
+  let fetchMock: ReturnType<typeof makeFetchMock>["fetchMock"];
+  let setImpl: ReturnType<typeof makeFetchMock>["setImpl"];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    ({ fetchMock, setImpl } = makeFetchMock());
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("503 with a runId in the JSON body classifies as wake-pending: one attempt, no retry, no Telegram fallback", async () => {
+    setImpl(async () =>
+      jsonResponse(503, {
+        ok: false,
+        error: "hook agent run did not start before admission timeout",
+        runId: "run-queued-1",
+      }),
+    );
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(wakeFailureCalls()).toHaveLength(0);
+    expect(console.info).toHaveBeenCalledWith(
+      expect.stringContaining("wake pending for warp.run.completed: 1 notification(s), 1 frame(s) durable"),
+    );
+
+    await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // still just one attempt
+    dispose();
+  });
+
+  it("503 without a runId in the body keeps the existing retry ladder (#26 unchanged)", async () => {
+    setImpl(async () => jsonResponse(503, { ok: false, error: "service unavailable" }));
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+    expect(wakeFailureCalls()).toHaveLength(0); // still retrying
+
+    await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    expect(wakeFailureCalls()).toHaveLength(1);
+    dispose();
+  });
+
+  it("a 503 with a non-JSON body is not classified as pending and keeps the retry ladder", async () => {
+    setImpl(async () => ({ status: 503, text: async () => "upstream connect error", json: async () => { throw new Error("not json"); } }));
+    const { api } = makeApi();
+    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS + TOTAL_RETRY_WINDOW_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    expect(wakeFailureCalls()).toHaveLength(1);
+    dispose();
+  });
+
+  it("caps concurrent wake POSTs at one per session: a second scope's completion waits for the first to settle (#30)", async () => {
+    let resolveFirst!: (value: FetchResponse) => void;
+    const firstResponse = new Promise<FetchResponse>((resolve) => {
+      resolveFirst = resolve;
+    });
+    let callCount = 0;
+    setImpl(async () => {
+      callCount += 1;
+      return callCount === 1 ? firstResponse : jsonResponse(200, { runId: "run-2" });
+    });
+    const { api } = makeApi();
+    const TWO_SCOPE_CONFIG: WsNotificationsConfig = {
+      ...CONFIG,
+      injectScopes: ["warp.run.completed", "warp.run.failed"],
+    };
+    const { inject, dispose } = createNotificationInjector(api, TWO_SCOPE_CONFIG);
+
+    await inject(frame("1")); // scope warp.run.completed
+    await vi.advanceTimersByTimeAsync(COALESCE_MS); // its leading wake fires, fetch #1 in flight (unresolved)
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    await inject(frameWithScope("2", "warp.run.failed")); // a second, independent completion
+    await vi.advanceTimersByTimeAsync(COALESCE_MS); // its own leading wake elapses too
+    expect(fetchMock).toHaveBeenCalledTimes(1); // queued behind #1 — same session, in-flight cap 1
+
+    resolveFirst(jsonResponse(200, { runId: "run-1" }));
+    await vi.advanceTimersByTimeAsync(0); // let the queue advance to the next task
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // #2 now proceeds
+    dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #30: owed-wake replay drains sequentially instead of fanning out. Several
+// markers accumulated for the same scope before a restart merge into ONE
+// leading-phase wake (union of frames, earliest sinceTs); a marker older
+// than `wakeOwedMaxAgeMs` is dropped (its frames already reached the agent
+// via `enqueueSystemEvent`) instead of firing a stale wake turn.
+// ---------------------------------------------------------------------------
+
+describe("createNotificationInjector — owed-wake replay drains, doesn't fan out (#30)", () => {
+  let tmpDir: string;
+  let fetchMock: ReturnType<typeof makeFetchMock>["fetchMock"];
+  let calls: ReturnType<typeof makeFetchMock>["calls"];
+  let setImpl: ReturnType<typeof makeFetchMock>["setImpl"];
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "imajin-ws-owed-replay-test-"));
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    ({ fetchMock, calls, setImpl } = makeFetchMock());
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("merges 5 owed markers for the same scope into exactly one wake with the union of frames", async () => {
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    const stateDir = resolveStateDir(undefined, keypairPath)!;
+    const seedStore = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await seedStore.load();
+    const baseTs = Date.now() - 5_000;
+    for (let i = 0; i < 5; i += 1) {
+      await seedStore.set(`warp.run.completed:${baseTs + i}:leading`, {
+        scope: "warp.run.completed",
+        sinceTs: baseTs + i,
+        frames: [frame(`r${i}`)],
+        injected: true,
+      });
+    }
+
+    const { api } = makeApi();
+    const { ready, dispose } = createNotificationInjector(api, CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await ready;
+    // The merged replay's flush is fire-and-forget from `ready`'s point of
+    // view (it never blocks startup on a wake's outcome) — give its promise
+    // chain (fetch -> json() -> persisted delete) a tick to finish.
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // one drained wake, not five
+    const body = JSON.parse(calls[0][1].body);
+    expect(String(body.message)).toContain("warp.run.completed × 5");
+    // Merged replay always fires as "leading", keyed by the earliest sinceTs.
+    expect(calls[0][1].headers["Idempotency-Key"]).toBe(`imajin-wake:warp.run.completed:${baseTs}:leading`);
+
+    // Consolidated to a single persisted marker (cleared on the 2xx above).
+    const reloaded = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await reloaded.load();
+    expect(reloaded.all()).toEqual([]);
+    dispose();
+  });
+
+  it("recovers from a crash between the merged set and the source deletes without double-waking or losing anything", async () => {
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    const stateDir = resolveStateDir(undefined, keypairPath)!;
+    const seedStore = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await seedStore.load();
+    const baseTs = Date.now() - 5_000;
+    const sourceFrames: NotificationFrame[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      const f = frame(`r${i}`);
+      sourceFrames.push(f);
+      await seedStore.set(`warp.run.completed:${baseTs + i}:leading`, {
+        scope: "warp.run.completed",
+        sinceTs: baseTs + i,
+        frames: [f],
+        injected: true,
+      });
+    }
+    // Simulate a crash landing exactly between the merged `set` and the
+    // source `delete`s (the ordering this fix protects): the merged marker
+    // (union of all 5 frames, keyed by the earliest sinceTs) is already on
+    // disk, but the stale per-window source markers it was meant to replace
+    // haven't been deleted yet. Re-initializing from this exact persisted
+    // state must fire exactly one wake (never double-wake on the duplicate
+    // content) and must never lose a frame.
+    const mergedKey = `warp.run.completed:${baseTs}:leading`;
+    await seedStore.set(mergedKey, {
+      scope: "warp.run.completed",
+      sinceTs: baseTs,
+      frames: sourceFrames,
+      injected: true,
+    });
+
+    const { api } = makeApi();
+    const { ready, dispose } = createNotificationInjector(api, CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await ready;
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Exactly one wake, deduped by frame id (5, not 10).
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(calls[0][1].body);
+    expect(String(body.message)).toContain("warp.run.completed × 5");
+    expect(calls[0][1].headers["Idempotency-Key"]).toBe(`imajin-wake:${mergedKey}`);
+
+    // Fully consolidated and cleared by the 2xx above — nothing left owed.
+    const reloaded = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await reloaded.load();
+    expect(reloaded.all()).toEqual([]);
+    dispose();
+  });
+
+  it("drops an owed marker older than wakeOwedMaxAgeMs without waking, and clears it", async () => {
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    const stateDir = resolveStateDir(undefined, keypairPath)!;
+    const seedStore = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await seedStore.load();
+    const staleTs = Date.now() - (DEFAULT_WAKE_OWED_MAX_AGE_MS + 60_000);
+    await seedStore.set(`warp.run.completed:${staleTs}:leading`, {
+      scope: "warp.run.completed",
+      sinceTs: staleTs,
+      frames: [frame("stale-1")],
+      injected: true,
+    });
+
+    const { api } = makeApi();
+    const { ready, dispose } = createNotificationInjector(api, CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await ready;
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(console.log).toHaveBeenCalledWith(
+      expect.stringContaining("owed wake expired for warp.run.completed (1 frame(s)"),
+    );
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("injected only"));
+
+    const reloaded = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await reloaded.load();
+    expect(reloaded.all()).toEqual([]); // cleared — nothing left to replay on a further restart
+    dispose();
+  });
+
+  it("a fresh (non-expired) marker for a different scope still replays normally alongside an expired one", async () => {
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    const stateDir = resolveStateDir(undefined, keypairPath)!;
+    const seedStore = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await seedStore.load();
+    const staleTs = Date.now() - (DEFAULT_WAKE_OWED_MAX_AGE_MS + 60_000);
+    await seedStore.set(`warp.run.completed:${staleTs}:leading`, {
+      scope: "warp.run.completed",
+      sinceTs: staleTs,
+      frames: [frame("stale-1")],
+      injected: true,
+    });
+    const freshTs = Date.now() - 1_000;
+    await seedStore.set(`warp.run.failed:${freshTs}:leading`, {
+      scope: "warp.run.failed",
+      sinceTs: freshTs,
+      frames: [frameWithScope("fresh-1", "warp.run.failed")],
+      injected: true,
+    });
+
+    const { api } = makeApi();
+    const TWO_SCOPE_CONFIG: WsNotificationsConfig = {
+      ...CONFIG,
+      injectScopes: ["warp.run.completed", "warp.run.failed"],
+    };
+    const { ready, dispose } = createNotificationInjector(api, TWO_SCOPE_CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await ready;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // only the fresh scope woke
+    const body = JSON.parse(calls[0][1].body);
+    expect(String(body.message)).toContain("warp.run.failed");
+    dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #31 + #30 interaction: a wake-pending outcome keeps the owed marker across
+// a restart, and a later 2xx (on that replay) clears it — same contract as
+// the pre-existing #26 retry-then-clear restart tests.
+// ---------------------------------------------------------------------------
+
+describe("createNotificationInjector — wake-pending marker survives a restart and clears on a later 2xx (#31)", () => {
+  let tmpDir: string;
+  let fetchMock: ReturnType<typeof makeFetchMock>["fetchMock"];
+  let setImpl: ReturnType<typeof makeFetchMock>["setImpl"];
+
+  beforeEach(async () => {
+    tmpDir = await mkdtemp(join(tmpdir(), "imajin-ws-pending-restart-test-"));
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    ({ fetchMock, setImpl } = makeFetchMock());
+    vi.stubGlobal("fetch", fetchMock);
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    await rm(tmpDir, { recursive: true, force: true });
+  });
+
+  it("keeps the marker after a wake-pending outcome, then clears it on a 2xx replay after restart", async () => {
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    setImpl(async () =>
+      jsonResponse(503, { ok: false, error: "admission timeout", runId: "run-queued-1" }),
+    );
+    const { api } = makeApi();
+    const { inject, ready, dispose } = createNotificationInjector(api, CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await ready;
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(COALESCE_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(wakeFailureCalls()).toHaveLength(0); // pending, not a failure
+    dispose();
+
+    fetchMock.mockClear();
+    setImpl(async () => jsonResponse(200, { runId: "run-ok" }));
+    const restarted = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
+    await restarted.ready;
+
+    expect(fetchMock).toHaveBeenCalledTimes(1); // marker retained -> replayed on the next start
+    // Same as above: let the replay's 2xx flush finish persisting the delete
+    // before tearing down and reading the file again.
+    await vi.advanceTimersByTimeAsync(0);
+    restarted.dispose();
+
+    fetchMock.mockClear();
+    const restartedAgain = createNotificationInjector(api, CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await restartedAgain.ready;
+
+    expect(fetchMock).not.toHaveBeenCalled(); // cleared by the prior 2xx — nothing left to replay
+    restartedAgain.dispose();
   });
 });

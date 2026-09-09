@@ -19,6 +19,7 @@ import {
   DEDUP_STATE_FILENAME,
   NotificationDedupStore,
   PENDING_WAKES_FILENAME,
+  type PendingWakeRecord,
   PendingWakeStore,
   pendingWakeKey,
   resolveStateDir,
@@ -53,6 +54,19 @@ export interface WsNotificationsConfig {
    * user-visible wake lag for a single completion).
    */
   wakeCoalesceMs?: number;
+  /**
+   * Age bound (ms, #30) for a persisted "wake owed" marker replayed at
+   * startup: when a marker is older than this, its frames were already
+   * durably injected (`enqueueSystemEvent` succeeded before the marker was
+   * ever written — see `PendingWakeRecord.injected`), so instead of firing a
+   * possibly very stale wake turn, the marker is dropped with a log line
+   * (`owed wake expired for <scope> … — injected only`) and the agent picks
+   * the context up on its next natural turn. Default 3600000 (1h). Guards
+   * against exactly the 2026-09-09 incident: ~20 owed markers, some many
+   * hours stale, all replaying as live wakes the moment the hook token was
+   * fixed.
+   */
+  wakeOwedMaxAgeMs?: number;
   /**
    * Bearer token for the Gateway's `hooks.token` (#18) — required to call
    * `POST /hooks/agent`. Accepts either a plain string (unchanged) or a
@@ -106,6 +120,11 @@ export const DEFAULT_WAKE_SETTLE_MS = 10_000;
 // single completion waited the entire window; leading-edge + trailing now
 // surfaces a single completion in ~DEFAULT_WAKE_SETTLE_MS instead.
 export const DEFAULT_WAKE_COALESCE_MS = 30_000;
+// Age bound for a persisted owed-wake marker replayed at startup (#30):
+// beyond this, the marker's frames are treated as inject-only (they already
+// reached the agent's context via `enqueueSystemEvent`) rather than worth a
+// fresh, possibly very stale, wake turn.
+export const DEFAULT_WAKE_OWED_MAX_AGE_MS = 3_600_000;
 // Gateway hooks defaults (#18, docs/automation/webhook.md).
 const DEFAULT_HOOKS_PATH = "/hooks";
 const DEFAULT_HOOK_AGENT_ID = "main";
@@ -409,6 +428,16 @@ async function resolveHookToken(
 
 interface WakeHookResult {
   ok: boolean;
+  /**
+   * `wake-pending` (#31): the payload is already durable and a wake is
+   * either running or queued behind one that is — a client-side timeout, or
+   * a 503 whose JSON body carries a `runId` (the gateway queued the run but
+   * couldn't start it before its admission window). Always `false` when
+   * `ok` is `true`. Callers must not walk the retry ladder for this case
+   * and must keep the owed marker — see `postWakeHookWithRetries` and
+   * `flushWakeTurn`.
+   */
+  pending?: boolean;
   /** Only present on an admitted (200) response, and only when the body carries one. */
   runId?: string;
   /** Only present on a non-ok result — never includes the token. */
@@ -458,6 +487,30 @@ async function postWakeHook(params: {
     });
     if (res.status !== 200) {
       const text = await res.text().catch(() => "");
+      if (res.status === 503) {
+        // Admission-timeout 503 (#31): the gateway queued the run — it
+        // returns the queued `runId` in the JSON body — but couldn't start
+        // it before its admission window. Distinguishable from a "real" 503
+        // (gateway down/rejecting) only by that `runId`; a non-JSON or
+        // runId-less 503 body falls through to the retryable-failure return
+        // below, unchanged from before #31.
+        let queuedRunId: string | undefined;
+        try {
+          const body = text ? (JSON.parse(text) as Record<string, unknown>) : undefined;
+          const rawId = body?.runId;
+          queuedRunId = typeof rawId === "string" ? rawId : undefined;
+        } catch {
+          // Not the admission-timeout JSON shape — treat as a real 503 below.
+        }
+        if (queuedRunId) {
+          return {
+            ok: false,
+            pending: true,
+            runId: queuedRunId,
+            reason: `gateway queued the run (runId=${queuedRunId}) but it did not start before the admission timeout`,
+          };
+        }
+      }
       return { ok: false, reason: `gateway returned ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}` };
     }
     let runId: string | undefined;
@@ -470,10 +523,14 @@ async function postWakeHook(params: {
     }
     return { ok: true, runId };
   } catch (err: any) {
-    const reason =
-      err?.name === "AbortError"
-        ? `timed out after ${HOOK_REQUEST_TIMEOUT_MS}ms`
-        : String(err?.code ?? err?.message ?? err);
+    if (err?.name === "AbortError") {
+      // Client-side timeout (#31): the gateway accepted the POST but the
+      // agent turn didn't return within HOOK_REQUEST_TIMEOUT_MS — a normal
+      // turn is longer than that under any load, so this is not evidence
+      // the wake was refused, just that it's still running/queued.
+      return { ok: false, pending: true, reason: `timed out after ${HOOK_REQUEST_TIMEOUT_MS}ms` };
+    }
+    const reason = String(err?.code ?? err?.message ?? err);
     return { ok: false, reason };
   } finally {
     clearTimeout(timeoutHandle);
@@ -496,6 +553,14 @@ export async function postWakeHookWithRetries(
   params: Parameters<typeof postWakeHook>[0],
 ): Promise<WakeHookResult> {
   let result = await postWakeHook(params);
+  if (result.pending) {
+    // wake-pending (#31): never walk the retry ladder — the payload is
+    // already durable and a wake is either running or queued behind one
+    // that is, so retrying here would only add more queued turns for the
+    // same session. The caller logs one summary line and keeps the owed
+    // marker; a later 2xx (this run or a replay after restart) clears it.
+    return result;
+  }
   let attempt = 0;
   for (const delayMs of HOOK_RETRY_DELAYS_MS) {
     if (result.ok) {
@@ -507,6 +572,9 @@ export async function postWakeHookWithRetries(
     );
     await sleep(delayMs);
     result = await postWakeHook(params);
+    if (result.pending) {
+      return result;
+    }
   }
   return result;
 }
@@ -577,6 +645,7 @@ export function createNotificationInjector(
   const wakeSessionKey = wsNotifications?.wakeSessionKey?.trim() ?? targetSession;
   const wakeCoalesceMs = wsNotifications?.wakeCoalesceMs ?? DEFAULT_WAKE_COALESCE_MS;
   const wakeSettleMs = wsNotifications?.wakeSettleMs ?? DEFAULT_WAKE_SETTLE_MS;
+  const wakeOwedMaxAgeMs = wsNotifications?.wakeOwedMaxAgeMs ?? DEFAULT_WAKE_OWED_MAX_AGE_MS;
   // Resolved once here (not per request, #20) — `flushWakeTurn` awaits
   // `hookTokenReady` before reading `hookToken`.
   let hookToken: string | undefined;
@@ -618,23 +687,125 @@ export function createNotificationInjector(
     sendFrame({ type: "notification_ack", id });
   }
 
+  // Per-target-session in-flight cap (#30, default 1): every wake POST —
+  // startup replay and a live coalesce firing alike — funnels through this
+  // queue so a burst behaves like a drain, never a fan-out (the Gateway
+  // itself runs one turn at a time per session anyway; queuing here just
+  // stops this plugin from ever offering it more than one at once). A
+  // queued wake waits for the current one to *settle* — admitted (2xx),
+  // wake-pending (#31, single attempt, no retry), or retries-exhausted —
+  // before its own attempt starts.
+  const wakeQueueBySession = new Map<string, Promise<void>>();
+  function scheduleWakeTurn(
+    scope: string,
+    frames: NotificationFrame[],
+    windowStart: number,
+    phase: "leading" | "trailing",
+  ): Promise<void> {
+    const sessionKey = wakeSessionKey || "(unconfigured)";
+    const prior = wakeQueueBySession.get(sessionKey) ?? Promise.resolve();
+    const task = prior.then(
+      () => flushWakeTurn(scope, frames, windowStart, phase),
+      () => flushWakeTurn(scope, frames, windowStart, phase),
+    );
+    // `flushWakeTurn` never throws (every branch handles its own errors), but
+    // guard the queue chain anyway so one unexpected rejection can't wedge
+    // every wake behind it forever.
+    wakeQueueBySession.set(sessionKey, task.catch(() => {}));
+    return task;
+  }
+
   // Loaded once at construction (mirrors `hookTokenReady`'s pattern below).
   // `inject()` awaits this before consulting the dedup store. Once loaded,
   // immediately replay any wake that was owed but never confirmed delivered
   // before the last restart (#2098 Candidate B) — no fresh coalesce wait.
+  // #30: a scope can accumulate several owed markers across many failed
+  // flushes before a restart (each failed flush retains its marker but
+  // still moves the in-memory scope back to idle, so the next notification
+  // opens a brand-new window) — replaying each one as its own wake is
+  // exactly the fan-out that storms the gateway. Group by scope first, drop
+  // anything older than `wakeOwedMaxAgeMs` (already durably injected, so
+  // nothing is lost), then merge whatever's left into ONE leading-phase
+  // wake with the union of frames and the earliest `sinceTs`.
+  interface OwedEntry {
+    key: string;
+    owed: PendingWakeRecord;
+  }
   const stateReady: Promise<void> = Promise.all([dedupStore.load(), pendingWakeStore.load()])
-    .then(() => {
+    .then(async () => {
+      const owedByScope = new Map<string, OwedEntry[]>();
       for (const [key, owed] of pendingWakeStore.all()) {
-        // The persisted key carries a `:leading`/`:trailing` suffix appended
-        // below (see `flushWakeTurn`'s `pendingKey`) so a restart replays the
-        // right phase's Idempotency-Key even though `PendingWakeRecord`
-        // itself has no phase field (#25). Any older, pre-#25 key (no
-        // suffix) replays as `leading` — the only phase that existed then.
-        const phase: "leading" | "trailing" = key.endsWith(":trailing") ? "trailing" : "leading";
+        const list = owedByScope.get(owed.scope) ?? [];
+        list.push({ key, owed });
+        owedByScope.set(owed.scope, list);
+      }
+
+      for (const [scope, entries] of owedByScope) {
+        const now = Date.now();
+        const live: OwedEntry[] = [];
+        for (const entry of entries) {
+          const age = now - entry.owed.sinceTs;
+          if (age > wakeOwedMaxAgeMs) {
+            // Every frame that ever reaches this store already passed
+            // `enqueueSystemEvent` successfully (`inject()` below only pushes
+            // into the coalesce buffer — and therefore this store — after
+            // that durable step succeeds), so "injected only" always holds
+            // here; `PendingWakeRecord.injected` documents that guarantee
+            // rather than gating on it.
+            console.log(
+              `[imajin-ws] owed wake expired for ${scope} (${entry.owed.frames.length} frame(s), age ${age}ms) — injected only`,
+            );
+            await pendingWakeStore.delete(entry.key);
+          } else {
+            live.push(entry);
+          }
+        }
+        if (live.length === 0) {
+          continue;
+        }
+
+        const framesById = new Map<string, NotificationFrame>();
+        let earliestSinceTs = live[0].owed.sinceTs;
+        for (const entry of live) {
+          earliestSinceTs = Math.min(earliestSinceTs, entry.owed.sinceTs);
+          for (const f of entry.owed.frames) {
+            framesById.set(f.id, f);
+          }
+        }
+        const mergedFrames = [...framesById.values()];
+        const mergedKey = `${pendingWakeKey(scope, earliestSinceTs)}:leading`;
+        const needsConsolidation = live.length > 1 || live[0].key !== mergedKey;
+
+        if (needsConsolidation) {
+          // Write the merged marker BEFORE deleting the markers it subsumes
+          // (each `set`/`delete` persists the whole file on its own). A crash
+          // between the two must never land on "merged marker never written,
+          // some source markers already gone" — that loses a wake outright.
+          // Set-first means the worst a crash-between leaves behind is a
+          // harmless duplicate (merged key + one or more stale source keys,
+          // all describing a subset of the same union) — the next startup's
+          // merge re-consolidates it idempotently (same scope, same or wider
+          // union, same earliest sinceTs → same `mergedKey`), so set-first is
+          // strictly safer and converges rather than losing anything.
+          await pendingWakeStore.set(mergedKey, {
+            scope,
+            sinceTs: earliestSinceTs,
+            frames: mergedFrames,
+            injected: true,
+          });
+          for (const entry of live) {
+            if (entry.key !== mergedKey) {
+              await pendingWakeStore.delete(entry.key);
+            }
+          }
+        }
+
         console.log(
-          `[imajin-ws] replaying owed wake ${key} from persisted state (${owed.frames.length} notification(s))`,
+          live.length > 1
+            ? `[imajin-ws] replaying owed wake for ${scope} from persisted state: merged ${live.length} window(s) into ${mergedFrames.length} notification(s)`
+            : `[imajin-ws] replaying owed wake ${mergedKey} from persisted state (${mergedFrames.length} notification(s))`,
         );
-        void flushWakeTurn(owed.scope, owed.frames, owed.sinceTs, phase);
+        void scheduleWakeTurn(scope, mergedFrames, earliestSinceTs, "leading");
       }
     })
     .catch((err: any) => {
@@ -774,6 +945,20 @@ export function createNotificationInjector(
       return;
     }
 
+    if (result.pending) {
+      // wake-pending (#31): one summary line per coalesce window, not one per
+      // attempt — no retry ladder was walked (`postWakeHookWithRetries`
+      // already stopped after the single attempt). The owed marker stays
+      // exactly as-is: a restart replays it once (subject to
+      // `wakeOwedMaxAgeMs`, #30), and a later 2xx for the same scope
+      // (whether from this run or a future replay) clears it as today. Not
+      // a failure, so no Telegram escalation.
+      console.info(
+        `[imajin-ws] wake pending for ${scope}: ${frames.length} notification(s), ${frames.length} frame(s) durable (${result.reason})`,
+      );
+      return;
+    }
+
     console.error(
       `[imajin-ws] wake hook FAILED for ${scope} → ${wakeSessionKey}: ${result.reason} (${phase}, ${frames.length} notification(s) coalesced)`,
     );
@@ -799,7 +984,7 @@ export function createNotificationInjector(
     const { frames, windowStart } = state;
     const trailingTimeout = setTimeout(() => onTrailingFire(scope), wakeCoalesceMs);
     coalesceByScope.set(scope, { phase: "trailing", timeout: trailingTimeout, frames: [], windowStart });
-    void flushWakeTurn(scope, frames, windowStart, "leading");
+    void scheduleWakeTurn(scope, frames, windowStart, "leading");
   }
 
   /**
@@ -818,7 +1003,7 @@ export function createNotificationInjector(
     if (state.frames.length === 0) {
       return;
     }
-    void flushWakeTurn(scope, state.frames, state.windowStart, "trailing");
+    void scheduleWakeTurn(scope, state.frames, state.windowStart, "trailing");
   }
 
   function dispose() {
@@ -910,6 +1095,7 @@ export function createNotificationInjector(
         scope: nf.scope,
         sinceTs: existing.windowStart,
         frames: existing.frames,
+        injected: true,
       });
       const firesInMs = existing.phase === "leading" ? wakeSettleMs : wakeCoalesceMs;
       console.log(
@@ -925,6 +1111,7 @@ export function createNotificationInjector(
       scope: nf.scope,
       sinceTs: windowStart,
       frames: [nf],
+      injected: true,
     });
     console.log(`[imajin-ws] warp wake: leading batched ${nf.id} (n=1, fires in ${wakeSettleMs}ms)`);
   }

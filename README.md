@@ -50,6 +50,7 @@ In `openclaw.json`:
   - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
   - **`wsNotifications.wakeSettleMs`** — leading-edge settle window in ms (#25); default `10000` (10s); see "Coalescing" below
   - **`wsNotifications.wakeCoalesceMs`** — trailing coalesce window in ms (#25); default `30000` (30s, was `300000`/5min); see "Coalescing" below
+  - **`wsNotifications.wakeOwedMaxAgeMs`** — age bound in ms (#30) for a persisted "wake owed" marker replayed at startup; older markers are dropped (their frames already reached the agent via the durable system-event queue) instead of firing a stale wake; default `3600000` (1h); see "Ack, dedup, and persisted wakes" below
   - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
 - **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway system-agent proposals to the kernel and applies signed operator decisions from /jin (#24); see "Gateway approvals bridge" below:
   - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
@@ -316,6 +317,55 @@ If wakes feel slow, `wakeSettleMs`/`wakeCoalesceMs` are the knob to check —
 not the kernel sweep. A stale trailing-only 5-minute default was previously
 found to be the *entire* user-visible wake lag (~5m10s for a single
 completion) even though the kernel path itself was fast (#25).
+
+#### Drain, not fan-out: in-flight cap and owed-wake replay (#30)
+
+A `POST /hooks/agent` call is a full agent turn, serialized by the Gateway
+per session — so offering it more than one wake at a time for the same
+session just queues turns behind each other without helping anything land
+sooner. This plugin now caps itself to **one in-flight wake POST per
+session**: every wake — a live coalesce firing or a startup replay — funnels
+through one queue per `wakeSessionKey`, and a queued wake waits for the
+current one to *settle* (admitted, wake-pending, or retries-exhausted)
+before its own attempt starts.
+
+Startup replay also **merges** every owed marker for the same scope into a
+single wake instead of firing one per marker: a scope can accumulate several
+owed markers across many failed flushes before a restart (each failed flush
+retains its marker but still returns the in-memory scope to idle, so the
+next notification opens a brand-new window) — replaying each one
+individually is exactly the fan-out that can storm the Gateway with dozens
+of simultaneous wake attempts. The merged replay uses the union of every
+marker's frames, the earliest `sinceTs`, and always fires as the `leading`
+phase.
+
+An owed marker older than `wakeOwedMaxAgeMs` (default `3600000`, 1h) is
+dropped instead of replayed: its frames already reached the agent's context
+via the durable `enqueueSystemEvent` queue when they were first received, so
+waking a possibly hours-stale turn just for those notifications adds no
+value. This logs `owed wake expired for <scope> (N frame(s), age …ms) —
+injected only` and clears the marker; the agent still sees the context on
+its next natural turn.
+
+#### Wake-pending: timeout and admission-timeout 503 aren't failures (#31)
+
+Two `POST /hooks/agent` outcomes mean the wake is already running or queued
+— not refused — so retrying only adds more queued turns behind it:
+
+- A **client-side timeout** (`HOOK_REQUEST_TIMEOUT_MS`, 10s): the Gateway
+  accepted the POST but the agent turn didn't return in time — a normal turn
+  routinely takes longer than that.
+- A **503 whose JSON body carries a `runId`**: the Gateway queued the run but
+  couldn't start it before its admission window. A runId-less 503 (or any
+  other non-2xx/network failure) is unaffected and still walks the
+  `HOOK_RETRY_DELAYS_MS` ladder to the Telegram fallback exactly as before.
+
+Either outcome logs one `wake pending for <scope>: N notification(s), M
+frame(s) durable` info line — never the per-attempt retry-warning spam — and
+keeps the owed marker instead of escalating to the Telegram fallback. A
+later 2xx for the same scope (during this run, or on a future replay subject
+to `wakeOwedMaxAgeMs` above) clears it exactly like any other successful
+wake.
 
 ### Real-time notifications (#1904)
 

@@ -77,6 +77,10 @@
     "wsNotifications.stateDir": {
       "label": "Notification State Directory",
       "help": "Directory for the ack-dedup LRU and pending-wake persistence files (#26). Defaults to a directory colocated with keypairPath."
+    },
+    "wsNotifications.wakeOwedMaxAgeMs": {
+      "label": "Owed Wake Max Age (ms)",
+      "help": "Age bound for a persisted 'wake owed' marker replayed at startup (#30). A marker older than this is dropped \u2014 already durably injected \u2014 instead of firing a stale wake. Default 3600000 (1h)."
     }
   },
   "configSchema": {
@@ -123,6 +127,10 @@
           "wakeCoalesceMs": {
             "type": "number",
             "description": "Trailing coalesce window for Warp wake turns, in ms, measured from the leading wake (#25). Any notification arriving in this window after the leading wake fires batches into ONE follow-up wake at the window's end. Default 30000 (30s, was 300000/5min)."
+          },
+          "wakeOwedMaxAgeMs": {
+            "type": "number",
+            "description": "Age bound, in ms, for a persisted 'wake owed' marker replayed at startup (#30). A marker older than this is dropped instead of firing a stale wake \u2014 its frames already reached the agent via the durable system-event queue \u2014 and logged as expired. Default 3600000 (1h)."
           },
           "hookToken": {
             "description": "Bearer token for the Gateway's POST /hooks/agent, matching that Gateway's hooks.token. Accepts a plain string or a SecretRef object (#20), resolved once via the plugin SDK. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var when omitted or unresolvable.",
