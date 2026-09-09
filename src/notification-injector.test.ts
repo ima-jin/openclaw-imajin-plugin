@@ -1699,6 +1699,60 @@ describe("createNotificationInjector — owed-wake replay drains, doesn't fan ou
     dispose();
   });
 
+  it("recovers from a crash between the merged set and the source deletes without double-waking or losing anything", async () => {
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    const keypairPath = join(tmpDir, ".jin-identity.json");
+    const stateDir = resolveStateDir(undefined, keypairPath)!;
+    const seedStore = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await seedStore.load();
+    const baseTs = Date.now() - 5_000;
+    const sourceFrames: NotificationFrame[] = [];
+    for (let i = 0; i < 5; i += 1) {
+      const f = frame(`r${i}`);
+      sourceFrames.push(f);
+      await seedStore.set(`warp.run.completed:${baseTs + i}:leading`, {
+        scope: "warp.run.completed",
+        sinceTs: baseTs + i,
+        frames: [f],
+        injected: true,
+      });
+    }
+    // Simulate a crash landing exactly between the merged `set` and the
+    // source `delete`s (the ordering this fix protects): the merged marker
+    // (union of all 5 frames, keyed by the earliest sinceTs) is already on
+    // disk, but the stale per-window source markers it was meant to replace
+    // haven't been deleted yet. Re-initializing from this exact persisted
+    // state must fire exactly one wake (never double-wake on the duplicate
+    // content) and must never lose a frame.
+    const mergedKey = `warp.run.completed:${baseTs}:leading`;
+    await seedStore.set(mergedKey, {
+      scope: "warp.run.completed",
+      sinceTs: baseTs,
+      frames: sourceFrames,
+      injected: true,
+    });
+
+    const { api } = makeApi();
+    const { ready, dispose } = createNotificationInjector(api, CONFIG, {
+      sendFrame: vi.fn(),
+      keypairPath,
+    });
+    await ready;
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Exactly one wake, deduped by frame id (5, not 10).
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const body = JSON.parse(calls[0][1].body);
+    expect(String(body.message)).toContain("warp.run.completed × 5");
+    expect(calls[0][1].headers["Idempotency-Key"]).toBe(`imajin-wake:${mergedKey}`);
+
+    // Fully consolidated and cleared by the 2xx above — nothing left owed.
+    const reloaded = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+    await reloaded.load();
+    expect(reloaded.all()).toEqual([]);
+    dispose();
+  });
+
   it("drops an owed marker older than wakeOwedMaxAgeMs without waking, and clears it", async () => {
     const keypairPath = join(tmpDir, ".jin-identity.json");
     const stateDir = resolveStateDir(undefined, keypairPath)!;

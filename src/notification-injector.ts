@@ -777,17 +777,27 @@ export function createNotificationInjector(
         const needsConsolidation = live.length > 1 || live[0].key !== mergedKey;
 
         if (needsConsolidation) {
-          for (const entry of live) {
-            if (entry.key !== mergedKey) {
-              await pendingWakeStore.delete(entry.key);
-            }
-          }
+          // Write the merged marker BEFORE deleting the markers it subsumes
+          // (each `set`/`delete` persists the whole file on its own). A crash
+          // between the two must never land on "merged marker never written,
+          // some source markers already gone" — that loses a wake outright.
+          // Set-first means the worst a crash-between leaves behind is a
+          // harmless duplicate (merged key + one or more stale source keys,
+          // all describing a subset of the same union) — the next startup's
+          // merge re-consolidates it idempotently (same scope, same or wider
+          // union, same earliest sinceTs → same `mergedKey`), so set-first is
+          // strictly safer and converges rather than losing anything.
           await pendingWakeStore.set(mergedKey, {
             scope,
             sinceTs: earliestSinceTs,
             frames: mergedFrames,
             injected: true,
           });
+          for (const entry of live) {
+            if (entry.key !== mergedKey) {
+              await pendingWakeStore.delete(entry.key);
+            }
+          }
         }
 
         console.log(
