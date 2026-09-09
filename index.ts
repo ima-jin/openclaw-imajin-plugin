@@ -29,6 +29,10 @@ import { ImajinClient } from "./src/client.js";
 import { ImajinWsService, type NotificationFrame } from "./src/ws-service.js";
 import { createNotificationInjector, type WsNotificationsConfig } from "./src/notification-injector.js";
 import {
+  startGatewayApprovalsBridge,
+  type ApprovalsBridgePluginConfig,
+} from "./src/gateway-approvals-bridge.js";
+import {
   createIdentityTool,
   createAttestTool,
   createTransactTool,
@@ -79,6 +83,7 @@ export default definePluginEntry({
       wsNotifications?: WsNotificationsConfig;
       attestation?: TurnUsageAttestationConfig;
       approvalBridge?: ApprovalBridgeSettings;
+      approvals?: ApprovalsBridgePluginConfig;
     };
 
     if (!config?.nodeUrl) {
@@ -183,6 +188,28 @@ export default definePluginEntry({
         );
       }
 
+      // Gateway approvals bridge (#24): publishes staged Gateway system-agent
+      // proposals to the kernel and applies signed operator decisions back to
+      // the Gateway. Off unless `approvals.enabled` + `approvals.operatorDid`
+      // (+ the token/secret it needs) are configured — see
+      // `src/gateway-approvals-bridge.ts` for the full trust chain. Started
+      // fire-and-forget so a slow/unavailable Gateway loopback connection can
+      // never delay the rest of plugin registration.
+      let approvalsBridgeFrameHandler: ((frame: unknown) => void) | undefined;
+      const approvalsBridgeReady = startGatewayApprovalsBridge(api, config.approvals, {
+        did: config.did,
+        keypairPath: config.keypairPath,
+        nodeUrl: config.nodeUrl,
+      })
+        .then((started) => {
+          approvalsBridgeFrameHandler = started?.onKernelFrame;
+          return started;
+        })
+        .catch((err: unknown) => {
+          console.error("[imajin-approvals-bridge] failed to start:", err);
+          return undefined;
+        });
+
       wsService.onFrame((frame) => {
         if (frame.type === "notification") {
           const nf = frame as NotificationFrame;
@@ -198,6 +225,10 @@ export default definePluginEntry({
           void approvalBridge.handleFrame(frame).catch((err: unknown) => {
             console.error(`[imajin-approval] handleFrame failed for ${frame.requestId}:`, err);
           });
+        } else if (frame.type === "bus_event") {
+          // Kernel bus-event fan-out (#1884) — currently only consumed by the
+          // gateway approvals bridge's `operator.approval.decided` handler.
+          approvalsBridgeFrameHandler?.(frame);
         } else {
           console.log(`[imajin-ws] frame: type=${frame.type}`, JSON.stringify(frame).slice(0, 200));
         }
@@ -218,6 +249,7 @@ export default definePluginEntry({
           console.log("[imajin-ws] service stop called");
           wsService.stop();
           disposeInjector();
+          void approvalsBridgeReady.then((started) => started?.dispose());
         },
       });
     }
