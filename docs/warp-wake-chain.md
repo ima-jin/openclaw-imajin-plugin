@@ -15,6 +15,19 @@
 > restart: see the README's "Ack, dedup, and persisted wakes" section and
 > `src/notification-state-store.ts` for the durability mechanics this doc's
 > Hop 6/7 sections don't yet describe in detail.
+>
+> **#30/#31 update (2026-09-09, the owed-wake replay storm):** the incident
+> that motivated this update is documented in a new section below,
+> "Incident: the 2026-09-09 replay storm (#30, #31)". Two changes to Hop 7:
+> (1) every wake POST — startup replay and a live coalesce firing alike —
+> now funnels through a per-session in-flight queue (`scheduleWakeTurn` in
+> `src/notification-injector.ts`), and startup replay merges every owed
+> marker for the same scope into ONE wake instead of firing one per marker
+> (subject to `wakeOwedMaxAgeMs`, see the README's "Drain, not fan-out"
+> section); (2) `postWakeHook`'s outcome classifier now recognizes
+> `wake-pending` (a client timeout, or a 503 whose body carries a `runId`)
+> as distinct from a real failure — no retry ladder, no Telegram escalation,
+> owed marker kept (see the README's "Wake-pending" section).
 
 This is the full path a Warp cloud-agent run's outcome travels before it turns
 into a real agent turn in the owner's DM, hop by hop, with exact source
@@ -428,6 +441,39 @@ line (Hop 5's grep) and check that `runId`'s `warp.agent.dispatched`/
 `warp.run.resumed` timestamps in `kernel.event_subscription_log` directly —
 if its latest activity is under 6h old, file it against
 `ima-jin/imajin-ai` as a #2032 regression with that evidence attached.
+
+## Incident: the 2026-09-09 replay storm (#30, #31)
+
+2026-09-09 11:15–11:27 EDT, right after the `/hooks/agent` token mismatch
+from the #26 incident chain was fixed (`IMAJIN_WAKE_HOOK_TOKEN` ≠ the
+Gateway's `hooks.token` since Sept 6 — every wake had 401'd, so ~20 overnight
+`warp.run.completed` notifications sat as owed-wake markers, each retained by
+the #26 "transient failure, keep the marker" rule). On the first successful
+resolve, `notification-injector.ts` replayed every owed wake **at once**
+(`replaying owed wake … from persisted state`, once per marker), and 5 fresh
+completions landed in the same window — 77 `wake hook attempt 1` lines in 12
+minutes. Each wake is a full agent turn on the target session, serialized by
+the Gateway, so everything behind the first failed with `timed out after
+10000ms` or `503 {"ok":false,"error":"hook agent run did not start before
+admission timeout","runId":…}` — then retried ×3 per notification via
+`HOOK_RETRY_DELAYS_MS`, multiplying the load. Nothing was lost (payloads were
+already durable via `enqueueSystemEvent`), but ~18 of the replays were for
+runs whose PRs had been reviewed and merged hours earlier — pure wake noise.
+
+Fixed by #30 (drain, don't fan out) and #31 (timeout/admission-503 are
+pending, not failures) — see the README's "Drain, not fan-out" and
+"Wake-pending" sections for the resulting behavior. In short: a per-session
+in-flight cap of 1 makes a burst of replays (or live completions) drain
+sequentially instead of fanning out; owed markers for the same scope merge
+into one wake on replay; a marker older than `wakeOwedMaxAgeMs` is dropped as
+already-injected rather than replayed; and a timeout or admission-timeout 503
+no longer walks the retry ladder at all — it logs once, keeps the marker, and
+waits for the run that's already in flight.
+
+**Grep:** `"wake pending for "` (#31, one line per pending outcome, not one
+per attempt), `"owed wake expired for "` (#30, a stale marker was dropped
+unreplayed), `"replaying owed wake for … merged "` (#30, N markers collapsed
+into one wake).
 
 ## Operator quick-reference: grep by symptom
 
