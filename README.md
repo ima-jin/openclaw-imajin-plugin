@@ -48,6 +48,8 @@ In `openclaw.json`:
   - **`wsNotifications.hookToken`** — Bearer token for the Gateway's `POST /hooks/agent`; a plain string, or (recommended, #20) a SecretRef object resolved via the plugin SDK; falls back to the `IMAJIN_WAKE_HOOK_TOKEN` env var
   - **`wsNotifications.hooksPath`** — Gateway hooks base path; defaults to `/hooks`
   - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
+  - **`wsNotifications.wakeSettleMs`** — leading-edge settle window in ms (#25); default `10000` (10s); see "Coalescing" below
+  - **`wsNotifications.wakeCoalesceMs`** — trailing coalesce window in ms (#25); default `30000` (30s, was `300000`/5min); see "Coalescing" below
   - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
 
 ### Turn-usage attestation
@@ -191,10 +193,30 @@ connection refused, or a ~10s timeout) falls back to the deterministic
 Telegram ping from `directSend` (#14) — the same backstop that fires when
 the hook is disabled entirely.
 
-Coalescing (multiple completions within `wakeCoalesceMs`, default 5 min)
-is keyed by scope and by an `Idempotency-Key` derived from the coalesce
-window's start time, so repeated notifications in the same window collapse
-to one hook call.
+#### Coalescing (#25)
+
+Warp wake turns coalesce in two phases, so a single completion doesn't wait
+out the same window a burst needs:
+
+- **Leading edge.** The first qualifying notification in an idle window
+  fires its own wake after `wsNotifications.wakeSettleMs` (default `10000`,
+  10s). Any further notification arriving before that settle elapses joins
+  the same leading wake.
+- **Trailing batch.** Once the leading wake fires, any notification arriving
+  within the next `wsNotifications.wakeCoalesceMs` (default `30000`, 30s —
+  was `300000`/5min) batches into ONE follow-up wake fired at that window's
+  end. A burst therefore produces at most two wake turns: one leading, one
+  trailing.
+
+Both wakes of one window share the window's start time but are kept
+distinct via a `:leading`/`:trailing`-suffixed `Idempotency-Key`
+(`imajin-wake:<scope>:<windowStart>:<leading|trailing>`), so a notification
+the kernel replays (#26) can never double-wake either one.
+
+If wakes feel slow, `wakeSettleMs`/`wakeCoalesceMs` are the knob to check —
+not the kernel sweep. A stale trailing-only 5-minute default was previously
+found to be the *entire* user-visible wake lag (~5m10s for a single
+completion) even though the kernel path itself was fast (#25).
 
 ### Real-time notifications (#1904)
 
