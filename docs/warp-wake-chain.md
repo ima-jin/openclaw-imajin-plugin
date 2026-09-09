@@ -225,10 +225,15 @@ at `notification-injector.ts:116-121`).
 2. Instant direct channel ping via `sendChannelMessage` (`:191-201`,
    `openclaw message send` CLI, no model in the loop) — logs
    `"direct-sent {scope} → {channel}:{target}"`.
-3. Coalesce into `coalesceByScope` (`:207`), keyed by scope, for
-   `wakeCoalesceMs` (default 5 minutes, `DEFAULT_WAKE_COALESCE_MS`,
-   `:43`). Logs `"warp wake: batched {id} (n=N, fires in Xms)"` on every
-   push, whether it starts a new batch or joins an existing one — so no
+3. Coalesce into `coalesceByScope` (#25, leading-edge + trailing — see
+   `notification-injector.ts`'s module doc comment above `createNotificationInjector`):
+   the first frame in an idle window fires its own wake after `wakeSettleMs`
+   (default 10s, `DEFAULT_WAKE_SETTLE_MS`); anything arriving in the
+   following `wakeCoalesceMs` window (default 30s, `DEFAULT_WAKE_COALESCE_MS`
+   — was 300s/5min, the entire lag root-caused below) batches into one
+   trailing wake fired at that window's end. Logs
+   `"warp wake: {leading|trailing} batched {id} (n=N, fires in ~Xms)"` on
+   every push, whether it starts a new batch or joins an existing one — so no
    notification is ever silently dropped from the batch (regression-tested,
    see `src/notification-injector.test.ts` "keeps the newest notification…").
 

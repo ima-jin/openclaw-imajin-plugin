@@ -98,9 +98,13 @@
             "type": "string",
             "description": "Session key to wake with a real agent turn via the Gateway's POST /hooks/agent (#18). Defaults to targetSession."
           },
+          "wakeSettleMs": {
+            "type": "number",
+            "description": "Leading-edge settle window for Warp wake turns, in ms (#25). The first qualifying notification in an idle window fires its own wake after this delay; anything joining before it fires batches into that same leading wake. Default 10000 (10s)."
+          },
           "wakeCoalesceMs": {
             "type": "number",
-            "description": "Coalesce window for Warp wake turns, in ms. Default 300000 (5 min)."
+            "description": "Trailing coalesce window for Warp wake turns, in ms, measured from the leading wake (#25). Any notification arriving in this window after the leading wake fires batches into ONE follow-up wake at the window's end. Default 30000 (30s, was 300000/5min)."
           },
           "hookToken": {
             "description": "Bearer token for the Gateway's POST /hooks/agent, matching that Gateway's hooks.token. Accepts a plain string or a SecretRef object (#20), resolved once via the plugin SDK. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var when omitted or unresolvable.",

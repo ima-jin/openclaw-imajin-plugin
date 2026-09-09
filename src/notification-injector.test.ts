@@ -7,6 +7,8 @@ import { ImajinWsService, type NotificationFrame } from "./ws-service.js";
 import {
   createNotificationInjector,
   buildWakeTurnMessage,
+  DEFAULT_WAKE_COALESCE_MS,
+  DEFAULT_WAKE_SETTLE_MS,
   HOOK_REQUEST_TIMEOUT_MS,
   HOOK_RETRY_DELAYS_MS,
   HOOK_TOKEN_ENV,
@@ -182,11 +184,16 @@ function makeApi(gatewayPort?: number) {
 }
 
 const SESSION = "agent:main:telegram:direct:1";
+// Existing tests below exercise a single frame per window and advance by
+// COALESCE_MS, expecting exactly one wake — so `wakeSettleMs` (the knob that
+// now actually gates a single frame's wake, #25) is set to the same value as
+// `wakeCoalesceMs` here, keeping their timing assertions valid unchanged.
 const COALESCE_MS = 1_000;
 const HOOK_TOKEN = "test-hook-token-do-not-log";
 const CONFIG: WsNotificationsConfig = {
   injectScopes: ["warp.run.completed"],
   targetSession: SESSION,
+  wakeSettleMs: COALESCE_MS,
   wakeCoalesceMs: COALESCE_MS,
   hookToken: HOOK_TOKEN,
   directSend: { channel: "telegram", target: "1", cliPath: "/usr/bin/openclaw" },
@@ -407,7 +414,7 @@ describe("createNotificationInjector — wake hook request shape", () => {
       Authorization: `Bearer ${HOOK_TOKEN}`,
       "Content-Type": "application/json",
     });
-    expect(init.headers["Idempotency-Key"]).toMatch(/^imajin-wake:warp\.run\.completed:\d+$/);
+    expect(init.headers["Idempotency-Key"]).toMatch(/^imajin-wake:warp\.run\.completed:\d+:leading$/);
 
     const body = JSON.parse(init.body);
     expect(body).toMatchObject({
@@ -1320,5 +1327,172 @@ describe("createNotificationInjector — persisted state across a simulated rest
 
     expect(fetchMock).toHaveBeenCalledTimes(1); // marker retained -> replayed on the next start
     restarted.dispose();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #25: leading-edge + trailing wake coalescing. The old trailing-only
+// DEFAULT_WAKE_COALESCE_MS (5 min) was the *entire* observed wake lag for a
+// single completion (measured 5m10s / 5m09s on two separate runs, both
+// batches n=1). Leading-edge + trailing surfaces a single completion in
+// ~wakeSettleMs while still capping a burst at two wake turns.
+// ---------------------------------------------------------------------------
+
+describe("createNotificationInjector — leading-edge + trailing wake coalescing (#25)", () => {
+  const SETTLE_MS = 500;
+  const TRAILING_MS = 2_000;
+  const LT_CONFIG: WsNotificationsConfig = {
+    ...CONFIG,
+    wakeSettleMs: SETTLE_MS,
+    wakeCoalesceMs: TRAILING_MS,
+  };
+
+  let fetchMock: ReturnType<typeof makeFetchMock>["fetchMock"];
+  let calls: ReturnType<typeof makeFetchMock>["calls"];
+  let setImpl: ReturnType<typeof makeFetchMock>["setImpl"];
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    execFileMock.mockReset();
+    stubExecFile("ok");
+    ({ fetchMock, calls, setImpl } = makeFetchMock());
+    vi.stubGlobal("fetch", fetchMock);
+    setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
+
+  it("defaults wakeSettleMs to 10s and wakeCoalesceMs to 30s (was 300s)", () => {
+    expect(DEFAULT_WAKE_SETTLE_MS).toBe(10_000);
+    expect(DEFAULT_WAKE_COALESCE_MS).toBe(30_000);
+  });
+
+  it("a single frame fires exactly one wake after wakeSettleMs, with no trailing wake", async () => {
+    const { inject, dispose } = createNotificationInjector(makeApi().api, LT_CONFIG);
+
+    await inject(frame("1"));
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(SETTLE_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // leading wake
+    expect(calls[0][1].headers["Idempotency-Key"]).toMatch(/:leading$/);
+
+    // Nothing else arrives — the trailing window must not produce a second wake.
+    await vi.advanceTimersByTimeAsync(TRAILING_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    dispose();
+  });
+
+  it("a burst batches into the leading wake during settle, and later arrivals batch into exactly one trailing wake", async () => {
+    const { inject, dispose } = createNotificationInjector(makeApi().api, LT_CONFIG);
+
+    await inject(frame("1", "Warp run 1 SUCCEEDED"));
+    await inject(frame("2", "Warp run 2 SUCCEEDED")); // joins the leading batch (still within settle)
+    await vi.advanceTimersByTimeAsync(SETTLE_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const leadingMessage = String(JSON.parse(calls[0][1].body).message);
+    expect(leadingMessage).toContain("× 2");
+    expect(leadingMessage).toContain("Warp run 1 SUCCEEDED");
+    expect(leadingMessage).toContain("Warp run 2 SUCCEEDED");
+
+    // Arrive during the trailing window — must batch together, not each fire its own wake.
+    await inject(frame("3", "Warp run 3 SUCCEEDED"));
+    await inject(frame("4", "Warp run 4 SUCCEEDED"));
+    await vi.advanceTimersByTimeAsync(TRAILING_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // exactly leading + one trailing wake
+    expect(calls[1][1].headers["Idempotency-Key"]).toMatch(/:trailing$/);
+    const trailingMessage = String(JSON.parse(calls[1][1].body).message);
+    expect(trailingMessage).toContain("× 2");
+    expect(trailingMessage).toContain("Warp run 3 SUCCEEDED");
+    expect(trailingMessage).toContain("Warp run 4 SUCCEEDED");
+    expect(trailingMessage).not.toContain("Warp run 1 SUCCEEDED");
+    expect(trailingMessage).not.toContain("Warp run 2 SUCCEEDED");
+    dispose();
+  });
+
+  it("a frame arriving after the trailing window closes starts a brand-new leading wake", async () => {
+    const { inject, dispose } = createNotificationInjector(makeApi().api, LT_CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(SETTLE_MS); // leading wake #1
+    await vi.advanceTimersByTimeAsync(TRAILING_MS); // trailing window closes with nothing pending
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const firstKey = calls[0][1].headers["Idempotency-Key"];
+
+    await inject(frame("2")); // scope is idle again — a brand-new leading window
+    await vi.advanceTimersByTimeAsync(SETTLE_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    const secondKey = calls[1][1].headers["Idempotency-Key"];
+    expect(secondKey).toMatch(/:leading$/);
+    expect(secondKey).not.toBe(firstKey); // fresh windowStart
+
+    // And it too must not produce a stray trailing wake on its own.
+    await vi.advanceTimersByTimeAsync(TRAILING_MS);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    dispose();
+  });
+
+  it("a replayed duplicate frame during the settle window does not add an extra wake", async () => {
+    const { inject, dispose } = createNotificationInjector(makeApi().api, LT_CONFIG);
+    const f = frame("dup-1");
+
+    await inject(f);
+    await inject(f); // kernel replay of the same id, still inside the settle window
+    await vi.advanceTimersByTimeAsync(SETTLE_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const message = String(JSON.parse(calls[0][1].body).message);
+    expect(message).toContain("× 1"); // the duplicate must not be counted twice
+    dispose();
+  });
+
+  it("a replayed duplicate frame during the trailing window does not add an extra wake", async () => {
+    const { inject, dispose } = createNotificationInjector(makeApi().api, LT_CONFIG);
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(SETTLE_MS); // leading wake fires, trailing window opens
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    const f2 = frame("2");
+    await inject(f2);
+    await inject(f2); // replay during the trailing window
+    await vi.advanceTimersByTimeAsync(TRAILING_MS);
+
+    expect(fetchMock).toHaveBeenCalledTimes(2); // leading + exactly one trailing wake
+    const trailingMessage = String(JSON.parse(calls[1][1].body).message);
+    expect(trailingMessage).toContain("× 1");
+    dispose();
+  });
+
+  it("honours a config override of both wakeSettleMs and wakeCoalesceMs", async () => {
+    const CUSTOM_SETTLE_MS = 300;
+    const CUSTOM_TRAILING_MS = 700;
+    const { inject, dispose } = createNotificationInjector(makeApi().api, {
+      ...CONFIG,
+      wakeSettleMs: CUSTOM_SETTLE_MS,
+      wakeCoalesceMs: CUSTOM_TRAILING_MS,
+    });
+
+    await inject(frame("1"));
+    await vi.advanceTimersByTimeAsync(CUSTOM_SETTLE_MS - 100);
+    expect(fetchMock).not.toHaveBeenCalled(); // settle hasn't elapsed yet
+    await vi.advanceTimersByTimeAsync(100);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // leading wake at exactly wakeSettleMs
+
+    await inject(frame("2"));
+    await vi.advanceTimersByTimeAsync(CUSTOM_TRAILING_MS - 100);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // trailing window hasn't elapsed yet
+    await vi.advanceTimersByTimeAsync(100);
+    expect(fetchMock).toHaveBeenCalledTimes(2); // trailing wake at exactly wakeCoalesceMs
+    dispose();
   });
 });

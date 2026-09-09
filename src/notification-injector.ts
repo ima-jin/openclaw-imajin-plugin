@@ -36,7 +36,22 @@ export interface WsNotificationsConfig {
    * when omitted.
    */
   wakeSessionKey?: string;
-  /** Coalesce window for Warp wake turns (ms). Default 300000 (5 min). */
+  /**
+   * Leading-edge settle window (ms, #25): how long the first qualifying
+   * frame in an idle window waits before its wake fires. Any further frame
+   * arriving during this settle joins the same leading wake. Default 10000
+   * (10s).
+   */
+  wakeSettleMs?: number;
+  /**
+   * Trailing coalesce window (ms, #25): once the leading wake fires, any
+   * frame arriving within this window (measured from the leading fire, not
+   * from the frame itself) batches into ONE follow-up wake fired at the
+   * window's end — so a burst still produces at most two wake turns
+   * (leading + one trailing batch). Default 30000 (30s, was 300000/5min —
+   * see #25: the old trailing-only 5-minute window was the entire
+   * user-visible wake lag for a single completion).
+   */
   wakeCoalesceMs?: number;
   /**
    * Bearer token for the Gateway's `hooks.token` (#18) — required to call
@@ -82,8 +97,15 @@ const INJECTION_TTL_MS = 15 * 60_000;
 // refuses anything larger, which would look like a lost notification.
 const MAX_INJECTED_CHARS = 4_000;
 const MAX_DATA_JSON_CHARS = 2_000;
-// Default coalesce window for Warp wake turns.
-export const DEFAULT_WAKE_COALESCE_MS = 300_000;
+// Leading-edge settle window (#25): the first frame in an idle window fires
+// its own wake after this delay; anything joining before it fires batches
+// into that same leading wake.
+export const DEFAULT_WAKE_SETTLE_MS = 10_000;
+// Trailing coalesce window for Warp wake turns, measured from the moment
+// the leading wake fires (#25). Was 300_000 (5 min) — trailing-only meant a
+// single completion waited the entire window; leading-edge + trailing now
+// surfaces a single completion in ~DEFAULT_WAKE_SETTLE_MS instead.
+export const DEFAULT_WAKE_COALESCE_MS = 30_000;
 // Gateway hooks defaults (#18, docs/automation/webhook.md).
 const DEFAULT_HOOKS_PATH = "/hooks";
 const DEFAULT_HOOK_AGENT_ID = "main";
@@ -499,12 +521,20 @@ export async function postWakeHookWithRetries(
  * Flow:
  * 1. Durable context injection (`enqueueNextTurnInjection` or fallback
  *    `enqueueSystemEvent`) so the event survives restarts — unchanged by #18.
- * 2. Coalesce: multiple completions within the coalesce window are batched and
- *    flushed together, keyed by scope + the coalesce window's start time
- *    (`Idempotency-Key: imajin-wake:<scope>:<coalesceWindowStart>`) rather than
- *    the tag-based unschedule/coalesce #13/#17 used — `unschedulePluginSessionTurnsByTag`
- *    is gated the same bundled-only way as `scheduleSessionTurn` and cannot be
- *    used by a third-party plugin either way.
+ * 2. Coalesce (#25): leading-edge + trailing. The first qualifying frame in an
+ *    idle window fires its own wake after a short settle (`wakeSettleMs`);
+ *    anything joining before that settle elapses batches into the same
+ *    leading wake. Once the leading wake fires, any frame arriving within
+ *    the following `wakeCoalesceMs` window batches into ONE trailing wake
+ *    fired at that window's end — so a burst produces at most two wake
+ *    turns. Both wakes of one window share the window's start time but are
+ *    kept distinct via a `:leading`/`:trailing` suffix
+ *    (`Idempotency-Key: imajin-wake:<scope>:<windowStart>:<leading|trailing>`),
+ *    so a replayed frame can never double-wake either one — this replaces
+ *    the tag-based unschedule/coalesce #13/#17 used previously;
+ *    `unschedulePluginSessionTurnsByTag` is gated the same bundled-only way
+ *    as `scheduleSessionTurn` and cannot be used by a third-party plugin
+ *    either way.
  * 3. Run a real agent turn in the owner's session via the local Gateway's
  *    `POST /hooks/agent` (`postWakeHook` above) instead of the bundled-only
  *    `api.session.workflow.scheduleSessionTurn` seam (#13, #17): that seam
@@ -546,6 +576,7 @@ export function createNotificationInjector(
   const targetSession = wsNotifications?.targetSession?.trim();
   const wakeSessionKey = wsNotifications?.wakeSessionKey?.trim() ?? targetSession;
   const wakeCoalesceMs = wsNotifications?.wakeCoalesceMs ?? DEFAULT_WAKE_COALESCE_MS;
+  const wakeSettleMs = wsNotifications?.wakeSettleMs ?? DEFAULT_WAKE_SETTLE_MS;
   // Resolved once here (not per request, #20) — `flushWakeTurn` awaits
   // `hookTokenReady` before reading `hookToken`.
   let hookToken: string | undefined;
@@ -594,10 +625,16 @@ export function createNotificationInjector(
   const stateReady: Promise<void> = Promise.all([dedupStore.load(), pendingWakeStore.load()])
     .then(() => {
       for (const [key, owed] of pendingWakeStore.all()) {
+        // The persisted key carries a `:leading`/`:trailing` suffix appended
+        // below (see `flushWakeTurn`'s `pendingKey`) so a restart replays the
+        // right phase's Idempotency-Key even though `PendingWakeRecord`
+        // itself has no phase field (#25). Any older, pre-#25 key (no
+        // suffix) replays as `leading` — the only phase that existed then.
+        const phase: "leading" | "trailing" = key.endsWith(":trailing") ? "trailing" : "leading";
         console.log(
           `[imajin-ws] replaying owed wake ${key} from persisted state (${owed.frames.length} notification(s))`,
         );
-        void flushWakeTurn(owed.scope, owed.frames, owed.sinceTs);
+        void flushWakeTurn(owed.scope, owed.frames, owed.sinceTs, phase);
       }
     })
     .catch((err: any) => {
@@ -631,16 +668,20 @@ export function createNotificationInjector(
 
   let warnedMissingWakeKey = false;
 
-  // In-memory coalesce buffer, keyed by scope. `windowStart` is the wall-clock
-  // time the buffer opened — it becomes the `Idempotency-Key`'s window
-  // component so repeated flushes of the same window (there should only ever
-  // be one) collide instead of double-waking, while a new window after the
-  // previous one fires gets a fresh key (#18: coalesce by window + idempotency
-  // key, replacing the tag-based unschedule/coalesce from #13/#17).
-  const coalesceByScope = new Map<
-    string,
-    { timeout: ReturnType<typeof setTimeout>; frames: NotificationFrame[]; windowStart: number }
-  >();
+  // In-memory coalesce state, keyed by scope (#25: leading-edge + trailing —
+  // see the module doc comment above). `windowStart` is the wall-clock time
+  // the *leading* phase opened; it stays fixed across both phases of one
+  // window so the `:leading`/`:trailing`-suffixed Idempotency-Key stays
+  // stable per scope+window (repeated flushes of the same phase collide
+  // instead of double-waking), while a brand-new window after the trailing
+  // phase closes gets a fresh `windowStart`.
+  interface CoalesceState {
+    phase: "leading" | "trailing";
+    timeout: ReturnType<typeof setTimeout>;
+    frames: NotificationFrame[];
+    windowStart: number;
+  }
+  const coalesceByScope = new Map<string, CoalesceState>();
 
   console.log(
     `[imajin-ws] injection APIs: enqueueSystemEvent=${!!enqueueSystemEvent}, directSend=${!!ds?.target}`,
@@ -658,7 +699,9 @@ export function createNotificationInjector(
     );
   }
   if (wakeSessionKey) {
-    console.log(`[imajin-ws] wake turns → session ${wakeSessionKey} (coalesce ${wakeCoalesceMs}ms)`);
+    console.log(
+      `[imajin-ws] wake turns → session ${wakeSessionKey} (settle ${wakeSettleMs}ms, coalesce ${wakeCoalesceMs}ms)`,
+    );
   }
 
   /** The #14 Telegram fallback — unchanged backstop for a disabled/unreachable hook. */
@@ -671,9 +714,16 @@ export function createNotificationInjector(
     }
   }
 
-  async function flushWakeTurn(scope: string, frames: NotificationFrame[], windowStart: number) {
-    coalesceByScope.delete(scope);
-    const pendingKey = pendingWakeKey(scope, windowStart);
+  async function flushWakeTurn(
+    scope: string,
+    frames: NotificationFrame[],
+    windowStart: number,
+    phase: "leading" | "trailing",
+  ) {
+    // Distinct-but-deterministic per phase (#25): both wakes of one window
+    // share `windowStart`, so the suffix is what keeps a replayed frame from
+    // double-waking either the leading or the trailing wake independently.
+    const pendingKey = `${pendingWakeKey(scope, windowStart)}:${phase}`;
     await hookTokenReady;
 
     if (!wakeSessionKey) {
@@ -703,7 +753,7 @@ export function createNotificationInjector(
       return;
     }
 
-    const idempotencyKey = `imajin-wake:${scope}:${windowStart}`;
+    const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
     const gatewayPort = resolveGatewayPort(api);
     const result = await postWakeHookWithRetries({
       gatewayPort,
@@ -718,19 +768,57 @@ export function createNotificationInjector(
     if (result.ok) {
       console.log(
         `[imajin-ws] wake admitted${result.runId ? ` runId=${result.runId}` : ""} for ${scope} → ${wakeSessionKey} ` +
-          `(${frames.length} notification(s) coalesced)`,
+          `(${phase}, ${frames.length} notification(s) coalesced)`,
       );
       await pendingWakeStore.delete(pendingKey);
       return;
     }
 
     console.error(
-      `[imajin-ws] wake hook FAILED for ${scope} → ${wakeSessionKey}: ${result.reason} (${frames.length} notification(s) coalesced)`,
+      `[imajin-ws] wake hook FAILED for ${scope} → ${wakeSessionKey}: ${result.reason} (${phase}, ${frames.length} notification(s) coalesced)`,
     );
     // Marker intentionally retained: a transient hook failure (unlike the two
     // static-misconfiguration branches above) is worth retrying on the next
     // restart (#26) — cleared only once `postWakeHookWithRetries` reports 2xx.
     await escalateWakeFailure(scope, frames, result.reason ?? "unknown wake hook failure");
+  }
+
+  /**
+   * Fires when a scope's leading settle (`wakeSettleMs`) elapses (#25).
+   * Flushes whatever batched during the settle as the leading wake, then
+   * immediately opens the trailing phase for `wakeCoalesceMs` so any frame
+   * that arrives while the (possibly slow, retried) leading flush is still
+   * in flight joins the trailing batch rather than being lost or re-joining
+   * the batch that's already being sent.
+   */
+  function onLeadingFire(scope: string) {
+    const state = coalesceByScope.get(scope);
+    if (!state || state.phase !== "leading") {
+      return;
+    }
+    const { frames, windowStart } = state;
+    const trailingTimeout = setTimeout(() => onTrailingFire(scope), wakeCoalesceMs);
+    coalesceByScope.set(scope, { phase: "trailing", timeout: trailingTimeout, frames: [], windowStart });
+    void flushWakeTurn(scope, frames, windowStart, "leading");
+  }
+
+  /**
+   * Fires when a scope's trailing window (`wakeCoalesceMs`, measured from
+   * the leading wake) elapses (#25). A no-op when nothing arrived during
+   * the trailing window — a single completion must never produce a second,
+   * empty wake. The scope returns to idle either way, so the next frame
+   * (whenever it arrives) starts a brand-new leading window.
+   */
+  function onTrailingFire(scope: string) {
+    const state = coalesceByScope.get(scope);
+    if (!state || state.phase !== "trailing") {
+      return;
+    }
+    coalesceByScope.delete(scope);
+    if (state.frames.length === 0) {
+      return;
+    }
+    void flushWakeTurn(scope, state.frames, state.windowStart, "trailing");
   }
 
   function dispose() {
@@ -809,33 +897,36 @@ export function createNotificationInjector(
 
     // Run a real agent turn in the owner's DM (via the Gateway wake hook)
     // instead of poking the heartbeat lane (isolated, cannot see the owner's
-    // session). Coalesce by scope; the window's start time becomes part of
-    // the Idempotency-Key sent with the eventual hook request.
+    // session). Leading-edge + trailing coalesce (#25): see the module doc
+    // comment and `onLeadingFire`/`onTrailingFire` above for the full state
+    // machine. A frame joins whichever phase is currently open (leading or
+    // trailing); a frame arriving while the scope is idle starts a brand-new
+    // leading window.
     const existing = coalesceByScope.get(nf.scope);
     if (existing) {
       existing.frames.push(nf);
-      await pendingWakeStore.set(pendingWakeKey(nf.scope, existing.windowStart), {
+      const pendingKey = `${pendingWakeKey(nf.scope, existing.windowStart)}:${existing.phase}`;
+      await pendingWakeStore.set(pendingKey, {
         scope: nf.scope,
         sinceTs: existing.windowStart,
         frames: existing.frames,
       });
-      console.log(`[imajin-ws] warp wake: batched ${nf.id} (n=${existing.frames.length}, fires in ${wakeCoalesceMs}ms)`);
+      const firesInMs = existing.phase === "leading" ? wakeSettleMs : wakeCoalesceMs;
+      console.log(
+        `[imajin-ws] warp wake: ${existing.phase} batched ${nf.id} (n=${existing.frames.length}, fires in ~${firesInMs}ms)`,
+      );
       return;
     }
 
     const windowStart = Date.now();
-    const timeout = setTimeout(() => {
-      const buf = coalesceByScope.get(nf.scope);
-      if (buf) void flushWakeTurn(nf.scope, buf.frames, buf.windowStart);
-    }, wakeCoalesceMs);
-
-    coalesceByScope.set(nf.scope, { timeout, frames: [nf], windowStart });
-    await pendingWakeStore.set(pendingWakeKey(nf.scope, windowStart), {
+    const timeout = setTimeout(() => onLeadingFire(nf.scope), wakeSettleMs);
+    coalesceByScope.set(nf.scope, { phase: "leading", timeout, frames: [nf], windowStart });
+    await pendingWakeStore.set(`${pendingWakeKey(nf.scope, windowStart)}:leading`, {
       scope: nf.scope,
       sinceTs: windowStart,
       frames: [nf],
     });
-    console.log(`[imajin-ws] warp wake: batched ${nf.id} (n=1, fires in ${wakeCoalesceMs}ms)`);
+    console.log(`[imajin-ws] warp wake: leading batched ${nf.id} (n=1, fires in ${wakeSettleMs}ms)`);
   }
 
   return { inject, dispose, ready: stateReady };
