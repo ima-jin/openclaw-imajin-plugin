@@ -48,6 +48,7 @@ In `openclaw.json`:
   - **`wsNotifications.hookToken`** — Bearer token for the Gateway's `POST /hooks/agent`; a plain string, or (recommended, #20) a SecretRef object resolved via the plugin SDK; falls back to the `IMAJIN_WAKE_HOOK_TOKEN` env var
   - **`wsNotifications.hooksPath`** — Gateway hooks base path; defaults to `/hooks`
   - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
+  - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
 
 ### Turn-usage attestation
 
@@ -72,6 +73,7 @@ the signed claim without the content ever leaving the agent's own machine.
 - [ ] Webhook receiver — push Imajin events (messages, transactions) into agent sessions
 - [ ] Chat bridge — send/receive messages as a DID via Imajin chat
 - [x] Approval bridge — route OpenClaw gateway approvals to /jin, resolve from signed decisions (#1816)
+- [x] Ack-confirmed delivery, dedup, and persisted pending wakes (#26)
 
 ### Approval bridge (#1816)
 
@@ -212,6 +214,47 @@ via `api.registerService` so it starts and stops with the plugin lifecycle:
   `openclaw.json` controls which scopes (e.g. `warp.run.completed`) wake the
   agent session (#1672). Unrecognized scopes and malformed frames are logged
   and dropped — they never crash the socket.
+
+### Ack, dedup, and persisted wakes (#26)
+
+The kernel side of this contract (`ima-jin/imajin-ai#2099`) re-offers a
+notification on reconnect — up to 3 times — until the plugin acknowledges it,
+so a gateway crash between the kernel's `ws.send()` and this plugin actually
+receiving the frame can no longer strand the notification forever. This
+plugin implements its half of that contract:
+
+- **Ack frame.** After `inject()` has durably enqueued the system event for a
+  notification (the `enqueueSystemEvent` call succeeding), the plugin sends
+  `{ "type": "notification_ack", "id": "<notification id>" }` back over the
+  same authenticated WS connection (`ImajinWsService.send`). The ack is never
+  sent before that durable step, and never sent at all when the socket isn't
+  open — the kernel just replays on the next reconnect in that case.
+- **Dedup by id.** A small persisted LRU of the last 500 durably-injected
+  notification ids lives at `<stateDir>/notification-ack-dedup.json`. A
+  replayed id that's already in the LRU is acked again but never re-injected,
+  re-pinged, or re-batched into a wake.
+- **Persisted pending wakes.** Every mutation of the in-memory coalesce
+  buffer (a new wake batch opening, or another notification joining one
+  already open) is mirrored to `<stateDir>/pending-wakes.json`, keyed by
+  `scope:windowStart` (the same window id used in the wake hook's
+  `Idempotency-Key`). A gateway restart inside the coalesce window used to
+  silently drop the buffered wake (#2098 Candidate B); now, on the next
+  start, any owed wake found in that file is flushed immediately — no fresh
+  `wakeCoalesceMs` wait. The marker is cleared only once the wake hook
+  reports a 2xx.
+- **Hook retry with backoff.** A non-2xx/network failure from
+  `POST /hooks/agent` is retried 3 times (5s / 15s / 45s backoff) before
+  falling back to the #14 Telegram ping; the owed marker is kept through the
+  retries and even through the Telegram fallback, and is cleared only on an
+  eventual 2xx (whether that happens during this run or after a later
+  restart).
+- **State directory (`wsNotifications.stateDir`).** Defaults to a directory
+  named `imajin-ws-state` colocated with `keypairPath` (e.g.
+  `/path/to/imajin-ws-state/` next to `/path/to/.jin-identity.json`).
+  Persistence is best-effort: a missing/corrupt state file degrades to empty
+  state rather than throwing, and this plugin still works exactly as before
+  (in-memory-only dedup/coalesce, no cross-restart durability) if `keypairPath`
+  and `stateDir` are both unset.
 
 ## Development
 Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` (dynamic, only on the SecretRef `hookToken` path, #20) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
