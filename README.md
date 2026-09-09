@@ -49,6 +49,11 @@ In `openclaw.json`:
   - **`wsNotifications.hooksPath`** — Gateway hooks base path; defaults to `/hooks`
   - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
   - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
+- **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway system-agent proposals to the kernel and applies signed operator decisions from /jin (#24); see "Gateway approvals bridge" below:
+  - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
+  - **`approvals.operatorDid`** — the operator's Imajin DID
+  - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection; a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
+  - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
 
 ### Turn-usage attestation
 
@@ -74,6 +79,7 @@ the signed claim without the content ever leaving the agent's own machine.
 - [ ] Chat bridge — send/receive messages as a DID via Imajin chat
 - [x] Approval bridge — route OpenClaw gateway approvals to /jin, resolve from signed decisions (#1816)
 - [x] Ack-confirmed delivery, dedup, and persisted pending wakes (#26)
+- [x] Gateway approvals bridge — publish staged Gateway proposals to the kernel and apply signed decisions from /jin (#24)
 
 ### Approval bridge (#1816)
 
@@ -102,6 +108,99 @@ approvals (exec elevation, Skill Workshop proposals) and a human approver on /ji
   `approvalCapability.nativeRuntime` (see the `TODO(#1816 request leg)` comment in
   `index.ts`), which is a larger lift tracked as follow-up alongside the existing
   "Imajin chat as a full messaging channel" TODO.
+
+### Gateway approvals bridge (#24)
+
+Plugin half of `ima-jin/imajin-ai#2059` (kernel half merged in imajin-ai PR
+#2078). When the OpenClaw system-agent stages a proposal (gateway restart /
+config mutation) and it is awaiting the operator's decision, this bridge
+carries that decision to and from /jin without ever bypassing the Gateway's
+own approval store. See `docs/approvals-bridge.md` for a sequence diagram.
+
+**What it does**
+
+1. Opens the plugin's OWN loopback OpenClaw Gateway operator connection,
+   scoped `operator.approvals` only (`src/gateway-approvals-bridge.ts`, via
+   `openclaw/plugin-sdk/gateway-runtime`'s `createOperatorApprovalsGatewayClient`
+   — the same helper the OpenClaw CLI's own `openclaw approvals` tooling
+   uses). On `openclaw.approval.requested`, and on startup via a
+   `openclaw.approval.list` reconcile (so a proposal staged while the plugin
+   was down is not missed), it signs and publishes an
+   `operator.approval.requested` kernel notification.
+2. Subscribes on the plugin's EXISTING kernel WebSocket
+   (`src/ws-service.ts`) for the resulting `operator.approval.decided` bus
+   event (delivered via the kernel's #1884 grant-bound event-subscription
+   fan-out — the agent's own DID needs an active delegation grant for the
+   `operator:approvals` capability on the kernel side; see "Live check
+   before enabling" below). Before ever touching the Gateway, it verifies
+   the event's `issuer`/`subject`/`decidedBy` all equal the configured
+   `approvals.operatorDid` exactly, then compares its own record of the
+   `contentHash` it originally signed for that proposal id against the
+   Gateway's CURRENT `approval.get` snapshot. Only on a match does it call
+   `approval.resolve` (`approve` → `allow-once`, `deny` → `deny`).
+
+**The trust chain**
+
+`plugin-signed request` → `operator decides on /jin` → `kernel witnesses` →
+`plugin verifies signer + hash` → `Gateway approval store`. Concretely:
+
+- The plugin signs `{proposalId, kind, summary, keysTouched, contentHash}`
+  with the agent's existing DID keypair (the same one used for
+  challenge-response) over the canonical JSON of exactly those five fields
+  (`canonicalize`, mirroring `@imajin/auth`'s canonical JSON so the same
+  signature could, in principle, be verified kernel-side later).
+- The kernel does not verify that signature in v1 (see
+  `ima-jin/imajin-ai#2059`'s "target shape" comment — the human countersign
+  step is a follow-up); it stores the notification and renders the /jin
+  confirm card from the four fields it does validate
+  (`proposalId`/`kind`/`summary`/`keysTouched`).
+- The operator decides on /jin; the kernel signs and publishes
+  `operator.approval.decided` with its own node key, over the
+  #1884 event-subscription channel this plugin already holds an
+  authenticated session on.
+- The plugin verifies the decision is kernel-witnessed (delivered over that
+  grant-scoped, already-authenticated session) and attributed to exactly
+  the configured operator DID, then verifies the content hash against the
+  Gateway's current proposal before ever calling `approval.resolve`.
+
+**Config keys**: `approvals.enabled`, `approvals.operatorDid`,
+`approvals.gatewayToken` (optional), `approvals.notifyWebhookSecret`
+(required to publish) — see "Configuration" above.
+
+**What the Gateway payload did / didn't expose for `keysTouched`**
+
+The Gateway's `SystemAgentApprovalRequestPayload` (`openclaw/src/infra/
+system-agent-approvals.ts`) exposes only a human `description` string, a
+free-text `title`/`command`, and a `proposalHash` — there is no structured
+list of touched config keys. `keysTouched` is therefore always published as
+an empty array; the /jin card's `summary` (the Gateway's already-redacted
+`description`) is the only human-readable detail carried. `kind` is a
+disclosed heuristic over that same free text (`deriveProposalKind`) for the
+same reason — the Gateway payload has no structured kind field either.
+
+**What was deliberately left**
+
+- **`operator.approval.mismatch`** is published as a generic kernel
+  notification (same `POST /notify/api/send`, scope
+  `operator.approval.mismatch`) since no dedicated kernel-side handling for
+  this scope exists (it was not part of the merged #2059/PR #2078
+  contract). It reaches the operator via the standard notify channels
+  (in-app/email) but will not render as a dedicated /jin card — that is
+  kernel-side follow-up work, out of scope here.
+- A `withdrawn` decision is a documented no-op: `approval.resolve` has no
+  "withdraw" for a system-agent proposal already forwarded to it.
+- The plugin's own request-signature is not yet verified by the kernel (see
+  the trust-chain section above) — that lands with the human-countersign
+  follow-up (`ima-jin/imajin-ai#2059` step 2).
+
+**Live check before enabling**: per the #24 investigation, system-agent
+approval records "appear broadly visible" to any `operator.approvals`-scoped
+connection, but per-record visibility is filtered by requester/reviewer
+binding and this needs a live check against your own Gateway deployment
+before relying on it — confirm that the operator-scoped connection this
+bridge opens can actually see the specific system-agent records you expect
+it to see (and none it shouldn't) before flipping `approvals.enabled: true`
+in a shared environment.
 
 ### Wake on Warp completion (#18)
 
@@ -257,7 +356,7 @@ plugin implements its half of that contract:
   and `stateDir` are both unset.
 
 ## Development
-Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` (dynamic, only on the SecretRef `hookToken` path, #20) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
+Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` / `src/gateway-approvals-bridge.ts` (dynamic — only on the SecretRef paths, #20, and the live Gateway/kernel wiring in `gateway-approvals-bridge.ts`'s `createLiveGatewayApprovalsClient`, #24) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
 
 ## About Imajin
 

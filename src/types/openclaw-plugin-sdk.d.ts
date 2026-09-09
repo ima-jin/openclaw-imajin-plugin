@@ -105,3 +105,40 @@ declare module "openclaw/plugin-sdk/secret-ref-runtime" {
     options: { config: unknown; env?: NodeJS.ProcessEnv; cache?: SecretRefResolveCache },
   ): Promise<Map<string, unknown>>;
 }
+
+/**
+ * Minimal stub for the plugin's own loopback Gateway operator connection
+ * (#24, gateway-approvals-bridge.ts). Verified against the real installed
+ * `openclaw` package's `plugin-sdk/gateway-runtime` re-exports of
+ * `GatewayClient` (`src/gateway/client.ts`) and
+ * `createOperatorApprovalsGatewayClient` (`src/gateway/operator-approvals-
+ * client.ts`, the same helper the OpenClaw CLI's own operator-approvals
+ * tooling uses) — only the handful of members this plugin actually calls
+ * are declared here, not the full SDK surface.
+ */
+declare module "openclaw/plugin-sdk/gateway-runtime" {
+  export interface GatewayClientEvent {
+    event: string;
+    payload?: unknown;
+    seq?: number;
+  }
+  export class GatewayClient {
+    request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
+    stop(): void;
+    stopAndWait(): Promise<void>;
+  }
+  export function createOperatorApprovalsGatewayClient(params: {
+    config: unknown;
+    gatewayUrl?: string;
+    clientDisplayName?: string;
+    onEvent?: (event: GatewayClientEvent) => void;
+    onHelloOk?: () => void;
+    onConnectError?: (err: unknown) => void;
+    onClose?: (code?: number, reason?: string) => void;
+    onReconnectPaused?: (info: unknown) => void;
+  }): Promise<GatewayClient>;
+  export function startGatewayClientWhenEventLoopReady(
+    client: GatewayClient,
+    options?: { clientOptions?: Record<string, unknown> },
+  ): Promise<{ ready: boolean; aborted?: boolean }>;
+}

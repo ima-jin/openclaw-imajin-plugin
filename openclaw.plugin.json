@@ -56,6 +56,24 @@
       "label": "Approval Bridge: Pinned Approver Public Key",
       "help": "Ed25519 public key (hex) of the sole trusted human approver for OpenClaw gateway approval decisions signed on /jin (#1816). Channel/WS auth alone never resolves an approval — only a signature from this key does."
     },
+    "approvals.enabled": {
+      "label": "Gateway Approvals Bridge: Enabled",
+      "help": "Publish staged Gateway system-agent proposals (restart / config mutation) to the kernel and apply signed operator decisions from /jin back to the Gateway (#24). Off by default; requires did + keypairPath + operatorDid + notifyWebhookSecret."
+    },
+    "approvals.operatorDid": {
+      "label": "Gateway Approvals Bridge: Operator DID",
+      "help": "The Imajin DID of the human operator who decides proposals on /jin. The kernel notification is addressed to this DID and the returned operator.approval.decided event is only ever trusted when every identity field matches it exactly."
+    },
+    "approvals.gatewayToken": {
+      "label": "Gateway Approvals Bridge: Gateway Token",
+      "help": "Optional bearer override for the plugin's own loopback OpenClaw Gateway operator connection (scopes: [\"operator.approvals\"]). Accepts a plain string or a SecretRef object ({source, provider, id}), resolved via the plugin SDK. When omitted, Gateway auth is resolved automatically from the host's own gateway config (the same mechanism the existing approvalBridge feature already relies on). Never logged.",
+      "sensitive": true
+    },
+    "approvals.notifyWebhookSecret": {
+      "label": "Gateway Approvals Bridge: Kernel Notify Webhook Secret",
+      "help": "Bearer value for the kernel's POST /notify/api/send x-webhook-secret header (that kernel's NOTIFY_WEBHOOK_SECRET). Accepts a plain string or a SecretRef object, resolved via the plugin SDK. Falls back to the IMAJIN_NOTIFY_WEBHOOK_SECRET env var when omitted. Required for the bridge to publish anything. Never logged.",
+      "sensitive": true
+    },
     "wsNotifications.stateDir": {
       "label": "Notification State Directory",
       "help": "Directory for the ack-dedup LRU and pending-wake persistence files (#26). Defaults to a directory colocated with keypairPath."
@@ -168,6 +186,53 @@
           "pinnedApproverPublicKeyHex": {
             "type": "string",
             "description": "Ed25519 public key (hex) of the sole trusted human approver. A decision is resolved only when it carries a valid signature from this exact key, references the matching request id, and arrives before the request's expiry."
+          }
+        }
+      },
+      "approvals": {
+        "type": "object",
+        "description": "Gateway approvals bridge (#24): publish staged Gateway system-agent proposals to the kernel as operator.approval.requested, and apply signed operator.approval.decided decisions from /jin back to the Gateway's own approval store. Additive and off by default; requires did + keypairPath.",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Explicit opt-in. Off unless true, even if the other approvals.* fields are set."
+          },
+          "operatorDid": {
+            "type": "string",
+            "description": "The operator's Imajin DID (did:imajin:...). The kernel notification is addressed to this DID; a decided event is only trusted when issuer/subject/decidedBy all equal it exactly."
+          },
+          "gatewayToken": {
+            "description": "Optional bearer override for the plugin's own loopback Gateway operator connection. A plain string or a SecretRef object, resolved once via the plugin SDK. Optional: Gateway auth otherwise resolves automatically from the host's own gateway config.",
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source", "provider", "id"],
+                "properties": {
+                  "source": { "type": "string", "enum": ["env", "file", "exec", "store"] },
+                  "provider": { "type": "string" },
+                  "id": { "type": "string" }
+                }
+              }
+            ]
+          },
+          "notifyWebhookSecret": {
+            "description": "Bearer value for the kernel's POST /notify/api/send x-webhook-secret header. A plain string or a SecretRef object, resolved once via the plugin SDK. Falls back to the IMAJIN_NOTIFY_WEBHOOK_SECRET env var. Required for the bridge to publish anything.",
+            "oneOf": [
+              { "type": "string" },
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source", "provider", "id"],
+                "properties": {
+                  "source": { "type": "string", "enum": ["env", "file", "exec", "store"] },
+                  "provider": { "type": "string" },
+                  "id": { "type": "string" }
+                }
+              }
+            ]
           }
         }
       }
