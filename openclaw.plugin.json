@@ -64,6 +64,10 @@
       "label": "Gateway Approvals Bridge: Operator DID",
       "help": "The Imajin DID of the human operator who decides proposals on /jin. The kernel notification is addressed to this DID and the returned operator.approval.decided event is only ever trusted when every identity field matches it exactly."
     },
+    "approvals.sources": {
+      "label": "Gateway Approvals Bridge: Sources",
+      "help": "Which approval sources to drive (#33): \"system-agent\" (OpenClaw gateway restart / config-mutation proposals) and/or \"skill-workshop\" (pending Skill Workshop skill proposals). Defaults to both. A source left out of this list neither lists nor subscribes."
+    },
     "approvals.gatewayToken": {
       "label": "Gateway Approvals Bridge: Gateway Token",
       "help": "Optional bearer override for the plugin's own loopback OpenClaw Gateway operator connection (scopes: [\"operator.approvals\"]). Accepts a plain string or a SecretRef object ({source, provider, id}), resolved via the plugin SDK. When omitted, Gateway auth is resolved automatically from the host's own gateway config (the same mechanism the existing approvalBridge feature already relies on). Never logged.",
@@ -213,6 +217,11 @@
           "operatorDid": {
             "type": "string",
             "description": "The operator's Imajin DID (did:imajin:...). The kernel notification is addressed to this DID; a decided event is only trusted when issuer/subject/decidedBy all equal it exactly."
+          },
+          "sources": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["system-agent", "skill-workshop"] },
+            "description": "Which approval sources to drive (#33). Defaults to [\"system-agent\", \"skill-workshop\"] (both) when omitted. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
           },
           "gatewayToken": {
             "description": "Optional bearer override for the plugin's own loopback Gateway operator connection. A plain string or a SecretRef object, resolved once via the plugin SDK. Optional: Gateway auth otherwise resolves automatically from the host's own gateway config.",

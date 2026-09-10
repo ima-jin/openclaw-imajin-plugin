@@ -4,17 +4,21 @@ import { sha512 } from "@noble/hashes/sha2.js";
 import {
   GatewayApprovalsBridge,
   buildApprovalRequestedPayload,
-  deriveProposalKind,
   isApprovalsBridgeConfigured,
   isKernelBusEventFrame,
   signCanonicalPayload,
-  type GatewayApprovalsClient,
-  type GatewayApprovalSnapshot,
   type KernelBusEventFrame,
   type KernelNotifyClient,
+} from "./gateway-approvals-bridge.js";
+import {
+  createSystemAgentSource,
+  deriveProposalKind,
+  type GatewayApprovalsClient,
+  type GatewayApprovalSnapshot,
   type SystemAgentApprovalDecisionKind,
   type SystemAgentApprovalRequestRecord,
-} from "./gateway-approvals-bridge.js";
+} from "./sources/system-agent.js";
+import type { ApprovalSource } from "./sources/types.js";
 
 if ("hashes" in ed && ed.hashes) {
   (ed.hashes as { sha512?: typeof sha512 }).sha512 = sha512;
@@ -54,7 +58,12 @@ function makeRecord(overrides: Partial<SystemAgentApprovalRequestRecord> = {}): 
   };
 }
 
-function makeDecidedFrame(overrides: Partial<KernelBusEventFrame> = {}): KernelBusEventFrame {
+function makeDecidedFrame(
+  overrides: Partial<Omit<KernelBusEventFrame, "payload">> & {
+    payload?: Partial<NonNullable<KernelBusEventFrame["payload"]>>;
+  } = {},
+): KernelBusEventFrame {
+  const { payload: payloadOverrides, ...rest } = overrides;
   return {
     type: "bus_event",
     eventType: "operator.approval.decided",
@@ -66,9 +75,20 @@ function makeDecidedFrame(overrides: Partial<KernelBusEventFrame> = {}): KernelB
       decision: "approve",
       decidedBy: OPERATOR_DID,
       decidedAt: new Date().toISOString(),
+      ...payloadOverrides,
     },
-    ...overrides,
+    ...rest,
   };
+}
+
+/** Reads the `contentHash` from the Nth (default: most recent) `publishApprovalRequested` call — needed to build a decided frame that passes the bridge's #2084 echo check. */
+function publishedContentHash(
+  kernelMock: { publishApprovalRequested: ReturnType<typeof vi.fn> },
+  callIndex = -1,
+): string {
+  const calls = kernelMock.publishApprovalRequested.mock.calls;
+  const call = callIndex === -1 ? calls[calls.length - 1] : calls[callIndex];
+  return call[0].contentHash as string;
 }
 
 describe("deriveProposalKind", () => {
@@ -86,30 +106,43 @@ describe("deriveProposalKind", () => {
 });
 
 describe("buildApprovalRequestedPayload", () => {
-  it("signs exactly the five canonical fields and never includes keysTouched entries", async () => {
+  it("signs+hashes exactly the kernel's six canonical fields, folding sourceRevision into detail, and never includes keysTouched entries", async () => {
     const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
     const record = makeRecord();
-    const payload = await buildApprovalRequestedPayload(record, { did: AGENT_DID, privateKeyHex });
+    const request = {
+      proposalId: record.id,
+      kind: `system-agent:${deriveProposalKind(record.request)}`,
+      summary: record.request.description,
+      sourceRevision: record.request.proposalHash,
+    };
+    const payload = await buildApprovalRequestedPayload("system-agent", request, { did: AGENT_DID, privateKeyHex });
 
     expect(payload.proposalId).toBe(record.id);
-    expect(payload.contentHash).toBe(record.request.proposalHash);
+    expect(payload.source).toBe("system-agent");
     expect(payload.keysTouched).toEqual([]);
     expect(payload.signerDid).toBe(AGENT_DID);
+    // #2084 correction: no top-level `sourceRevision` — it rides inside `detail`,
+    // matching the kernel's exact recomputation (`ima-jin/imajin-ai#2154`).
+    expect((payload as unknown as Record<string, unknown>).sourceRevision).toBeUndefined();
+    expect(payload.detail).toEqual({ sourceRevision: record.request.proposalHash });
+    expect(payload.contentHash.startsWith("sha256:")).toBe(true);
+
+    const digestFields = {
+      proposalId: payload.proposalId,
+      source: payload.source,
+      kind: payload.kind,
+      summary: payload.summary,
+      keysTouched: payload.keysTouched,
+      detail: payload.detail,
+    };
+    const { canonicalize } = await import("./approval-bridge.js");
+    const { sha256 } = await import("@noble/hashes/sha2.js");
+    const expectedHash = `sha256:${Buffer.from(sha256(new TextEncoder().encode(canonicalize(digestFields)))).toString("hex")}`;
+    expect(payload.contentHash).toBe(expectedHash);
 
     const verified = await ed.verifyAsync(
       Uint8Array.from(Buffer.from(payload.signature, "hex")),
-      new TextEncoder().encode(
-        await (async () => {
-          const { canonicalize } = await import("./approval-bridge.js");
-          return canonicalize({
-            proposalId: payload.proposalId,
-            kind: payload.kind,
-            summary: payload.summary,
-            keysTouched: payload.keysTouched,
-            contentHash: payload.contentHash,
-          });
-        })(),
-      ),
+      new TextEncoder().encode(canonicalize(digestFields)),
       Uint8Array.from(Buffer.from(publicKeyHex, "hex")),
     );
     expect(verified).toBe(true);
@@ -167,9 +200,10 @@ describe("GatewayApprovalsBridge", () => {
   });
 
   function newBridge(): GatewayApprovalsBridge {
+    const source = createSystemAgentSource(gateway as unknown as GatewayApprovalsClient);
     return new GatewayApprovalsBridge(
       { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex },
-      gateway as unknown as GatewayApprovalsClient,
+      new Map<string, ApprovalSource>([["system-agent", source]]),
       kernel as unknown as KernelNotifyClient,
       logger,
     );
@@ -186,7 +220,11 @@ describe("GatewayApprovalsBridge", () => {
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
     const published = kernel.publishApprovalRequested.mock.calls[0][0];
     expect(published.proposalId).toBe(record.id);
-    expect(published.contentHash).toBe(record.request.proposalHash);
+    // #2084: contentHash is a sha256 digest covering the whole payload (incl.
+    // detail), not the raw source-native proposalHash — which now rides
+    // inside detail.sourceRevision instead.
+    expect(published.contentHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    expect(published.detail).toEqual({ sourceRevision: record.request.proposalHash });
     expect(bridge.isPublished(record.id)).toBe(true);
   });
 
@@ -243,14 +281,35 @@ describe("GatewayApprovalsBridge", () => {
     const record = makeRecord();
     requestedHandler!(record);
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
 
+    // The kernel-echoed contentHash still matches what was staged (check 1
+    // passes) — the drift is discovered at check 2, where the Gateway's
+    // CURRENT proposalHash (folded into the recomputed digest's
+    // detail.sourceRevision) no longer matches.
     gateway.get.mockResolvedValue(pendingSnapshot("b".repeat(64))); // different from record.request.proposalHash
-    await bridge.handleKernelDecision(makeDecidedFrame());
+    await bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash } }));
 
     expect(gateway.resolve).not.toHaveBeenCalled();
     expect(kernel.publishMismatch).toHaveBeenCalledWith(
       "system-agent:abc123",
       expect.stringContaining("no longer matches"),
+    );
+  });
+
+  it("decided-event contentHash mismatch (kernel echo): does not resolve and publishes a mismatch event, without ever calling getCurrent", async () => {
+    const bridge = newBridge();
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+
+    await bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash: "sha256:" + "0".repeat(64) } }));
+
+    expect(gateway.get).not.toHaveBeenCalled();
+    expect(gateway.resolve).not.toHaveBeenCalled();
+    expect(kernel.publishMismatch).toHaveBeenCalledWith(
+      "system-agent:abc123",
+      expect.stringContaining("does not match the staged proposal"),
     );
   });
 
@@ -275,9 +334,10 @@ describe("GatewayApprovalsBridge", () => {
     const bridge = newBridge();
     requestedHandler!(makeRecord());
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
 
     gateway.get.mockResolvedValue({ status: "expired" } satisfies GatewayApprovalSnapshot);
-    await bridge.handleKernelDecision(makeDecidedFrame());
+    await bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash } }));
 
     expect(gateway.resolve).not.toHaveBeenCalled();
     expect(logger.info).toHaveBeenCalledWith(expect.stringContaining("no longer pending"));
@@ -289,9 +349,10 @@ describe("GatewayApprovalsBridge", () => {
     const record = makeRecord();
     requestedHandler!(record);
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
 
     gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
-    await bridge.handleKernelDecision(makeDecidedFrame());
+    await bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash } }));
 
     expect(gateway.resolve).toHaveBeenCalledWith("system-agent:abc123", "allow-once");
     expect(bridge.isPublished("system-agent:abc123")).toBe(false);
@@ -302,6 +363,7 @@ describe("GatewayApprovalsBridge", () => {
     const record = makeRecord({ id: "system-agent:deny-me" });
     requestedHandler!(record);
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
 
     gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
     await bridge.handleKernelDecision(
@@ -311,6 +373,7 @@ describe("GatewayApprovalsBridge", () => {
           decision: "deny",
           decidedBy: OPERATOR_DID,
           decidedAt: new Date().toISOString(),
+          contentHash,
         },
       }),
     );
@@ -323,11 +386,12 @@ describe("GatewayApprovalsBridge", () => {
     const record = makeRecord();
     requestedHandler!(record);
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
 
     gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
     gateway.resolve.mockRejectedValue(new Error("approval already resolved"));
 
-    await expect(bridge.handleKernelDecision(makeDecidedFrame())).resolves.toBeUndefined();
+    await expect(bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash } }))).resolves.toBeUndefined();
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("approval.resolve failed"));
   });
 
@@ -354,6 +418,20 @@ describe("GatewayApprovalsBridge", () => {
     );
     expect(gateway.get).not.toHaveBeenCalled();
     expect(gateway.resolve).not.toHaveBeenCalled();
+  });
+});
+
+describe("computeContentHash covers detail (#2084)", () => {
+  it("mutating detail changes the digest even when everything else stays the same", async () => {
+    const { buildDigestFields, computeContentHash } = await import("./gateway-approvals-bridge.js");
+    const base = { proposalId: "p1", source: "skill-workshop", kind: "skill-workshop:update", summary: "s" };
+    const hashA = await computeContentHash(
+      buildDigestFields({ ...base, detail: { description: "first draft" }, sourceRevision: "rev-1" }),
+    );
+    const hashB = await computeContentHash(
+      buildDigestFields({ ...base, detail: { description: "second draft" }, sourceRevision: "rev-1" }),
+    );
+    expect(hashA).not.toBe(hashB);
   });
 });
 

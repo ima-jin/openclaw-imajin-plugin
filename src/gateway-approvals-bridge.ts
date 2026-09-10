@@ -1,110 +1,115 @@
 /**
- * Gateway approvals bridge (#24, plugin half of ima-jin/imajin-ai#2059).
+ * Generic gateway-approvals bridge (#33, generalizing #24's plugin half of
+ * ima-jin/imajin-ai#2059).
  *
- * When the OpenClaw system-agent stages a proposal (gateway restart / config
- * mutation) awaiting operator approval, this module:
+ * Drives zero or more `ApprovalSource`s (`./sources/types.ts`) — one per
+ * `approvals.sources` config entry (default: `system-agent` and
+ * `skill-workshop`, `./sources/system-agent.ts` / `./sources/skill-
+ * workshop.ts`). For every source this bridge:
  *
- *   1. Observes it on the plugin's OWN loopback Gateway operator connection
- *      (scoped `operator.approvals` — never anything broader), via the
- *      `openclaw.approval.requested` event and, at startup, a reconcile pass
- *      over `openclaw.approval.list` so a proposal staged while the plugin
- *      was down is not missed.
+ *   1. Observes pending items via that source's own `list()` (startup
+ *      reconcile, so an item staged while the plugin was down is not
+ *      missed) and `subscribe()` (live discovery).
  *   2. Publishes a kernel notification `operator.approval.requested`
  *      (`POST /notify/api/send`, see `KernelNotifyClient`) signed by this
- *      agent's existing DID keypair — the same one `client.ts`/`ws-service.ts`
- *      use for challenge-response — over the canonical JSON of exactly
- *      `{proposalId, kind, summary, keysTouched, contentHash}`.
- *   3. Subscribes on the plugin's EXISTING kernel WS (`ImajinWsService`) for
- *      the resulting `operator.approval.decided` bus event, verifies it, and
- *      only then calls the Gateway's own `approval.resolve` — this bridge
- *      never bypasses the Gateway's approval store, it only relays the
- *      operator's decision to it.
+ *      agent's existing DID keypair — the same one `client.ts`/`ws-
+ *      service.ts` use for challenge-response.
+ *   3. Subscribes on the plugin's EXISTING kernel WebSocket
+ *      (`ImajinWsService`) for the resulting `operator.approval.decided`
+ *      bus event, verifies it, and only then calls the OWNING source's own
+ *      `resolve()` — this bridge never bypasses a source's own backing
+ *      store, it only relays the operator's decision to it.
  *
- * `keysTouched` is always `[]`: the Gateway's `SystemAgentApprovalRequestPayload`
- * (ima-jin/openclaw-imajin-plugin#24 investigation, `openclaw/src/infra/
- * system-agent-approvals.ts`) exposes only a human `description` string and a
- * `proposalHash` — there is no structured "touched config keys" list to
- * report. `kind` is a disclosed heuristic over `title`/`description`/`command`
- * for the same reason (see `deriveProposalKind`): the Gateway payload carries
- * no structured kind either.
+ * ## `contentHash` digest definition (#2084 review of #33, corrected against
+ * the actual kernel implementation, `ima-jin/imajin-ai#2154`,
+ * `apps/kernel/src/lib/notify/operator-approvals.ts` ~L222-254)
  *
- * `contentHash` verification: the kernel's `operator.approval.decided` bus
- * event (`packages/bus/src/types.ts` in ima-jin/imajin-ai) carries only
- * `{proposalId, decision, decidedBy, decidedAt, reason?}` — it does NOT echo
- * back a `contentHash`. This bridge therefore verifies against its OWN
- * record of the `contentHash` it signed and published for that `proposalId`
- * (`published`, below), re-fetched against the Gateway's CURRENT
- * `approval.get` snapshot before ever calling `approval.resolve` — the same
- * tamper/replay protection the issue specifies, sourced honestly from what
- * the kernel wire contract actually carries.
+ * A human countersigns exactly what they were shown on the /jin card — so
+ * `contentHash` MUST cover the WHOLE canonical payload the operator is
+ * shown, including `source` and `detail`, not just each source's native
+ * revision pin. An unsigned `detail` would mean the card the human reads is
+ * not bound to what gets applied. The kernel RECOMPUTES this hash itself
+ * and returns 400 on mismatch, so the digest key set below is exact — not
+ * a plugin-side choice:
  *
- * This module has NO top-level `openclaw` plugin-sdk imports, so the pure
- * `GatewayApprovalsBridge` class (and every function above it) can be unit
- * tested with plain fakes. `createLiveGatewayApprovalsClient` and
- * `createHttpKernelNotifyClient` — the only parts that need the real SDK/
- * network — are isolated at the bottom and wired up by `index.ts`.
+ * ```
+ * contentHash = "sha256:" + sha256hex(canonicalize({
+ *   proposalId, source, kind, summary, keysTouched, detail
+ * }))
+ * ```
+ *
+ * Exactly those SIX keys — no top-level `sourceRevision` (the kernel does
+ * not recompute over one). `canonicalize` (`./approval-bridge.js`) sorts
+ * object keys, so property order above is immaterial. The kernel accepts
+ * an optional `"sha256:"` prefix on ingest; this bridge always emits it.
+ *
+ * `detail` is therefore ALWAYS present on the wire (never omitted, even for
+ * system-agent, which has no other structured detail): each source's own
+ * NATIVE anti-tamper pin rides INSIDE it as `detail.sourceRevision` (the
+ * Gateway's `proposalHash` for system-agent, Skill Workshop's
+ * `revisionHash` — see `./sources/types.ts`), so it is still covered by the
+ * hash and still available for the fail-closed `expectedRevisionHash` check
+ * on apply, without being a sibling key the kernel's own recomputation
+ * doesn't know about. `buildDigestFields` below performs this merge.
+ *
+ * This bridge SIGNS that same canonical 6-key object (`buildApprovalRequestedPayload`)
+ * with the agent DID keypair, and `contentHash` rides on the outgoing wire
+ * payload alongside the signature so the kernel side can independently
+ * recompute and match it.
+ *
+ * On a decision, the source adapter still passes `sourceRevision` (read
+ * from `detail.sourceRevision`, tracked internally — never a separate wire
+ * field) as `expectedRevisionHash` to `skills.proposals.apply`/`reject`
+ * (Skill Workshop's own fail-closed check, unchanged). The bridge
+ * ADDITIONALLY verifies, before ever calling `resolve`: (1) the decided
+ * event's own `contentHash` equals the one staged for this proposal, and
+ * (2) a freshly recomputed digest — built from the source's CURRENT
+ * `sourceRevision` and `detail` (`ApprovalSource.getCurrent`) — still
+ * equals the staged `contentHash`. Either mismatch is drift: a kernel
+ * mismatch notice, then the source's `onDriftPolicy` (`"leave"` for
+ * system-agent, exact #24 parity; `"restage"` for Skill Workshop) — never
+ * a resolve.
+ *
+ * This module has NO top-level `openclaw` plugin-sdk imports outside the
+ * "Live wiring" section at the bottom, so `GatewayApprovalsBridge` (and
+ * every function above it) can be unit tested with plain fakes.
  */
 import { readFile } from "node:fs/promises";
 import { canonicalize } from "./approval-bridge.js";
 import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
+import {
+  ApprovalContentDriftError,
+  type ApprovalDecision,
+  type ApprovalSource,
+  type ApprovalSourceCurrentState,
+  type ApprovalSourceRequest,
+  type Unsubscribe,
+} from "./sources/types.js";
+import { createLiveGatewayApprovalsClient, createSystemAgentSource } from "./sources/system-agent.js";
+import { createLiveSkillWorkshopConnection, createSkillWorkshopSource } from "./sources/skill-workshop.js";
 
-// --- Wire types (Gateway side, `openclaw/src/infra/system-agent-approvals.ts`) ---
-
-export type SystemAgentApprovalDecisionKind = "allow-once" | "deny";
-
-export interface SystemAgentApprovalRequestPayload {
-  title: string;
-  description: string;
-  command: string;
-  proposalHash: string;
-  allowedDecisions: readonly SystemAgentApprovalDecisionKind[];
-  agentId?: string | null;
-  sessionKey?: string | null;
-  sessionId?: string;
-  [key: string]: unknown;
-}
-
-/** One pending `openclaw.approval.list` entry / `openclaw.approval.requested` event payload. */
-export interface SystemAgentApprovalRequestRecord {
-  id: string;
-  request: SystemAgentApprovalRequestPayload;
-  createdAtMs: number;
-  expiresAtMs: number;
-}
-
-export type GatewayApprovalStatus = "pending" | "allowed" | "denied" | "expired" | "cancelled";
-
-/** The relevant projection of `approval.get`'s `ApprovalSnapshot` (gateway-protocol). */
-export interface GatewayApprovalSnapshot {
-  status: GatewayApprovalStatus;
-  presentation?: { proposalHash?: string; [key: string]: unknown };
-}
-
-/** Abstracts the plugin's own loopback Gateway operator connection (#24). */
-export interface GatewayApprovalsClient {
-  /** `openclaw.approval.list` — startup reconcile for proposals staged while the plugin was down. */
-  list(): Promise<SystemAgentApprovalRequestRecord[]>;
-  /** `approval.get` — the CURRENT staged proposal, used for the hash-mismatch check. */
-  get(id: string): Promise<GatewayApprovalSnapshot | null>;
-  /** `approval.resolve` with `kind: "system-agent"`. */
-  resolve(id: string, decision: SystemAgentApprovalDecisionKind): Promise<{ applied: boolean }>;
-  /** Registers the live `openclaw.approval.requested` handler. */
-  onRequested(handler: (record: SystemAgentApprovalRequestRecord) => void): void;
-}
-
-// --- Wire types (kernel side, `docs/notify-operator-approvals-contract.md` in ima-jin/imajin-ai) ---
-
-export type KernelApprovalProposalKind = "restart" | "config-mutation" | "other";
+// --- Wire types (kernel side, `docs/notify-operator-approvals-contract.md` in ima-jin/imajin-ai, generalized by #2152) ---
 
 /** The `operator.approval.requested` notification `data` payload this bridge publishes. */
 export interface KernelApprovalRequestedPayload {
   proposalId: string;
-  kind: KernelApprovalProposalKind;
+  /** Which `ApprovalSource` published this (#2152's open source vocabulary). Covered by `contentHash` and signed. */
+  source: string;
+  /** Namespaced `"<source>:<subkind>"` (#2152), e.g. `"system-agent:restart"` or `"skill-workshop:update"`. */
+  kind: string;
   summary: string;
   keysTouched: string[];
-  /** The Gateway's `proposalHash`. */
+  /**
+   * Bounded structured payload for a per-kind /jin card renderer (#2152).
+   * ALWAYS present (#2084, matching the kernel's exact digest recomputation
+   * — see module doc): carries `sourceRevision` (each source's own NATIVE
+   * anti-tamper pin) plus whatever per-kind fields the source adds. Covered
+   * by `contentHash` and signed.
+   */
+  detail: Record<string, unknown>;
+  /** `"sha256:" + sha256hex(canonicalize({proposalId, source, kind, summary, keysTouched, detail}))` — see the module doc's digest definition (#2084). Covers the WHOLE payload the operator is shown, including `detail.sourceRevision`. */
   contentHash: string;
-  /** Hex Ed25519 signature over `canonicalize({proposalId, kind, summary, keysTouched, contentHash})`. */
+  /** Hex Ed25519 signature over the SAME canonical object `contentHash` digests. */
   signature: string;
   /** The agent DID that produced `signature` — the same keypair used for challenge-response. */
   signerDid: string;
@@ -160,50 +165,83 @@ function defaultLogger(): Logger {
   };
 }
 
-const MAX_SUMMARY_LENGTH = 2000;
-
 /**
- * Disclosed heuristic: the Gateway's `SystemAgentApprovalRequestPayload`
- * carries no structured `kind` (only a human `title`/`description`/`command`
- * — see the #24 investigation comment and `openclaw/src/gateway/server-
- * methods/system-agent-approval.ts`, which always sets `title: "OpenClaw
- * change"`). This maps free text to the kernel's fixed `ApprovalProposalKind`
- * enum, defaulting to `"other"` when neither a restart nor a config-mutation
- * keyword is found — never guessed more specifically than that.
+ * The exact SIX fields `contentHash`/the signature cover (#2084's digest
+ * definition, matching the kernel's own recomputation — see module doc).
+ * `detail` is ALWAYS present: `buildDigestFields` merges each source's own
+ * `detail` (if any) with `sourceRevision`, so there is never a bare/omitted
+ * `detail` key to reason about.
  */
-export function deriveProposalKind(
-  request: Pick<SystemAgentApprovalRequestPayload, "title" | "description" | "command">,
-): KernelApprovalProposalKind {
-  const text = `${request.title ?? ""} ${request.description ?? ""} ${request.command ?? ""}`.toLowerCase();
-  if (/\brestart(ing|ed)?\b/.test(text)) return "restart";
-  if (/\bconfig(uration)?\b|\bmutat(e|ion|ing)\b|\bset\b/.test(text)) return "config-mutation";
-  return "other";
-}
-
-function truncateSummary(summary: string): string {
-  return summary.length <= MAX_SUMMARY_LENGTH ? summary : summary.slice(0, MAX_SUMMARY_LENGTH);
+export interface ApprovalDigestFields {
+  proposalId: string;
+  source: string;
+  kind: string;
+  summary: string;
+  keysTouched: string[];
+  detail: Record<string, unknown>;
 }
 
 /**
- * Builds and signs the `operator.approval.requested` payload for one Gateway
- * proposal record. `keysTouched` is always `[]` (see module doc).
+ * Builds the exact object `computeContentHash`/`signCanonicalPayload`
+ * operate on — shared by publish-time signing and decision-time digest
+ * recomputation. Folds `sourceRevision` into `detail.sourceRevision` (#2084
+ * correction: the kernel recomputes over exactly `{proposalId, source,
+ * kind, summary, keysTouched, detail}` — six keys, no top-level
+ * `sourceRevision` sibling) so it is covered by the hash without
+ * introducing a key the kernel's own recomputation doesn't know about.
+ */
+export function buildDigestFields(params: {
+  proposalId: string;
+  source: string;
+  kind: string;
+  summary: string;
+  detail?: Record<string, unknown>;
+  sourceRevision: string;
+}): ApprovalDigestFields {
+  return {
+    proposalId: params.proposalId,
+    source: params.source,
+    kind: params.kind,
+    summary: params.summary,
+    keysTouched: [] as string[],
+    detail: { ...(params.detail ?? {}), sourceRevision: params.sourceRevision },
+  };
+}
+
+/**
+ * Builds and signs the `operator.approval.requested` payload for one
+ * source's pending item. Per #2084: `contentHash` and the signature both
+ * cover the WHOLE canonical 6-key payload the operator is shown, including
+ * `source` and `detail` (see the module doc's digest definition) —
+ * `keysTouched` stays always `[]`: no current source has a structured
+ * touched-keys list to report (see each source's own module doc).
  */
 export async function buildApprovalRequestedPayload(
-  record: SystemAgentApprovalRequestRecord,
+  sourceId: string,
+  request: ApprovalSourceRequest,
   signer: { did: string; privateKeyHex: string },
 ): Promise<KernelApprovalRequestedPayload> {
-  const fields = {
-    proposalId: record.id,
-    kind: deriveProposalKind(record.request),
-    summary: truncateSummary(record.request.description || record.request.title || record.id),
-    keysTouched: [] as string[],
-    contentHash: record.request.proposalHash,
+  const digestFields = buildDigestFields({
+    proposalId: request.proposalId,
+    source: sourceId,
+    kind: request.kind,
+    summary: request.summary,
+    detail: request.detail,
+    sourceRevision: request.sourceRevision,
+  });
+  const [contentHash, signature] = await Promise.all([
+    computeContentHash(digestFields),
+    signCanonicalPayload(digestFields, signer.privateKeyHex),
+  ]);
+  return {
+    ...digestFields,
+    contentHash,
+    signature,
+    signerDid: signer.did,
   };
-  const signature = await signCanonicalPayload(fields, signer.privateKeyHex);
-  return { ...fields, signature, signerDid: signer.did };
 }
 
-// --- Signing (Ed25519 over the canonical JSON of the 5 signed fields) ---
+// --- Signing + digest (Ed25519 / sha256 over the canonical JSON of the digest fields) ---
 
 async function loadEd25519() {
   const ed = await import("@noble/ed25519");
@@ -240,16 +278,28 @@ function bytesToHex(bytes: Uint8Array): string {
  * `canonicalize` (imported from `./approval-bridge.js`) mirrors `@imajin/
  * auth`'s canonical JSON so the signature could, in principle, be verified
  * by the same routine the kernel uses — even though the kernel does not
- * verify it in v1 (see the module doc's contentHash section).
+ * verify it in v1 (a pre-existing gap, unrelated to the #2084 digest scope
+ * change: the digest now covers more, but the kernel-side verification step
+ * itself remains a documented follow-up).
  */
 export async function signCanonicalPayload(
-  payload: Record<string, unknown>,
+  payload: object,
   privateKeyHex: string,
 ): Promise<string> {
   const ed = await loadEd25519();
   const bytes = new TextEncoder().encode(canonicalize(payload));
   const signature = await ed.signAsync(bytes, hexToBytes(privateKeyHex));
   return bytesToHex(signature);
+}
+
+/**
+ * `"sha256:" + sha256(canonicalize(fields))` — the #2084 `contentHash`
+ * digest. See the module doc for the exact field list this covers.
+ */
+export async function computeContentHash(fields: object): Promise<string> {
+  const { sha256 } = await import("@noble/hashes/sha2.js");
+  const bytes = new TextEncoder().encode(canonicalize(fields));
+  return `sha256:${bytesToHex(sha256(bytes))}`;
 }
 
 // --- Config gate ---
@@ -260,8 +310,14 @@ export interface ApprovalsBridgePluginConfig {
   /** The operator DID the kernel notification is addressed `to` and the decided event must be signed `by`. */
   operatorDid?: string;
   /**
+   * Which sources to drive (#33). Defaults to every known source
+   * (`["system-agent", "skill-workshop"]`) when omitted. A source not in
+   * this list neither lists nor subscribes — it is never constructed.
+   */
+  sources?: string[];
+  /**
    * Optional explicit credential override for the plugin's own loopback
-   * Gateway operator connection. Accepts a plain string or a SecretRef
+   * Gateway operator connection(s). Accepts a plain string or a SecretRef
    * (same style as `wsNotifications.hookToken`, #20) — never a literal in
    * config, never logged. When omitted, Gateway auth is resolved
    * automatically from the host's own `gateway` config (the same mechanism
@@ -292,6 +348,15 @@ export function isApprovalsBridgeConfigured(
   return Boolean(config?.enabled && config?.operatorDid?.trim() && agentDid?.trim());
 }
 
+export const KNOWN_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop"] as const;
+export type KnownApprovalSourceId = (typeof KNOWN_APPROVAL_SOURCE_IDS)[number];
+
+/** Resolves `approvals.sources` to the set of source ids to drive, defaulting to every known source. */
+export function resolveEnabledApprovalSourceIds(configured: string[] | undefined): Set<string> {
+  if (!configured || configured.length === 0) return new Set(KNOWN_APPROVAL_SOURCE_IDS);
+  return new Set(configured.filter((id) => (KNOWN_APPROVAL_SOURCE_IDS as readonly string[]).includes(id)));
+}
+
 // --- The bridge itself (pure logic + orchestration; fully unit-testable) ---
 
 export interface GatewayApprovalsBridgeConfig {
@@ -301,25 +366,36 @@ export interface GatewayApprovalsBridgeConfig {
 }
 
 interface TrackedProposal {
+  sourceId: string;
+  kind: string;
+  summary: string;
+  detail?: Record<string, unknown>;
+  /** The source-native pin at publish time — passed to `source.resolve()` as `expectedSourceRevision`. */
+  sourceRevision: string;
+  /** The composite digest signed and published to the kernel for this proposal (#2084). */
   contentHash: string;
 }
 
 export class GatewayApprovalsBridge {
   private readonly published = new Map<string, TrackedProposal>();
   private readonly logger: Logger;
+  private readonly unsubscribes: Unsubscribe[] = [];
 
   constructor(
     private readonly config: GatewayApprovalsBridgeConfig,
-    private readonly gateway: GatewayApprovalsClient,
+    private readonly sources: Map<string, ApprovalSource>,
     private readonly kernel: KernelNotifyClient,
     logger?: Logger,
   ) {
     this.logger = logger ?? defaultLogger();
-    this.gateway.onRequested((record) => {
-      void this.handleGatewayRequested(record).catch((err: unknown) => {
-        this.logger.error(`failed to handle openclaw.approval.requested ${record.id}: ${String(err)}`);
+    for (const source of this.sources.values()) {
+      const unsubscribe = source.subscribe((request) => {
+        void this.handleSourceRequested(source.id, request).catch((err: unknown) => {
+          this.logger.error(`failed to handle ${source.id} request ${request.proposalId}: ${String(err)}`);
+        });
       });
-    });
+      this.unsubscribes.push(unsubscribe);
+    }
   }
 
   /** True once this bridge has published (and is tracking) the given proposal id. */
@@ -327,28 +403,40 @@ export class GatewayApprovalsBridge {
     return this.published.has(proposalId);
   }
 
+  /** Stops observing every source. Does not evict already-tracked proposals. */
+  dispose(): void {
+    for (const unsubscribe of this.unsubscribes) unsubscribe();
+  }
+
   /**
-   * Startup reconcile (#24): a proposal staged while the plugin was down
-   * would never fire a live `openclaw.approval.requested` event, so this
-   * lists every currently-pending proposal and publishes only the ones this
-   * bridge has not already published in this process lifetime.
+   * Startup reconcile (#24, generalized by #33): an item staged while the
+   * plugin was down would never fire a live `subscribe()` callback, so this
+   * lists every currently-pending item from EVERY active source and
+   * publishes only the ones this bridge has not already published in this
+   * process lifetime.
    */
   async reconcile(): Promise<void> {
-    let records: SystemAgentApprovalRequestRecord[];
-    try {
-      records = await this.gateway.list();
-    } catch (err) {
-      this.logger.error(`startup reconcile: openclaw.approval.list failed: ${String(err)}`);
-      return;
-    }
-    for (const record of records) {
-      if (this.published.has(record.id)) continue;
-      await this.handleGatewayRequested(record);
+    for (const source of this.sources.values()) {
+      await this.reconcileSource(source);
     }
   }
 
-  private async handleGatewayRequested(record: SystemAgentApprovalRequestRecord): Promise<void> {
-    if (this.published.has(record.id)) {
+  private async reconcileSource(source: ApprovalSource): Promise<void> {
+    let requests: ApprovalSourceRequest[];
+    try {
+      requests = await source.list();
+    } catch (err) {
+      this.logger.error(`startup reconcile: ${source.id}.list() failed: ${String(err)}`);
+      return;
+    }
+    for (const request of requests) {
+      if (this.published.has(request.proposalId)) continue;
+      await this.handleSourceRequested(source.id, request);
+    }
+  }
+
+  private async handleSourceRequested(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
+    if (this.published.has(request.proposalId)) {
       // Dedup by proposalId (#24): a reconnect/replay of the same event, or a
       // reconcile racing a live event for the same proposal, must never
       // re-publish.
@@ -356,23 +444,32 @@ export class GatewayApprovalsBridge {
     }
     let payload: KernelApprovalRequestedPayload;
     try {
-      payload = await buildApprovalRequestedPayload(record, {
+      payload = await buildApprovalRequestedPayload(sourceId, request, {
         did: this.config.agentDid,
         privateKeyHex: this.config.agentPrivateKeyHex,
       });
     } catch (err) {
-      this.logger.error(`failed to sign operator.approval.requested for ${record.id}: ${String(err)}`);
+      this.logger.error(`failed to sign operator.approval.requested for ${request.proposalId}: ${String(err)}`);
       return;
     }
     // Reserve before the network call: a concurrent duplicate (live event +
     // reconcile racing) must never publish twice.
-    this.published.set(record.id, { contentHash: payload.contentHash });
+    this.published.set(request.proposalId, {
+      sourceId,
+      kind: request.kind,
+      summary: request.summary,
+      detail: request.detail,
+      sourceRevision: request.sourceRevision,
+      contentHash: payload.contentHash,
+    });
     try {
       await this.kernel.publishApprovalRequested(payload);
-      this.logger.info(`published operator.approval.requested for ${record.id} (kind=${payload.kind})`);
+      this.logger.info(
+        `published operator.approval.requested for ${request.proposalId} (source=${sourceId}, kind=${payload.kind})`,
+      );
     } catch (err) {
-      this.published.delete(record.id);
-      this.logger.error(`failed to publish operator.approval.requested for ${record.id}: ${String(err)}`);
+      this.published.delete(request.proposalId);
+      this.logger.error(`failed to publish operator.approval.requested for ${request.proposalId}: ${String(err)}`);
     }
   }
 
@@ -383,7 +480,7 @@ export class GatewayApprovalsBridge {
   async handleKernelDecision(frame: KernelBusEventFrame): Promise<void> {
     if (frame.eventType !== "operator.approval.decided") return;
     const payload = frame.payload as
-      | Partial<{ proposalId: string; decision: string; decidedBy: string }>
+      | Partial<{ proposalId: string; decision: string; decidedBy: string; contentHash: string }>
       | undefined;
     const proposalId = payload?.proposalId;
     if (typeof proposalId !== "string" || proposalId.length === 0) {
@@ -396,7 +493,7 @@ export class GatewayApprovalsBridge {
     // — see module doc) AND signed/attributed to exactly the configured
     // operator DID on every identity field the envelope carries. A decision
     // is never applied on channel-trust (an authenticated WS frame) alone —
-    // the Gateway is never even contacted unless every check below passes.
+    // no source is ever contacted unless every check below passes.
     const operatorDid = this.config.operatorDid;
     const isOperator =
       frame.issuer === operatorDid && frame.subject === operatorDid && payload?.decidedBy === operatorDid;
@@ -408,19 +505,21 @@ export class GatewayApprovalsBridge {
     }
 
     if (payload?.decision === "withdrawn") {
-      // No Gateway-side analog: `approval.resolve` has no "withdraw" decision
-      // for a system-agent proposal already forwarded to it. Documented no-op.
+      // No generic source analog in v1: no active source exposes a
+      // "withdraw" decision for an item already forwarded to it. Documented
+      // no-op, preserved from #24.
       this.logger.info(
-        `operator.approval.decided withdrawn for ${proposalId} — no Gateway action (unsupported by approval.resolve)`,
+        `operator.approval.decided withdrawn for ${proposalId} — no source action (unsupported in v1)`,
       );
       return;
     }
-    if (payload?.decision !== "approve" && payload?.decision !== "deny") {
+    if (payload?.decision !== "approve" && payload?.decision !== "deny" && payload?.decision !== "reject") {
       this.logger.warn(
         `ignoring operator.approval.decided for ${proposalId}: unrecognized decision ${String(payload?.decision)}`,
       );
       return;
     }
+    const decision: ApprovalDecision = payload.decision === "approve" ? "approve" : "reject";
 
     const tracked = this.published.get(proposalId);
     if (!tracked) {
@@ -431,48 +530,112 @@ export class GatewayApprovalsBridge {
       return;
     }
 
-    let snapshot: GatewayApprovalSnapshot | null;
-    try {
-      snapshot = await this.gateway.get(proposalId);
-    } catch (err) {
-      this.logger.error(`approval.get failed for ${proposalId}: ${String(err)}`);
+    const source = this.sources.get(tracked.sourceId);
+    if (!source) {
+      // Config changed (source disabled) between publish and decision.
+      this.logger.error(
+        `operator.approval.decided for ${proposalId}: source "${tracked.sourceId}" is no longer active — no-op`,
+      );
       return;
     }
-    if (!snapshot || snapshot.status !== "pending") {
-      // Idempotent (#24): already resolved/expired/unknown on the Gateway.
+
+    // #2084 check 1: the decided event must echo back EXACTLY the
+    // `contentHash` this bridge signed and published for this proposal — a
+    // human countersigns exactly what they were shown, so an echoed hash
+    // that doesn't match means kernel-side tampering/corruption, or a
+    // decision bound to a since-superseded (re-staged) version. Cheap and
+    // RPC-free, so it is checked before ever contacting the source.
+    if (payload.contentHash !== tracked.contentHash) {
+      await this.handleDrift(
+        source,
+        tracked,
+        proposalId,
+        "operator.approval.decided contentHash does not match the staged proposal",
+      );
+      return;
+    }
+
+    let current: ApprovalSourceCurrentState | null;
+    try {
+      current = await source.getCurrent(proposalId);
+    } catch (err) {
+      this.logger.error(`${tracked.sourceId}.getCurrent failed for ${proposalId}: ${String(err)}`);
+      return;
+    }
+    if (!current || !current.pending) {
+      // Idempotent (#24): already resolved/expired/unknown at the source.
       this.logger.info(
-        `operator.approval.decided for ${proposalId}: no longer pending on the Gateway (status=${
-          snapshot?.status ?? "unknown"
-        }) — no-op`,
+        `operator.approval.decided for ${proposalId}: no longer pending at ${tracked.sourceId} — no-op`,
       );
       this.published.delete(proposalId);
       return;
     }
 
-    const currentHash = snapshot.presentation?.proposalHash;
-    if (!currentHash || currentHash !== tracked.contentHash) {
-      this.logger.warn(`content hash mismatch for ${proposalId} — refusing to apply decision`);
-      try {
-        await this.kernel.publishMismatch(proposalId, "contentHash no longer matches the staged proposal");
-      } catch (err) {
-        this.logger.error(`failed to publish operator.approval.mismatch for ${proposalId}: ${String(err)}`);
-      }
+    // #2084 check 2: recompute the FULL digest from the source's CURRENT
+    // `sourceRevision` + `detail` and compare against what was originally
+    // signed — catches drift even when only `detail` changed (e.g. a
+    // proposal's description was revised) without necessarily changing the
+    // source's own native revision pin. `kind`/`summary`/`source` are
+    // assumed stable for the life of one proposal id (see module doc).
+    const recomputedHash = current.sourceRevision
+      ? await computeContentHash(
+          buildDigestFields({
+            proposalId,
+            source: tracked.sourceId,
+            kind: tracked.kind,
+            summary: tracked.summary,
+            detail: current.detail,
+            sourceRevision: current.sourceRevision,
+          }),
+        )
+      : null;
+    if (!recomputedHash || recomputedHash !== tracked.contentHash) {
+      await this.handleDrift(source, tracked, proposalId, "contentHash no longer matches the staged proposal");
       return;
     }
 
-    const gatewayDecision: SystemAgentApprovalDecisionKind = payload.decision === "approve" ? "allow-once" : "deny";
     try {
-      await this.gateway.resolve(proposalId, gatewayDecision);
-      this.logger.info(`applied ${gatewayDecision} for ${proposalId}`);
+      const result = await source.resolve(proposalId, decision, tracked.sourceRevision);
+      this.logger.info(`applied ${decision} for ${proposalId} (source=${tracked.sourceId}, applied=${result.applied})`);
+      this.published.delete(proposalId);
     } catch (err) {
-      // The Gateway treats a repeat of the SAME decision as idempotent
-      // success and errors cleanly on a genuine conflict (#24) — log, never
-      // crash the bridge (and never the kernel WS session/notification
-      // injector, which this bridge has no other coupling to).
-      this.logger.warn(`approval.resolve failed for ${proposalId} (${gatewayDecision}): ${String(err)}`);
-    } finally {
+      if (err instanceof ApprovalContentDriftError) {
+        await this.handleDrift(source, tracked, proposalId, err.message);
+        return;
+      }
+      // The Gateway/source treats a repeat of the SAME decision as
+      // idempotent success and errors cleanly on a genuine conflict (#24) —
+      // log, never crash the bridge.
+      this.logger.warn(`approval.resolve failed for ${proposalId} (${decision}): ${String(err)}`);
       this.published.delete(proposalId);
     }
+  }
+
+  /**
+   * Shared handling for a detected content-hash drift, whether caught
+   * before ever calling `resolve` (pre-check) or via a thrown
+   * `ApprovalContentDriftError` from `resolve` itself (race-window
+   * fallback). Publishes the best-effort kernel mismatch notice, then
+   * branches on the source's `onDriftPolicy`.
+   */
+  private async handleDrift(
+    source: ApprovalSource,
+    tracked: TrackedProposal,
+    proposalId: string,
+    reason: string,
+  ): Promise<void> {
+    this.logger.warn(`content hash mismatch for ${proposalId} (source=${tracked.sourceId}) — refusing to apply decision`);
+    try {
+      await this.kernel.publishMismatch(proposalId, reason);
+    } catch (err) {
+      this.logger.error(`failed to publish operator.approval.mismatch for ${proposalId}: ${String(err)}`);
+    }
+    if (source.onDriftPolicy === "restage") {
+      this.published.delete(proposalId);
+      await this.reconcileSource(source);
+    }
+    // "leave" (default, #24 parity): keep the stale entry tracked until a
+    // full reconcile/reconnect naturally repopulates it.
   }
 }
 
@@ -541,97 +704,6 @@ async function resolveApprovalsSecret(
   return { value: undefined, source: "none" };
 }
 
-/**
- * Builds the live `GatewayApprovalsClient` backed by the plugin's own
- * loopback Gateway operator connection. Uses `createOperatorApprovalsGatewayClient`
- * (`openclaw/plugin-sdk/gateway-runtime`) — the exact function the OpenClaw
- * CLI's own operator-approvals tooling uses (`operator-approvals-client.ts`)
- * — which resolves Gateway auth automatically from the host's own `gateway`
- * config. When `gatewayTokenOverride` is set, it is layered onto a shallow
- * copy of that config (never mutating the host's real config object) so an
- * operator can pin a dedicated credential without disturbing the Gateway's
- * own default auth.
- */
-export async function createLiveGatewayApprovalsClient(
-  api: { runtime?: { config?: { current?: () => Record<string, unknown> } } },
-  opts: { gatewayTokenOverride?: string; clientDisplayName: string },
-): Promise<{ client: GatewayApprovalsClient; start: () => Promise<void>; stop: () => void }> {
-  const { createOperatorApprovalsGatewayClient, startGatewayClientWhenEventLoopReady } = await import(
-    "openclaw/plugin-sdk/gateway-runtime"
-  );
-
-  let requestedHandler: ((record: SystemAgentApprovalRequestRecord) => void) | undefined;
-
-  const baseConfig = (api.runtime?.config?.current?.() ?? {}) as Record<string, unknown> & {
-    gateway?: Record<string, unknown> & { auth?: Record<string, unknown> };
-  };
-  const bootstrapConfig = opts.gatewayTokenOverride
-    ? {
-        ...baseConfig,
-        gateway: {
-          ...baseConfig.gateway,
-          auth: { ...baseConfig.gateway?.auth, token: opts.gatewayTokenOverride },
-        },
-      }
-    : baseConfig;
-
-  const gatewayClient = await createOperatorApprovalsGatewayClient({
-    config: bootstrapConfig,
-    clientDisplayName: opts.clientDisplayName,
-    onEvent: (evt) => {
-      if (evt.event !== "openclaw.approval.requested") return;
-      const record = evt.payload as SystemAgentApprovalRequestRecord | undefined;
-      if (record && typeof record.id === "string" && record.request?.proposalHash) {
-        requestedHandler?.(record);
-      }
-    },
-    onConnectError: (err) => {
-      console.error(`[imajin-approvals-bridge] gateway connect error: ${String(err)}`);
-    },
-    onClose: (code, reason) => {
-      console.warn(`[imajin-approvals-bridge] gateway connection closed (${code}): ${reason ?? ""}`);
-    },
-  });
-
-  const client: GatewayApprovalsClient = {
-    async list() {
-      const records = await gatewayClient.request<SystemAgentApprovalRequestRecord[]>(
-        "openclaw.approval.list",
-        {},
-      );
-      return (records ?? []).filter(
-        (record) => typeof record?.id === "string" && Boolean(record.request?.proposalHash),
-      );
-    },
-    async get(id: string) {
-      const result = await gatewayClient.request<{ approval: GatewayApprovalSnapshot }>("approval.get", { id });
-      return result?.approval ?? null;
-    },
-    async resolve(id: string, decision: SystemAgentApprovalDecisionKind) {
-      const result = await gatewayClient.request<{ applied: boolean }>("approval.resolve", {
-        id,
-        kind: "system-agent",
-        decision,
-      });
-      return { applied: result?.applied === true };
-    },
-    onRequested(handler) {
-      requestedHandler = handler;
-    },
-  };
-
-  return {
-    client,
-    start: async () => {
-      const readiness = await startGatewayClientWhenEventLoopReady(gatewayClient, { clientOptions: {} });
-      if (!readiness.ready) {
-        throw new Error("gateway approvals bridge: gateway client failed to start");
-      }
-    },
-    stop: () => gatewayClient.stop(),
-  };
-}
-
 /** Live `KernelNotifyClient` over `POST /notify/api/send`. */
 export function createHttpKernelNotifyClient(opts: {
   nodeUrl: string;
@@ -668,11 +740,14 @@ export interface StartGatewayApprovalsBridgeDeps {
 }
 
 /**
- * Orchestrates the whole bridge for `index.ts`: resolves secrets, opens the
- * Gateway loopback client, constructs the kernel HTTP client, runs the
- * startup reconcile, and returns a frame handler for the plugin's existing
- * kernel WS plus a `dispose()`. Returns `undefined` when the feature is not
- * fully configured — nothing opens in that case (see `isApprovalsBridgeConfigured`).
+ * Orchestrates the whole bridge for `index.ts`: resolves secrets, opens one
+ * Gateway loopback connection per enabled source (#33's `approvals.sources`,
+ * each behind its own try/catch so one source's Gateway hiccup never blocks
+ * another), constructs the kernel HTTP client, runs the startup reconcile,
+ * and returns a frame handler for the plugin's existing kernel WS plus a
+ * `dispose()`. Returns `undefined` when the feature is not fully configured,
+ * or when every enabled source failed to start (see
+ * `isApprovalsBridgeConfigured`).
  */
 export async function startGatewayApprovalsBridge(
   api: { runtime?: { config?: { current?: () => Record<string, unknown> } } },
@@ -714,30 +789,53 @@ export async function startGatewayApprovalsBridge(
     operatorDid: config!.operatorDid!,
   });
 
-  let live: Awaited<ReturnType<typeof createLiveGatewayApprovalsClient>>;
-  try {
-    live = await createLiveGatewayApprovalsClient(api, {
-      gatewayTokenOverride: gatewayTokenResult.value,
-      clientDisplayName: "Imajin Gateway approvals bridge",
-    });
-  } catch (err) {
-    console.error(`[imajin-approvals-bridge] failed to create gateway client: ${String(err)}`);
+  const enabledSourceIds = resolveEnabledApprovalSourceIds(config!.sources);
+  const sources = new Map<string, ApprovalSource>();
+  const stoppers: Array<() => void> = [];
+
+  if (enabledSourceIds.has("system-agent")) {
+    try {
+      const live = await createLiveGatewayApprovalsClient(api, {
+        gatewayTokenOverride: gatewayTokenResult.value,
+        clientDisplayName: "Imajin Gateway approvals bridge (system-agent)",
+      });
+      await live.start();
+      sources.set("system-agent", createSystemAgentSource(live.client));
+      stoppers.push(live.stop);
+    } catch (err) {
+      console.error(`[imajin-approvals-bridge] failed to start system-agent source: ${String(err)}`);
+    }
+  }
+
+  if (enabledSourceIds.has("skill-workshop")) {
+    try {
+      const live = await createLiveSkillWorkshopConnection(api, {
+        gatewayTokenOverride: gatewayTokenResult.value,
+        clientDisplayName: "Imajin Gateway approvals bridge (skill-workshop)",
+      });
+      await live.start();
+      sources.set("skill-workshop", createSkillWorkshopSource(live.client));
+      stoppers.push(live.stop);
+    } catch (err) {
+      console.error(`[imajin-approvals-bridge] failed to start skill-workshop source: ${String(err)}`);
+    }
+  }
+
+  if (sources.size === 0) {
+    console.warn("[imajin-approvals-bridge] no approval sources could be started — bridge not started");
     return undefined;
   }
 
   const bridge = new GatewayApprovalsBridge(
     { operatorDid: config!.operatorDid!, agentDid: deps.did!, agentPrivateKeyHex: keypair.privateKeyHex },
-    live.client,
+    sources,
     kernel,
   );
 
   try {
-    await live.start();
     await bridge.reconcile();
   } catch (err) {
-    console.error(`[imajin-approvals-bridge] startup failed: ${String(err)}`);
-    live.stop();
-    return undefined;
+    console.error(`[imajin-approvals-bridge] startup reconcile failed: ${String(err)}`);
   }
 
   return {
@@ -747,6 +845,9 @@ export async function startGatewayApprovalsBridge(
         console.error(`[imajin-approvals-bridge] failed to handle kernel decision frame: ${String(err)}`);
       });
     },
-    dispose: () => live.stop(),
+    dispose: () => {
+      bridge.dispose();
+      for (const stop of stoppers) stop();
+    },
   };
 }
