@@ -96,7 +96,7 @@ function toApprovalSourceRequest(record: SystemAgentApprovalRequestRecord): Appr
     proposalId: record.id,
     kind: `system-agent:${deriveProposalKind(record.request)}`,
     summary: truncateSummary(record.request.description || record.request.title || record.id),
-    contentHash: record.request.proposalHash,
+    sourceRevision: record.request.proposalHash,
   };
 }
 
@@ -129,19 +129,24 @@ export function createSystemAgentSource(client: GatewayApprovalsClient): Approva
       if (!snapshot) return null;
       return {
         pending: snapshot.status === "pending",
-        contentHash: snapshot.presentation?.proposalHash ?? null,
+        sourceRevision: snapshot.presentation?.proposalHash ?? null,
+        // system-agent has no structured detail to refresh here (see module
+        // doc) — the bridge's recomputed digest for this source therefore
+        // only ever varies with `sourceRevision`, matching #24's original
+        // (proposalHash-only) anti-tamper check exactly.
       };
     },
 
-    // `_expectedContentHash` is intentionally unused: system-agent's own
+    // `_expectedSourceRevision` is intentionally unused: system-agent's own
     // anti-tamper check already happened at the bridge level via `getCurrent`
-    // (`approval.get`'s live `proposalHash`, #24's original check) before
+    // (`approval.get`'s live `proposalHash`, #24's original check, now folded
+    // into the bridge's composite `contentHash` digest per #2084) before
     // `resolve` is ever called, and the Gateway's own `approval.resolve` has
     // no revision-binding parameter to forward it to.
     async resolve(
       proposalId: string,
       decision: ApprovalDecision,
-      _expectedContentHash: string,
+      _expectedSourceRevision: string,
     ): Promise<{ applied: boolean }> {
       const gatewayDecision: SystemAgentApprovalDecisionKind = decision === "approve" ? "allow-once" : "deny";
       return client.resolve(proposalId, gatewayDecision);

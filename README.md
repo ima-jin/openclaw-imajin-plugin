@@ -149,9 +149,12 @@ diagrams, including the generic leg.
 2. The bridge signs and publishes one `operator.approval.requested` kernel
    notification per pending item, tagged with that source's id and a
    namespaced `kind` (`"system-agent:restart"`, `"skill-workshop:update"`,
-   etc. — #2152's open kind/source vocabulary). Skill Workshop additionally
-   sends a bounded (≤16 KB) `detail`: `{skillName, kind, scan, description,
-   diffSummary}`.
+   etc. — #2152's open kind/source vocabulary). `detail` is ALWAYS present
+   (#2084): each source's own native anti-tamper pin rides inside it as
+   `detail.sourceRevision`, alongside whatever per-kind fields the source
+   adds — Skill Workshop's `{skillName, kind, scan, description,
+   diffSummary}` — so the operator-facing card is fully covered by
+   `contentHash` (see "The trust chain" below for the exact digest).
 3. Subscribes on the plugin's EXISTING kernel WebSocket
    (`src/ws-service.ts`) for the resulting `operator.approval.decided` bus
    event (delivered via the kernel's #1884 grant-bound event-subscription
@@ -159,16 +162,18 @@ diagrams, including the generic leg.
    `operator:approvals` capability on the kernel side; see "Live check
    before enabling" below). Before ever touching a source, it verifies the
    event's `issuer`/`subject`/`decidedBy` all equal the configured
-   `approvals.operatorDid` exactly, then refetches that source's CURRENT
-   state (`ApprovalSource.getCurrent`) and compares it against the
-   `contentHash` originally signed for that proposal id. Only on a match
-   does it call `source.resolve(id, decision, contentHash)` — for
-   `system-agent` that maps `approve → allow-once`, `reject`/`deny →
-   deny`; for `skill-workshop` that calls `skills.proposals.apply`/`reject`
-   with the matching `expectedRevisionHash` (the Gateway itself then fails
-   closed on a stale hash). A mismatch publishes a best-effort kernel
-   notice and either leaves the stale entry tracked (`system-agent`, exact
-   #24 behaviour) or evicts + immediately re-lists that one source so the
+   `approvals.operatorDid` exactly, then (#2084) checks the decided event's
+   own `contentHash` matches what was staged, refetches that source's
+   CURRENT state (`ApprovalSource.getCurrent`), and recomputes the digest
+   from the current `sourceRevision` + `detail` to confirm it STILL matches.
+   Only when both checks pass does it call
+   `source.resolve(id, decision, sourceRevision)` — for `system-agent`
+   that maps `approve → allow-once`, `reject`/`deny → deny`; for
+   `skill-workshop` that calls `skills.proposals.apply`/`reject` with the
+   matching `expectedRevisionHash` (the Gateway itself then fails closed on
+   a stale hash). A mismatch publishes a best-effort kernel notice and
+   either leaves the stale entry tracked (`system-agent`, exact #24
+   behaviour) or evicts + immediately re-lists that one source so the
    operator sees a fresh card (`skill-workshop`, #33's "revision drift →
    no apply + re-stage").
 
@@ -185,27 +190,35 @@ plugin SDK.
 
 **The trust chain**
 
-`plugin-signed request` → `operator decides on /jin` → `kernel witnesses` →
-`plugin verifies signer + hash` → `Gateway approval store`. Concretely:
+`plugin-signed request` → `kernel recomputes + verifies contentHash` →
+`operator decides on /jin` → `kernel witnesses` → `plugin verifies signer +
+hash (twice)` → `Gateway approval store`. Concretely:
 
-- The plugin signs `{proposalId, kind, summary, keysTouched, contentHash}`
-  with the agent's existing DID keypair (the same one used for
-  challenge-response) over the canonical JSON of exactly those five fields
-  (`canonicalize`, mirroring `@imajin/auth`'s canonical JSON so the same
-  signature could, in principle, be verified kernel-side later).
-- The kernel does not verify that signature in v1 (see
+- **`contentHash` digest (#2084)**: `"sha256:" + sha256hex(canonicalize({
+  proposalId, source, kind, summary, keysTouched, detail}))` — exactly
+  those six keys, matching the kernel's OWN recomputation
+  (`ima-jin/imajin-ai#2154`), which returns 400 on mismatch. There is no
+  top-level `sourceRevision`: each source's native anti-tamper pin rides
+  INSIDE `detail` as `detail.sourceRevision`, so `detail` is always present
+  and the pin is covered by the hash. The plugin signs the SAME canonical
+  object with the agent's existing DID keypair (the same one used for
+  challenge-response).
+- The kernel does not verify the Ed25519 *signature* in v1 (see
   `ima-jin/imajin-ai#2059`'s "target shape" comment — the human countersign
-  step is a follow-up); it stores the notification and renders the /jin
-  confirm card from the four fields it does validate
-  (`proposalId`/`kind`/`summary`/`keysTouched`).
+  step is a follow-up); it DOES verify `contentHash` by recomputing it
+  itself and rejecting the request on mismatch, then stores the
+  notification and renders the /jin confirm card from the validated
+  payload.
 - The operator decides on /jin; the kernel signs and publishes
-  `operator.approval.decided` with its own node key, over the
-  #1884 event-subscription channel this plugin already holds an
-  authenticated session on.
+  `operator.approval.decided` (echoing back `contentHash`) with its own
+  node key, over the #1884 event-subscription channel this plugin already
+  holds an authenticated session on.
 - The plugin verifies the decision is kernel-witnessed (delivered over that
   grant-scoped, already-authenticated session) and attributed to exactly
-  the configured operator DID, then verifies the content hash against the
-  Gateway's current proposal before ever calling `approval.resolve`.
+  the configured operator DID, then verifies (a) the decided event's own
+  `contentHash` matches what was staged, and (b) a digest recomputed from
+  the source's CURRENT state still matches — before ever calling
+  `approval.resolve` / `skills.proposals.apply`/`reject`.
 
 **Config keys**: `approvals.enabled`, `approvals.operatorDid`,
 `approvals.sources` (optional, defaults to both), `approvals.gatewayToken`
@@ -234,9 +247,10 @@ same reason — the Gateway payload has no structured kind field either.
   kernel-side follow-up work, out of scope here.
 - A `withdrawn` decision is a documented no-op: `approval.resolve` has no
   "withdraw" for a system-agent proposal already forwarded to it.
-- The plugin's own request-signature is not yet verified by the kernel (see
-  the trust-chain section above) — that lands with the human-countersign
-  follow-up (`ima-jin/imajin-ai#2059` step 2).
+- The plugin's own Ed25519 request-*signature* is not yet verified by the
+  kernel (see the trust-chain section above — the kernel does verify
+  `contentHash` itself, per #2084) — signature verification lands with the
+  human-countersign follow-up (`ima-jin/imajin-ai#2059` step 2).
 
 **Live check before enabling**: per the #24 investigation, system-agent
 approval records "appear broadly visible" to any `operator.approvals`-scoped

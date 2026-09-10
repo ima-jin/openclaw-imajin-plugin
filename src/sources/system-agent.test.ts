@@ -54,7 +54,7 @@ describe("createSystemAgentSource", () => {
     expect(requests[0]).toMatchObject({
       proposalId: "system-agent:abc123",
       kind: "system-agent:restart",
-      contentHash: "a".repeat(64),
+      sourceRevision: "a".repeat(64),
     });
     expect(requests[0].detail).toBeUndefined();
   });
@@ -78,7 +78,7 @@ describe("createSystemAgentSource", () => {
     fns.get.mockResolvedValue({ status: "pending", presentation: { proposalHash: "h" } });
     const source = createSystemAgentSource(client);
 
-    await expect(source.getCurrent("id-1")).resolves.toEqual({ pending: true, contentHash: "h" });
+    await expect(source.getCurrent("id-1")).resolves.toEqual({ pending: true, sourceRevision: "h" });
   });
 
   it("getCurrent() returns null when the Gateway has no record of the proposal", async () => {

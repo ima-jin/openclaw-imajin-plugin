@@ -107,7 +107,7 @@ function toApprovalSourceRequest(proposal: SkillWorkshopProposalSummary): Approv
     proposalId: proposal.id,
     kind: `skill-workshop:${proposal.kind}`,
     summary: description,
-    contentHash: proposal.revisionHash,
+    sourceRevision: proposal.revisionHash,
     detail: boundDetail({
       skillName: proposal.skillName,
       kind: proposal.kind,
@@ -183,28 +183,34 @@ export function createSkillWorkshopSource(
     async getCurrent(proposalId: string): Promise<ApprovalSourceCurrentState | null> {
       const pending = await currentPending(client);
       const match = pending.find((proposal) => proposal.id === proposalId);
-      if (!match) return { pending: false, contentHash: null };
-      return { pending: true, contentHash: match.revisionHash };
+      if (!match) return { pending: false, sourceRevision: null };
+      // #2084: return the CURRENT `detail` too (built the same way `list()`
+      // does) so the bridge can recompute its full `contentHash` digest and
+      // catch a proposal whose detail changed after the operator decided,
+      // even in the (Skill Workshop-unlikely, but not bridge-assumed) case
+      // where `revisionHash` itself did not.
+      const { detail } = toApprovalSourceRequest(match);
+      return { pending: true, sourceRevision: match.revisionHash, detail };
     },
 
     async resolve(
       proposalId: string,
       decision: ApprovalDecision,
-      expectedContentHash: string,
+      expectedSourceRevision: string,
     ): Promise<{ applied: boolean }> {
       try {
         if (decision === "approve") {
-          const result = await client.apply(proposalId, expectedContentHash);
+          const result = await client.apply(proposalId, expectedSourceRevision);
           return { applied: result?.applied !== false };
         }
-        await client.reject(proposalId, expectedContentHash);
+        await client.reject(proposalId, expectedSourceRevision);
         return { applied: true };
       } catch (err) {
         if (isRevisionChangedError(err)) {
           throw new ApprovalContentDriftError(
             proposalId,
             `skill-workshop proposal ${proposalId} revision changed before decision ` +
-              `(expected ${expectedContentHash}, current ${String(err.details?.currentRevisionHash)})`,
+              `(expected ${expectedSourceRevision}, current ${String(err.details?.currentRevisionHash)})`,
           );
         }
         throw err;

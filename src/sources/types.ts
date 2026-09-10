@@ -34,21 +34,36 @@
  *     calling `resolve`. Without it, preserving #24's exact system-agent
  *     behaviour (required: "zero behaviour change") would not be possible
  *     from the bridge alone.
- *   - `resolve` takes a third `expectedContentHash` argument (the sketch
- *     shows only `resolve(id, decision)`). The bridge already tracks the
- *     exact hash it signed and published for this proposal id (`published`,
- *     in `gateway-approvals-bridge.ts`) — passing it through lets a source
- *     bind its own native anti-tamper primitive to EXACTLY what the operator
- *     reviewed (Skill Workshop's `expectedRevisionHash` param on `apply`/
- *     `reject`) without re-deriving or re-caching that value itself, which
- *     would otherwise risk silently rebinding to a newer, unreviewed
- *     revision on every list()/poll refresh.
+ *   - `resolve` takes a third `expectedSourceRevision` argument (the sketch
+ *     shows only `resolve(id, decision)`). This is the source's own NATIVE
+ *     anti-tamper pin (the Gateway's `proposalHash` for system-agent, Skill
+ *     Workshop's `revisionHash`) — never the kernel-facing `contentHash`
+ *     digest (see `gateway-approvals-bridge.ts`'s module doc for that
+ *     distinction, tightened per #2084 review). The bridge tracks it
+ *     exactly (`published`, in `gateway-approvals-bridge.ts`) and passes it
+ *     straight through so a source's own revision-binding primitive (Skill
+ *     Workshop's `expectedRevisionHash` param on `apply`/`reject`) is bound
+ *     to EXACTLY what the operator reviewed.
  *   - `onDriftPolicy` was added so each source can express what should
  *     happen after a detected mismatch: system-agent's existing behaviour
  *     (#24) leaves the stale entry tracked until a full reconcile/reconnect
  *     fixes it up; Skill Workshop instead wants the drifted proposal
  *     immediately re-staged with its current revision hash (#33 acceptance:
  *     "revision drift → no apply + re-stage").
+ *
+ * #2084 review update: the kernel-facing `contentHash` (computed by the
+ * bridge, not by sources, matching the kernel's OWN recomputation —
+ * `ima-jin/imajin-ai#2154`) covers the WHOLE canonical `{proposalId,
+ * source, kind, summary, keysTouched, detail}` payload the operator is
+ * shown. There is no top-level `sourceRevision` on the wire: the bridge
+ * folds each source's `sourceRevision` (below) into `detail.sourceRevision`
+ * before hashing, so it is covered by the hash without adding a key the
+ * kernel's recomputation doesn't expect. See `gateway-approvals-bridge.ts`'s
+ * module doc for the exact digest definition. `ApprovalSourceRequest`/
+ * `ApprovalSourceCurrentState` below only ever carry each source's NATIVE
+ * `sourceRevision` as its own field — they never merge it into `detail`
+ * themselves, and never compute or see the composite `contentHash` itself;
+ * that stays entirely bridge-owned so every source shares one digest rule.
  */
 
 /** The kernel's generic decision vocabulary (#2152) — never source-specific. */
@@ -67,18 +82,19 @@ export interface ApprovalSourceRequest {
   /** Human summary shown on the /jin default card. Bounded by the source. */
   summary: string;
   /**
-   * The source's own native anti-tamper hash (the Gateway's `proposalHash`
-   * for system-agent, Skill Workshop's `revisionHash`). This is deliberately
-   * NOT a hash this plugin computes over the outgoing payload itself — see
-   * `gateway-approvals-bridge.ts`'s module doc for why that would overstate
-   * the actual guarantee this bridge can honestly provide in v1.
+   * The source's own NATIVE anti-tamper pin (the Gateway's `proposalHash`
+   * for system-agent, Skill Workshop's `revisionHash`). This is one
+   * ingredient of the bridge's composite `contentHash` digest (#2084) —
+   * never the digest itself. See `gateway-approvals-bridge.ts`'s module doc.
    */
-  contentHash: string;
+  sourceRevision: string;
   /**
    * Optional bounded structured payload for a per-kind /jin card renderer
    * (#2152). Omitted entirely for sources with nothing structured to add
    * (system-agent). Must fit the kernel's 16 KB cap — enforced by the
-   * source that populates it.
+   * source that populates it. Covered by the bridge's `contentHash` digest
+   * (#2084) — mutating `detail` without changing `sourceRevision` still
+   * changes the digest.
    */
   detail?: Record<string, unknown>;
 }
@@ -86,8 +102,15 @@ export interface ApprovalSourceRequest {
 /** A source's current, live view of one proposal — used only for the anti-tamper check before resolving a decision. */
 export interface ApprovalSourceCurrentState {
   pending: boolean;
-  /** `null` when the source cannot recover any hash for a no-longer-pending/unknown proposal. */
-  contentHash: string | null;
+  /** `null` when the source cannot recover a revision pin for a no-longer-pending/unknown proposal. */
+  sourceRevision: string | null;
+  /**
+   * The CURRENT `detail` for this proposal, refetched live (#2084) — lets
+   * the bridge recompute the full `contentHash` digest and catch a
+   * proposal whose `detail` changed after the operator decided, even when
+   * `sourceRevision` alone did not.
+   */
+  detail?: Record<string, unknown>;
 }
 
 export type Unsubscribe = () => void;
@@ -107,16 +130,19 @@ export interface ApprovalSource {
 
   /**
    * Carries a verified operator decision back to this source's own backing
-   * store. `expectedContentHash` is exactly the `contentHash` this proposal
-   * was published with (see module doc) — a source with its own native
+   * store. `expectedSourceRevision` is exactly this proposal's `sourceRevision`
+   * at publish time (see module doc) — a source with its own native
    * revision-binding primitive (e.g. Skill Workshop's `expectedRevisionHash`)
    * should pass it straight through so the decision can only ever apply to
-   * the content the operator actually reviewed.
+   * the content the operator actually reviewed. The bridge has ALREADY
+   * verified the composite `contentHash` (covering `detail` too, #2084)
+   * before ever calling this — this parameter is the source-native
+   * fail-closed pin, not a re-statement of that check.
    */
   resolve(
     proposalId: string,
     decision: ApprovalDecision,
-    expectedContentHash: string,
+    expectedSourceRevision: string,
   ): Promise<{ applied: boolean }>;
 
   /** Button labels for the /jin card. Omit for the default (Approve/Deny). */

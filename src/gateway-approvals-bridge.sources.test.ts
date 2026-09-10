@@ -35,15 +35,20 @@ function makeKernel(): { publishApprovalRequested: ReturnType<typeof vi.fn>; pub
   };
 }
 
-function makeDecidedFrame(proposalId: string, decision = "approve"): KernelBusEventFrame {
+function makeDecidedFrame(proposalId: string, decision = "approve", contentHash?: string): KernelBusEventFrame {
   return {
     type: "bus_event",
     eventType: "operator.approval.decided",
     issuer: OPERATOR_DID,
     subject: OPERATOR_DID,
     scope: "operator",
-    payload: { proposalId, decision, decidedBy: OPERATOR_DID, decidedAt: new Date().toISOString() },
+    payload: { proposalId, decision, decidedBy: OPERATOR_DID, decidedAt: new Date().toISOString(), contentHash },
   };
+}
+
+function lastPublishedContentHash(kernel: { publishApprovalRequested: ReturnType<typeof vi.fn> }): string {
+  const calls = kernel.publishApprovalRequested.mock.calls;
+  return calls[calls.length - 1][0].contentHash as string;
 }
 
 // --- Adapter contract suite (#33 acceptance: "adapter contract test run against both sources") ---
@@ -105,11 +110,12 @@ describe.each([
 
     const [request] = await source.list();
     expect(request.proposalId).toBe("contract-proposal");
-    expect(request.contentHash).toBe("hash-1");
+    expect(request.sourceRevision).toBe("hash-1");
     expect(request.kind.startsWith(`${source.id}:`)).toBe(true);
 
     const current = await source.getCurrent(request.proposalId);
-    expect(current).toEqual({ pending: true, contentHash: "hash-1" });
+    expect(current?.pending).toBe(true);
+    expect(current?.sourceRevision).toBe("hash-1");
 
     const result = await source.resolve(request.proposalId, "approve", "hash-1");
     expect(result.applied).toBe(true);
@@ -202,10 +208,14 @@ describe("GatewayApprovalsBridge + skill-workshop: revision drift", () => {
     await bridge.reconcile();
     expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
     expect(bridge.isPublished("proposal-1")).toBe(true);
+    const stagedContentHash = lastPublishedContentHash(kernel);
 
     // The proposal was revised (new revisionHash) after the operator saw it,
     // but is still pending — subsequent list() calls (getCurrent's pre-check,
-    // then reconcileSource's re-stage) return the fresh revision.
+    // then reconcileSource's re-stage) return the fresh revision. The kernel
+    // still echoes back the ORIGINALLY staged contentHash (check 1 passes;
+    // the kernel has no way to know the source drifted) — the drift is
+    // caught at check 2, the bridge's own recompute against current state.
     listMock.mockResolvedValue({
       proposals: [
         {
@@ -220,14 +230,53 @@ describe("GatewayApprovalsBridge + skill-workshop: revision drift", () => {
       ],
     });
 
-    await bridge.handleKernelDecision(makeDecidedFrame("proposal-1", "approve"));
+    await bridge.handleKernelDecision(makeDecidedFrame("proposal-1", "approve", stagedContentHash));
 
     expect(client.apply).not.toHaveBeenCalled();
     expect(kernel.publishMismatch).toHaveBeenCalledWith("proposal-1", expect.stringContaining("no longer matches"));
     // Re-staged: evicted then immediately re-published with the fresh hash.
     expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(2);
     const secondPublish = kernel.publishApprovalRequested.mock.calls[1][0];
-    expect(secondPublish.contentHash).toBe("rev-2");
+    expect(secondPublish.contentHash).not.toBe(stagedContentHash);
+    expect(secondPublish.detail).toMatchObject({ sourceRevision: "rev-2" });
     expect(bridge.isPublished("proposal-1")).toBe(true);
+  });
+
+  it("hash covers detail (#2084): mutating only detail (same sourceRevision) still blocks the decision", async () => {
+    const listMock = vi.fn();
+    const pendingProposal = (description: string) => ({
+      proposals: [
+        {
+          id: "proposal-2",
+          kind: "update" as const,
+          status: "pending",
+          description,
+          skillName: "trip-planning",
+          scanState: "clean" as const,
+          revisionHash: "rev-same",
+        },
+      ],
+    });
+    listMock.mockResolvedValueOnce(pendingProposal("original description"));
+    const client: SkillWorkshopGatewayClient = { list: listMock, apply: vi.fn(), reject: vi.fn() };
+    const source = createSkillWorkshopSource(client);
+    const kernel = makeKernel();
+    const bridge = new GatewayApprovalsBridge(
+      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
+      new Map<string, ApprovalSource>([["skill-workshop", source]]),
+      kernel as unknown as KernelNotifyClient,
+    );
+
+    await bridge.reconcile();
+    const stagedContentHash = lastPublishedContentHash(kernel);
+
+    // Only `description` (part of `detail`) changes; `revisionHash` (the
+    // source-native `sourceRevision`) stays exactly "rev-same".
+    listMock.mockResolvedValue(pendingProposal("a materially different description"));
+
+    await bridge.handleKernelDecision(makeDecidedFrame("proposal-2", "approve", stagedContentHash));
+
+    expect(client.apply).not.toHaveBeenCalled();
+    expect(kernel.publishMismatch).toHaveBeenCalledWith("proposal-2", expect.stringContaining("no longer matches"));
   });
 });

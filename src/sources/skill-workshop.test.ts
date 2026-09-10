@@ -62,7 +62,7 @@ describe("createSkillWorkshopSource", () => {
     expect(requests[0]).toMatchObject({
       proposalId: "proposal-1",
       kind: "skill-workshop:update",
-      contentHash: "rev-1",
+      sourceRevision: "rev-1",
     });
     expect(requests[0].detail).toMatchObject({
       skillName: "trip-planning",
@@ -119,7 +119,7 @@ describe("createSkillWorkshopSource", () => {
     fns.list.mockResolvedValue({ proposals: [] });
     const source = createSkillWorkshopSource(client);
 
-    await expect(source.getCurrent("proposal-1")).resolves.toEqual({ pending: false, contentHash: null });
+    await expect(source.getCurrent("proposal-1")).resolves.toEqual({ pending: false, sourceRevision: null });
   });
 
   it("stage -> decide approve -> apply is called with the matching expectedRevisionHash", async () => {
