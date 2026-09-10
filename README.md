@@ -52,10 +52,11 @@ In `openclaw.json`:
   - **`wsNotifications.wakeCoalesceMs`** — trailing coalesce window in ms (#25); default `30000` (30s, was `300000`/5min); see "Coalescing" below
   - **`wsNotifications.wakeOwedMaxAgeMs`** — age bound in ms (#30) for a persisted "wake owed" marker replayed at startup; older markers are dropped (their frames already reached the agent via the durable system-event queue) instead of firing a stale wake; default `3600000` (1h); see "Ack, dedup, and persisted wakes" below
   - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
-- **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway system-agent proposals to the kernel and applies signed operator decisions from /jin (#24); see "Gateway approvals bridge" below:
+- **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway proposals from one or more sources to the kernel and applies signed operator decisions from /jin (#24, generalized by #33); see "Gateway approvals bridge" below:
   - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
   - **`approvals.operatorDid`** — the operator's Imajin DID
-  - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection; a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
+  - **`approvals.sources`** — which sources to drive (#33): `"system-agent"` and/or `"skill-workshop"`; defaults to both when omitted. A source left out neither lists nor subscribes.
+  - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection(s); a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
   - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
 
 ### Turn-usage attestation
@@ -83,6 +84,7 @@ the signed claim without the content ever leaving the agent's own machine.
 - [x] Approval bridge — route OpenClaw gateway approvals to /jin, resolve from signed decisions (#1816)
 - [x] Ack-confirmed delivery, dedup, and persisted pending wakes (#26)
 - [x] Gateway approvals bridge — publish staged Gateway proposals to the kernel and apply signed decisions from /jin (#24)
+- [x] Generic source-adapter bridge + Skill Workshop source (#33)
 
 ### Approval bridge (#1816)
 
@@ -112,35 +114,74 @@ approvals (exec elevation, Skill Workshop proposals) and a human approver on /ji
   `index.ts`), which is a larger lift tracked as follow-up alongside the existing
   "Imajin chat as a full messaging channel" TODO.
 
-### Gateway approvals bridge (#24)
+### Gateway approvals bridge (#24, generalized by #33)
 
 Plugin half of `ima-jin/imajin-ai#2059` (kernel half merged in imajin-ai PR
-#2078). When the OpenClaw system-agent stages a proposal (gateway restart /
-config mutation) and it is awaiting the operator's decision, this bridge
-carries that decision to and from /jin without ever bypassing the Gateway's
-own approval store. See `docs/approvals-bridge.md` for a sequence diagram.
+#2078), generalized into a source-adapter model by #33 (companion kernel
+issue `ima-jin/imajin-ai#2152`). When a source (OpenClaw system-agent, or
+Skill Workshop) stages a proposal awaiting the operator's decision, this
+bridge carries that decision to and from /jin without ever bypassing that
+source's own backing store. See `docs/approvals-bridge.md` for sequence
+diagrams, including the generic leg.
 
-**What it does**
+**Sources** (`approvals.sources`, default both):
 
-1. Opens the plugin's OWN loopback OpenClaw Gateway operator connection,
-   scoped `operator.approvals` only (`src/gateway-approvals-bridge.ts`, via
+| Source | File | Backing store | Decision labels |
+| --- | --- | --- | --- |
+| `system-agent` | `src/sources/system-agent.ts` | OpenClaw Gateway `openclaw.approval.*` / `approval.resolve` | Approve / Deny (default) |
+| `skill-workshop` | `src/sources/skill-workshop.ts` | Gateway `skills.proposals.*` | Apply / Reject |
+
+**What it does, per source**
+
+1. Each `ApprovalSource` (`src/sources/types.ts`) observes its own pending
+   items via `list()` (startup reconcile, so an item staged while the
+   plugin was down is not missed) and `subscribe()` (live discovery).
+   `system-agent` opens the plugin's OWN loopback OpenClaw Gateway operator
+   connection, scoped `operator.approvals` only, via
    `openclaw/plugin-sdk/gateway-runtime`'s `createOperatorApprovalsGatewayClient`
-   — the same helper the OpenClaw CLI's own `openclaw approvals` tooling
-   uses). On `openclaw.approval.requested`, and on startup via a
-   `openclaw.approval.list` reconcile (so a proposal staged while the plugin
-   was down is not missed), it signs and publishes an
-   `operator.approval.requested` kernel notification.
-2. Subscribes on the plugin's EXISTING kernel WebSocket
+   (the same helper the OpenClaw CLI's own `openclaw approvals` tooling
+   uses) and listens for `openclaw.approval.requested`. `skill-workshop`
+   reuses the same connection-bootstrap helper (see "Known limitation"
+   below) and polls `skills.proposals.list` on an interval — there is no
+   SDK-exposed "a new proposal appeared" push event; `skills.proposals.
+   events.list` is real but scoped to one already-known proposal's own
+   revision history, not a discovery feed.
+2. The bridge signs and publishes one `operator.approval.requested` kernel
+   notification per pending item, tagged with that source's id and a
+   namespaced `kind` (`"system-agent:restart"`, `"skill-workshop:update"`,
+   etc. — #2152's open kind/source vocabulary). Skill Workshop additionally
+   sends a bounded (≤16 KB) `detail`: `{skillName, kind, scan, description,
+   diffSummary}`.
+3. Subscribes on the plugin's EXISTING kernel WebSocket
    (`src/ws-service.ts`) for the resulting `operator.approval.decided` bus
    event (delivered via the kernel's #1884 grant-bound event-subscription
    fan-out — the agent's own DID needs an active delegation grant for the
    `operator:approvals` capability on the kernel side; see "Live check
-   before enabling" below). Before ever touching the Gateway, it verifies
-   the event's `issuer`/`subject`/`decidedBy` all equal the configured
-   `approvals.operatorDid` exactly, then compares its own record of the
-   `contentHash` it originally signed for that proposal id against the
-   Gateway's CURRENT `approval.get` snapshot. Only on a match does it call
-   `approval.resolve` (`approve` → `allow-once`, `deny` → `deny`).
+   before enabling" below). Before ever touching a source, it verifies the
+   event's `issuer`/`subject`/`decidedBy` all equal the configured
+   `approvals.operatorDid` exactly, then refetches that source's CURRENT
+   state (`ApprovalSource.getCurrent`) and compares it against the
+   `contentHash` originally signed for that proposal id. Only on a match
+   does it call `source.resolve(id, decision, contentHash)` — for
+   `system-agent` that maps `approve → allow-once`, `reject`/`deny →
+   deny`; for `skill-workshop` that calls `skills.proposals.apply`/`reject`
+   with the matching `expectedRevisionHash` (the Gateway itself then fails
+   closed on a stale hash). A mismatch publishes a best-effort kernel
+   notice and either leaves the stale entry tracked (`system-agent`, exact
+   #24 behaviour) or evicts + immediately re-lists that one source so the
+   operator sees a fresh card (`skill-workshop`, #33's "revision drift →
+   no apply + re-stage").
+
+**Known limitation**: the plugin SDK's only exported loopback-operator-
+connection factory (`createOperatorApprovalsGatewayClient`) declares
+`scopes: ["operator.approvals"]`; `skills.proposals.list` needs
+`operator.read` and `skills.proposals.apply`/`reject` need
+`operator.admin`. The `skill-workshop` source reuses that same factory
+since no scope-parameterized alternative is exposed at this SDK version —
+if a deployment's Gateway enforces per-connection scope checks strictly,
+those RPCs will surface as a logged, swallowed error (never crashing the
+bridge) rather than succeed. Flagged as follow-up work for the OpenClaw
+plugin SDK.
 
 **The trust chain**
 
@@ -167,8 +208,9 @@ own approval store. See `docs/approvals-bridge.md` for a sequence diagram.
   Gateway's current proposal before ever calling `approval.resolve`.
 
 **Config keys**: `approvals.enabled`, `approvals.operatorDid`,
-`approvals.gatewayToken` (optional), `approvals.notifyWebhookSecret`
-(required to publish) — see "Configuration" above.
+`approvals.sources` (optional, defaults to both), `approvals.gatewayToken`
+(optional), `approvals.notifyWebhookSecret` (required to publish) — see
+"Configuration" above.
 
 **What the Gateway payload did / didn't expose for `keysTouched`**
 

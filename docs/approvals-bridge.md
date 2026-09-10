@@ -1,10 +1,74 @@
-# Gateway approvals bridge — sequence (#24)
+# Gateway approvals bridge — sequence (#24, generalized by #33)
 
 Plugin half of `ima-jin/imajin-ai#2059` (kernel half merged in
-`ima-jin/imajin-ai` PR #2078). See `README.md` → "Gateway approvals bridge"
-for config keys and what was deliberately left out of v1.
+`ima-jin/imajin-ai` PR #2078), generalized into a source-adapter model by
+#33 (companion kernel issue `ima-jin/imajin-ai#2152`). See `README.md` →
+"Gateway approvals bridge" for config keys and what was deliberately left
+out of v1.
 
-## Request leg — proposal staged → kernel notification
+## Generic leg — one bridge, N `ApprovalSource`s (#33)
+
+The sequence diagrams below ("Request leg" / "Decision leg") describe the
+system-agent source concretely — they are still exactly accurate for it.
+`GatewayApprovalsBridge` itself no longer talks to the OpenClaw Gateway
+directly; it is driven by a `Map<string, ApprovalSource>` built from
+`approvals.sources` (default: both `system-agent` and `skill-workshop`).
+
+```
+ approvals.sources: ["system-agent", "skill-workshop"]
+                │                        │
+                ▼                        ▼
+   sources/system-agent.ts    sources/skill-workshop.ts
+   (openclaw.approval.*,      (skills.proposals.list /
+    approval.resolve)          .apply / .reject)
+                │                        │
+                │  ApprovalSourceRequest │  ApprovalSourceRequest
+                │  {proposalId, kind:    │  {proposalId, kind:
+                │   "system-agent:*",    │   "skill-workshop:*",
+                │   summary, contentHash}│   summary, contentHash, detail}
+                └───────────┬────────────┘
+                            ▼
+              GatewayApprovalsBridge (this file)
+        sign → dedup by proposalId → POST /notify/api/send
+                            │
+                            ▼
+                       Kernel (/jin)
+                            │
+         operator.approval.decided {proposalId, decision, decidedBy}
+                            ▼
+              GatewayApprovalsBridge routes by the
+              proposalId's TRACKED sourceId, then:
+                1. `source.getCurrent(id)` — not pending? no-op + evict.
+                2. hash mismatch? `kernel.publishMismatch` +
+                   `onDriftPolicy`: "leave" (system-agent, #24 parity) or
+                   "restage" (skill-workshop, #33: evict + re-list so the
+                   operator sees a fresh card at the current hash).
+                3. match → `source.resolve(id, decision, contentHash)`.
+```
+
+Adding a third source is exactly "one file + one `approvals.sources`
+entry, no bridge edits" (#33 acceptance criterion) — implement
+`ApprovalSource` (`src/sources/types.ts`) and register it in
+`startGatewayApprovalsBridge` (`src/gateway-approvals-bridge.ts`).
+
+### Skill Workshop source (#33)
+
+`sources/skill-workshop.ts` maps pending `skills.proposals.list` entries
+(scope `operator.read`) to `ApprovalSourceRequest`s with `kind:
+"skill-workshop:create"` or `"skill-workshop:update"`, `contentHash` =
+the proposal's own `revisionHash`, and a bounded (≤16 KB) `detail`:
+`{skillName, kind, scan, description, diffSummary}`. There is no
+SDK-exposed "a new proposal appeared" push event — `skills.proposals.
+events.list` (also real, scope `operator.read`) is scoped to one already-
+known proposal's own revision history, not a discovery feed — so
+`subscribe()` is an honest interval poll of `skills.proposals.list`
+instead. `resolve()` calls `skills.proposals.apply`/`reject` (scope
+`operator.admin`) with the tracked `expectedRevisionHash`; the Gateway
+itself fails closed on a stale hash (`SkillProposalRevisionChangedError`),
+which this source translates into an `ApprovalContentDriftError` so the
+bridge's generic mismatch/`"restage"` handling applies uniformly.
+
+## Request leg — proposal staged → kernel notification (system-agent, concrete example)
 
 ```
 OpenClaw system-agent    OpenClaw Gateway         gateway-approvals-bridge.ts        Kernel (/jin)

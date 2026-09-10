@@ -4,17 +4,21 @@ import { sha512 } from "@noble/hashes/sha2.js";
 import {
   GatewayApprovalsBridge,
   buildApprovalRequestedPayload,
-  deriveProposalKind,
   isApprovalsBridgeConfigured,
   isKernelBusEventFrame,
   signCanonicalPayload,
-  type GatewayApprovalsClient,
-  type GatewayApprovalSnapshot,
   type KernelBusEventFrame,
   type KernelNotifyClient,
+} from "./gateway-approvals-bridge.js";
+import {
+  createSystemAgentSource,
+  deriveProposalKind,
+  type GatewayApprovalsClient,
+  type GatewayApprovalSnapshot,
   type SystemAgentApprovalDecisionKind,
   type SystemAgentApprovalRequestRecord,
-} from "./gateway-approvals-bridge.js";
+} from "./sources/system-agent.js";
+import type { ApprovalSource } from "./sources/types.js";
 
 if ("hashes" in ed && ed.hashes) {
   (ed.hashes as { sha512?: typeof sha512 }).sha512 = sha512;
@@ -89,9 +93,16 @@ describe("buildApprovalRequestedPayload", () => {
   it("signs exactly the five canonical fields and never includes keysTouched entries", async () => {
     const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
     const record = makeRecord();
-    const payload = await buildApprovalRequestedPayload(record, { did: AGENT_DID, privateKeyHex });
+    const request = {
+      proposalId: record.id,
+      kind: `system-agent:${deriveProposalKind(record.request)}`,
+      summary: record.request.description,
+      contentHash: record.request.proposalHash,
+    };
+    const payload = await buildApprovalRequestedPayload("system-agent", request, { did: AGENT_DID, privateKeyHex });
 
     expect(payload.proposalId).toBe(record.id);
+    expect(payload.source).toBe("system-agent");
     expect(payload.contentHash).toBe(record.request.proposalHash);
     expect(payload.keysTouched).toEqual([]);
     expect(payload.signerDid).toBe(AGENT_DID);
@@ -167,9 +178,10 @@ describe("GatewayApprovalsBridge", () => {
   });
 
   function newBridge(): GatewayApprovalsBridge {
+    const source = createSystemAgentSource(gateway as unknown as GatewayApprovalsClient);
     return new GatewayApprovalsBridge(
       { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex },
-      gateway as unknown as GatewayApprovalsClient,
+      new Map<string, ApprovalSource>([["system-agent", source]]),
       kernel as unknown as KernelNotifyClient,
       logger,
     );
