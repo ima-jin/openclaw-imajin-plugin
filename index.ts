@@ -42,11 +42,17 @@ import {
   createWarpTool,
   createInferTool,
   createChatTool,
+  createImajinStatusTool,
 } from "./src/tools.js";
 import {
   createTurnUsageAttestationHandler,
   type TurnUsageAttestationConfig,
 } from "./src/turn-usage-attestation.js";
+import {
+  registerImajinProvider,
+  isImajinCatalogInvalidationScope,
+} from "./src/imajin-provider.js";
+import { isImajinModelAllowedByPolicy } from "./src/sources/imajin-catalog.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -84,7 +90,16 @@ export default definePluginEntry({
       attestation?: TurnUsageAttestationConfig;
       approvalBridge?: ApprovalBridgeSettings;
       approvals?: ApprovalsBridgePluginConfig;
+      inferProxyBaseUrl?: string;
     };
+
+    // Imajin model provider (#36): registers `imajin` as an OpenClaw model
+    // provider with a live kernel catalog. Independent of `nodeUrl`/`did` —
+    // it only ever talks to the local kernel inference proxy
+    // (`inferProxyBaseUrl`, default loopback) — so it works even on an
+    // otherwise-unconfigured install.
+    const imajinProvider = registerImajinProvider(api, { inferProxyBaseUrl: config?.inferProxyBaseUrl });
+    api.registerTool(createImajinStatusTool({ baseUrl: imajinProvider.baseUrl, cache: imajinProvider.cache }));
 
     if (!config?.nodeUrl) {
       console.warn(
@@ -200,6 +215,23 @@ export default definePluginEntry({
         did: config.did,
         keypairPath: config.keypairPath,
         nodeUrl: config.nodeUrl,
+        // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
+        // enabled via `approvals.sources` alongside system-agent/skill-
+        // workshop. Reads the config's live `modelPolicy.allow` on every
+        // check rather than a snapshot, so an operator edit takes effect
+        // without a plugin restart.
+        imajinCatalog: {
+          listDiscoveredModels: () => imajinProvider.cache.peek()?.models ?? [],
+          isModelAllowed: (modelId: string) => {
+            const liveConfig = api.runtime?.config?.current?.() as
+              | { agents?: { defaults?: { modelPolicy?: { allow?: string[] } } } }
+              | undefined;
+            return isImajinModelAllowedByPolicy(
+              liveConfig?.agents?.defaults?.modelPolicy?.allow,
+              modelId,
+            );
+          },
+        },
       })
         .then((started) => {
           approvalsBridgeFrameHandler = started?.onKernelFrame;
@@ -216,6 +248,16 @@ export default definePluginEntry({
           console.log(
             `[imajin-ws] notification: ${nf.scope} — ${nf.title}`,
           );
+          // WS-driven catalog refresh (#36 item 2): a connector sealed /
+          // unsealed / model-changed kernel notification invalidates the
+          // imajin provider's discovery cache so the NEXT `catalog.run` call
+          // refetches immediately instead of waiting out the 60s TTL. See
+          // `IMAJIN_CATALOG_INVALIDATION_SCOPES` for the documented
+          // candidate scope names and the kernel-side follow-up note.
+          if (isImajinCatalogInvalidationScope(nf.scope)) {
+            console.log(`[imajin-plugin] invalidating imajin catalog cache (scope=${nf.scope})`);
+            imajinProvider.cache.invalidate();
+          }
           // The WS socket callback runs outside any agent turn, so injection is
           // fire-and-forget: never let a rejected promise reach the socket.
           void injector(nf).catch((err: unknown) => {

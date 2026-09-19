@@ -9,6 +9,8 @@ import {
 } from "./gateway-approvals-bridge.js";
 import { createSystemAgentSource, type GatewayApprovalsClient } from "./sources/system-agent.js";
 import { createSkillWorkshopSource, type SkillWorkshopGatewayClient } from "./sources/skill-workshop.js";
+import { createImajinCatalogSource, type ImajinModelPolicyGatewayClient } from "./sources/imajin-catalog.js";
+import type { ImajinRuntimeModel } from "./imajin-provider.js";
 import type { ApprovalSource } from "./sources/types.js";
 
 if ("hashes" in ed && ed.hashes) {
@@ -278,5 +280,108 @@ describe("GatewayApprovalsBridge + skill-workshop: revision drift", () => {
 
     expect(client.apply).not.toHaveBeenCalled();
     expect(kernel.publishMismatch).toHaveBeenCalledWith("proposal-2", expect.stringContaining("no longer matches"));
+  });
+});
+
+// --- imajin-catalog (#36): publish on a newly discovered row; resolve only ever writes config on a verified decision ---
+
+function makeImajinModel(id: string, connector: string): ImajinRuntimeModel {
+  return {
+    id,
+    name: `${id} (via ${connector})`,
+    reasoning: false,
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128_000,
+    maxTokens: 8192,
+    connector,
+  };
+}
+
+describe("GatewayApprovalsBridge + imajin-catalog: publish on new row, config write only on decision", () => {
+  it("publishes operator.approval.requested for a newly discovered model, and only writes config.patch after a verified approve decision", async () => {
+    let discovered: ImajinRuntimeModel[] = [];
+    const gateway: ImajinModelPolicyGatewayClient = {
+      getConfig: vi.fn().mockResolvedValue({ hash: "cfg-hash-1", allow: ["openai/*"] }),
+      patchModelPolicyAllow: vi.fn().mockResolvedValue(undefined),
+    };
+    const source = createImajinCatalogSource({
+      listDiscoveredModels: () => discovered,
+      isModelAllowed: () => false,
+      gateway,
+    });
+    const kernel = makeKernel();
+    const bridge = new GatewayApprovalsBridge(
+      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
+      new Map<string, ApprovalSource>([["imajin-catalog", source]]),
+      kernel as unknown as KernelNotifyClient,
+    );
+
+    // Nothing discovered yet — reconcile publishes nothing, and no config is
+    // ever read or written just from starting the bridge.
+    await bridge.reconcile();
+    expect(kernel.publishApprovalRequested).not.toHaveBeenCalled();
+    expect(gateway.getConfig).not.toHaveBeenCalled();
+
+    // A new kernel brain appears (sealing a connector card on /jin).
+    discovered = [makeImajinModel("grok-4", "xai")];
+    await bridge.reconcile();
+    expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
+    const published = kernel.publishApprovalRequested.mock.calls[0][0];
+    expect(published.source).toBe("imajin-catalog");
+    expect(published.kind).toBe("imajin-catalog:new-model");
+    expect(published.detail).toMatchObject({ modelId: "grok-4", ref: "imajin/grok-4" });
+    expect(bridge.isPublished("imajin-catalog:grok-4")).toBe(true);
+
+    // #36 hard requirement: no config write has happened yet — only a
+    // verified `operator.approval.decided` can trigger one.
+    expect(gateway.getConfig).not.toHaveBeenCalled();
+    expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
+
+    const stagedContentHash = lastPublishedContentHash(kernel);
+    await bridge.handleKernelDecision(makeDecidedFrame("imajin-catalog:grok-4", "approve", stagedContentHash));
+
+    expect(gateway.getConfig).toHaveBeenCalledTimes(1);
+    expect(gateway.patchModelPolicyAllow).toHaveBeenCalledWith(["openai/*", "imajin/grok-4"], "cfg-hash-1");
+  });
+
+  it("never writes config for a decision from an unverified signer (not the configured operator)", async () => {
+    const gateway: ImajinModelPolicyGatewayClient = {
+      getConfig: vi.fn().mockResolvedValue({ hash: "cfg-hash-1", allow: [] }),
+      patchModelPolicyAllow: vi.fn().mockResolvedValue(undefined),
+    };
+    const source = createImajinCatalogSource({
+      listDiscoveredModels: () => [makeImajinModel("grok-4", "xai")],
+      isModelAllowed: () => false,
+      gateway,
+    });
+    const kernel = makeKernel();
+    const bridge = new GatewayApprovalsBridge(
+      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
+      new Map<string, ApprovalSource>([["imajin-catalog", source]]),
+      kernel as unknown as KernelNotifyClient,
+    );
+
+    await bridge.reconcile();
+    const stagedContentHash = lastPublishedContentHash(kernel);
+
+    const forgedFrame: KernelBusEventFrame = {
+      type: "bus_event",
+      eventType: "operator.approval.decided",
+      issuer: "did:imajin:not-the-operator",
+      subject: "did:imajin:not-the-operator",
+      scope: "operator",
+      payload: {
+        proposalId: "imajin-catalog:grok-4",
+        decision: "approve",
+        decidedBy: "did:imajin:not-the-operator",
+        contentHash: stagedContentHash,
+      },
+    };
+
+    await bridge.handleKernelDecision(forgedFrame);
+
+    expect(gateway.getConfig).not.toHaveBeenCalled();
+    expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
   });
 });

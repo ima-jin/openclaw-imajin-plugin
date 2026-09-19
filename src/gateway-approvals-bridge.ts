@@ -87,6 +87,8 @@ import {
 } from "./sources/types.js";
 import { createLiveGatewayApprovalsClient, createSystemAgentSource } from "./sources/system-agent.js";
 import { createLiveSkillWorkshopConnection, createSkillWorkshopSource } from "./sources/skill-workshop.js";
+import { createImajinCatalogSource, createLiveImajinCatalogConnection } from "./sources/imajin-catalog.js";
+import type { ImajinRuntimeModel } from "./imajin-provider.js";
 
 // --- Wire types (kernel side, `docs/notify-operator-approvals-contract.md` in ima-jin/imajin-ai, generalized by #2152) ---
 
@@ -348,12 +350,21 @@ export function isApprovalsBridgeConfigured(
   return Boolean(config?.enabled && config?.operatorDid?.trim() && agentDid?.trim());
 }
 
-export const KNOWN_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop"] as const;
+export const KNOWN_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop", "imajin-catalog"] as const;
 export type KnownApprovalSourceId = (typeof KNOWN_APPROVAL_SOURCE_IDS)[number];
 
-/** Resolves `approvals.sources` to the set of source ids to drive, defaulting to every known source. */
+/**
+ * Sources enabled when `approvals.sources` is omitted/empty. `imajin-catalog`
+ * (#36) is deliberately NOT included here — it is opt-in only, since most
+ * installs either have no `modelPolicy.allow` at all (already "allow any")
+ * or use the documented one-time `imajin/*` wildcard (see README); it must
+ * be named explicitly in `approvals.sources` to activate.
+ */
+const DEFAULT_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop"] as const;
+
+/** Resolves `approvals.sources` to the set of source ids to drive, defaulting to `DEFAULT_APPROVAL_SOURCE_IDS`. */
 export function resolveEnabledApprovalSourceIds(configured: string[] | undefined): Set<string> {
-  if (!configured || configured.length === 0) return new Set(KNOWN_APPROVAL_SOURCE_IDS);
+  if (!configured || configured.length === 0) return new Set(DEFAULT_APPROVAL_SOURCE_IDS);
   return new Set(configured.filter((id) => (KNOWN_APPROVAL_SOURCE_IDS as readonly string[]).includes(id)));
 }
 
@@ -737,6 +748,16 @@ export interface StartGatewayApprovalsBridgeDeps {
   did?: string;
   keypairPath?: string;
   nodeUrl: string;
+  /**
+   * Wires the opt-in `"imajin-catalog"` source (#36 item 3). Omitted unless
+   * the imajin provider (`../imajin-provider.ts`) was registered — a config
+   * with `approvals.sources` naming `"imajin-catalog"` but no accessor here
+   * logs a warning and never starts that one source.
+   */
+  imajinCatalog?: {
+    listDiscoveredModels: () => readonly ImajinRuntimeModel[];
+    isModelAllowed: (modelId: string) => boolean;
+  };
 }
 
 /**
@@ -818,6 +839,33 @@ export async function startGatewayApprovalsBridge(
       stoppers.push(live.stop);
     } catch (err) {
       console.error(`[imajin-approvals-bridge] failed to start skill-workshop source: ${String(err)}`);
+    }
+  }
+
+  if (enabledSourceIds.has("imajin-catalog")) {
+    if (deps.imajinCatalog) {
+      try {
+        const live = await createLiveImajinCatalogConnection(api, {
+          gatewayTokenOverride: gatewayTokenResult.value,
+          clientDisplayName: "Imajin Gateway approvals bridge (imajin-catalog)",
+        });
+        await live.start();
+        sources.set(
+          "imajin-catalog",
+          createImajinCatalogSource({
+            listDiscoveredModels: deps.imajinCatalog.listDiscoveredModels,
+            isModelAllowed: deps.imajinCatalog.isModelAllowed,
+            gateway: live.client,
+          }),
+        );
+        stoppers.push(live.stop);
+      } catch (err) {
+        console.error(`[imajin-approvals-bridge] failed to start imajin-catalog source: ${String(err)}`);
+      }
+    } else {
+      console.warn(
+        '[imajin-approvals-bridge] approvals.sources includes "imajin-catalog" but no catalog accessor was wired (imajin provider not registered) — source not started',
+      );
     }
   }
 

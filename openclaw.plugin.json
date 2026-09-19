@@ -3,6 +3,7 @@
   "activation": {
     "onStartup": true
   },
+  "providers": ["imajin"],
   "contracts": {
     "tools": [
       "imajin_identity",
@@ -13,7 +14,8 @@
       "imajin_media",
       "imajin_warp",
       "imajin_infer",
-      "imajin_chat"
+      "imajin_chat",
+      "imajin_status"
     ]
   },
   "uiHints": {
@@ -54,7 +56,12 @@
     },
     "approvalBridge.pinnedApproverPublicKeyHex": {
       "label": "Approval Bridge: Pinned Approver Public Key",
-      "help": "Ed25519 public key (hex) of the sole trusted human approver for OpenClaw gateway approval decisions signed on /jin (#1816). Channel/WS auth alone never resolves an approval — only a signature from this key does."
+      "help": "Ed25519 public key (hex) of the sole trusted human approver for OpenClaw gateway approval decisions signed on /jin (#1816). Channel/WS auth alone never resolves an approval \u2014 only a signature from this key does."
+    },
+    "inferProxyBaseUrl": {
+      "label": "Imajin Model Provider: Inference Proxy Base URL",
+      "help": "Base URL of the local kernel inference proxy the `imajin` OpenClaw model provider discovers its catalog from (#36). Default http://127.0.0.1:8787/openai/v1. Effective models endpoint is `<this>/models`; healthz is probed at the proxy root.",
+      "placeholder": "http://127.0.0.1:8787/openai/v1"
     },
     "approvals.enabled": {
       "label": "Gateway Approvals Bridge: Enabled",
@@ -66,7 +73,7 @@
     },
     "approvals.sources": {
       "label": "Gateway Approvals Bridge: Sources",
-      "help": "Which approval sources to drive (#33): \"system-agent\" (OpenClaw gateway restart / config-mutation proposals) and/or \"skill-workshop\" (pending Skill Workshop skill proposals). Defaults to both. A source left out of this list neither lists nor subscribes."
+      "help": "Which approval sources to drive (#33, #36): \"system-agent\" (OpenClaw gateway restart / config-mutation proposals), \"skill-workshop\" (pending Skill Workshop skill proposals), and/or \"imajin-catalog\" (opt-in per-model gating for newly discovered imajin/* models, #36 \u2014 an alternative to the one-time `imajin/*` modelPolicy.allow wildcard). Defaults to [\"system-agent\", \"skill-workshop\"] (imajin-catalog is opt-in, never defaulted-on). A source left out of this list neither lists nor subscribes."
     },
     "approvals.gatewayToken": {
       "label": "Gateway Approvals Bridge: Gateway Token",
@@ -106,6 +113,10 @@
       "actAs": {
         "type": "string",
         "description": "Default acting-for DID (X-Acting-For). Delegated writes default to this principal unless onBehalfOf is passed explicitly."
+      },
+      "inferProxyBaseUrl": {
+        "type": "string",
+        "description": "Base URL of the local kernel inference proxy the imajin OpenClaw model provider discovers its catalog from (#36). Defaults to http://127.0.0.1:8787/openai/v1. The effective model-list endpoint is `<this>/models` (OpenAI list shape, ima-jin/imajin-ai#2201); `GET /healthz` is probed at the proxy root."
       },
       "wsNotifications": {
         "type": "object",
@@ -220,8 +231,8 @@
           },
           "sources": {
             "type": "array",
-            "items": { "type": "string", "enum": ["system-agent", "skill-workshop"] },
-            "description": "Which approval sources to drive (#33). Defaults to [\"system-agent\", \"skill-workshop\"] (both) when omitted. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
+            "items": { "type": "string", "enum": ["system-agent", "skill-workshop", "imajin-catalog"] },
+            "description": "Which approval sources to drive (#33, #36). Defaults to [\"system-agent\", \"skill-workshop\"] when omitted \u2014 \"imajin-catalog\" (#36, per-model gating for newly discovered imajin/* models) is opt-in only and never defaulted on. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
           },
           "gatewayToken": {
             "description": "Optional bearer override for the plugin's own loopback Gateway operator connection. A plain string or a SecretRef object, resolved once via the plugin SDK. Optional: Gateway auth otherwise resolves automatically from the host's own gateway config.",
