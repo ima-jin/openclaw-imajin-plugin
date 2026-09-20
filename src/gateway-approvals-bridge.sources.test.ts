@@ -138,13 +138,12 @@ describe.each([
 
     const [request] = await source.list();
     expect(request.proposalId).toBe("contract-proposal");
-    // gateway-exec's kind is the literal "exec.command" (#38, kernel #2221),
-    // a deliberate exception to every other source's "<source>:<subkind>"
-    // namespacing — see gateway-exec.ts's module doc.
-    if (name === "gateway-exec") {
-      expect(request.kind).toBe("exec.command");
-    } else {
-      expect(request.kind.startsWith(`${source.id}:`)).toBe(true);
+    // Every source (including gateway-exec, #38, kernel #2221/PR #2223)
+    // namespaces `kind` as "<source>:<subkind>" — see gateway-exec.ts's
+    // module doc for why an earlier draft's bare "exec.command" literal was
+    // corrected to follow this convention.
+    expect(request.kind.startsWith(`${source.id}:`)).toBe(true);
+    if (name !== "gateway-exec") {
       expect(request.sourceRevision).toBe("hash-1");
     }
 
@@ -354,7 +353,7 @@ describe("GatewayApprovalsBridge + gateway-exec: verified-decision-only resolve"
     await bridge.reconcile();
     expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
     const published = kernel.publishApprovalRequested.mock.calls[0][0];
-    expect(published.kind).toBe("exec.command");
+    expect(published.kind).toBe("gateway-exec:command");
     expect(published.detail.command).toBe("deploy.sh --prod && echo done");
     const stagedContentHash = lastPublishedContentHash(kernel);
 

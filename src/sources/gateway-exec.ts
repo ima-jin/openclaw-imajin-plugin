@@ -1,8 +1,11 @@
 /**
  * OpenClaw gateway-exec `ApprovalSource` (#38) — the third source on the
  * generic gateway-approvals bridge (#33/#34), after `system-agent` (#24) and
- * `skill-workshop` (#33). Kernel half: `ima-jin/imajin-ai#2221` (operator-
- * approval kind `exec.command`, built in parallel with this plugin half).
+ * `skill-workshop` (#33). Kernel half: `ima-jin/imajin-ai#2221`, landed as
+ * `ima-jin/imajin-ai` PR #2223 — which fixed two contract details against
+ * the original plan: the `kind` naming (see below) and the outcome-
+ * reporting endpoint (see "Outcome reporting" below). This file has been
+ * updated to match #2223 exactly.
  *
  * ## Which hook: forwarded-channel payload vs. gateway event subscription?
  *
@@ -51,19 +54,23 @@
  *      code and no new scope beyond the `operator.approvals` the issue asks
  *      for ("request only that").
  *
- * ## Kernel `kind` is a deliberate exception to the `<source>:<subkind>` rule
+ * ## Kernel `kind` follows the standard `<source>:<subkind>` convention
  *
- * `types.ts`/`gateway-approvals-bridge.ts` document every OTHER source's
- * `kind` as namespaced `"<source>:<subkind>"` (`"system-agent:restart"`,
- * `"skill-workshop:update"`). This source's `kind` is the bare literal
- * `"exec.command"` instead, matching `ima-jin/imajin-ai#2221` verbatim — the
- * kernel-side card renderer built in that issue dispatches on this exact
- * string. The `source` field (`"gateway-exec"`, set by the bridge from this
- * source's `id`) still uniquely identifies which `ApprovalSource` published
- * it and is still covered by `contentHash`, so this does not create any
- * collision or tracking ambiguity at the bridge level — it only opts this
- * one kind out of the generic namespacing convention to match its parallel
- * kernel contract.
+ * `kind` is `"gateway-exec:command"` — the SAME `"<source>:<subkind>"`
+ * namespacing every other source already uses (`"system-agent:restart"`,
+ * `"skill-workshop:update"`, see `types.ts`/`gateway-approvals-bridge.ts`).
+ * An earlier draft of this source published the bare literal `"exec.
+ * command"` as a deliberate exception to that convention, reasoning that
+ * `ima-jin/imajin-ai#2221`'s kernel-side card renderer would dispatch on
+ * that exact string. `ima-jin/imajin-ai` PR #2223 landed the kernel's real
+ * `kind` validator instead — `NAMESPACE_SEGMENT_PATTERN =
+ * /^[a-z][a-z0-9-]{0,63}$/` applied to each colon-separated segment of
+ * `"<source>:<subkind>"` — which rejects a dot as an invalid segment
+ * character, so the bare `"exec.command"` literal was never valid on the
+ * real kernel. This source now follows the same convention as every other
+ * source instead of carving out an exception; the `source` field
+ * (`"gateway-exec"`) still uniquely identifies which `ApprovalSource`
+ * published it and both fields remain covered by `contentHash`.
  *
  * ## `sourceRevision`: an identity pin, not a content-revision pin
  *
@@ -103,21 +110,37 @@
  *
  * ## Outcome reporting (exit code / duration / output hash)
  *
- * `ima-jin/imajin-ai#2221` does not yet define the kernel endpoint for
- * attaching a post-execution outcome to an already-decided `exec.command`
- * approval. `createHttpKernelExecOutcomeClient` below implements the
- * CLIENT side against the same `POST /notify/api/send` mechanism every
- * other kernel write in this bridge already uses (scope
- * `operator.approval.exec.outcome`) so it is fully unit-tested now;
- * TODO(#2221): once the kernel PR lands, point this at whatever dedicated
- * endpoint it defines instead, if different. `wireGatewayExecOutcomeReporting`
- * wires it to the Gateway's exec-finished signal; TODO(#2221): the
- * `"exec.approval.finished"` event name/payload this listens for in the
- * live wiring below is a best-effort placeholder (no OpenClaw doc or public
- * source snippet confirms an exec-outcome broadcast at this SDK version) —
- * it is guarded narrowly enough to be a safe no-op if the real event never
- * arrives or has a different shape, and it never blocks or affects the
- * approve/deny path above.
+ * `createHttpKernelExecOutcomeClient` posts to the kernel's real,
+ * now-landed outcome endpoint (`ima-jin/imajin-ai` PR #2223):
+ *
+ * ```
+ * POST /notify/api/internal/operator-approvals/outcome
+ * x-webhook-secret: <NOTIFY_WEBHOOK_SECRET>   (the SAME secret this bridge
+ *                                               already resolves for every
+ *                                               other kernel write — never a
+ *                                               separate credential, never
+ *                                               logged)
+ * body: { proposalId, exitCode, durationMs, outputHash }
+ * -> 200 { ok: true }
+ *    400 validation error / proposalId is not an exec-kind approval
+ *    401 bad webhook secret
+ *    404 unknown proposalId
+ * ```
+ *
+ * Idempotent by design on the kernel side — POSTing again for the same
+ * `proposalId` OVERWRITES the previously posted outcome, so this client
+ * never needs to dedupe or guard against a duplicate post.
+ *
+ * `wireGatewayExecOutcomeReporting` wires this client to the Gateway's
+ * exec-finished signal. TODO: the `"exec.approval.finished"` event name/
+ * payload this listens for in the live wiring below is STILL an
+ * unconfirmed, best-effort placeholder — no OpenClaw doc or public source
+ * snippet available in this environment confirms an exec-outcome broadcast
+ * at the installed SDK version, and `ima-jin/imajin-ai` PR #2223 (the
+ * kernel side of this contract) only defines the endpoint above, not what
+ * emits the underlying Gateway event. It is guarded narrowly enough to be
+ * a safe no-op if the real event never arrives or has a different shape,
+ * and it never blocks or affects the approve/deny path above.
  */
 import type {
   ApprovalDecision,
@@ -153,9 +176,13 @@ export interface GatewayExecApprovalRecord {
   expiresAtMs: number;
 }
 
-/** Posted to the kernel after the Gateway reports an approved exec finished. */
+/**
+ * Posted to the kernel after the Gateway reports an approved exec
+ * finished. Field names match the kernel's `POST /notify/api/internal/
+ * operator-approvals/outcome` body verbatim (`ima-jin/imajin-ai` PR #2223).
+ */
 export interface GatewayExecOutcome {
-  approvalId: string;
+  proposalId: string;
   exitCode: number | null;
   durationMs: number;
   /** `"sha256:" + sha256hex(...)` over the captured output, never the raw output itself. */
@@ -170,11 +197,11 @@ export interface GatewayExecApprovalsClient {
   resolve(id: string, decision: Exclude<GatewayExecApprovalDecisionKind, "allow-always">): Promise<{ applied: boolean }>;
   /** Registers the live `exec.approval.requested` handler. */
   onRequested(handler: (record: GatewayExecApprovalRecord) => void): void;
-  /** Registers a best-effort "this approved exec finished" handler (TODO(#2221) — see module doc). */
+  /** Registers a best-effort "this approved exec finished" handler (trigger event still unconfirmed — see module doc's "Outcome reporting" section). */
   onFinished(handler: (outcome: GatewayExecOutcome) => void): void;
 }
 
-/** Posts an exec outcome to the kernel. Client-side half of the module doc's "Outcome reporting" TODO(#2221). */
+/** Posts an exec outcome to the kernel's `POST /notify/api/internal/operator-approvals/outcome` (see module doc's "Outcome reporting" section). */
 export interface KernelExecOutcomeClient {
   publishExecOutcome(outcome: GatewayExecOutcome): Promise<void>;
 }
@@ -182,10 +209,11 @@ export interface KernelExecOutcomeClient {
 const MAX_SUMMARY_LENGTH = 2000;
 
 /**
- * Literal kernel kind from `ima-jin/imajin-ai#2221`, NOT namespaced
- * `"gateway-exec:command"` — see module doc.
+ * Namespaced `"<source>:<subkind>"` kernel kind, matching the convention
+ * every other source uses (`ima-jin/imajin-ai#2221`/PR #2223) — see module
+ * doc.
  */
-export const GATEWAY_EXEC_KIND = "exec.command";
+export const GATEWAY_EXEC_KIND = "gateway-exec:command";
 
 function truncateSummary(summary: string): string {
   return summary.length <= MAX_SUMMARY_LENGTH ? summary : summary.slice(0, MAX_SUMMARY_LENGTH);
@@ -302,33 +330,38 @@ export function createGatewayExecSource(
   };
 }
 
-// --- Outcome reporting (client-side proven now; trigger is TODO(#2221), see module doc) ---
+// --- Outcome reporting (client side implemented against the real endpoint; trigger event is still a TODO placeholder, see module doc) ---
 
-/** Live `KernelExecOutcomeClient` over the same `POST /notify/api/send` mechanism every other kernel write in this bridge uses. */
+/**
+ * Live `KernelExecOutcomeClient` over the kernel's dedicated outcome
+ * endpoint (`ima-jin/imajin-ai` PR #2223) — see module doc's "Outcome
+ * reporting" section for the full contract (status codes, idempotency).
+ * `webhookSecret` is the SAME `NOTIFY_WEBHOOK_SECRET`-backed value every
+ * other kernel write in this bridge already resolves via the plugin's
+ * SecretRef/config mechanism — never a literal, never logged.
+ */
 export function createHttpKernelExecOutcomeClient(opts: {
   nodeUrl: string;
   webhookSecret: string;
-  operatorDid: string;
 }): KernelExecOutcomeClient {
   const baseUrl = opts.nodeUrl.replace(/\/$/, "");
   return {
     async publishExecOutcome(outcome: GatewayExecOutcome): Promise<void> {
-      // TODO(#2221): switch to the dedicated outcome/follow-up endpoint the
-      // kernel PR defines, if it differs from the generic notify mechanism.
-      const res = await fetch(`${baseUrl}/notify/api/send`, {
+      const res = await fetch(`${baseUrl}/notify/api/internal/operator-approvals/outcome`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           "x-webhook-secret": opts.webhookSecret,
         },
         body: JSON.stringify({
-          to: opts.operatorDid,
-          scope: "operator.approval.exec.outcome",
-          data: outcome,
+          proposalId: outcome.proposalId,
+          exitCode: outcome.exitCode,
+          durationMs: outcome.durationMs,
+          outputHash: outcome.outputHash,
         }),
       });
       if (!res.ok) {
-        throw new Error(`kernel notify operator.approval.exec.outcome failed (${res.status}): ${await res.text()}`);
+        throw new Error(`kernel operator-approvals outcome POST failed (${res.status}): ${await res.text()}`);
       }
     },
   };
@@ -350,7 +383,7 @@ export function wireGatewayExecOutcomeReporting(
 ): Unsubscribe {
   client.onFinished((outcome) => {
     void kernel.publishExecOutcome(outcome).catch((err: unknown) => {
-      logger.error(`[imajin-approvals-bridge] failed to publish exec outcome for ${outcome.approvalId}: ${String(err)}`);
+      logger.error(`[imajin-approvals-bridge] failed to publish exec outcome for ${outcome.proposalId}: ${String(err)}`);
     });
   });
   return () => {};
@@ -400,16 +433,17 @@ export async function createLiveGatewayExecConnection(
         if (isValidRecord(record)) requestedHandler?.(record);
         return;
       }
-      // TODO(#2221): best-effort/placeholder event name — see module doc.
+      // TODO: best-effort/placeholder event name — STILL unconfirmed, see
+      // module doc's "Outcome reporting" section.
       if (evt.event === "exec.approval.finished") {
         const outcome = evt.payload as Partial<GatewayExecOutcome> | undefined;
         if (
-          typeof outcome?.approvalId === "string" &&
+          typeof outcome?.proposalId === "string" &&
           typeof outcome.durationMs === "number" &&
           typeof outcome.outputHash === "string"
         ) {
           finishedHandler?.({
-            approvalId: outcome.approvalId,
+            proposalId: outcome.proposalId,
             exitCode: typeof outcome.exitCode === "number" ? outcome.exitCode : null,
             durationMs: outcome.durationMs,
             outputHash: outcome.outputHash,

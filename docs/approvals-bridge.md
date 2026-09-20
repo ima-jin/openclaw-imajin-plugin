@@ -105,11 +105,14 @@ an `ApprovalContentDriftError` so the bridge's generic mismatch/
 `sources/gateway-exec.ts` maps pending `exec.approval.list` entries /
 `exec.approval.requested` events (the plugin's OWN loopback Gateway
 connection, scope `operator.approvals` only) to `ApprovalSourceRequest`s
-with the LITERAL kernel `kind: "exec.command"` (matching `ima-jin/imajin-
-ai#2221` verbatim — a deliberate exception to every other source's
-`"<source>:<subkind>"` namespacing) and `detail: {command, host, cwd,
-agentId, sessionKey, requestedBy, approvalId, expiresAt}`. `command` is
-NEVER truncated — the Gateway itself already rejects an oversized command at
+with the namespaced kernel `kind: "gateway-exec:command"` (the same
+`"<source>:<subkind>"` convention every other source uses; an earlier draft
+published the bare literal `"exec.command"`, but `ima-jin/imajin-ai` PR
+#2223 landed the kernel's real kind validator — which rejects a dot as an
+invalid segment character — so this source now follows the standard
+convention like every other one) and `detail: {command, host, cwd, agentId,
+sessionKey, requestedBy, approvalId, expiresAt}`. `command` is NEVER
+truncated — the Gateway itself already rejects an oversized command at
 request time rather than truncating it, so this source never needs to
 shrink it (unlike Skill Workshop's bounded `description`/`diffSummary`).
 Since an exec approval record is immutable while pending (no RPC mutates
@@ -119,12 +122,13 @@ Since an exec approval record is immutable while pending (no RPC mutates
 legitimate revision). `resolve()` maps `approve -> allow-once`,
 `reject -> deny`, and is exhaustive over the bridge's decision vocabulary so
 it can never reach `exec.approval.resolve` with `"allow-always"`. Outcome
-reporting (exit code / duration / output hash, posted after the Gateway
-reports an approved exec finished) is a `gateway-exec`-specific side channel
-wired alongside the source (`wireGatewayExecOutcomeReporting`), not part of
-the generic `ApprovalSource` contract — see `gateway-exec.ts`'s module doc
-for the full "which hook" rationale and the `TODO(#2221)` outcome-endpoint
-note.
+reporting (`{proposalId, exitCode, durationMs, outputHash}`, posted after
+the Gateway reports an approved exec finished, to the kernel's `POST
+/notify/api/internal/operator-approvals/outcome`, `ima-jin/imajin-ai` PR
+#2223) is a `gateway-exec`-specific side channel wired alongside the source
+(`wireGatewayExecOutcomeReporting`), not part of the generic
+`ApprovalSource` contract — see `gateway-exec.ts`'s module doc for the full
+"which hook" rationale and the outcome-endpoint contract.
 
 ## Request leg — proposal staged → kernel notification (system-agent, concrete example)
 

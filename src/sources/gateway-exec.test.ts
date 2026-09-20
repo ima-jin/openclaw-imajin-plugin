@@ -57,7 +57,7 @@ describe("createGatewayExecSource", () => {
     expect(source.decisionLabels).toEqual({ approve: "Allow once", reject: "Deny" });
   });
 
-  it("list() maps records to the literal exec.command kind with a verbatim, untruncated detail.command", async () => {
+  it("list() maps records to the namespaced gateway-exec:command kind with a verbatim, untruncated detail.command", async () => {
     const { client, fns } = makeClient();
     const record = makeRecord();
     fns.list.mockResolvedValue([record]);
@@ -67,10 +67,11 @@ describe("createGatewayExecSource", () => {
 
     expect(requests).toHaveLength(1);
     expect(requests[0].proposalId).toBe("exec-approval-1");
-    expect(requests[0].kind).toBe("exec.command");
+    expect(requests[0].kind).toBe("gateway-exec:command");
     expect(requests[0].kind).toBe(GATEWAY_EXEC_KIND);
-    // Never namespaced "gateway-exec:..." — see module doc.
-    expect(requests[0].kind.includes(":")).toBe(false);
+    // Namespaced "<source>:<subkind>", same convention as every other source
+    // (kernel's real kind validator rejects dots — see module doc).
+    expect(requests[0].kind.startsWith(`${source.id}:`)).toBe(true);
     expect(requests[0].detail).toEqual({
       command: record.request.command,
       host: "gateway",
@@ -118,7 +119,7 @@ describe("createGatewayExecSource", () => {
     handler(makeRecord({ id: "exec-approval-2" }));
 
     expect(onRequested).toHaveBeenCalledWith(
-      expect.objectContaining({ proposalId: "exec-approval-2", kind: "exec.command" }),
+      expect.objectContaining({ proposalId: "exec-approval-2", kind: "gateway-exec:command" }),
     );
   });
 
@@ -183,25 +184,24 @@ describe("createGatewayExecSource", () => {
 
 describe("createHttpKernelExecOutcomeClient", () => {
   const outcome: GatewayExecOutcome = {
-    approvalId: "exec-approval-1",
+    proposalId: "exec-approval-1",
     exitCode: 0,
     durationMs: 4200,
     outputHash: "sha256:" + "a".repeat(64),
   };
 
-  it("POSTs the outcome to /notify/api/send with the webhook secret and operator.approval.exec.outcome scope", async () => {
+  it("POSTs the outcome to the kernel's operator-approvals outcome endpoint with the webhook secret", async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, text: async () => "" });
     vi.stubGlobal("fetch", fetchMock);
     const client = createHttpKernelExecOutcomeClient({
       nodeUrl: "https://jin.example/",
       webhookSecret: "secret-1",
-      operatorDid: "did:imajin:operator",
     });
 
     await client.publishExecOutcome(outcome);
 
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://jin.example/notify/api/send",
+      "https://jin.example/notify/api/internal/operator-approvals/outcome",
       expect.objectContaining({
         method: "POST",
         headers: expect.objectContaining({ "x-webhook-secret": "secret-1" }),
@@ -209,23 +209,25 @@ describe("createHttpKernelExecOutcomeClient", () => {
     );
     const body = JSON.parse((fetchMock.mock.calls[0][1] as { body: string }).body);
     expect(body).toEqual({
-      to: "did:imajin:operator",
-      scope: "operator.approval.exec.outcome",
-      data: outcome,
+      proposalId: "exec-approval-1",
+      exitCode: 0,
+      durationMs: 4200,
+      outputHash: outcome.outputHash,
     });
     vi.unstubAllGlobals();
   });
 
-  it("throws when the kernel responds with a non-ok status", async () => {
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500, text: async () => "boom" }));
-    const client = createHttpKernelExecOutcomeClient({
-      nodeUrl: "https://jin.example",
-      webhookSecret: "secret-1",
-      operatorDid: "did:imajin:operator",
-    });
+  it("throws when the kernel responds with a non-ok status (400/401/404)", async () => {
+    for (const status of [400, 401, 404, 500]) {
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status, text: async () => "boom" }));
+      const client = createHttpKernelExecOutcomeClient({
+        nodeUrl: "https://jin.example",
+        webhookSecret: "secret-1",
+      });
 
-    await expect(client.publishExecOutcome(outcome)).rejects.toThrow(/failed \(500\)/);
-    vi.unstubAllGlobals();
+      await expect(client.publishExecOutcome(outcome)).rejects.toThrow(new RegExp(`failed \\(${status}\\)`));
+      vi.unstubAllGlobals();
+    }
   });
 });
 
@@ -237,7 +239,7 @@ describe("wireGatewayExecOutcomeReporting", () => {
 
     const handler = fns.onFinished.mock.calls[0][0];
     const outcome: GatewayExecOutcome = {
-      approvalId: "exec-approval-1",
+      proposalId: "exec-approval-1",
       exitCode: 1,
       durationMs: 100,
       outputHash: "sha256:" + "b".repeat(64),
@@ -254,7 +256,7 @@ describe("wireGatewayExecOutcomeReporting", () => {
     wireGatewayExecOutcomeReporting(client, kernel, logger);
 
     const handler = fns.onFinished.mock.calls[0][0];
-    handler({ approvalId: "exec-approval-1", exitCode: null, durationMs: 1, outputHash: "sha256:" + "c".repeat(64) });
+    handler({ proposalId: "exec-approval-1", exitCode: null, durationMs: 1, outputHash: "sha256:" + "c".repeat(64) });
 
     await vi.waitFor(() => expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("exec-approval-1")));
   });

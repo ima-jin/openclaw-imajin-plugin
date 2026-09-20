@@ -852,7 +852,6 @@ export async function startGatewayApprovalsBridge(
       const outcomeClient = createHttpKernelExecOutcomeClient({
         nodeUrl: deps.nodeUrl,
         webhookSecret: notifySecretResult.value,
-        operatorDid: config!.operatorDid!,
       });
       stoppers.push(wireGatewayExecOutcomeReporting(live.client, outcomeClient));
     } catch (err) {

@@ -151,7 +151,8 @@ diagrams, including the generic leg.
 2. The bridge signs and publishes one `operator.approval.requested` kernel
    notification per pending item, tagged with that source's id and a
    namespaced `kind` (`"system-agent:restart"`, `"skill-workshop:update"`,
-   etc. — #2152's open kind/source vocabulary). `detail` is ALWAYS present
+   `"gateway-exec:command"`, etc. — #2152's open kind/source vocabulary).
+   `detail` is ALWAYS present
    (#2084): each source's own native anti-tamper pin rides inside it as
    `detail.sourceRevision`, alongside whatever per-kind fields the source
    adds — Skill Workshop's `{skillName, kind, scan, description,
@@ -194,14 +195,14 @@ plugin SDK.
 
 Forwards pending OpenClaw **host-exec** approvals (`tools.exec.mode: "ask"`/
 `"auto"`, or a per-agent `ask: "on-miss"`/`"always"`) to /jin as kernel
-operator-approvals of kind `exec.command`, and resolves the operator's
-decision back through OpenClaw's own `exec.approval.resolve`. It is a
-separate `ApprovalSource` (`src/sources/gateway-exec.ts`) driven by the same
-generic bridge described above — see that file's module doc for the full
-design rationale (why it subscribes to the Gateway's own `exec.approval.
-requested` event rather than registering as an `approvals.exec.targets`
-forwarded-channel destination, the `exec.command` kernel kind, the identity-
-only `sourceRevision`, and outcome reporting).
+operator-approvals of kind `gateway-exec:command`, and resolves the
+operator's decision back through OpenClaw's own `exec.approval.resolve`. It
+is a separate `ApprovalSource` (`src/sources/gateway-exec.ts`) driven by the
+same generic bridge described above — see that file's module doc for the
+full design rationale (why it subscribes to the Gateway's own `exec.
+approval.requested` event rather than registering as an `approvals.exec.
+targets` forwarded-channel destination, the identity-only `sourceRevision`,
+and outcome reporting).
 
 **Opt-in, off by default.** Unlike `system-agent`/`skill-workshop`,
 `gateway-exec` is never enabled just because `approvals.enabled: true` and
@@ -268,13 +269,18 @@ generic bridge itself already drops any kernel-decided value outside
 `approve`/`reject`/`withdrawn` before any source is ever touched.
 
 **Outcome reporting**: after the Gateway reports an approved exec finished,
-the source posts `{exitCode, durationMs, outputHash}` back to the kernel via
-`createHttpKernelExecOutcomeClient` (`POST /notify/api/send`, scope
-`operator.approval.exec.outcome`). `ima-jin/imajin-ai#2221` does not yet
-define a dedicated outcome endpoint — this is a documented placeholder
-(`TODO(#2221)` in `gateway-exec.ts`) that will move to whatever endpoint
-that kernel PR defines once merged; the client-side POST is fully unit
-tested regardless of which endpoint it ultimately targets.
+the source posts `{proposalId, exitCode, durationMs, outputHash}` to the
+kernel's dedicated outcome endpoint (`ima-jin/imajin-ai` PR #2223, via
+`createHttpKernelExecOutcomeClient`):
+`POST /notify/api/internal/operator-approvals/outcome`, header
+`x-webhook-secret: <NOTIFY_WEBHOOK_SECRET>` (the same secret this bridge
+already resolves for every other kernel write). `200 {ok:true}` on success;
+`400`/`401`/`404` on a validation error, a bad secret, or an unknown
+proposal, respectively. Re-posting for the same `proposalId` OVERWRITES the
+previously posted outcome (idempotent by kernel design). The Gateway-side
+"exec finished" trigger event this listens for is still an unconfirmed,
+narrowly-guarded best-effort placeholder — see the `TODO` in
+`gateway-exec.ts`'s module doc.
 
 **The trust chain**
 
