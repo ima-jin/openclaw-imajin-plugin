@@ -41,8 +41,9 @@
  * within seconds of a kernel WS notification, not just the ~60s TTL. This
  * module owns a small process-local TTL cache instead, with an explicit
  * `invalidate()` the plugin's existing `ImajinWsService` frame handler calls
- * (see `index.ts`) — see `IMAJIN_CATALOG_INVALIDATION_SCOPES` below for the
- * documented candidate scope names.
+ * (see `index.ts`) on the three kernel notification scopes named by
+ * `IMAJIN_CATALOG_INVALIDATION_SCOPES` below — confirmed against the landed
+ * kernel/proxy half `ima-jin/imajin-ai#2219` (closing #2205).
  *
  * A failed or empty fetch NEVER serves a previously-cached (now stale) list
  * past its own TTL: a proxy outage degrades straight to "no models", never
@@ -265,22 +266,23 @@ export class ImajinCatalogCache {
 // --- WS-driven invalidation (#36 item 2) ---
 
 /**
- * Documented candidate kernel notification scopes that should invalidate
- * the catalog cache (connector sealed / unsealed / model-changed). As of
- * this writing the kernel/proxy half (`ima-jin/imajin-ai#2201`) does not yet
- * document emitting any of these over the existing `wsNotifications` bridge
- * — this list is this plugin's documented reaction contract; confirming (or
- * renaming) the exact emitted scope(s) is a kernel-side follow-up (see the
- * PR body).
+ * Kernel notification scopes that invalidate the catalog cache, confirmed
+ * against the landed kernel/proxy half (`ima-jin/imajin-ai#2219`, closing
+ * `ima-jin/imajin-ai#2205`): `connector.credential.sealed` and
+ * `connector.credential.unsealed` fire on a connector's credential being
+ * sealed/unsealed, `connector.models.changed` fires when the usable model
+ * set for a connector changes. All three arrive as the kernel's existing
+ * generic notification envelope (`type: "notification"`, `scope`, `data`,
+ * `createdAt`) over the plugin's existing `wsNotifications` bridge — the
+ * same `NotificationFrame` shape `index.ts` already dispatches on via
+ * `nf.scope`. `data` carries `{ provider }` for the two credential scopes
+ * and `{ provider, hint }` for `connector.models.changed`; neither is
+ * consulted here since invalidation only needs the scope match.
  */
 export const IMAJIN_CATALOG_INVALIDATION_SCOPES: readonly string[] = [
-  "imajin.connector.sealed",
-  "imajin.connector.unsealed",
-  "imajin.connector.model_changed",
-  "imajin.connector.model-changed",
-  "connector.sealed",
-  "connector.unsealed",
-  "connector.model_changed",
+  "connector.credential.sealed",
+  "connector.credential.unsealed",
+  "connector.models.changed",
 ];
 
 export function isImajinCatalogInvalidationScope(scope: string): boolean {

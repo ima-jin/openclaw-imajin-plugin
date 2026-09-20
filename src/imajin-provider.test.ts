@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import {
+  IMAJIN_CATALOG_INVALIDATION_SCOPES,
   IMAJIN_PROVIDER_ID,
   IMAJIN_SYNTHETIC_API_KEY,
   ImajinCatalogCache,
@@ -209,15 +210,33 @@ describe("ImajinCatalogCache", () => {
 });
 
 describe("isImajinCatalogInvalidationScope", () => {
-  it("matches every documented candidate scope", () => {
-    expect(isImajinCatalogInvalidationScope("imajin.connector.sealed")).toBe(true);
-    expect(isImajinCatalogInvalidationScope("imajin.connector.unsealed")).toBe(true);
-    expect(isImajinCatalogInvalidationScope("connector.model_changed")).toBe(true);
+  it("matches exactly the three kernel scopes confirmed by ima-jin/imajin-ai#2219", () => {
+    expect(isImajinCatalogInvalidationScope("connector.credential.sealed")).toBe(true);
+    expect(isImajinCatalogInvalidationScope("connector.credential.unsealed")).toBe(true);
+    expect(isImajinCatalogInvalidationScope("connector.models.changed")).toBe(true);
+  });
+
+  it("exposes exactly those three scopes and no others", () => {
+    expect(IMAJIN_CATALOG_INVALIDATION_SCOPES).toEqual([
+      "connector.credential.sealed",
+      "connector.credential.unsealed",
+      "connector.models.changed",
+    ]);
   });
 
   it("does not match an unrelated notification scope", () => {
     expect(isImajinCatalogInvalidationScope("warp.run.completed")).toBe(false);
     expect(isImajinCatalogInvalidationScope("")).toBe(false);
+  });
+
+  it("no longer matches the retired pre-#2219 speculative scope names", () => {
+    expect(isImajinCatalogInvalidationScope("imajin.connector.sealed")).toBe(false);
+    expect(isImajinCatalogInvalidationScope("imajin.connector.unsealed")).toBe(false);
+    expect(isImajinCatalogInvalidationScope("imajin.connector.model_changed")).toBe(false);
+    expect(isImajinCatalogInvalidationScope("imajin.connector.model-changed")).toBe(false);
+    expect(isImajinCatalogInvalidationScope("connector.sealed")).toBe(false);
+    expect(isImajinCatalogInvalidationScope("connector.unsealed")).toBe(false);
+    expect(isImajinCatalogInvalidationScope("connector.model_changed")).toBe(false);
   });
 });
 

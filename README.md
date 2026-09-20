@@ -94,15 +94,17 @@ the kernel with its own app key, never a value you enter.
 **Live discovery + refresh**: the catalog is fetched live and cached for
 60s (advisory — a proxy outage degrades straight to "no models", never a
 stale/wrong catalog; the static seed is intentionally empty). On a kernel
-notification whose scope matches `IMAJIN_CATALOG_INVALIDATION_SCOPES`
-(`src/imajin-provider.ts` — candidate connector sealed/unsealed/model-
-changed scope names) arriving over the plugin's existing WS connection, the
-cache is invalidated immediately so the next model list reflects `/jin`
-within seconds instead of waiting out the TTL. **Kernel-side follow-up**:
-as of this writing `ima-jin/imajin-ai#2201` does not yet document the
-kernel emitting any of these scopes over the existing `wsNotifications`
-bridge — confirming (or renaming) the exact emitted scope name(s) is
-tracked as kernel-side follow-up work.
+notification whose scope is `connector.credential.sealed`,
+`connector.credential.unsealed`, or `connector.models.changed`
+(`IMAJIN_CATALOG_INVALIDATION_SCOPES`, `src/imajin-provider.ts` — confirmed
+against the landed kernel/proxy half `ima-jin/imajin-ai#2219`, closing
+`ima-jin/imajin-ai#2205`) arriving over the plugin's existing WS connection,
+the cache is invalidated immediately so the next model list reflects `/jin`
+within seconds instead of waiting out the TTL. These arrive as the kernel's
+existing generic notification envelope (`type: "notification"`, `scope`,
+`data`, `createdAt`) — the same shape the plugin already dispatches on via
+`nf.scope` — with `data: { provider }` on the two credential scopes and
+`data: { provider, hint }` on `connector.models.changed`.
 
 **The allow-list step (one-time)**: OpenClaw's own
 `agents.defaults.modelPolicy.allow` accepts trailing prefix wildcards

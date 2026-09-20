@@ -248,12 +248,12 @@ export default definePluginEntry({
           console.log(
             `[imajin-ws] notification: ${nf.scope} — ${nf.title}`,
           );
-          // WS-driven catalog refresh (#36 item 2): a connector sealed /
-          // unsealed / model-changed kernel notification invalidates the
-          // imajin provider's discovery cache so the NEXT `catalog.run` call
-          // refetches immediately instead of waiting out the 60s TTL. See
-          // `IMAJIN_CATALOG_INVALIDATION_SCOPES` for the documented
-          // candidate scope names and the kernel-side follow-up note.
+          // WS-driven catalog refresh (#36 item 2): a `connector.credential.
+          // sealed` / `connector.credential.unsealed` / `connector.models.
+          // changed` kernel notification (confirmed scopes, ima-jin/imajin-
+          // ai#2219) invalidates the imajin provider's discovery cache so the
+          // NEXT `catalog.run` call refetches immediately instead of waiting
+          // out the 60s TTL. See `IMAJIN_CATALOG_INVALIDATION_SCOPES`.
           if (isImajinCatalogInvalidationScope(nf.scope)) {
             console.log(`[imajin-plugin] invalidating imajin catalog cache (scope=${nf.scope})`);
             imajinProvider.cache.invalidate();
