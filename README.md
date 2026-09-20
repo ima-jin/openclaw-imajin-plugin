@@ -55,7 +55,7 @@ In `openclaw.json`:
 - **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway proposals from one or more sources to the kernel and applies signed operator decisions from /jin (#24, generalized by #33); see "Gateway approvals bridge" below:
   - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
   - **`approvals.operatorDid`** — the operator's Imajin DID
-  - **`approvals.sources`** — which sources to drive (#33): `"system-agent"` and/or `"skill-workshop"`; defaults to both when omitted. A source left out neither lists nor subscribes.
+  - **`approvals.sources`** — which sources to drive: `"system-agent"` and/or `"skill-workshop"` (#33) default on when this array is omitted; `"gateway-exec"` (#38, OpenClaw host-exec approvals) is opt-in ONLY and must be listed explicitly — it is never included in that default, since it grants remote-execution-grade `operator.approvals` authority over live host-exec approvals. A source left out neither lists nor subscribes.
   - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection(s); a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
   - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
 
@@ -85,6 +85,7 @@ the signed claim without the content ever leaving the agent's own machine.
 - [x] Ack-confirmed delivery, dedup, and persisted pending wakes (#26)
 - [x] Gateway approvals bridge — publish staged Gateway proposals to the kernel and apply signed decisions from /jin (#24)
 - [x] Generic source-adapter bridge + Skill Workshop source (#33)
+- [x] gateway-exec source — forward OpenClaw host-exec approvals to /jin, resolve allow-once/deny (#38)
 
 ### Approval bridge (#1816)
 
@@ -124,12 +125,13 @@ bridge carries that decision to and from /jin without ever bypassing that
 source's own backing store. See `docs/approvals-bridge.md` for sequence
 diagrams, including the generic leg.
 
-**Sources** (`approvals.sources`, default both):
+**Sources** (`approvals.sources`; `system-agent` + `skill-workshop` default on, `gateway-exec` is opt-in ONLY — see "gateway-exec source" below):
 
 | Source | File | Backing store | Decision labels |
 | --- | --- | --- | --- |
 | `system-agent` | `src/sources/system-agent.ts` | OpenClaw Gateway `openclaw.approval.*` / `approval.resolve` | Approve / Deny (default) |
 | `skill-workshop` | `src/sources/skill-workshop.ts` | Gateway `skills.proposals.*` | Apply / Reject |
+| `gateway-exec` | `src/sources/gateway-exec.ts` | OpenClaw Gateway `exec.approval.*` | Allow once / Deny (never Always) |
 
 **What it does, per source**
 
@@ -187,6 +189,92 @@ if a deployment's Gateway enforces per-connection scope checks strictly,
 those RPCs will surface as a logged, swallowed error (never crashing the
 bridge) rather than succeed. Flagged as follow-up work for the OpenClaw
 plugin SDK.
+
+### gateway-exec source (#38)
+
+Forwards pending OpenClaw **host-exec** approvals (`tools.exec.mode: "ask"`/
+`"auto"`, or a per-agent `ask: "on-miss"`/`"always"`) to /jin as kernel
+operator-approvals of kind `exec.command`, and resolves the operator's
+decision back through OpenClaw's own `exec.approval.resolve`. It is a
+separate `ApprovalSource` (`src/sources/gateway-exec.ts`) driven by the same
+generic bridge described above — see that file's module doc for the full
+design rationale (why it subscribes to the Gateway's own `exec.approval.
+requested` event rather than registering as an `approvals.exec.targets`
+forwarded-channel destination, the `exec.command` kernel kind, the identity-
+only `sourceRevision`, and outcome reporting).
+
+**Opt-in, off by default.** Unlike `system-agent`/`skill-workshop`,
+`gateway-exec` is never enabled just because `approvals.enabled: true` and
+`approvals.sources` is omitted — it must be listed explicitly:
+
+```json5
+{
+  plugins: {
+    entries: {
+      imajin: {
+        config: {
+          approvals: {
+            enabled: true,
+            operatorDid: "did:imajin:operator",
+            sources: ["system-agent", "skill-workshop", "gateway-exec"],
+            notifyWebhookSecret: { source: "store", provider: "default", id: "IMAJIN_NOTIFY_WEBHOOK_SECRET" },
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+This source relies on OpenClaw's own **approval forwarding to chat/plugin
+channels** being reachable in principle (it observes the same underlying
+`exec.approval.*` Gateway surface that feature is built on), documented
+under "Approval forwarding to chat channels" in OpenClaw's `tools/exec-
+approvals-advanced` docs — the `approvals.exec.targets` snippet there is
+OpenClaw's OWN config (not this plugin's), shown here for context:
+
+```json5
+// In the OpenClaw GATEWAY's own openclaw.json, not this plugin's config:
+{
+  approvals: {
+    exec: {
+      enabled: true,
+      mode: "session", // "session" | "targets" | "both"
+      targets: [{ channel: "telegram", to: "123456789" }],
+    },
+  },
+}
+```
+
+**Scope**: like every other source, this one opens the plugin's own loopback
+Gateway connection via `createOperatorApprovalsGatewayClient`, which
+declares `scopes: ["operator.approvals"]` — the same dedicated,
+remote-execution-grade scope OpenClaw's own docs call out as required for
+`exec.approval.resolve`/`approval.resolve` ("Minimal scopes for third-party
+clients"). No broader scope (e.g. `operator.admin`) is ever requested for
+this source.
+
+**ORDERING NOTE**: land this plugin change together with its kernel half
+(`ima-jin/imajin-ai#2221`) **before** flipping the Gateway's `ssh` exec
+policy from `deny` to `ask` (with `askFallback: deny`). Flipping the policy
+first routes approval prompts to the legacy Telegram `/approve` flow this
+source is meant to replace, with no /jin card to catch them in the interim.
+
+**Never `allow-always`**: `resolve()` only ever sends `allow-once` or `deny`
+to `exec.approval.resolve` — an exhaustive switch over the bridge's generic
+`approve`/`reject` decision vocabulary makes any other value (including a
+hypothetical `allow-always`) throw rather than reach the Gateway. The
+generic bridge itself already drops any kernel-decided value outside
+`approve`/`reject`/`withdrawn` before any source is ever touched.
+
+**Outcome reporting**: after the Gateway reports an approved exec finished,
+the source posts `{exitCode, durationMs, outputHash}` back to the kernel via
+`createHttpKernelExecOutcomeClient` (`POST /notify/api/send`, scope
+`operator.approval.exec.outcome`). `ima-jin/imajin-ai#2221` does not yet
+define a dedicated outcome endpoint — this is a documented placeholder
+(`TODO(#2221)` in `gateway-exec.ts`) that will move to whatever endpoint
+that kernel PR defines once merged; the client-side POST is fully unit
+tested regardless of which endpoint it ultimately targets.
 
 **The trust chain**
 

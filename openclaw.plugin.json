@@ -66,7 +66,7 @@
     },
     "approvals.sources": {
       "label": "Gateway Approvals Bridge: Sources",
-      "help": "Which approval sources to drive (#33): \"system-agent\" (OpenClaw gateway restart / config-mutation proposals) and/or \"skill-workshop\" (pending Skill Workshop skill proposals). Defaults to both. A source left out of this list neither lists nor subscribes."
+      "help": "Which approval sources to drive: \"system-agent\" (OpenClaw gateway restart / config-mutation proposals, #33) and/or \"skill-workshop\" (pending Skill Workshop skill proposals, #33) are on by default. \"gateway-exec\" (OpenClaw host-exec approvals filed to the kernel as kind exec.command, #38) is opt-in ONLY \u2014 it is never enabled unless listed here explicitly, even when this array is otherwise omitted, because it grants remote-execution-grade operator.approvals authority over live host-exec approvals. ORDERING NOTE: land this + ima-jin/imajin-ai#2221 before flipping the ssh exec policy from deny to ask (askFallback: deny) \u2014 flipping first routes prompts to the legacy Telegram /approve path this source replaces. A source left out of this list neither lists nor subscribes."
     },
     "approvals.gatewayToken": {
       "label": "Gateway Approvals Bridge: Gateway Token",
@@ -220,8 +220,8 @@
           },
           "sources": {
             "type": "array",
-            "items": { "type": "string", "enum": ["system-agent", "skill-workshop"] },
-            "description": "Which approval sources to drive (#33). Defaults to [\"system-agent\", \"skill-workshop\"] (both) when omitted. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
+            "items": { "type": "string", "enum": ["system-agent", "skill-workshop", "gateway-exec"] },
+            "description": "Which approval sources to drive (#33, #38). Defaults to [\"system-agent\", \"skill-workshop\"] when omitted \u2014 \"gateway-exec\" (#38) is opt-in ONLY and is never included in that default, since it grants remote-execution-grade operator.approvals authority over live OpenClaw host-exec approvals; list it explicitly to enable it. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
           },
           "gatewayToken": {
             "description": "Optional bearer override for the plugin's own loopback Gateway operator connection. A plain string or a SecretRef object, resolved once via the plugin SDK. Optional: Gateway auth otherwise resolves automatically from the host's own gateway config.",
