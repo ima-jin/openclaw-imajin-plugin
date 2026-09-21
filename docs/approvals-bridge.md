@@ -81,7 +81,7 @@ The bridge signs the same canonical object with the agent DID keypair. The
 kernel accepts an optional `"sha256:"` prefix on ingest; this bridge always
 emits it.
 
-### Skill Workshop source (#33)
+### Skill Workshop source (#33, scope fix #35)
 
 `sources/skill-workshop.ts` maps pending `skills.proposals.list` entries
 (scope `operator.read`) to `ApprovalSourceRequest`s with `kind:
@@ -99,6 +99,41 @@ proposals.apply`/`reject` (scope `operator.admin`) with the tracked
 (`SkillProposalRevisionChangedError`), which this source translates into
 an `ApprovalContentDriftError` so the bridge's generic mismatch/
 "restage" handling applies uniformly.
+
+**Connection scopes (#35).** The plugin SDK's only loopback-operator-
+connection factory (`createOperatorApprovalsGatewayClient`) hardcodes
+`scopes: ["operator.approvals"]`, which is insufficient for the
+`operator.read`/`operator.admin` this source's RPCs actually need — on a
+Gateway that enforces per-connection scopes strictly (token-mode auth),
+every poll failed closed with `FORBIDDEN: missing scope: operator.read`.
+Set `approvals.skillWorkshop.operatorScopes: ["operator.read",
+"operator.admin"]` to fix this: the source then opens its connection via
+`createOperatorGatewayClient` (`src/gateway-operator-client.ts`) instead of
+the SDK factory. That module's doc explains exactly how it builds the
+connection (loopback-only `resolveGatewayAuth` + `resolveGatewayPort`
+bootstrap) and how it disclosably differs from the SDK's own factory (no
+operator-approval-runtime-token shortcut, since that helper is not exported
+from the public plugin SDK). Only known operator scopes
+(`operator.read`/`operator.admin`/`operator.approvals`/`operator.write`)
+are accepted — an unrecognized entry fails plugin startup with a clear
+error. Off by default (`operatorScopes: []`): this is additive, config-
+gated, interim behaviour, pending an upstream scope-parameterized loopback
+factory (tracked as `openclaw/openclaw#TBD`) that will let
+`gateway-operator-client.ts` be deleted entirely. A missing-scope error is
+now logged exactly once per source instance (`createSkillWorkshopSource`'s
+`warnMissingScopeOnce`), and `subscribe()`'s poll backs off afterward
+(`MISSING_SCOPE_BACKOFF_MULTIPLIER`×) instead of repeating the same doomed
+request every interval — still never crashing the bridge.
+
+**Authority note.** `operator.admin` on this connection lets the plugin
+apply/reject Skill Workshop proposals directly — this matches the source's
+existing job (it is the thing `resolve()` already calls
+`skills.proposals.apply`/`reject` through), not a widening of what this
+source does; only the connection's DECLARED scope set changes, from a value
+that made every one of its RPCs fail anyway to the value those RPCs already
+required server-side. The scope is confined to this one loopback
+connection and is never granted implicitly — it requires an explicit
+`approvals.skillWorkshop.operatorScopes` config entry.
 
 ### gateway-exec source (#38)
 

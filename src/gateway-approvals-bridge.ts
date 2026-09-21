@@ -87,6 +87,7 @@ import {
 } from "./sources/types.js";
 import { createLiveGatewayApprovalsClient, createSystemAgentSource } from "./sources/system-agent.js";
 import { createLiveSkillWorkshopConnection, createSkillWorkshopSource } from "./sources/skill-workshop.js";
+import { assertKnownOperatorGatewayScopes } from "./gateway-operator-client.js";
 import { createImajinCatalogSource, createLiveImajinCatalogConnection } from "./sources/imajin-catalog.js";
 import type { ImajinRuntimeModel } from "./imajin-provider.js";
 import {
@@ -342,6 +343,31 @@ export interface ApprovalsBridgePluginConfig {
    * bridge to publish anything — never a literal in config, never logged.
    */
   notifyWebhookSecret?: SecretInput;
+  /**
+   * Skill Workshop source config (#35). There is no separate `enabled`
+   * flag here: whether the `skill-workshop` source runs at all is already
+   * governed by `approvals.sources` (default on) — adding a second on/off
+   * switch would just create two ways to disable the same thing. Off by
+   * default (`operatorScopes: []` or omitted): unchanged SDK-default
+   * behaviour (today's dead-on-arrival-on-strict-gateways posture, #35).
+   */
+  skillWorkshop?: {
+    /**
+     * Operator scopes to request on the skill-workshop source's OWN
+     * loopback Gateway connection instead of the SDK's fixed
+     * `["operator.approvals"]`-only default — see `gateway-operator-
+     * client.ts`'s module doc for why this is necessary and
+     * `docs/approvals-bridge.md` for the authority/security rationale.
+     * Default `[]`: behaviour is unchanged from before #35. Set
+     * `["operator.read", "operator.admin"]` to grant exactly what
+     * `skills.proposals.list`/`apply`/`reject` require. Only scopes in
+     * `gateway-operator-client.ts`'s `KNOWN_OPERATOR_GATEWAY_SCOPES` are
+     * accepted — an unrecognized entry fails plugin startup with a clear
+     * error instead of silently opening a connection the Gateway will
+     * reject anyway.
+     */
+    operatorScopes?: string[];
+  };
 }
 
 /**
@@ -846,9 +872,12 @@ export async function startGatewayApprovalsBridge(
 
   if (enabledSourceIds.has("skill-workshop")) {
     try {
+      const operatorScopes = config!.skillWorkshop?.operatorScopes ?? [];
+      assertKnownOperatorGatewayScopes(operatorScopes, "approvals.skillWorkshop.operatorScopes");
       const live = await createLiveSkillWorkshopConnection(api, {
         gatewayTokenOverride: gatewayTokenResult.value,
         clientDisplayName: "Imajin Gateway approvals bridge (skill-workshop)",
+        operatorScopes,
       });
       await live.start();
       sources.set("skill-workshop", createSkillWorkshopSource(live.client));

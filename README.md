@@ -59,6 +59,7 @@ In `openclaw.json`:
   - **`approvals.sources`** — which sources to drive: `"system-agent"` and/or `"skill-workshop"` (#33) default on when this array is omitted; `"imajin-catalog"` (opt-in per-model gating for newly discovered `imajin/*` models, #36) and `"gateway-exec"` (#38, OpenClaw host-exec approvals) are opt-in ONLY and must be listed explicitly — neither is ever included in that default; gateway-exec grants remote-execution-grade `operator.approvals` authority over live host-exec approvals. A source left out neither lists nor subscribes.
   - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection(s); a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
   - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
+  - **`approvals.skillWorkshop.operatorScopes`** — operator scopes (#35) for the `skill-workshop` source's OWN loopback Gateway connection; default `[]` (unchanged SDK-default, `operator.approvals` only); set `["operator.read", "operator.admin"]` to fix `FORBIDDEN: missing scope` on strict/token-mode gateways; see "Gateway approvals bridge" below
 - **`inferProxyBaseUrl`** (optional) — base URL of the local kernel inference proxy the `imajin` OpenClaw model provider discovers its catalog from (#36); defaults to `http://127.0.0.1:8787/openai/v1`; see "Kernel brains as OpenClaw models" below
 
 ### Turn-usage attestation
@@ -161,6 +162,7 @@ probe of the proxy's `GET /healthz` body.
 - [x] Imajin OpenClaw model provider — live catalog from the kernel passthrough, WS-driven refresh, allow-list via operator approval (#36)
 - [x] gateway-exec source — forward OpenClaw host-exec approvals to /jin, resolve allow-once/deny (#38)
 - [x] `imajin_vault` — owner→agent credential handoff via delegation grant, values kept out of model context (#40, kernel half ima-jin/imajin-ai#2231); see `docs/vault-handoff.md`
+- [x] `approvals.skillWorkshop.operatorScopes` — scope-parameterized loopback Gateway client for the skill-workshop source, fixing #35's `FORBIDDEN: missing scope` on strict/token-mode gateways
 
 ### Approval bridge (#1816)
 
@@ -218,8 +220,9 @@ diagrams, including the generic leg.
    `openclaw/plugin-sdk/gateway-runtime`'s `createOperatorApprovalsGatewayClient`
    (the same helper the OpenClaw CLI's own `openclaw approvals` tooling
    uses) and listens for `openclaw.approval.requested`. `skill-workshop`
-   reuses the same connection-bootstrap helper (see "Known limitation"
-   below) and polls `skills.proposals.list` on an interval — there is no
+   uses that same connection-bootstrap helper BY DEFAULT, or the #35
+   scoped one when `approvals.skillWorkshop.operatorScopes` is set (see
+   below), and polls `skills.proposals.list` on an interval — there is no
    SDK-exposed "a new proposal appeared" push event; `skills.proposals.
    events.list` is real but scoped to one already-known proposal's own
    revision history, not a discovery feed.
@@ -255,16 +258,67 @@ diagrams, including the generic leg.
    operator sees a fresh card (`skill-workshop`, #33's "revision drift →
    no apply + re-stage").
 
-**Known limitation**: the plugin SDK's only exported loopback-operator-
-connection factory (`createOperatorApprovalsGatewayClient`) declares
-`scopes: ["operator.approvals"]`; `skills.proposals.list` needs
-`operator.read` and `skills.proposals.apply`/`reject` need
-`operator.admin`. The `skill-workshop` source reuses that same factory
-since no scope-parameterized alternative is exposed at this SDK version —
-if a deployment's Gateway enforces per-connection scope checks strictly,
-those RPCs will surface as a logged, swallowed error (never crashing the
-bridge) rather than succeed. Flagged as follow-up work for the OpenClaw
-plugin SDK.
+**Fixed in #35 (interim, config-gated)**: the plugin SDK's only exported
+loopback-operator-connection factory (`createOperatorApprovalsGatewayClient`)
+declares `scopes: ["operator.approvals"]`; `skills.proposals.list` needs
+`operator.read` and `skills.proposals.apply`/`reject` need `operator.admin`.
+On a Gateway that enforces per-connection scope checks strictly (token-mode
+auth), the `skill-workshop` source's connection through that factory can
+never satisfy those RPCs — every poll failed closed with `FORBIDDEN:
+missing scope: operator.read`, logged and swallowed on every single poll.
+
+Set `approvals.skillWorkshop.operatorScopes` to grant this source's own
+loopback connection the scopes it actually needs instead:
+
+```json5
+{
+  plugins: {
+    entries: {
+      imajin: {
+        config: {
+          approvals: {
+            enabled: true,
+            operatorDid: "did:imajin:operator",
+            skillWorkshop: {
+              operatorScopes: ["operator.read", "operator.admin"],
+            },
+          },
+        },
+      },
+    },
+  },
+}
+```
+
+`operatorScopes` defaults to `[]` (unchanged SDK-default behaviour) — this
+is opt-in and off by default. Only `operator.read`, `operator.admin`,
+`operator.approvals`, and `operator.write` are accepted; an unrecognized
+entry fails plugin startup with a clear error rather than silently opening
+a connection the Gateway will reject anyway (`src/gateway-operator-
+client.ts`'s `assertKnownOperatorGatewayScopes`). When set, the source opens
+its Gateway connection via `createOperatorGatewayClient` (`src/gateway-
+operator-client.ts`) instead of the SDK factory — see that file's module
+doc for exactly how it builds the connection and how it differs from the
+SDK's own factory (loopback-only, no operator-approval-runtime-token
+shortcut). A missing-scope RPC error is now logged exactly ONCE (not once
+per poll) with a pointer back at this config key, and the poll backs off
+rather than repeating the same doomed request every interval.
+
+**Authority**: `operator.admin` on this connection lets the plugin itself
+apply/reject Skill Workshop proposals — this is the intended authority,
+not scope creep: this bridge IS the component that applies a proposal once
+the operator approves it on /jin (see "What it does, per source" above and
+`docs/approvals-bridge.md`'s trust chain). The scope is confined to this
+one loopback connection, granted only when explicitly configured, and
+never includes the unrelated `operator.questions`/`operator.pairing`/
+`operator.talk`/`operator.talk.secrets` scopes the real Gateway also
+supports.
+
+**Removal plan**: this is an interim fix pending an upstream, scope-
+parameterized loopback-connection factory in the OpenClaw plugin SDK
+(tracked as `openclaw/openclaw#TBD`, filed alongside #35). Once that ships,
+`src/gateway-operator-client.ts` should be deleted and every caller should
+switch back to the SDK's own factory with the scopes it then accepts.
 
 ### gateway-exec source (#38)
 
