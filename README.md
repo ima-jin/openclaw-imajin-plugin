@@ -13,6 +13,7 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_transact` | Settlement  | Check MJNx/MJN balances, view transaction history            |
 | `imajin_fair`     | Attribution | Inspect .fair manifests — who made what and who gets paid    |
 | `imajin_discover` | Discovery   | Search the network for people, businesses, events, stubs     |
+| `imajin_vault`    | Vault       | Fetch owner-granted secrets (delegation grants) as protected handles — values never enter model context (#40) |
 
 ## Configuration
 
@@ -86,6 +87,7 @@ the signed claim without the content ever leaving the agent's own machine.
 - [x] Gateway approvals bridge — publish staged Gateway proposals to the kernel and apply signed decisions from /jin (#24)
 - [x] Generic source-adapter bridge + Skill Workshop source (#33)
 - [x] gateway-exec source — forward OpenClaw host-exec approvals to /jin, resolve allow-once/deny (#38)
+- [x] `imajin_vault` — owner→agent credential handoff via delegation grant, values kept out of model context (#40, kernel half ima-jin/imajin-ai#2231); see `docs/vault-handoff.md`
 
 ### Approval bridge (#1816)
 

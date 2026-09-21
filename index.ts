@@ -42,6 +42,7 @@ import {
   createWarpTool,
   createInferTool,
   createChatTool,
+  createVaultTool,
 } from "./src/tools.js";
 import {
   createTurnUsageAttestationHandler,
@@ -109,6 +110,7 @@ export default definePluginEntry({
     api.registerTool(createMediaTool(client));
     api.registerTool(createWarpTool(client));
     api.registerTool(createInferTool(client));
+    api.registerTool(createVaultTool(client));
 
     // Chat — requires keypair for auth
     if (config.keypairPath) {
