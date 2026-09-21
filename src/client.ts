@@ -711,6 +711,36 @@ export class ImajinClient {
     return this.post(path, body, opts);
   }
 
+  /**
+   * Low-level authenticated request that does NOT throw on a non-2xx status and does NOT
+   * assume a JSON body — it returns the raw status/content-type/text so a caller can branch
+   * on specific status codes (e.g. vault grant 403/404/410) without a generic `get`/`post`
+   * error message (which embeds the response body) ever being constructed. Used by
+   * `src/vault/kernel-contract.ts` so every vault-related status-code decision stays
+   * value-free at the transport layer, and by anything else that needs the same
+   * challenge-response auth this client already performs without inventing a second
+   * request path.
+   */
+  async requestRaw(
+    path: string,
+    opts?: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown; onBehalfOf?: string },
+  ): Promise<{ status: number; contentType: string; text: string }> {
+    const headers = await this.authHeaders({ onBehalfOf: opts?.onBehalfOf });
+    const method = opts?.method ?? "GET";
+    const hasBody = opts?.body !== undefined;
+    if (hasBody) headers["Content-Type"] = "application/json";
+    const res = await fetch(`${this.baseUrl}${path}`, {
+      method,
+      headers,
+      ...(hasBody ? { body: JSON.stringify(opts?.body) } : {}),
+    });
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type") ?? "",
+      text: await res.text(),
+    };
+  }
+
   // --- Warp Cloud Agent dispatch (#1428 / #1619) ---
 
   /**

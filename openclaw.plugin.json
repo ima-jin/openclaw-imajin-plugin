@@ -13,7 +13,8 @@
       "imajin_media",
       "imajin_warp",
       "imajin_infer",
-      "imajin_chat"
+      "imajin_chat",
+      "imajin_vault"
     ]
   },
   "uiHints": {
