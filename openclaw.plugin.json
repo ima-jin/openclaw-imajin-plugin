@@ -73,7 +73,7 @@
     },
     "approvals.sources": {
       "label": "Gateway Approvals Bridge: Sources",
-      "help": "Which approval sources to drive (#33, #36): \"system-agent\" (OpenClaw gateway restart / config-mutation proposals), \"skill-workshop\" (pending Skill Workshop skill proposals), and/or \"imajin-catalog\" (opt-in per-model gating for newly discovered imajin/* models, #36 \u2014 an alternative to the one-time `imajin/*` modelPolicy.allow wildcard). Defaults to [\"system-agent\", \"skill-workshop\"] (imajin-catalog is opt-in, never defaulted-on). A source left out of this list neither lists nor subscribes."
+      "help": "Which approval sources to drive: \"system-agent\" (OpenClaw gateway restart / config-mutation proposals, #33) and/or \"skill-workshop\" (pending Skill Workshop skill proposals, #33) are on by default. \"imajin-catalog\" (opt-in per-model gating for newly discovered imajin/* models, #36 \u2014 an alternative to the one-time `imajin/*` modelPolicy.allow wildcard) and \"gateway-exec\" (OpenClaw host-exec approvals filed to the kernel as kind gateway-exec:command, #38) are opt-in ONLY \u2014 neither is ever enabled unless listed here explicitly, even when this array is otherwise omitted; gateway-exec grants remote-execution-grade operator.approvals authority over live host-exec approvals. ORDERING NOTE: land gateway-exec + ima-jin/imajin-ai#2221 before flipping the ssh exec policy from deny to ask (askFallback: deny) \u2014 flipping first routes prompts to the legacy Telegram /approve path this source replaces. A source left out of this list neither lists nor subscribes."
     },
     "approvals.gatewayToken": {
       "label": "Gateway Approvals Bridge: Gateway Token",
@@ -231,8 +231,8 @@
           },
           "sources": {
             "type": "array",
-            "items": { "type": "string", "enum": ["system-agent", "skill-workshop", "imajin-catalog"] },
-            "description": "Which approval sources to drive (#33, #36). Defaults to [\"system-agent\", \"skill-workshop\"] when omitted \u2014 \"imajin-catalog\" (#36, per-model gating for newly discovered imajin/* models) is opt-in only and never defaulted on. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
+            "items": { "type": "string", "enum": ["system-agent", "skill-workshop", "imajin-catalog", "gateway-exec"] },
+            "description": "Which approval sources to drive (#33, #36, #38). Defaults to [\"system-agent\", \"skill-workshop\"] when omitted \u2014 \"imajin-catalog\" (#36, per-model gating for newly discovered imajin/* models) and \"gateway-exec\" (#38, grants remote-execution-grade operator.approvals authority over live OpenClaw host-exec approvals) are opt-in ONLY and never included in that default; list either explicitly to enable it. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
           },
           "gatewayToken": {
             "description": "Optional bearer override for the plugin's own loopback Gateway operator connection. A plain string or a SecretRef object, resolved once via the plugin SDK. Optional: Gateway auth otherwise resolves automatically from the host's own gateway config.",

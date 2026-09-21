@@ -11,6 +11,11 @@ import { createSystemAgentSource, type GatewayApprovalsClient } from "./sources/
 import { createSkillWorkshopSource, type SkillWorkshopGatewayClient } from "./sources/skill-workshop.js";
 import { createImajinCatalogSource, type ImajinModelPolicyGatewayClient } from "./sources/imajin-catalog.js";
 import type { ImajinRuntimeModel } from "./imajin-provider.js";
+import {
+  createGatewayExecSource,
+  type GatewayExecApprovalRecord,
+  type GatewayExecApprovalsClient,
+} from "./sources/gateway-exec.js";
 import type { ApprovalSource } from "./sources/types.js";
 
 if ("hashes" in ed && ed.hashes) {
@@ -99,10 +104,33 @@ function makeSkillWorkshopFixture(): { source: ApprovalSource; makePending: () =
   return { source: createSkillWorkshopSource(client), makePending: () => {} };
 }
 
+function makeGatewayExecFixture(): { source: ApprovalSource; makePending: () => void } {
+  const record: GatewayExecApprovalRecord = {
+    id: "contract-proposal",
+    request: {
+      command: "echo hi",
+      cwd: "/tmp",
+      host: "gateway",
+      agentId: "main",
+      sessionKey: "agent:main:telegram:direct:1",
+    },
+    createdAtMs: Date.now(),
+    expiresAtMs: Date.now() + 1_800_000,
+  };
+  const client: GatewayExecApprovalsClient = {
+    list: vi.fn().mockResolvedValue([record]),
+    resolve: vi.fn().mockResolvedValue({ applied: true }),
+    onRequested: vi.fn(),
+    onFinished: vi.fn(),
+  };
+  return { source: createGatewayExecSource(client, { agentDid: AGENT_DID }), makePending: () => {} };
+}
+
 describe.each([
   ["system-agent", makeSystemAgentFixture],
   ["skill-workshop", makeSkillWorkshopFixture],
-])("ApprovalSource contract: %s", (_name, makeFixture) => {
+  ["gateway-exec", makeGatewayExecFixture],
+])("ApprovalSource contract: %s", (name, makeFixture) => {
   it("implements list/subscribe/getCurrent/resolve and reports a consistent proposalId+contentHash", async () => {
     const { source } = makeFixture();
     expect(typeof source.list).toBe("function");
@@ -112,14 +140,19 @@ describe.each([
 
     const [request] = await source.list();
     expect(request.proposalId).toBe("contract-proposal");
-    expect(request.sourceRevision).toBe("hash-1");
+    // Every source (including gateway-exec, #38, kernel #2221/PR #2223)
+    // namespaces `kind` as "<source>:<subkind>" — see gateway-exec.ts's
+    // module doc for why an earlier draft's bare "exec.command" literal was
+    // corrected to follow this convention.
     expect(request.kind.startsWith(`${source.id}:`)).toBe(true);
+    if (name !== "gateway-exec") {
+      expect(request.sourceRevision).toBe("hash-1");
+    }
 
     const current = await source.getCurrent(request.proposalId);
     expect(current?.pending).toBe(true);
-    expect(current?.sourceRevision).toBe("hash-1");
 
-    const result = await source.resolve(request.proposalId, "approve", "hash-1");
+    const result = await source.resolve(request.proposalId, "approve", current!.sourceRevision!);
     expect(result.applied).toBe(true);
 
     const unsubscribe = source.subscribe(() => {});
@@ -383,5 +416,154 @@ describe("GatewayApprovalsBridge + imajin-catalog: publish on new row, config wr
 
     expect(gateway.getConfig).not.toHaveBeenCalled();
     expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
+  });
+});
+
+// --- gateway-exec (#38) end-to-end: resolve is only ever called after a
+// verified operator.approval.decided with a matching contentHash. ---
+
+function makeExecRecord(overrides: Partial<GatewayExecApprovalRecord> = {}): GatewayExecApprovalRecord {
+  return {
+    id: "exec-1",
+    request: {
+      command: "deploy.sh --prod && echo done",
+      cwd: "/srv/app",
+      host: "gateway",
+      agentId: "main",
+      sessionKey: "agent:main:telegram:direct:1",
+    },
+    createdAtMs: Date.now(),
+    expiresAtMs: Date.now() + 1_800_000,
+    ...overrides,
+  };
+}
+
+describe("GatewayApprovalsBridge + gateway-exec: verified-decision-only resolve", () => {
+  it("approve resolves allow-once exactly once, with the verbatim command staged in detail", async () => {
+    const listMock = vi.fn().mockResolvedValue([makeExecRecord()]);
+    const client: GatewayExecApprovalsClient = {
+      list: listMock,
+      resolve: vi.fn().mockResolvedValue({ applied: true }),
+      onRequested: vi.fn(),
+      onFinished: vi.fn(),
+    };
+    const source = createGatewayExecSource(client, { agentDid: AGENT_DID });
+    const kernel = makeKernel();
+    const bridge = new GatewayApprovalsBridge(
+      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
+      new Map<string, ApprovalSource>([["gateway-exec", source]]),
+      kernel as unknown as KernelNotifyClient,
+    );
+
+    await bridge.reconcile();
+    expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
+    const published = kernel.publishApprovalRequested.mock.calls[0][0];
+    expect(published.kind).toBe("gateway-exec:command");
+    expect(published.detail.command).toBe("deploy.sh --prod && echo done");
+    const stagedContentHash = lastPublishedContentHash(kernel);
+
+    await bridge.handleKernelDecision(makeDecidedFrame("exec-1", "approve", stagedContentHash));
+
+    expect(client.resolve).toHaveBeenCalledTimes(1);
+    expect(client.resolve).toHaveBeenCalledWith("exec-1", "allow-once");
+    expect(client.resolve).not.toHaveBeenCalledWith("exec-1", "allow-always");
+  });
+
+  it("reject resolves deny", async () => {
+    const client: GatewayExecApprovalsClient = {
+      list: vi.fn().mockResolvedValue([makeExecRecord({ id: "exec-2" })]),
+      resolve: vi.fn().mockResolvedValue({ applied: true }),
+      onRequested: vi.fn(),
+      onFinished: vi.fn(),
+    };
+    const source = createGatewayExecSource(client, { agentDid: AGENT_DID });
+    const kernel = makeKernel();
+    const bridge = new GatewayApprovalsBridge(
+      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
+      new Map<string, ApprovalSource>([["gateway-exec", source]]),
+      kernel as unknown as KernelNotifyClient,
+    );
+
+    await bridge.reconcile();
+    const stagedContentHash = lastPublishedContentHash(kernel);
+
+    await bridge.handleKernelDecision(makeDecidedFrame("exec-2", "reject", stagedContentHash));
+
+    expect(client.resolve).toHaveBeenCalledWith("exec-2", "deny");
+  });
+
+  it("an unrecognized wire decision (e.g. a hypothetical allow-always) is dropped before any source is touched", async () => {
+    const client: GatewayExecApprovalsClient = {
+      list: vi.fn().mockResolvedValue([makeExecRecord({ id: "exec-3" })]),
+      resolve: vi.fn().mockResolvedValue({ applied: true }),
+      onRequested: vi.fn(),
+      onFinished: vi.fn(),
+    };
+    const source = createGatewayExecSource(client, { agentDid: AGENT_DID });
+    const kernel = makeKernel();
+    const bridge = new GatewayApprovalsBridge(
+      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
+      new Map<string, ApprovalSource>([["gateway-exec", source]]),
+      kernel as unknown as KernelNotifyClient,
+    );
+
+    await bridge.reconcile();
+    const stagedContentHash = lastPublishedContentHash(kernel);
+
+    await bridge.handleKernelDecision(makeDecidedFrame("exec-3", "allow-always", stagedContentHash));
+
+    expect(client.resolve).not.toHaveBeenCalled();
+  });
+
+  it("a decided event whose contentHash does not match the staged proposal is never resolved (check 1)", async () => {
+    const client: GatewayExecApprovalsClient = {
+      list: vi.fn().mockResolvedValue([makeExecRecord({ id: "exec-4" })]),
+      resolve: vi.fn().mockResolvedValue({ applied: true }),
+      onRequested: vi.fn(),
+      onFinished: vi.fn(),
+    };
+    const source = createGatewayExecSource(client, { agentDid: AGENT_DID });
+    const kernel = makeKernel();
+    const bridge = new GatewayApprovalsBridge(
+      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
+      new Map<string, ApprovalSource>([["gateway-exec", source]]),
+      kernel as unknown as KernelNotifyClient,
+    );
+
+    await bridge.reconcile();
+
+    await bridge.handleKernelDecision(makeDecidedFrame("exec-4", "approve", "sha256:" + "0".repeat(64)));
+
+    expect(client.resolve).not.toHaveBeenCalled();
+    expect(kernel.publishMismatch).toHaveBeenCalledWith("exec-4", expect.stringContaining("contentHash"));
+  });
+
+  it("an expired/already-resolved approval (no longer in list()) is never resolved — idempotent no-op", async () => {
+    const listMock = vi.fn();
+    listMock.mockResolvedValueOnce([makeExecRecord({ id: "exec-5" })]);
+    const client: GatewayExecApprovalsClient = {
+      list: listMock,
+      resolve: vi.fn().mockResolvedValue({ applied: true }),
+      onRequested: vi.fn(),
+      onFinished: vi.fn(),
+    };
+    const source = createGatewayExecSource(client, { agentDid: AGENT_DID });
+    const kernel = makeKernel();
+    const bridge = new GatewayApprovalsBridge(
+      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
+      new Map<string, ApprovalSource>([["gateway-exec", source]]),
+      kernel as unknown as KernelNotifyClient,
+    );
+
+    await bridge.reconcile();
+    const stagedContentHash = lastPublishedContentHash(kernel);
+
+    // OpenClaw itself expired (or someone else already resolved) the approval
+    // before the operator's decision arrived — it drops out of list().
+    listMock.mockResolvedValue([]);
+
+    await bridge.handleKernelDecision(makeDecidedFrame("exec-5", "approve", stagedContentHash));
+
+    expect(client.resolve).not.toHaveBeenCalled();
   });
 });

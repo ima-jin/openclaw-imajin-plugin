@@ -89,6 +89,12 @@ import { createLiveGatewayApprovalsClient, createSystemAgentSource } from "./sou
 import { createLiveSkillWorkshopConnection, createSkillWorkshopSource } from "./sources/skill-workshop.js";
 import { createImajinCatalogSource, createLiveImajinCatalogConnection } from "./sources/imajin-catalog.js";
 import type { ImajinRuntimeModel } from "./imajin-provider.js";
+import {
+  createGatewayExecSource,
+  createHttpKernelExecOutcomeClient,
+  createLiveGatewayExecConnection,
+  wireGatewayExecOutcomeReporting,
+} from "./sources/gateway-exec.js";
 
 // --- Wire types (kernel side, `docs/notify-operator-approvals-contract.md` in ima-jin/imajin-ai, generalized by #2152) ---
 
@@ -350,21 +356,31 @@ export function isApprovalsBridgeConfigured(
   return Boolean(config?.enabled && config?.operatorDid?.trim() && agentDid?.trim());
 }
 
-export const KNOWN_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop", "imajin-catalog"] as const;
+export const KNOWN_APPROVAL_SOURCE_IDS = [
+  "system-agent",
+  "skill-workshop",
+  "imajin-catalog",
+  "gateway-exec",
+] as const;
 export type KnownApprovalSourceId = (typeof KNOWN_APPROVAL_SOURCE_IDS)[number];
 
 /**
- * Sources enabled when `approvals.sources` is omitted/empty. `imajin-catalog`
- * (#36) is deliberately NOT included here — it is opt-in only, since most
- * installs either have no `modelPolicy.allow` at all (already "allow any")
- * or use the documented one-time `imajin/*` wildcard (see README); it must
- * be named explicitly in `approvals.sources` to activate.
+ * Sources driven when `approvals.sources` is omitted entirely. Deliberately
+ * NOT every `KNOWN_APPROVAL_SOURCE_IDS` entry:
+ *   - `imajin-catalog` (#36) is opt-in only, since most installs either have
+ *     no `modelPolicy.allow` at all (already "allow any") or use the
+ *     documented one-time `imajin/*` wildcard (see README).
+ *   - `gateway-exec` (#38) grants remote-execution-grade `operator.approvals`
+ *     authority over live host-exec approvals.
+ * Both must be named explicitly in `approvals.sources` to activate, even
+ * when the bridge itself is already enabled -- never enabled implicitly by
+ * an existing `approvals.enabled: true` deployment that predates either.
  */
-const DEFAULT_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop"] as const;
+const DEFAULT_ENABLED_APPROVAL_SOURCE_IDS: readonly KnownApprovalSourceId[] = ["system-agent", "skill-workshop"];
 
-/** Resolves `approvals.sources` to the set of source ids to drive, defaulting to `DEFAULT_APPROVAL_SOURCE_IDS`. */
+/** Resolves `approvals.sources` to the set of source ids to drive, defaulting to `DEFAULT_ENABLED_APPROVAL_SOURCE_IDS` (opt-in-only sources excluded). */
 export function resolveEnabledApprovalSourceIds(configured: string[] | undefined): Set<string> {
-  if (!configured || configured.length === 0) return new Set(DEFAULT_APPROVAL_SOURCE_IDS);
+  if (!configured || configured.length === 0) return new Set(DEFAULT_ENABLED_APPROVAL_SOURCE_IDS);
   return new Set(configured.filter((id) => (KNOWN_APPROVAL_SOURCE_IDS as readonly string[]).includes(id)));
 }
 
@@ -866,6 +882,28 @@ export async function startGatewayApprovalsBridge(
       console.warn(
         '[imajin-approvals-bridge] approvals.sources includes "imajin-catalog" but no catalog accessor was wired (imajin provider not registered) — source not started',
       );
+    }
+  }
+
+  if (enabledSourceIds.has("gateway-exec")) {
+    try {
+      const live = await createLiveGatewayExecConnection(api, {
+        gatewayTokenOverride: gatewayTokenResult.value,
+        clientDisplayName: "Imajin Gateway approvals bridge (gateway-exec)",
+      });
+      await live.start();
+      sources.set("gateway-exec", createGatewayExecSource(live.client, { agentDid: deps.did! }));
+      stoppers.push(live.stop);
+      // Outcome reporting (#38) is a side channel alongside the source
+      // itself, not part of the generic ApprovalSource contract — see
+      // gateway-exec.ts's module doc.
+      const outcomeClient = createHttpKernelExecOutcomeClient({
+        nodeUrl: deps.nodeUrl,
+        webhookSecret: notifySecretResult.value,
+      });
+      stoppers.push(wireGatewayExecOutcomeReporting(live.client, outcomeClient));
+    } catch (err) {
+      console.error(`[imajin-approvals-bridge] failed to start gateway-exec source: ${String(err)}`);
     }
   }
 
