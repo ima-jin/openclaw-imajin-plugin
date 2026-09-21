@@ -49,15 +49,23 @@ describe("imajin_vault tool — grep-proof value safety", () => {
     }
   }
 
-  it("list_grants returns metadata only, never a value field", async () => {
+  it("only supports list_grants and fetch — ack_consumed is not a valid action", async () => {
+    expect(tool.parameters.properties.action.enum).toEqual(["list_grants", "fetch"]);
+    const result = await tool.execute("1", { action: "ack_consumed" } as never);
+    expect(result.content[0].text).toMatch(/Unknown action/);
+  });
+
+  it("list_grants returns metadata only (subject/field/status/purpose), never a value field", async () => {
     global.fetch = mockFetch({
       grants: [
         {
-          grantId: "g1",
-          ownerDid: "did:imajin:owner",
+          grantId: "vdg_1",
+          subject: "did:imajin:owner",
+          field: "gha-runner-token",
           purpose: "gha-runner-registration",
-          expiresAt: "2026-01-01T00:00:00Z",
           oneTime: true,
+          status: "active",
+          expiresAt: null,
           consumedAt: null,
           createdAt: "2025-12-31T00:00:00Z",
         },
@@ -67,18 +75,22 @@ describe("imajin_vault tool — grep-proof value safety", () => {
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.grants).toHaveLength(1);
     expect(parsed.grants[0]).not.toHaveProperty("value");
+    expect(parsed.grants[0]).toMatchObject({ subject: "did:imajin:owner", field: "gha-runner-token" });
     assertNoLeak(result);
   });
 
   it("fetch returns ONLY a handle + metadata — the JSON-serialized result never contains the secret value", async () => {
     global.fetch = mockFetch({
+      ok: true,
+      field: "gha-runner-token",
       value: KNOWN_SECRET,
+      purpose: "gha-runner-registration",
       oneTime: true,
       expiresAt: new Date(Date.now() + 60_000).toISOString(),
     });
     const result = await tool.execute("1", {
       action: "fetch",
-      grantId: "g1",
+      grantId: "vdg_1",
       name: "GH_TOKEN",
     });
     const parsed = JSON.parse(result.content[0].text);
@@ -96,18 +108,34 @@ describe("imajin_vault tool — grep-proof value safety", () => {
     expect(seen).toEqual({ GH_TOKEN: KNOWN_SECRET });
   });
 
+  it("fetch works when the kernel reports no expiry on the grant (expiresAt: null)", async () => {
+    global.fetch = mockFetch({
+      ok: true,
+      field: "F",
+      value: KNOWN_SECRET,
+      purpose: null,
+      oneTime: false,
+      expiresAt: null,
+    });
+    const result = await tool.execute("1", { action: "fetch", grantId: "vdg_1", name: "GH_TOKEN" });
+    const parsed = JSON.parse(result.content[0].text);
+    expect(parsed.expiresAt).toEqual(expect.any(String));
+    expect(new Date(parsed.expiresAt).getTime()).toBeGreaterThan(Date.now());
+    assertNoLeak(result);
+  });
+
   it("fetch requires grantId and name", async () => {
     const r1 = await tool.execute("1", { action: "fetch" } as never);
     expect(r1.content[0].text).toMatch(/grantId/i);
 
-    const r2 = await tool.execute("1", { action: "fetch", grantId: "g1" } as never);
+    const r2 = await tool.execute("1", { action: "fetch", grantId: "vdg_1" } as never);
     expect(r2.content[0].text).toMatch(/name/i);
   });
 
   it("fetch rejects an unsupported 'as' value", async () => {
     const result = await tool.execute("1", {
       action: "fetch",
-      grantId: "g1",
+      grantId: "vdg_1",
       name: "X",
       as: "stdout",
     } as never);
@@ -118,31 +146,31 @@ describe("imajin_vault tool — grep-proof value safety", () => {
     global.fetch = mockFetch({ error: "gone" }, 410);
     const result = await tool.execute("1", {
       action: "fetch",
-      grantId: "g1",
+      grantId: "vdg_1",
       name: "GH_TOKEN",
     });
     expect(result.content[0].text).toMatch(/grant_already_consumed/);
     assertNoLeak(result);
   });
 
-  it("maps a kernel 403 to grant_not_for_this_agent", async () => {
-    global.fetch = mockFetch({ error: "forbidden" }, 403);
+  it("maps a kernel 404 to grant_not_found (unknown grantId or belongs to another agent)", async () => {
+    global.fetch = mockFetch({ error: "not found" }, 404);
     const result = await tool.execute("1", {
       action: "fetch",
-      grantId: "g1",
-      name: "GH_TOKEN",
-    });
-    expect(result.content[0].text).toMatch(/grant_not_for_this_agent/);
-  });
-
-  it("maps a kernel 404 to grant_not_found", async () => {
-    global.fetch = mockFetch({ error: "missing" }, 404);
-    const result = await tool.execute("1", {
-      action: "fetch",
-      grantId: "g1",
+      grantId: "vdg_1",
       name: "GH_TOKEN",
     });
     expect(result.content[0].text).toMatch(/grant_not_found/);
+  });
+
+  it("maps a kernel 403 to grant_not_active (inactive/expired/revoked)", async () => {
+    global.fetch = mockFetch({ error: "forbidden" }, 403);
+    const result = await tool.execute("1", {
+      action: "fetch",
+      grantId: "vdg_1",
+      name: "GH_TOKEN",
+    });
+    expect(result.content[0].text).toMatch(/grant_not_active/);
   });
 
   it("redacts an upstream 500 error — the tool result never contains the raw upstream body", async () => {
@@ -155,23 +183,12 @@ describe("imajin_vault tool — grep-proof value safety", () => {
     } as unknown as Response);
     const result = await tool.execute("1", {
       action: "fetch",
-      grantId: "g1",
+      grantId: "vdg_1",
       name: "GH_TOKEN",
     });
     expect(result.content[0].text).toMatch(/vault_request_failed/);
     expect(result.content[0].text).not.toContain(KNOWN_SECRET);
     expect(result.content[0].text).not.toContain(upstreamBody);
     assertNoLeak(result);
-  });
-
-  it("ack_consumed POSTs to the consume endpoint and returns consumedAt", async () => {
-    global.fetch = mockFetch({ consumedAt: "2026-01-01T00:00:00Z" });
-    const result = await tool.execute("1", { action: "ack_consumed", grantId: "g1" });
-    expect(JSON.parse(result.content[0].text)).toEqual({ consumedAt: "2026-01-01T00:00:00Z" });
-  });
-
-  it("ack_consumed requires grantId", async () => {
-    const result = await tool.execute("1", { action: "ack_consumed" } as never);
-    expect(result.content[0].text).toMatch(/grantId/i);
   });
 });

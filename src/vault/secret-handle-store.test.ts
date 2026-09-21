@@ -44,6 +44,17 @@ describe("createSecretHandle / withSecretEnv", () => {
     expect(new Date(expiresAt).getTime()).toBeLessThanOrEqual(now + 5_000 + 5);
   });
 
+  it("treats a null grantExpiresAt (no expiry on the grant) as the max TTL, not an immediately-expired handle", () => {
+    const now = Date.now();
+    const { expiresAt } = createSecretHandle({ name: "X", value: "v", grantExpiresAt: null });
+    const expiresMs = new Date(expiresAt).getTime();
+    // A naive `new Date(null)` resolves to the 1970 epoch, which would make
+    // this assertion fail by producing an already-expired handle instead.
+    expect(expiresMs).toBeGreaterThan(now);
+    expect(expiresMs).toBeLessThanOrEqual(now + DEFAULT_MAX_TTL_MS + 5);
+    expect(expiresMs).toBeGreaterThan(now + DEFAULT_MAX_TTL_MS - 5000);
+  });
+
   it("withSecretEnv resolves the handle to { [name]: value }", async () => {
     const { handle } = createSecretHandle({
       name: "GH_TOKEN",

@@ -1,27 +1,36 @@
 /**
  * Kernel contract for the `imajin_vault` tool — plugin half of the remote
  * human -> agent credential handoff (`ima-jin/openclaw-imajin-plugin#40`;
- * kernel half `ima-jin/imajin-ai#2231`).
+ * kernel half `ima-jin/imajin-ai#2231`, implemented in
+ * `ima-jin/imajin-ai` PR #2234, branch `feat/2231-vault-agent-credential-handoff`,
+ * commit `85dcd14102d8da66dabef70e3d8ee069d5371d6d`).
  *
  * ALL kernel route paths + wire shapes for the grant-fetch flow live in this
- * ONE module so a follow-up PR (once `ima-jin/imajin-ai#2231` actually lands
- * and its real routes/shapes are known) can re-point them here without
- * touching `../tools.ts` or `./secret-handle-store.ts` at all.
+ * ONE module so a future kernel-side contract change only requires editing
+ * this file — `../tools.ts` and `./secret-handle-store.ts` never reference a
+ * kernel path directly.
  *
- * At the time this was written, no `ima-jin/imajin-ai#2231` PR existed yet,
- * so the contract below is an ASSUMPTION (see this repo's PR body's "Wire
- * contract" section for the exact assumed paths/shapes):
+ * Confirmed against `ima-jin/imajin-ai` PR #2234
+ * (`apps/kernel/app/api/vault/delegation/grants/route.ts` +
+ * `apps/kernel/app/api/vault/delegation/grants/[grantId]/fetch/route.ts`):
  *
- *   GET  /auth/api/grants/mine?purpose=<string>&status=active
- *     -> { grants: [{ grantId, ownerDid, purpose, expiresAt, oneTime,
- *                      consumedAt, createdAt }] }   (metadata only, ever)
- *   POST /auth/api/grants/{grantId}/fetch
- *     -> { value, contentType?, oneTime, expiresAt }
- *        403 grant not scoped to this agent DID
- *        404 unknown/revoked grant
+ *   GET  /api/vault/delegation/grants?purpose=<string>
+ *     -> { grants: [{ grantId, subject, field, purpose, oneTime, status,
+ *                      expiresAt, consumedAt, createdAt }] }   (metadata only, ever)
+ *     no `status` filter param exists — the kernel returns every grant for
+ *     the authenticated grantee DID regardless of status.
+ *   POST /api/vault/delegation/grants/{grantId}/fetch
+ *     -> { ok: true, field, value, purpose, oneTime, expiresAt }
+ *        expiresAt may be `null` (no expiry on the grant itself).
+ *        404 grant unknown OR belongs to a different agent (deliberately
+ *             indistinguishable — anti-enumeration; the kernel's
+ *             `not_found`/`not_grantee` outcomes both map to 404)
+ *        403 grant inactive, expired, or revoked
  *        410 one-time grant already consumed
- *   POST /auth/api/grants/{grantId}/consume
- *     -> { consumedAt }   (idempotent)
+ *   There is NO separate consume endpoint: a `oneTime` grant is consumed
+ *   atomically inside `fetch` itself (the kernel claims it with a
+ *   `consumedAt IS NULL` guard before decrypting), so every fetch after the
+ *   first successful one returns 410.
  *
  * Every function here authenticates via the SAME `ImajinClient` challenge-
  * response session every other tool uses (`client.requestRaw`, which reuses
@@ -37,35 +46,29 @@
  */
 import type { ImajinClient } from "../client.js";
 
-/** One grant's metadata, as surfaced by `GET /auth/api/grants/mine`. Never carries a value. */
+/** One grant's metadata, as surfaced by `GET /api/vault/delegation/grants`. Never carries a value. */
 export interface VaultGrantMeta {
   grantId: string;
-  ownerDid: string;
-  purpose: string;
-  expiresAt: string;
+  subject: string;
+  field: string;
+  purpose: string | null;
   oneTime: boolean;
+  status: string;
+  expiresAt: string | null;
   consumedAt: string | null;
   createdAt: string;
 }
 
-/** The sealed value + its metadata, as surfaced by `POST /auth/api/grants/{grantId}/fetch`. */
+/** The sealed value + its metadata, as surfaced by `POST /api/vault/delegation/grants/{grantId}/fetch`. */
 export interface VaultGrantValue {
   value: string;
-  contentType?: string;
+  field: string;
+  purpose: string | null;
   oneTime: boolean;
-  expiresAt: string;
+  expiresAt: string | null;
 }
 
-/** Result of `POST /auth/api/grants/{grantId}/consume`. */
-export interface VaultConsumeResult {
-  consumedAt: string;
-}
-
-export type VaultErrorCode =
-  | "grant_not_found"
-  | "grant_not_for_this_agent"
-  | "grant_already_consumed"
-  | "vault_request_failed";
+export type VaultErrorCode = "grant_not_found" | "grant_not_active" | "grant_already_consumed" | "vault_request_failed";
 
 /** A clear, value-free error for every vault kernel-request failure mode. */
 export class VaultError extends Error {
@@ -77,23 +80,25 @@ export class VaultError extends Error {
   }
 }
 
-const GRANTS_MINE_PATH = "/auth/api/grants/mine";
+const GRANTS_PATH = "/api/vault/delegation/grants";
 const grantFetchPath = (grantId: string): string =>
-  `/auth/api/grants/${encodeURIComponent(grantId)}/fetch`;
-const grantConsumePath = (grantId: string): string =>
-  `/auth/api/grants/${encodeURIComponent(grantId)}/consume`;
+  `/api/vault/delegation/grants/${encodeURIComponent(grantId)}/fetch`;
 
 /**
  * Maps a non-2xx status to a value-free `VaultError`. Deliberately never
  * accepts or embeds the response body — see module doc's "Value-safety
  * invariant".
+ *
+ * 404 covers BOTH an unknown grantId and a grantId that belongs to a
+ * different agent — the kernel deliberately returns the same status for
+ * both (anti-enumeration, see module doc). 403 is inactive/expired/revoked.
  */
 function errorForStatus(status: number, action: string): VaultError {
   switch (status) {
-    case 403:
-      return new VaultError("grant_not_for_this_agent", "Grant is not scoped to this agent DID.");
     case 404:
-      return new VaultError("grant_not_found", "Grant not found or revoked.");
+      return new VaultError("grant_not_found", "Grant not found or not issued to this agent.");
+    case 403:
+      return new VaultError("grant_not_active", "Grant is inactive, expired, or revoked.");
     case 410:
       return new VaultError("grant_already_consumed", "One-time grant has already been consumed.");
     default:
@@ -113,15 +118,17 @@ function safeJsonParse(text: string): unknown {
  * List grants issued to the authenticated agent DID, optionally filtered by
  * `purpose`. Metadata only — the kernel route never returns values, and
  * this function passes the response through as-is (no value field exists
- * to accidentally forward).
+ * to accidentally forward). There is no `status` filter param on the real
+ * route — every grant for the caller is returned regardless of status.
  */
 export async function listGrantsMine(
   client: ImajinClient,
   opts: { purpose?: string; onBehalfOf?: string } = {},
 ): Promise<VaultGrantMeta[]> {
-  const params = new URLSearchParams({ status: "active" });
+  const params = new URLSearchParams();
   if (opts.purpose) params.set("purpose", opts.purpose);
-  const { status, text } = await client.requestRaw(`${GRANTS_MINE_PATH}?${params.toString()}`, {
+  const query = params.toString();
+  const { status, text } = await client.requestRaw(`${GRANTS_PATH}${query ? `?${query}` : ""}`, {
     onBehalfOf: opts.onBehalfOf,
   });
   if (status < 200 || status >= 300) throw errorForStatus(status, "list_grants");
@@ -130,11 +137,12 @@ export async function listGrantsMine(
 }
 
 /**
- * Fetches the sealed value for a grant. Callers MUST immediately hand the
- * returned `value` to `secret-handle-store.ts`'s `createSecretHandle` and
- * never let it reach a tool result, a log line, or a rethrown error — this
- * function itself never logs or wraps the value in anything other than the
- * plain returned object.
+ * Fetches the sealed value for a grant, consuming it atomically kernel-side
+ * when the grant is `oneTime` (there is no separate consume step — see
+ * module doc). Callers MUST immediately hand the returned `value` to
+ * `secret-handle-store.ts`'s `createSecretHandle` and never let it reach a
+ * tool result, a log line, or a rethrown error — this function itself never
+ * logs or wraps the value in anything other than the plain returned object.
  */
 export async function fetchGrantValue(
   client: ImajinClient,
@@ -155,27 +163,12 @@ export async function fetchGrantValue(
   }
   return {
     value: parsed.value,
-    ...(typeof parsed.contentType === "string" ? { contentType: parsed.contentType } : {}),
+    field: typeof parsed.field === "string" ? parsed.field : "",
+    purpose: typeof parsed.purpose === "string" ? parsed.purpose : null,
     oneTime: parsed.oneTime === true,
-    expiresAt:
-      typeof parsed.expiresAt === "string" ? parsed.expiresAt : new Date(Date.now() + 900_000).toISOString(),
-  };
-}
-
-/** Marks a one-time grant consumed. Idempotent on the kernel side. */
-export async function consumeGrant(
-  client: ImajinClient,
-  grantId: string,
-  opts: { onBehalfOf?: string } = {},
-): Promise<VaultConsumeResult> {
-  const { status, text } = await client.requestRaw(grantConsumePath(grantId), {
-    method: "POST",
-    body: {},
-    onBehalfOf: opts.onBehalfOf,
-  });
-  if (status < 200 || status >= 300) throw errorForStatus(status, "ack_consumed");
-  const parsed = safeJsonParse(text) as Partial<VaultConsumeResult> | null;
-  return {
-    consumedAt: typeof parsed?.consumedAt === "string" ? parsed.consumedAt : new Date().toISOString(),
+    // `null` is a real, meaningful value here (no expiry on the grant) — it is
+    // passed straight through to the handle store rather than fabricated into
+    // a fake timestamp; the handle store's own 15-min cap is the fallback TTL.
+    expiresAt: typeof parsed.expiresAt === "string" ? parsed.expiresAt : null,
   };
 }

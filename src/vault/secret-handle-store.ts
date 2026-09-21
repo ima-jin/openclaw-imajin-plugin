@@ -53,8 +53,12 @@ export interface CreateSecretHandleInput {
   name: string;
   /** The raw secret value. Never logged, never echoed back by this function. */
   value: string;
-  /** The grant's own `expiresAt` (ISO string, ms epoch, or Date) — TTL is capped to this. */
-  grantExpiresAt: string | number | Date;
+  /**
+   * The grant's own `expiresAt` (ISO string, ms epoch, or Date) — TTL is
+   * capped to this. `null` means the grant itself has no expiry, in which
+   * case `DEFAULT_MAX_TTL_MS` alone determines the handle's TTL.
+   */
+  grantExpiresAt: string | number | Date | null;
 }
 
 export interface CreateSecretHandleResult {
@@ -71,7 +75,11 @@ export function createSecretHandle(input: CreateSecretHandleInput): CreateSecret
   const now = Date.now();
   pruneExpired(now);
 
-  const grantExpiresMs = new Date(input.grantExpiresAt).getTime();
+  // `new Date(null)` resolves to the 1970 epoch (a finite, very-much-expired
+  // timestamp), NOT "no expiry" — so `null` must be special-cased to NaN
+  // before the finiteness check below, or a no-expiry grant would produce an
+  // already-expired handle instead of falling back to the max TTL.
+  const grantExpiresMs = input.grantExpiresAt === null ? Number.NaN : new Date(input.grantExpiresAt).getTime();
   const maxTtlExpiresMs = now + DEFAULT_MAX_TTL_MS;
   const expiresAtMs = Number.isFinite(grantExpiresMs)
     ? Math.min(grantExpiresMs, maxTtlExpiresMs)

@@ -13,7 +13,7 @@ import { readFile } from "node:fs/promises";
 import type { ImajinChat } from "./chat.js";
 import { validateDid } from "./client.js";
 import type { ImajinClient } from "./client.js";
-import { fetchGrantValue, consumeGrant, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
+import { fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
 import { createSecretHandle } from "./vault/secret-handle-store.js";
 
 type ToolContent = { type: "text"; text: string };
@@ -115,22 +115,22 @@ export function createVaultTool(client: ImajinClient) {
       "forbidden for secrets. The grant IS the record of the handoff. " +
       "SECRET VALUES NEVER ENTER MODEL CONTEXT, CHAT, OR TOOL-CALL LOGS THROUGH THIS TOOL. " +
       "Actions: " +
-      "list_grants (metadata ONLY for active grants issued to this agent's DID — grantId, " +
-      "ownerDid, purpose, expiresAt, oneTime, consumedAt, createdAt; optional purpose filter; " +
-      "NEVER returns a value), " +
+      "list_grants (metadata ONLY for grants issued to this agent's DID — grantId, subject, " +
+      "field, purpose, oneTime, status, expiresAt, consumedAt, createdAt; optional purpose " +
+      "filter; NEVER returns a value), " +
       "fetch (given a grantId, resolves the sealed value into a PROTECTED HANDLE — NOT the " +
       "value itself. The value is placed in an in-process, single-use, short-lived secret store " +
       "(TTL = min(grant expiresAt, 15 min); the value is deleted the first time anything reads " +
       "the handle). Returns ONLY { handle, name, expiresAt, oneTime } — redeem the handle via a " +
-      "follow-up exec bridge, never by asking this tool to print the value), " +
-      "ack_consumed (marks a one-time grant consumed after use; call this once the fetched " +
-      "value has actually been used).",
+      "follow-up exec bridge, never by asking this tool to print the value. A one-time grant is " +
+      "consumed ATOMICALLY by the kernel as part of this fetch — there is no separate consume " +
+      "step; a repeat fetch of an already-consumed one-time grant fails with grant_already_consumed).",
     parameters: {
       type: "object" as const,
       properties: {
         action: {
           type: "string" as const,
-          enum: ["list_grants", "fetch", "ack_consumed"],
+          enum: ["list_grants", "fetch"],
           description: "Action to perform",
         },
         purpose: {
@@ -139,7 +139,7 @@ export function createVaultTool(client: ImajinClient) {
         },
         grantId: {
           type: "string" as const,
-          description: "Grant id, as returned by list_grants (for fetch, ack_consumed)",
+          description: "Grant id, as returned by list_grants (for fetch)",
         },
         as: {
           type: "string" as const,
@@ -191,7 +191,7 @@ export function createVaultTool(client: ImajinClient) {
             }
             if (!grants.length) {
               return textResult(
-                params.purpose ? `No active grants found for purpose: ${params.purpose}` : "No active grants found",
+                params.purpose ? `No grants found for purpose: ${params.purpose}` : "No grants found",
               );
             }
             return jsonResult({ grants });
@@ -217,17 +217,6 @@ export function createVaultTool(client: ImajinClient) {
             });
             // Only the handle + metadata are ever returned — never grantValue.value.
             return jsonResult({ handle, name: params.name, expiresAt, oneTime: grantValue.oneTime });
-          }
-          case "ack_consumed": {
-            if (!params.grantId) return errorResult("ack_consumed requires 'grantId'");
-            try {
-              const result = await consumeGrant(client, params.grantId, {
-                onBehalfOf: params.onBehalfOf,
-              });
-              return jsonResult(result);
-            } catch (err) {
-              return vaultErrorResult(err);
-            }
           }
           default:
             return errorResult(`Unknown action: ${params.action}`);

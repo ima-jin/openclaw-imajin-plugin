@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ImajinClient } from "../client.js";
-import { listGrantsMine, fetchGrantValue, consumeGrant, VaultError } from "./kernel-contract.js";
+import { listGrantsMine, fetchGrantValue, VaultError } from "./kernel-contract.js";
 
 const KNOWN_SECRET = "ghp_super-secret-runner-registration-token-do-not-leak";
 
@@ -15,14 +15,16 @@ describe("listGrantsMine", () => {
     client = makeMockClient();
   });
 
-  it("GETs /auth/api/grants/mine?status=active and returns grants verbatim", async () => {
+  it("GETs /api/vault/delegation/grants with no query params and returns grants verbatim", async () => {
     const grants = [
       {
-        grantId: "g1",
-        ownerDid: "did:imajin:owner",
+        grantId: "vdg_1",
+        subject: "did:imajin:owner",
+        field: "gha-runner-token",
         purpose: "gha-runner-registration",
-        expiresAt: "2026-01-01T00:00:00Z",
         oneTime: true,
+        status: "active",
+        expiresAt: null,
         consumedAt: null,
         createdAt: "2025-12-31T00:00:00Z",
       },
@@ -35,11 +37,11 @@ describe("listGrantsMine", () => {
     const result = await listGrantsMine(client);
     expect(result).toEqual(grants);
     const [path, opts] = vi.mocked(client.requestRaw).mock.calls[0];
-    expect(path).toBe("/auth/api/grants/mine?status=active");
+    expect(path).toBe("/api/vault/delegation/grants");
     expect(opts).toEqual({ onBehalfOf: undefined });
   });
 
-  it("includes a purpose filter when provided", async () => {
+  it("includes a purpose filter when provided, and no other params", async () => {
     vi.mocked(client.requestRaw).mockResolvedValue({
       status: 200,
       contentType: "application/json",
@@ -47,7 +49,7 @@ describe("listGrantsMine", () => {
     });
     await listGrantsMine(client, { purpose: "gha-runner-registration" });
     const [path] = vi.mocked(client.requestRaw).mock.calls[0];
-    expect(path).toBe("/auth/api/grants/mine?status=active&purpose=gha-runner-registration");
+    expect(path).toBe("/api/vault/delegation/grants?purpose=gha-runner-registration");
   });
 
   it("returns an empty array when grants is missing or malformed", async () => {
@@ -84,56 +86,79 @@ describe("fetchGrantValue", () => {
     client = makeMockClient();
   });
 
-  it("POSTs to /auth/api/grants/{grantId}/fetch and returns the value", async () => {
+  it("POSTs to /api/vault/delegation/grants/{grantId}/fetch and returns the value + metadata", async () => {
     vi.mocked(client.requestRaw).mockResolvedValue({
       status: 200,
       contentType: "application/json",
-      text: JSON.stringify({ value: KNOWN_SECRET, oneTime: true, expiresAt: "2026-01-01T00:00:00Z" }),
+      text: JSON.stringify({
+        ok: true,
+        field: "gha-runner-token",
+        value: KNOWN_SECRET,
+        purpose: "gha-runner-registration",
+        oneTime: true,
+        expiresAt: "2026-01-01T00:00:00Z",
+      }),
     });
-    const result = await fetchGrantValue(client, "g1");
-    expect(result.value).toBe(KNOWN_SECRET);
-    expect(result.oneTime).toBe(true);
+    const result = await fetchGrantValue(client, "vdg_1");
+    expect(result).toEqual({
+      value: KNOWN_SECRET,
+      field: "gha-runner-token",
+      purpose: "gha-runner-registration",
+      oneTime: true,
+      expiresAt: "2026-01-01T00:00:00Z",
+    });
     const [path, opts] = vi.mocked(client.requestRaw).mock.calls[0];
-    expect(path).toBe("/auth/api/grants/g1/fetch");
+    expect(path).toBe("/api/vault/delegation/grants/vdg_1/fetch");
     expect(opts).toMatchObject({ method: "POST" });
+  });
+
+  it("passes a null expiresAt straight through (no expiry on the grant) instead of fabricating one", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValue({
+      status: 200,
+      contentType: "application/json",
+      text: JSON.stringify({ ok: true, field: "F", value: "v", purpose: null, oneTime: false, expiresAt: null }),
+    });
+    const result = await fetchGrantValue(client, "vdg_1");
+    expect(result.expiresAt).toBeNull();
+    expect(result.purpose).toBeNull();
   });
 
   it("URL-encodes the grantId", async () => {
     vi.mocked(client.requestRaw).mockResolvedValue({
       status: 200,
       contentType: "application/json",
-      text: JSON.stringify({ value: "v", oneTime: false, expiresAt: "2026-01-01T00:00:00Z" }),
+      text: JSON.stringify({ ok: true, field: "F", value: "v", purpose: null, oneTime: false, expiresAt: null }),
     });
     await fetchGrantValue(client, "g/1");
     const [path] = vi.mocked(client.requestRaw).mock.calls[0];
-    expect(path).toBe("/auth/api/grants/g%2F1/fetch");
+    expect(path).toBe("/api/vault/delegation/grants/g%2F1/fetch");
   });
 
-  it("maps 403 to grant_not_for_this_agent (value-free)", async () => {
+  it("maps 404 to grant_not_found (covers both unknown grantId and a grant belonging to another agent)", async () => {
     vi.mocked(client.requestRaw).mockResolvedValue({
-      status: 403,
+      status: 404,
       contentType: "text/plain",
-      text: `forbidden, would-be value: ${KNOWN_SECRET}`,
+      text: `not found, would-be value: ${KNOWN_SECRET}`,
     });
     let caught: unknown;
     try {
-      await fetchGrantValue(client, "g1");
+      await fetchGrantValue(client, "vdg_1");
     } catch (err) {
       caught = err;
     }
     expect(caught).toBeInstanceOf(VaultError);
-    expect((caught as VaultError).code).toBe("grant_not_for_this_agent");
+    expect((caught as VaultError).code).toBe("grant_not_found");
     expect((caught as VaultError).message).not.toContain(KNOWN_SECRET);
   });
 
-  it("maps 404 to grant_not_found", async () => {
-    vi.mocked(client.requestRaw).mockResolvedValue({ status: 404, contentType: "", text: "" });
-    await expect(fetchGrantValue(client, "g1")).rejects.toMatchObject({ code: "grant_not_found" });
+  it("maps 403 to grant_not_active (inactive/expired/revoked)", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValue({ status: 403, contentType: "", text: "" });
+    await expect(fetchGrantValue(client, "vdg_1")).rejects.toMatchObject({ code: "grant_not_active" });
   });
 
   it("maps 410 to grant_already_consumed", async () => {
     vi.mocked(client.requestRaw).mockResolvedValue({ status: 410, contentType: "", text: "" });
-    await expect(fetchGrantValue(client, "g1")).rejects.toMatchObject({ code: "grant_already_consumed" });
+    await expect(fetchGrantValue(client, "vdg_1")).rejects.toMatchObject({ code: "grant_already_consumed" });
   });
 
   it("redacts an upstream 500 error message (never includes the response body)", async () => {
@@ -145,7 +170,7 @@ describe("fetchGrantValue", () => {
     });
     let caught: unknown;
     try {
-      await fetchGrantValue(client, "g1");
+      await fetchGrantValue(client, "vdg_1");
     } catch (err) {
       caught = err;
     }
@@ -160,34 +185,8 @@ describe("fetchGrantValue", () => {
     vi.mocked(client.requestRaw).mockResolvedValue({
       status: 200,
       contentType: "application/json",
-      text: JSON.stringify({ oneTime: true }),
+      text: JSON.stringify({ ok: true, oneTime: true }),
     });
-    await expect(fetchGrantValue(client, "g1")).rejects.toMatchObject({ code: "vault_request_failed" });
-  });
-});
-
-describe("consumeGrant", () => {
-  let client: ReturnType<typeof makeMockClient>;
-
-  beforeEach(() => {
-    client = makeMockClient();
-  });
-
-  it("POSTs to /auth/api/grants/{grantId}/consume and returns consumedAt", async () => {
-    vi.mocked(client.requestRaw).mockResolvedValue({
-      status: 200,
-      contentType: "application/json",
-      text: JSON.stringify({ consumedAt: "2026-01-01T00:00:00Z" }),
-    });
-    const result = await consumeGrant(client, "g1");
-    expect(result).toEqual({ consumedAt: "2026-01-01T00:00:00Z" });
-    const [path, opts] = vi.mocked(client.requestRaw).mock.calls[0];
-    expect(path).toBe("/auth/api/grants/g1/consume");
-    expect(opts).toMatchObject({ method: "POST" });
-  });
-
-  it("maps 404 to grant_not_found", async () => {
-    vi.mocked(client.requestRaw).mockResolvedValue({ status: 404, contentType: "", text: "" });
-    await expect(consumeGrant(client, "g1")).rejects.toMatchObject({ code: "grant_not_found" });
+    await expect(fetchGrantValue(client, "vdg_1")).rejects.toMatchObject({ code: "vault_request_failed" });
   });
 });
