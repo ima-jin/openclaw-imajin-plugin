@@ -18,6 +18,8 @@ import {
   fetchImajinProxyHealthz,
   type ImajinCatalogCache,
 } from "./imajin-provider.js";
+import { fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
+import { createSecretHandle } from "./vault/secret-handle-store.js";
 
 type ToolContent = { type: "text"; text: string };
 type ToolResult = {
@@ -89,6 +91,137 @@ export function createIdentityTool(client: ImajinClient) {
             const connections = await client.getConnections(params.query);
             if (!connections.length) return textResult(`No connections found for: ${params.query}`);
             return jsonResult(connections);
+          }
+          default:
+            return errorResult(`Unknown action: ${params.action}`);
+        }
+      } catch (err: unknown) {
+        return errorResult(err instanceof Error ? err.message : String(err));
+      }
+    },
+  };
+}
+
+// --- Vault tool (#40, kernel half ima-jin/imajin-ai#2231) ---
+
+function vaultErrorResult(err: unknown): ToolResult {
+  if (err instanceof VaultError) return errorResult(`${err.code}: ${err.message}`);
+  return errorResult(err instanceof Error ? err.message : String(err));
+}
+
+export function createVaultTool(client: ImajinClient) {
+  return {
+    name: "imajin_vault",
+    label: "Imajin Vault",
+    description:
+      "Fetch owner-granted secrets from the Imajin vault (v2 delegation grants, #40, kernel " +
+      "half ima-jin/imajin-ai#2231) — the honest channel for a remote owner to hand the agent " +
+      "a short-lived credential (e.g. a runner registration token) when chat transcripts are " +
+      "forbidden for secrets. The grant IS the record of the handoff. " +
+      "SECRET VALUES NEVER ENTER MODEL CONTEXT, CHAT, OR TOOL-CALL LOGS THROUGH THIS TOOL. " +
+      "Actions: " +
+      "list_grants (metadata ONLY for grants issued to this agent's DID — grantId, subject, " +
+      "field, purpose, oneTime, status, expiresAt, consumedAt, createdAt; optional purpose " +
+      "filter; NEVER returns a value), " +
+      "fetch (given a grantId, resolves the sealed value into a PROTECTED HANDLE — NOT the " +
+      "value itself. The value is placed in an in-process, single-use, short-lived secret store " +
+      "(TTL = min(grant expiresAt, 15 min); the value is deleted the first time anything reads " +
+      "the handle). Returns ONLY { handle, name, expiresAt, oneTime } — redeem the handle via a " +
+      "follow-up exec bridge, never by asking this tool to print the value. A one-time grant is " +
+      "consumed ATOMICALLY by the kernel as part of this fetch — there is no separate consume " +
+      "step; a repeat fetch of an already-consumed one-time grant fails with grant_already_consumed).",
+    parameters: {
+      type: "object" as const,
+      properties: {
+        action: {
+          type: "string" as const,
+          enum: ["list_grants", "fetch"],
+          description: "Action to perform",
+        },
+        purpose: {
+          type: "string" as const,
+          description: "Filter grants by purpose string, e.g. 'gha-runner-registration' (for list_grants)",
+        },
+        grantId: {
+          type: "string" as const,
+          description: "Grant id, as returned by list_grants (for fetch)",
+        },
+        as: {
+          type: "string" as const,
+          enum: ["env"],
+          description:
+            "How the fetched value will be exposed when the handle is later redeemed. Only " +
+            "'env' is supported; defaults to 'env' (for fetch).",
+        },
+        name: {
+          type: "string" as const,
+          description:
+            "Env var name the fetched value will be exposed as when the handle is redeemed " +
+            "(for fetch). Required — this name is echoed back in the fetch result, the value is not.",
+        },
+        onBehalfOf: {
+          type: "string" as const,
+          description:
+            'DID to act on behalf of (agent delegation), or "self" to act as the agent itself with no delegation (#1545). ' +
+            "Grants are resolved against this principal (actingFor the owner DID recorded on the grant).",
+        },
+      },
+      required: ["action"],
+    },
+    async execute(
+      _id: string,
+      params: {
+        action: string;
+        purpose?: string;
+        grantId?: string;
+        as?: string;
+        name?: string;
+        onBehalfOf?: string;
+      },
+    ): Promise<ToolResult> {
+      if (params.onBehalfOf && params.onBehalfOf !== "self" && !validateDid(params.onBehalfOf)) {
+        return errorResult(`Invalid DID format for onBehalfOf: ${params.onBehalfOf}`);
+      }
+      try {
+        switch (params.action) {
+          case "list_grants": {
+            let grants;
+            try {
+              grants = await listGrantsMine(client, {
+                purpose: params.purpose,
+                onBehalfOf: params.onBehalfOf,
+              });
+            } catch (err) {
+              return vaultErrorResult(err);
+            }
+            if (!grants.length) {
+              return textResult(
+                params.purpose ? `No grants found for purpose: ${params.purpose}` : "No grants found",
+              );
+            }
+            return jsonResult({ grants });
+          }
+          case "fetch": {
+            if (!params.grantId) return errorResult("fetch requires 'grantId'");
+            if (!params.name) return errorResult("fetch requires 'name'");
+            if (params.as && params.as !== "env") {
+              return errorResult("fetch only supports as: 'env'");
+            }
+            let grantValue;
+            try {
+              grantValue = await fetchGrantValue(client, params.grantId, {
+                onBehalfOf: params.onBehalfOf,
+              });
+            } catch (err) {
+              return vaultErrorResult(err);
+            }
+            const { handle, expiresAt } = createSecretHandle({
+              name: params.name,
+              value: grantValue.value,
+              grantExpiresAt: grantValue.expiresAt,
+            });
+            // Only the handle + metadata are ever returned — never grantValue.value.
+            return jsonResult({ handle, name: params.name, expiresAt, oneTime: grantValue.oneTime });
           }
           default:
             return errorResult(`Unknown action: ${params.action}`);

@@ -15,7 +15,8 @@
       "imajin_warp",
       "imajin_infer",
       "imajin_chat",
-      "imajin_status"
+      "imajin_status",
+      "imajin_vault"
     ]
   },
   "uiHints": {
