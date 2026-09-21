@@ -87,6 +87,12 @@ import {
 } from "./sources/types.js";
 import { createLiveGatewayApprovalsClient, createSystemAgentSource } from "./sources/system-agent.js";
 import { createLiveSkillWorkshopConnection, createSkillWorkshopSource } from "./sources/skill-workshop.js";
+import {
+  createGatewayExecSource,
+  createHttpKernelExecOutcomeClient,
+  createLiveGatewayExecConnection,
+  wireGatewayExecOutcomeReporting,
+} from "./sources/gateway-exec.js";
 
 // --- Wire types (kernel side, `docs/notify-operator-approvals-contract.md` in ima-jin/imajin-ai, generalized by #2152) ---
 
@@ -348,12 +354,22 @@ export function isApprovalsBridgeConfigured(
   return Boolean(config?.enabled && config?.operatorDid?.trim() && agentDid?.trim());
 }
 
-export const KNOWN_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop"] as const;
+export const KNOWN_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop", "gateway-exec"] as const;
 export type KnownApprovalSourceId = (typeof KNOWN_APPROVAL_SOURCE_IDS)[number];
 
-/** Resolves `approvals.sources` to the set of source ids to drive, defaulting to every known source. */
+/**
+ * Sources driven when `approvals.sources` is omitted entirely. Deliberately
+ * NOT every `KNOWN_APPROVAL_SOURCE_IDS` entry: `gateway-exec` (#38) grants
+ * remote-execution-grade `operator.approvals` authority over live host-exec
+ * approvals, so it must be explicitly opted into via `approvals.sources`
+ * even when the bridge itself is already enabled -- never enabled implicitly
+ * by an existing `approvals.enabled: true` deployment that predates it.
+ */
+const DEFAULT_ENABLED_APPROVAL_SOURCE_IDS: readonly KnownApprovalSourceId[] = ["system-agent", "skill-workshop"];
+
+/** Resolves `approvals.sources` to the set of source ids to drive, defaulting to `DEFAULT_ENABLED_APPROVAL_SOURCE_IDS` (opt-in-only sources excluded). */
 export function resolveEnabledApprovalSourceIds(configured: string[] | undefined): Set<string> {
-  if (!configured || configured.length === 0) return new Set(KNOWN_APPROVAL_SOURCE_IDS);
+  if (!configured || configured.length === 0) return new Set(DEFAULT_ENABLED_APPROVAL_SOURCE_IDS);
   return new Set(configured.filter((id) => (KNOWN_APPROVAL_SOURCE_IDS as readonly string[]).includes(id)));
 }
 
@@ -818,6 +834,28 @@ export async function startGatewayApprovalsBridge(
       stoppers.push(live.stop);
     } catch (err) {
       console.error(`[imajin-approvals-bridge] failed to start skill-workshop source: ${String(err)}`);
+    }
+  }
+
+  if (enabledSourceIds.has("gateway-exec")) {
+    try {
+      const live = await createLiveGatewayExecConnection(api, {
+        gatewayTokenOverride: gatewayTokenResult.value,
+        clientDisplayName: "Imajin Gateway approvals bridge (gateway-exec)",
+      });
+      await live.start();
+      sources.set("gateway-exec", createGatewayExecSource(live.client, { agentDid: deps.did! }));
+      stoppers.push(live.stop);
+      // Outcome reporting (#38) is a side channel alongside the source
+      // itself, not part of the generic ApprovalSource contract — see
+      // gateway-exec.ts's module doc.
+      const outcomeClient = createHttpKernelExecOutcomeClient({
+        nodeUrl: deps.nodeUrl,
+        webhookSecret: notifySecretResult.value,
+      });
+      stoppers.push(wireGatewayExecOutcomeReporting(live.client, outcomeClient));
+    } catch (err) {
+      console.error(`[imajin-approvals-bridge] failed to start gateway-exec source: ${String(err)}`);
     }
   }
 

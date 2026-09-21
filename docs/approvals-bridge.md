@@ -54,10 +54,13 @@ directly; it is driven by a `Map<string, ApprovalSource>` built from
                 5. no drift → `source.resolve(id, decision, sourceRevision)`.
 ```
 
-Adding a third source is exactly "one file + one `approvals.sources`
+Adding another source is exactly "one file + one `approvals.sources`
 entry, no bridge edits" (#33 acceptance criterion) — implement
 `ApprovalSource` (`src/sources/types.ts`) and register it in
-`startGatewayApprovalsBridge` (`src/gateway-approvals-bridge.ts`).
+`startGatewayApprovalsBridge` (`src/gateway-approvals-bridge.ts`). `gateway-
+exec` (#38) is the first source that is opt-in ONLY (excluded from the
+default `approvals.sources` set even when that config key is omitted) — see
+`resolveEnabledApprovalSourceIds`'s module doc.
 
 ### `contentHash` digest definition (#2084)
 
@@ -95,7 +98,37 @@ proposals.apply`/`reject` (scope `operator.admin`) with the tracked
 `expectedRevisionHash`; the Gateway itself fails closed on a stale hash
 (`SkillProposalRevisionChangedError`), which this source translates into
 an `ApprovalContentDriftError` so the bridge's generic mismatch/
-`"restage"` handling applies uniformly.
+"restage" handling applies uniformly.
+
+### gateway-exec source (#38)
+
+`sources/gateway-exec.ts` maps pending `exec.approval.list` entries /
+`exec.approval.requested` events (the plugin's OWN loopback Gateway
+connection, scope `operator.approvals` only) to `ApprovalSourceRequest`s
+with the namespaced kernel `kind: "gateway-exec:command"` (the same
+`"<source>:<subkind>"` convention every other source uses; an earlier draft
+published the bare literal `"exec.command"`, but `ima-jin/imajin-ai` PR
+#2223 landed the kernel's real kind validator — which rejects a dot as an
+invalid segment character — so this source now follows the standard
+convention like every other one) and `detail: {command, host, cwd, agentId,
+sessionKey, requestedBy, approvalId, expiresAt}`. `command` is NEVER
+truncated — the Gateway itself already rejects an oversized command at
+request time rather than truncating it, so this source never needs to
+shrink it (unlike Skill Workshop's bounded `description`/`diffSummary`).
+Since an exec approval record is immutable while pending (no RPC mutates
+`command`/`cwd`/etc in place), `sourceRevision` is an identity pin
+(`` `${id}:${expiresAtMs}` ``) rather than a content-revision pin, and
+`onDriftPolicy` is `"leave"` (a mismatch here can only be a bug, never a
+legitimate revision). `resolve()` maps `approve -> allow-once`,
+`reject -> deny`, and is exhaustive over the bridge's decision vocabulary so
+it can never reach `exec.approval.resolve` with `"allow-always"`. Outcome
+reporting (`{proposalId, exitCode, durationMs, outputHash}`, posted after
+the Gateway reports an approved exec finished, to the kernel's `POST
+/notify/api/internal/operator-approvals/outcome`, `ima-jin/imajin-ai` PR
+#2223) is a `gateway-exec`-specific side channel wired alongside the source
+(`wireGatewayExecOutcomeReporting`), not part of the generic
+`ApprovalSource` contract — see `gateway-exec.ts`'s module doc for the full
+"which hook" rationale and the outcome-endpoint contract.
 
 ## Request leg — proposal staged → kernel notification (system-agent, concrete example)
 
