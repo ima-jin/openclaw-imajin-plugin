@@ -13,6 +13,11 @@ import { readFile } from "node:fs/promises";
 import type { ImajinChat } from "./chat.js";
 import { validateDid } from "./client.js";
 import type { ImajinClient } from "./client.js";
+import {
+  buildImajinStatusSnapshot,
+  fetchImajinProxyHealthz,
+  type ImajinCatalogCache,
+} from "./imajin-provider.js";
 import { fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
 import { createSecretHandle } from "./vault/secret-handle-store.js";
 
@@ -1232,6 +1237,42 @@ export function createChatTool(chat: ImajinChat) {
       } catch (err: unknown) {
         return errorResult(err instanceof Error ? err.message : String(err));
       }
+    },
+  };
+}
+
+// --- Status/doctor tool (#36 item 4) ---
+
+/**
+ * Extends the plugin's status/doctor-style output with the imajin model
+ * provider's current catalog, last discovery result/time, and the proxy's
+ * live `GET /healthz` body (#36 item 4). Framed as a tool (this plugin has
+ * no other native doctor/status hook to extend) so it fits the existing
+ * `imajin_*` tool surface and can be called on demand by the agent or an
+ * operator without waiting for the 60s discovery cache to turn over —
+ * `healthz` is always fetched fresh; the catalog/discovery fields reflect
+ * the cache's last resolved state (`cache.peek()`), never forcing a fetch.
+ */
+export function createImajinStatusTool(deps: { baseUrl: string; cache: ImajinCatalogCache }) {
+  return {
+    name: "imajin_status",
+    label: "Imajin Provider Status",
+    description:
+      "Report the imajin OpenClaw model provider's current status (#36): the discovered " +
+      "imajin/* catalog, the last discovery result and timestamp, and a fresh probe of the " +
+      "kernel inference proxy's GET /healthz.",
+    parameters: {
+      type: "object" as const,
+      properties: {},
+    },
+    async execute(): Promise<ToolResult> {
+      const healthz = await fetchImajinProxyHealthz(deps.baseUrl);
+      const snapshot = buildImajinStatusSnapshot({
+        baseUrl: deps.baseUrl,
+        cacheState: deps.cache.peek(),
+        healthz,
+      });
+      return jsonResult(snapshot);
     },
   };
 }
