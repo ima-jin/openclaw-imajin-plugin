@@ -79,6 +79,10 @@
       "help": "Bearer value for the kernel's POST /notify/api/send x-webhook-secret header (that kernel's NOTIFY_WEBHOOK_SECRET). Accepts a plain string or a SecretRef object, resolved via the plugin SDK. Falls back to the IMAJIN_NOTIFY_WEBHOOK_SECRET env var when omitted. Required for the bridge to publish anything. Never logged.",
       "sensitive": true
     },
+    "approvals.skillWorkshop.operatorScopes": {
+      "label": "Gateway Approvals Bridge: Skill Workshop Operator Scopes",
+      "help": "Operator scopes (#35) to request on the skill-workshop source's OWN loopback Gateway connection, instead of the SDK's fixed operator.approvals-only default (insufficient for skills.proposals.list/apply/reject on a strict/token-mode gateway). Default [] (or omitted): unchanged SDK-default behaviour. Set [\"operator.read\", \"operator.admin\"] to grant exactly what skills.proposals.list/apply/reject require \u2014 this plugin then applies proposals with that authority, since it is the component that does so. Only known operator scopes (operator.read, operator.admin, operator.approvals, operator.write) are accepted; an unrecognized entry fails plugin startup with a clear error. See docs/approvals-bridge.md."
+    },
     "wsNotifications.stateDir": {
       "label": "Notification State Directory",
       "help": "Directory for the ack-dedup LRU and pending-wake persistence files (#26). Defaults to a directory colocated with keypairPath."
@@ -255,6 +259,21 @@
                 }
               }
             ]
+          },
+          "skillWorkshop": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Skill Workshop source config (#35). No separate 'enabled' flag: whether the skill-workshop source runs at all is already governed by approvals.sources.",
+            "properties": {
+              "operatorScopes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": ["operator.read", "operator.admin", "operator.approvals", "operator.write"]
+                },
+                "description": "Operator scopes to request on the skill-workshop source's own loopback Gateway connection (via createOperatorGatewayClient, #35), instead of the SDK's fixed ['operator.approvals']-only default client. Default [] means unchanged SDK-default behaviour. Set ['operator.read', 'operator.admin'] to grant exactly what skills.proposals.list/apply/reject require. An entry outside this enum fails plugin startup with a clear error rather than silently connecting with a scope the Gateway will reject."
+              }
+            }
           }
         }
       }

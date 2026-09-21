@@ -162,4 +162,96 @@ describe("createSkillWorkshopSource", () => {
 
     await expect(source.resolve("proposal-1", "approve", "rev-1")).rejects.toThrow("network error");
   });
+
+  // --- #35: missing operator scope — single warning + backoff, never a crash ---
+
+  function makeMissingScopeError(): GatewayClientRequestError {
+    const err = new GatewayClientRequestError("missing scope: operator.read");
+    (err as unknown as { gatewayCode: string }).gatewayCode = "FORBIDDEN";
+    return err;
+  }
+
+  describe("#35 missing operator scope", () => {
+    let warnSpy: ReturnType<typeof vi.spyOn>;
+    let errorSpy: ReturnType<typeof vi.spyOn>;
+
+    beforeEach(() => {
+      warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+      errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      warnSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it("list() propagates the error but logs exactly one actionable warning", async () => {
+      const { client, fns } = makeClient();
+      fns.list.mockRejectedValue(makeMissingScopeError());
+      const source = createSkillWorkshopSource(client);
+
+      await expect(source.list()).rejects.toThrow("missing scope: operator.read");
+      await expect(source.list()).rejects.toThrow("missing scope: operator.read");
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      expect(warnSpy.mock.calls[0][0]).toContain("approvals.skillWorkshop.operatorScopes");
+      // The generic per-poll console.error path must never fire for this
+      // specific, disclosed failure mode.
+      expect(errorSpy).not.toHaveBeenCalled();
+    });
+
+    it("subscribe()'s poll logs the warning once and backs off instead of erroring every interval", async () => {
+      vi.useFakeTimers();
+      try {
+        const { client, fns } = makeClient();
+        fns.list.mockRejectedValue(makeMissingScopeError());
+        const source = createSkillWorkshopSource(client, { pollIntervalMs: 1000 });
+        const onRequested = vi.fn();
+        const unsubscribe = source.subscribe(onRequested);
+
+        // First poll fires after pollIntervalMs and hits the missing-scope error.
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(fns.list).toHaveBeenCalledTimes(1);
+
+        // Backed off: the NEXT poll should not fire at another 1000ms (only
+        // at 1000ms * MISSING_SCOPE_BACKOFF_MULTIPLIER from the first).
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(fns.list).toHaveBeenCalledTimes(1);
+
+        // ...but does fire once the full backoff window has elapsed, and the
+        // warning is still only ever logged once.
+        await vi.advanceTimersByTimeAsync(9000);
+        expect(fns.list).toHaveBeenCalledTimes(2);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(onRequested).not.toHaveBeenCalled();
+
+        unsubscribe();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it("subscribe() never crashes and keeps polling across a missing-scope error", async () => {
+      vi.useFakeTimers();
+      try {
+        const { client, fns } = makeClient();
+        fns.list.mockRejectedValueOnce(makeMissingScopeError());
+        fns.list.mockResolvedValue({ proposals: [makeProposal()] });
+        const source = createSkillWorkshopSource(client, { pollIntervalMs: 1000 });
+        const onRequested = vi.fn();
+        const unsubscribe = source.subscribe(onRequested);
+
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+
+        // Recovers on the next (backed-off) poll once the scope issue clears.
+        await vi.advanceTimersByTimeAsync(1000 * 10);
+        expect(onRequested).toHaveBeenCalledWith(expect.objectContaining({ proposalId: "proposal-1" }));
+
+        unsubscribe();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });

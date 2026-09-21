@@ -44,6 +44,7 @@
  */
 import type { ApprovalDecision, ApprovalSource, ApprovalSourceCurrentState, ApprovalSourceRequest } from "./types.js";
 import { ApprovalContentDriftError } from "./types.js";
+import { createOperatorGatewayClient } from "../gateway-operator-client.js";
 
 // --- Wire types (Gateway side, `skills.proposals.*`) ---
 
@@ -132,6 +133,25 @@ function isRevisionChangedError(err: unknown): err is Error & { details?: { curr
   );
 }
 
+/**
+ * Narrow, disclosed shape-check for the exact failure #35 is about: a
+ * Gateway RPC error indicating this source's own connection lacks a
+ * required operator scope (`FORBIDDEN: missing scope: operator.read`, seen
+ * on every poll before #35 — see this module's doc header and
+ * `gateway-operator-client.ts`). Mirrors `isRevisionChangedError`'s
+ * duck-typing convention (no SDK import) rather than importing the real
+ * `isGatewayClientRequestError`/`gatewayCode` shape from the plugin SDK, to
+ * keep this pure-adapter section free of SDK imports.
+ */
+function isMissingScopeError(err: unknown): err is Error {
+  if (!(err instanceof Error) || err.name !== "GatewayClientRequestError") return false;
+  const gatewayCode = (err as { gatewayCode?: unknown }).gatewayCode;
+  return gatewayCode === "FORBIDDEN" || /missing scope/i.test(err.message);
+}
+
+/** How much longer `subscribe()`'s poll interval grows after a missing-scope error, so a persistently misconfigured connection stops hammering the Gateway with a request it already knows will fail (#35). */
+const MISSING_SCOPE_BACKOFF_MULTIPLIER = 10;
+
 async function currentPending(client: SkillWorkshopGatewayClient): Promise<SkillWorkshopProposalSummary[]> {
   const result = await client.list();
   return (result.proposals ?? []).filter((proposal) => proposal.status === "pending");
@@ -143,6 +163,14 @@ async function currentPending(client: SkillWorkshopGatewayClient): Promise<Skill
  * it is never applied against its new content — it is evicted and
  * immediately re-listed so the operator sees a fresh card bound to the
  * current revision hash (see the module doc + `types.ts`).
+ *
+ * #35: a missing-scope error from `client.list()` (e.g. a connection opened
+ * without `operator.read`) is logged exactly ONCE per source instance —
+ * with an actionable pointer at `approvals.skillWorkshop.operatorScopes` —
+ * instead of the pre-#35 behaviour of a fresh `console.error` on every
+ * single poll. `subscribe()`'s poll additionally backs off
+ * (`MISSING_SCOPE_BACKOFF_MULTIPLIER`× its normal interval) after such an
+ * error, while still never crashing the bridge.
  */
 export function createSkillWorkshopSource(
   client: SkillWorkshopGatewayClient,
@@ -150,6 +178,28 @@ export function createSkillWorkshopSource(
 ): ApprovalSource {
   const pollIntervalMs = opts.pollIntervalMs ?? 15_000;
   const known = new Set<string>();
+  let missingScopeWarned = false;
+
+  function warnMissingScopeOnce(err: Error): void {
+    if (missingScopeWarned) return;
+    missingScopeWarned = true;
+    console.warn(
+      "[imajin-approvals-bridge] skill-workshop source needs operatorScopes " +
+        '["operator.read", "operator.admin"] on its Gateway connection (list needs operator.read; ' +
+        "apply/reject need operator.admin); set approvals.skillWorkshop.operatorScopes in plugin config " +
+        `to grant them — see docs/approvals-bridge.md. (${err.message})`,
+    );
+  }
+
+  /** Wraps `currentPending` so every call site (list/subscribe/getCurrent) gets the one-time missing-scope warning without changing each call site's own error propagation. */
+  async function pending(): Promise<SkillWorkshopProposalSummary[]> {
+    try {
+      return await currentPending(client);
+    } catch (err) {
+      if (isMissingScopeError(err)) warnMissingScopeOnce(err);
+      throw err;
+    }
+  }
 
   return {
     id: "skill-workshop",
@@ -157,32 +207,55 @@ export function createSkillWorkshopSource(
     decisionLabels: { approve: "Apply", reject: "Reject" },
 
     async list(): Promise<ApprovalSourceRequest[]> {
-      const pending = await currentPending(client);
-      for (const proposal of pending) known.add(proposal.id);
-      return pending.map(toApprovalSourceRequest);
+      const list = await pending();
+      for (const proposal of list) known.add(proposal.id);
+      return list.map(toApprovalSourceRequest);
     },
 
     subscribe(onRequested) {
-      const timer = setInterval(() => {
-        void currentPending(client)
-          .then((pending) => {
-            for (const proposal of pending) {
+      let stopped = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let backoff = false;
+
+      const scheduleNext = (): void => {
+        if (stopped) return;
+        const delay = backoff ? pollIntervalMs * MISSING_SCOPE_BACKOFF_MULTIPLIER : pollIntervalMs;
+        timer = setTimeout(runPoll, delay);
+        timer.unref?.();
+      };
+
+      const runPoll = (): void => {
+        void pending()
+          .then((list) => {
+            backoff = false;
+            for (const proposal of list) {
               if (known.has(proposal.id)) continue;
               known.add(proposal.id);
               onRequested(toApprovalSourceRequest(proposal));
             }
           })
           .catch((err: unknown) => {
-            console.error(`[imajin-approvals-bridge] skill-workshop poll failed: ${String(err)}`);
-          });
-      }, pollIntervalMs);
-      timer.unref?.();
-      return () => clearInterval(timer);
+            if (isMissingScopeError(err)) {
+              // Already logged once by `pending()` above — back off instead of
+              // repeating the same doomed request every interval.
+              backoff = true;
+            } else {
+              console.error(`[imajin-approvals-bridge] skill-workshop poll failed: ${String(err)}`);
+            }
+          })
+          .finally(() => scheduleNext());
+      };
+
+      scheduleNext();
+      return () => {
+        stopped = true;
+        if (timer) clearTimeout(timer);
+      };
     },
 
     async getCurrent(proposalId: string): Promise<ApprovalSourceCurrentState | null> {
-      const pending = await currentPending(client);
-      const match = pending.find((proposal) => proposal.id === proposalId);
+      const list = await pending();
+      const match = list.find((proposal) => proposal.id === proposalId);
       if (!match) return { pending: false, sourceRevision: null };
       // #2084: return the CURRENT `detail` too (built the same way `list()`
       // does) so the bridge can recompute its full `contentHash` digest and
@@ -222,20 +295,15 @@ export function createSkillWorkshopSource(
 // --- Live wiring (SDK/network — isolated from the pure adapter above) ---
 
 /**
- * Builds the live `SkillWorkshopGatewayClient`. Reuses the SAME Gateway
- * connection factory as the system-agent source
- * (`createOperatorApprovalsGatewayClient`, `openclaw/plugin-sdk/gateway-
- * runtime`) since it is the only plugin-SDK-exposed loopback-operator-
- * connection bootstrap at this SDK version — see the plan's "Research
- * findings" / this PR's description for the disclosed limitation: that
- * factory declares `scopes: ["operator.approvals"]`, while
- * `skills.proposals.list` needs `operator.read` and `skills.proposals.
- * apply`/`reject` need `operator.admin`. If a deployment's Gateway enforces
- * per-connection scope checks strictly, these calls will surface as a
- * logged, swallowed RPC error (same fail-safe posture as every other call
- * in this file) rather than crash the bridge; this is flagged as follow-up
- * work for the OpenClaw plugin SDK to expose a scope-parameterized (or
- * `operator.read`+`operator.admin`) connection factory.
+ * Builds the live `SkillWorkshopGatewayClient`. #35: the connection this
+ * wraps may be either the SDK default (`createOperatorApprovalsGatewayClient`,
+ * scopes `["operator.approvals"]` only — insufficient for
+ * `skills.proposals.*` on a strict/token-mode gateway) or the #35
+ * `operatorScopes`-configured one (`createOperatorGatewayClient`,
+ * `../gateway-operator-client.js`), depending on `createLiveSkillWorkshopConnection`'s
+ * `opts.operatorScopes` below. Either way, a missing-scope RPC error is
+ * still only ever logged (once, see `createSkillWorkshopSource`'s
+ * `warnMissingScopeOnce`) and backed off, never thrown past this bridge.
  */
 export function createLiveSkillWorkshopGatewayClient(gatewayClient: {
   request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
@@ -260,13 +328,26 @@ export function createLiveSkillWorkshopGatewayClient(gatewayClient: {
 /**
  * Opens this source's OWN Gateway connection (independent of the
  * system-agent source's connection, so one source's Gateway hiccup never
- * takes the other down) via the same `createOperatorApprovalsGatewayClient`
- * bootstrap `system-agent.ts` uses — see `createLiveSkillWorkshopGatewayClient`'s
- * doc for the disclosed connection-scope limitation this implies.
+ * takes the other down). By default this reuses the same
+ * `createOperatorApprovalsGatewayClient` bootstrap `system-agent.ts` uses —
+ * see `createLiveSkillWorkshopGatewayClient`'s doc for the disclosed
+ * connection-scope limitation this implies (#35).
+ *
+ * When `opts.operatorScopes` is a non-empty array, this instead opens the
+ * connection via `createOperatorGatewayClient`
+ * (`../gateway-operator-client.js`, #35) with exactly those scopes — the
+ * interim fix for the limitation above. Callers are responsible for
+ * validating `opts.operatorScopes` (see `assertKnownOperatorGatewayScopes`)
+ * before calling this function.
  */
 export async function createLiveSkillWorkshopConnection(
   api: { runtime?: { config?: { current?: () => Record<string, unknown> } } },
-  opts: { gatewayTokenOverride?: string; clientDisplayName: string; pollIntervalMs?: number },
+  opts: {
+    gatewayTokenOverride?: string;
+    clientDisplayName: string;
+    pollIntervalMs?: number;
+    operatorScopes?: string[];
+  },
 ): Promise<{ client: SkillWorkshopGatewayClient; start: () => Promise<void>; stop: () => void }> {
   const { createOperatorApprovalsGatewayClient, startGatewayClientWhenEventLoopReady } = await import(
     "openclaw/plugin-sdk/gateway-runtime"
@@ -285,16 +366,28 @@ export async function createLiveSkillWorkshopConnection(
       }
     : baseConfig;
 
-  const gatewayClient = await createOperatorApprovalsGatewayClient({
-    config: bootstrapConfig,
-    clientDisplayName: opts.clientDisplayName,
-    onConnectError: (err) => {
-      console.error(`[imajin-approvals-bridge] skill-workshop gateway connect error: ${String(err)}`);
-    },
-    onClose: (code, reason) => {
-      console.warn(`[imajin-approvals-bridge] skill-workshop gateway connection closed (${code}): ${reason ?? ""}`);
-    },
-  });
+  const onConnectError = (err: unknown): void => {
+    console.error(`[imajin-approvals-bridge] skill-workshop gateway connect error: ${String(err)}`);
+  };
+  const onClose = (code?: number, reason?: string): void => {
+    console.warn(`[imajin-approvals-bridge] skill-workshop gateway connection closed (${code}): ${reason ?? ""}`);
+  };
+
+  const gatewayClient =
+    opts.operatorScopes && opts.operatorScopes.length > 0
+      ? await createOperatorGatewayClient({
+          config: bootstrapConfig,
+          scopes: opts.operatorScopes,
+          clientDisplayName: opts.clientDisplayName,
+          onConnectError,
+          onClose,
+        })
+      : await createOperatorApprovalsGatewayClient({
+          config: bootstrapConfig,
+          clientDisplayName: opts.clientDisplayName,
+          onConnectError,
+          onClose,
+        });
 
   return {
     client: createLiveSkillWorkshopGatewayClient(gatewayClient),
