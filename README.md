@@ -56,10 +56,11 @@ In `openclaw.json`:
 - **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway proposals from one or more sources to the kernel and applies signed operator decisions from /jin (#24, generalized by #33); see "Gateway approvals bridge" below:
   - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
   - **`approvals.operatorDid`** — the operator's Imajin DID
-  - **`approvals.sources`** — which sources to drive: `"system-agent"` and/or `"skill-workshop"` (#33) default on when this array is omitted; `"gateway-exec"` (#38, OpenClaw host-exec approvals) is opt-in ONLY and must be listed explicitly — it is never included in that default, since it grants remote-execution-grade `operator.approvals` authority over live host-exec approvals. A source left out neither lists nor subscribes.
+  - **`approvals.sources`** — which sources to drive: `"system-agent"` and/or `"skill-workshop"` (#33) default on when this array is omitted; `"imajin-catalog"` (opt-in per-model gating for newly discovered `imajin/*` models, #36) and `"gateway-exec"` (#38, OpenClaw host-exec approvals) are opt-in ONLY and must be listed explicitly — neither is ever included in that default; gateway-exec grants remote-execution-grade `operator.approvals` authority over live host-exec approvals. A source left out neither lists nor subscribes.
   - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection(s); a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
   - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
   - **`approvals.skillWorkshop.operatorScopes`** — operator scopes (#35) for the `skill-workshop` source's OWN loopback Gateway connection; default `[]` (unchanged SDK-default, `operator.approvals` only); set `["operator.read", "operator.admin"]` to fix `FORBIDDEN: missing scope` on strict/token-mode gateways; see "Gateway approvals bridge" below
+- **`inferProxyBaseUrl`** (optional) — base URL of the local kernel inference proxy the `imajin` OpenClaw model provider discovers its catalog from (#36); defaults to `http://127.0.0.1:8787/openai/v1`; see "Kernel brains as OpenClaw models" below
 
 ### Turn-usage attestation
 
@@ -76,6 +77,77 @@ the turn's message batch. The transcript content itself is never uploaded or emb
 only a pointer plus a tamper-evident hash, so a later disclosure can be verified against
 the signed claim without the content ever leaving the agent's own machine.
 
+## Kernel brains as OpenClaw models (#36)
+
+Sealing a connector card on `/jin` becomes the whole OpenClaw model
+provisioning act. The plugin registers `imajin` as a real OpenClaw model
+provider (`api.registerProvider`, not `models.providers` config): every
+usable (connector, model) pair the kernel's `GET /infer/v1/models`
+passthrough reports (`ima-jin/imajin-ai#2201`) shows up as `imajin/<id>`,
+named `<id> (via <connector>)`, with zero hand-edited provider config.
+
+**The one config key**: `plugins.entries.imajin.config.inferProxyBaseUrl`
+(default `http://127.0.0.1:8787/openai/v1`) — the local kernel inference
+proxy's base URL. The provider discovers its catalog from `<this>/models`
+and probes `GET /healthz` (via `imajin_status`, see below) at the proxy
+root. There is no user credential to configure: the proxy authenticates to
+the kernel with its own app key, never a value you enter.
+
+**Live discovery + refresh**: the catalog is fetched live and cached for
+60s (advisory — a proxy outage degrades straight to "no models", never a
+stale/wrong catalog; the static seed is intentionally empty). On a kernel
+notification whose scope is `connector.credential.sealed`,
+`connector.credential.unsealed`, or `connector.models.changed`
+(`IMAJIN_CATALOG_INVALIDATION_SCOPES`, `src/imajin-provider.ts` — confirmed
+against the landed kernel/proxy half `ima-jin/imajin-ai#2219`, closing
+`ima-jin/imajin-ai#2205`) arriving over the plugin's existing WS connection,
+the cache is invalidated immediately so the next model list reflects `/jin`
+within seconds instead of waiting out the TTL. These arrive as the kernel's
+existing generic notification envelope (`type: "notification"`, `scope`,
+`data`, `createdAt`) — the same shape the plugin already dispatches on via
+`nf.scope` — with `data: { provider }` on the two credential scopes and
+`data: { provider, hint }` on `connector.models.changed`.
+
+**The allow-list step (one-time)**: OpenClaw's own
+`agents.defaults.modelPolicy.allow` accepts trailing prefix wildcards
+(confirmed directly against OpenClaw's docs/schema — not guessed), so the
+supported one-time operator setting is simply:
+
+```json5
+{
+  agents: {
+    defaults: {
+      modelPolicy: { allow: ["imajin/*" /* , ...your other allowed models */] },
+    },
+  },
+}
+```
+
+This plugin never writes that config automatically — it is a one-time
+manual step, exactly like adding any other provider to an existing
+allowlist. If you omit `modelPolicy.allow` entirely (or leave it `[]`),
+OpenClaw's own default is "allow any configured model", so `imajin/*`
+models are already selectable with no allow-list edit at all.
+
+**Stricter alternative — per-model operator approval (`imajin-catalog`
+source, opt-in)**: for operators who set a restrictive `modelPolicy.allow`
+for other providers but never want a blanket `imajin/*` grant, add
+`"imajin-catalog"` to `approvals.sources` (see "Gateway approvals bridge"
+above for the shared `approvals.*` config). Each newly discovered
+`imajin/<model>` not yet covered by the allow list then publishes an
+`operator.approval.requested` ("Enable imajin/<model> for agents?") card on
+/jin; only a verified, signed `operator.approval.decided` approval ever
+appends that one `imajin/<model>` ref to `agents.defaults.modelPolicy.allow`
+(via the Gateway's `config.get`/`config.patch` RPCs) — a reject is
+remembered so the same model is never re-proposed. This plugin NEVER writes
+Gateway config on any other path. Off by default: an install with no
+`modelPolicy.allow` configured never needs this (see above), and an install
+that never lists `"imajin-catalog"` in `approvals.sources` never starts it.
+
+**Doctor/status** (`imajin_status` tool): reports the current discovered
+`imajin/*` catalog, the last discovery result and timestamp, and a fresh
+probe of the proxy's `GET /healthz` body.
+
 ## Roadmap
 
 - [ ] Memory corpus supplement — agent's attestation chain as searchable memory
@@ -87,6 +159,7 @@ the signed claim without the content ever leaving the agent's own machine.
 - [x] Ack-confirmed delivery, dedup, and persisted pending wakes (#26)
 - [x] Gateway approvals bridge — publish staged Gateway proposals to the kernel and apply signed decisions from /jin (#24)
 - [x] Generic source-adapter bridge + Skill Workshop source (#33)
+- [x] Imajin OpenClaw model provider — live catalog from the kernel passthrough, WS-driven refresh, allow-list via operator approval (#36)
 - [x] gateway-exec source — forward OpenClaw host-exec approvals to /jin, resolve allow-once/deny (#38)
 - [x] `imajin_vault` — owner→agent credential handoff via delegation grant, values kept out of model context (#40, kernel half ima-jin/imajin-ai#2231); see `docs/vault-handoff.md`
 - [x] `approvals.skillWorkshop.operatorScopes` — scope-parameterized loopback Gateway client for the skill-workshop source, fixing #35's `FORBIDDEN: missing scope` on strict/token-mode gateways

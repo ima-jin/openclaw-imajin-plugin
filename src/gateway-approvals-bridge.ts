@@ -88,6 +88,8 @@ import {
 import { createLiveGatewayApprovalsClient, createSystemAgentSource } from "./sources/system-agent.js";
 import { createLiveSkillWorkshopConnection, createSkillWorkshopSource } from "./sources/skill-workshop.js";
 import { assertKnownOperatorGatewayScopes } from "./gateway-operator-client.js";
+import { createImajinCatalogSource, createLiveImajinCatalogConnection } from "./sources/imajin-catalog.js";
+import type { ImajinRuntimeModel } from "./imajin-provider.js";
 import {
   createGatewayExecSource,
   createHttpKernelExecOutcomeClient,
@@ -380,16 +382,25 @@ export function isApprovalsBridgeConfigured(
   return Boolean(config?.enabled && config?.operatorDid?.trim() && agentDid?.trim());
 }
 
-export const KNOWN_APPROVAL_SOURCE_IDS = ["system-agent", "skill-workshop", "gateway-exec"] as const;
+export const KNOWN_APPROVAL_SOURCE_IDS = [
+  "system-agent",
+  "skill-workshop",
+  "imajin-catalog",
+  "gateway-exec",
+] as const;
 export type KnownApprovalSourceId = (typeof KNOWN_APPROVAL_SOURCE_IDS)[number];
 
 /**
  * Sources driven when `approvals.sources` is omitted entirely. Deliberately
- * NOT every `KNOWN_APPROVAL_SOURCE_IDS` entry: `gateway-exec` (#38) grants
- * remote-execution-grade `operator.approvals` authority over live host-exec
- * approvals, so it must be explicitly opted into via `approvals.sources`
- * even when the bridge itself is already enabled -- never enabled implicitly
- * by an existing `approvals.enabled: true` deployment that predates it.
+ * NOT every `KNOWN_APPROVAL_SOURCE_IDS` entry:
+ *   - `imajin-catalog` (#36) is opt-in only, since most installs either have
+ *     no `modelPolicy.allow` at all (already "allow any") or use the
+ *     documented one-time `imajin/*` wildcard (see README).
+ *   - `gateway-exec` (#38) grants remote-execution-grade `operator.approvals`
+ *     authority over live host-exec approvals.
+ * Both must be named explicitly in `approvals.sources` to activate, even
+ * when the bridge itself is already enabled -- never enabled implicitly by
+ * an existing `approvals.enabled: true` deployment that predates either.
  */
 const DEFAULT_ENABLED_APPROVAL_SOURCE_IDS: readonly KnownApprovalSourceId[] = ["system-agent", "skill-workshop"];
 
@@ -779,6 +790,16 @@ export interface StartGatewayApprovalsBridgeDeps {
   did?: string;
   keypairPath?: string;
   nodeUrl: string;
+  /**
+   * Wires the opt-in `"imajin-catalog"` source (#36 item 3). Omitted unless
+   * the imajin provider (`../imajin-provider.ts`) was registered — a config
+   * with `approvals.sources` naming `"imajin-catalog"` but no accessor here
+   * logs a warning and never starts that one source.
+   */
+  imajinCatalog?: {
+    listDiscoveredModels: () => readonly ImajinRuntimeModel[];
+    isModelAllowed: (modelId: string) => boolean;
+  };
 }
 
 /**
@@ -863,6 +884,33 @@ export async function startGatewayApprovalsBridge(
       stoppers.push(live.stop);
     } catch (err) {
       console.error(`[imajin-approvals-bridge] failed to start skill-workshop source: ${String(err)}`);
+    }
+  }
+
+  if (enabledSourceIds.has("imajin-catalog")) {
+    if (deps.imajinCatalog) {
+      try {
+        const live = await createLiveImajinCatalogConnection(api, {
+          gatewayTokenOverride: gatewayTokenResult.value,
+          clientDisplayName: "Imajin Gateway approvals bridge (imajin-catalog)",
+        });
+        await live.start();
+        sources.set(
+          "imajin-catalog",
+          createImajinCatalogSource({
+            listDiscoveredModels: deps.imajinCatalog.listDiscoveredModels,
+            isModelAllowed: deps.imajinCatalog.isModelAllowed,
+            gateway: live.client,
+          }),
+        );
+        stoppers.push(live.stop);
+      } catch (err) {
+        console.error(`[imajin-approvals-bridge] failed to start imajin-catalog source: ${String(err)}`);
+      }
+    } else {
+      console.warn(
+        '[imajin-approvals-bridge] approvals.sources includes "imajin-catalog" but no catalog accessor was wired (imajin provider not registered) — source not started',
+      );
     }
   }
 
