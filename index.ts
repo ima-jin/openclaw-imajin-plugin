@@ -217,6 +217,10 @@ export default definePluginEntry({
         did: config.did,
         keypairPath: config.keypairPath,
         nodeUrl: config.nodeUrl,
+        // Reuses this plugin's EXISTING DID resolver (#44) to verify an
+        // operator's countersignature on `operator.approval.decided`
+        // against their registered public key — never a second resolver.
+        identityClient: client,
         // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
         // enabled via `approvals.sources` alongside system-agent/skill-
         // workshop. Reads the config's live `modelPolicy.allow` on every

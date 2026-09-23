@@ -85,6 +85,13 @@ import {
   type ApprovalSourceRequest,
   type Unsubscribe,
 } from "./sources/types.js";
+import {
+  createIdentityClientOperatorKeyResolver,
+  parseOperatorSignature,
+  verifyOperatorSignature,
+  type IdentityLookupClient,
+  type OperatorKeyResolver,
+} from "./operator-signature.js";
 import { createLiveGatewayApprovalsClient, createSystemAgentSource } from "./sources/system-agent.js";
 import { createLiveSkillWorkshopConnection, createSkillWorkshopSource } from "./sources/skill-workshop.js";
 import { assertKnownOperatorGatewayScopes } from "./gateway-operator-client.js";
@@ -368,6 +375,17 @@ export interface ApprovalsBridgePluginConfig {
      */
     operatorScopes?: string[];
   };
+  /**
+   * Mirrors the kernel's `OPERATOR_COUNTERSIGN_REQUIRED` (#2082/#44).
+   * `false`/omitted (default): a decision missing `operatorSignature` is
+   * still applied — unchanged v1 behavior. `true`: a decision (including a
+   * withdrawal) that doesn't carry a valid `operatorSignature` is rejected
+   * before ever reaching a source. A *supplied* signature is ALWAYS
+   * verified against the operator DID's registered key regardless of this
+   * flag — see `docs/notify-operator-approvals-contract.md`'s rollout
+   * order and the README "Operator countersignature" section.
+   */
+  requireOperatorCountersignature?: boolean;
 }
 
 /**
@@ -416,7 +434,31 @@ export interface GatewayApprovalsBridgeConfig {
   operatorDid: string;
   agentDid: string;
   agentPrivateKeyHex: string;
+  /**
+   * Mirrors the kernel's `OPERATOR_COUNTERSIGN_REQUIRED` (#2082/#44): while
+   * false (default), a decision missing `operatorSignature` is still
+   * applied — today's v1 behavior, unchanged. Any `operatorSignature` that
+   * IS supplied is verified UNCONDITIONALLY regardless of this flag — see
+   * `verifyOperatorCountersignature`. Once true, a decision (including a
+   * withdrawal) lacking a valid `operatorSignature` is rejected before it
+   * ever reaches a source's `resolve()`.
+   *
+   * There is no kernel route today that surfaces the kernel node's own
+   * flag value, so this cannot "discover" and mirror it automatically —
+   * it must be set independently per install once the operator's /jin
+   * client is confirmed to be sending real countersignatures. See the
+   * README "Operator countersignature" section for the recommended
+   * rollout order.
+   */
+  requireOperatorCountersignature?: boolean;
 }
+
+/** Default resolver when none is wired: a supplied `operatorSignature` can never be verified, so it fails closed rather than being silently trusted. */
+const UNRESOLVED_OPERATOR_KEY_RESOLVER: OperatorKeyResolver = {
+  async resolveOperatorPublicKey(): Promise<string | null> {
+    return null;
+  },
+};
 
 interface TrackedProposal {
   sourceId: string;
@@ -439,6 +481,7 @@ export class GatewayApprovalsBridge {
     private readonly sources: Map<string, ApprovalSource>,
     private readonly kernel: KernelNotifyClient,
     logger?: Logger,
+    private readonly keyResolver: OperatorKeyResolver = UNRESOLVED_OPERATOR_KEY_RESOLVER,
   ) {
     this.logger = logger ?? defaultLogger();
     for (const source of this.sources.values()) {
@@ -533,7 +576,14 @@ export class GatewayApprovalsBridge {
   async handleKernelDecision(frame: KernelBusEventFrame): Promise<void> {
     if (frame.eventType !== "operator.approval.decided") return;
     const payload = frame.payload as
-      | Partial<{ proposalId: string; decision: string; decidedBy: string; contentHash: string }>
+      | Partial<{
+          proposalId: string;
+          decision: string;
+          decidedBy: string;
+          contentHash: string;
+          decidedAt: string;
+          operatorSignature: unknown;
+        }>
       | undefined;
     const proposalId = payload?.proposalId;
     if (typeof proposalId !== "string" || proposalId.length === 0) {
@@ -544,9 +594,11 @@ export class GatewayApprovalsBridge {
     // Auth (load-bearing, #24): the decided event must be kernel-witnessed
     // (delivered over this agent's OWN authenticated, grant-scoped kernel WS
     // — see module doc) AND signed/attributed to exactly the configured
-    // operator DID on every identity field the envelope carries. A decision
-    // is never applied on channel-trust (an authenticated WS frame) alone —
-    // no source is ever contacted unless every check below passes.
+    // operator DID on every identity field the envelope carries. This is
+    // CHANNEL trust only — it proves the kernel recorded a decision, never
+    // that the operator actually made it (#44/`ima-jin/imajin-ai#2082`): see
+    // `verifyOperatorCountersignature` below, which is what actually
+    // establishes that. A decision is never applied on either check alone.
     const operatorDid = this.config.operatorDid;
     const isOperator =
       frame.issuer === operatorDid && frame.subject === operatorDid && payload?.decidedBy === operatorDid;
@@ -557,22 +609,20 @@ export class GatewayApprovalsBridge {
       return;
     }
 
-    if (payload?.decision === "withdrawn") {
-      // No generic source analog in v1: no active source exposes a
-      // "withdraw" decision for an item already forwarded to it. Documented
-      // no-op, preserved from #24.
-      this.logger.info(
-        `operator.approval.decided withdrawn for ${proposalId} — no source action (unsupported in v1)`,
-      );
-      return;
-    }
-    if (payload?.decision !== "approve" && payload?.decision !== "deny" && payload?.decision !== "reject") {
+    if (
+      payload?.decision !== "withdrawn" &&
+      payload?.decision !== "approve" &&
+      payload?.decision !== "deny" &&
+      payload?.decision !== "reject"
+    ) {
       this.logger.warn(
         `ignoring operator.approval.decided for ${proposalId}: unrecognized decision ${String(payload?.decision)}`,
       );
       return;
     }
-    const decision: ApprovalDecision = payload.decision === "approve" ? "approve" : "reject";
+    // `payload` is narrowed non-undefined from here on (TS control-flow
+    // analysis of the aliased `payload?.decision` checks above).
+    const rawDecision = payload.decision;
 
     const tracked = this.published.get(proposalId);
     if (!tracked) {
@@ -592,12 +642,13 @@ export class GatewayApprovalsBridge {
       return;
     }
 
-    // #2084 check 1: the decided event must echo back EXACTLY the
-    // `contentHash` this bridge signed and published for this proposal — a
-    // human countersigns exactly what they were shown, so an echoed hash
-    // that doesn't match means kernel-side tampering/corruption, or a
-    // decision bound to a since-superseded (re-staged) version. Cheap and
-    // RPC-free, so it is checked before ever contacting the source.
+    // #2084 check 1 (unchanged; applied uniformly to `withdrawn` too by
+    // #44): the decided event must echo back EXACTLY the `contentHash` this
+    // bridge signed and published for this proposal — a human countersigns
+    // exactly what they were shown, so an echoed hash that doesn't match
+    // means kernel-side tampering/corruption, or a decision bound to a
+    // since-superseded (re-staged) version. Cheap and RPC-free, so it is
+    // checked before ever contacting the source.
     if (payload.contentHash !== tracked.contentHash) {
       await this.handleDrift(
         source,
@@ -607,6 +658,29 @@ export class GatewayApprovalsBridge {
       );
       return;
     }
+
+    // #44/`ima-jin/imajin-ai#2082`: verify the OPERATOR's own
+    // countersignature — never the kernel's witness signature checked
+    // above. Runs for EVERY decision, including `withdrawn`, before
+    // anything is ever treated as accepted: a kernel-forged withdrawal must
+    // be rejected exactly like a kernel-forged approve/reject, even though
+    // `withdrawn` never reaches a source's `resolve()` below either way.
+    const signatureCheck = await this.verifyOperatorCountersignature(tracked, rawDecision, payload);
+    if (!signatureCheck.ok) {
+      this.logger.warn(`rejected operator.approval.decided for ${proposalId}: ${signatureCheck.error}`);
+      return;
+    }
+
+    if (rawDecision === "withdrawn") {
+      // No generic source analog in v1: no active source exposes a
+      // "withdraw" decision for an item already forwarded to it. Documented
+      // no-op, preserved from #24.
+      this.logger.info(
+        `operator.approval.decided withdrawn for ${proposalId} — no source action (unsupported in v1)`,
+      );
+      return;
+    }
+    const decision: ApprovalDecision = rawDecision === "approve" ? "approve" : "reject";
 
     let current: ApprovalSourceCurrentState | null;
     try {
@@ -662,6 +736,55 @@ export class GatewayApprovalsBridge {
       this.logger.warn(`approval.resolve failed for ${proposalId} (${decision}): ${String(err)}`);
       this.published.delete(proposalId);
     }
+  }
+
+  /**
+   * #44/`ima-jin/imajin-ai#2082`: verifies `payload.operatorSignature`
+   * (when present) directly against the operator DID's registered Ed25519
+   * public key — never the kernel's witness signature, and never a
+   * `contentHash` value read off the wire event. The fields verified are
+   * reconstructed from `tracked.contentHash` (THIS bridge's own record of
+   * what it published in the matching `operator.approval.requested`),
+   * since that is exactly the value the operator's /jin client actually
+   * signed over — the kernel's own `effectiveContentHash` invariant
+   * guarantees the two are identical for a legitimately-decided proposal,
+   * so there is nothing to gain (and a spoofable field to lose) by trusting
+   * a wire-supplied value instead.
+   *
+   * Mirrors the kernel's own config semantics
+   * (`OPERATOR_COUNTERSIGN_REQUIRED`, see `GatewayApprovalsBridgeConfig`):
+   * while `requireOperatorCountersignature` is off (default), an absent
+   * signature is tolerated (today's v1 behavior) — but a signature that IS
+   * supplied is verified unconditionally, and a malformed or invalid one is
+   * ALWAYS rejected regardless of the flag.
+   */
+  private async verifyOperatorCountersignature(
+    tracked: TrackedProposal,
+    rawDecision: string,
+    payload: { decidedAt?: string; operatorSignature?: unknown },
+  ): Promise<{ ok: true } | { ok: false; error: string }> {
+    const parsed = parseOperatorSignature(payload.operatorSignature);
+    if (!parsed.ok) {
+      return { ok: false, error: `malformed operatorSignature: ${parsed.error}` };
+    }
+    if (!parsed.value) {
+      if (this.config.requireOperatorCountersignature) {
+        return { ok: false, error: "operatorSignature is required on this bridge but was not supplied" };
+      }
+      return { ok: true };
+    }
+    if (typeof payload.decidedAt !== "string" || payload.decidedAt.length === 0) {
+      return { ok: false, error: "decidedAt is required when operatorSignature is present" };
+    }
+    const operatorPublicKeyHex = await this.keyResolver.resolveOperatorPublicKey(this.config.operatorDid);
+    if (!operatorPublicKeyHex) {
+      return { ok: false, error: "could not resolve the operator DID to a registered public key" };
+    }
+    return verifyOperatorSignature(
+      { contentHash: tracked.contentHash, decision: rawDecision, decidedAt: payload.decidedAt },
+      parsed.value,
+      operatorPublicKeyHex,
+    );
   }
 
   /**
@@ -800,6 +923,16 @@ export interface StartGatewayApprovalsBridgeDeps {
     listDiscoveredModels: () => readonly ImajinRuntimeModel[];
     isModelAllowed: (modelId: string) => boolean;
   };
+  /**
+   * Resolves an operator DID to its registered Ed25519 public key (#44) —
+   * this plugin's EXISTING DID resolver (`ImajinClient.getIdentity`, `GET
+   * /registry/api/identity/:did`), reused rather than adding a second one.
+   * Required to verify any `operatorSignature` the kernel supplies on
+   * `operator.approval.decided`; when omitted, a *present* signature is
+   * unverifiable and therefore rejected (fails closed) — see
+   * `verifyOperatorCountersignature`.
+   */
+  identityClient?: IdentityLookupClient;
 }
 
 /**
@@ -941,10 +1074,21 @@ export async function startGatewayApprovalsBridge(
     return undefined;
   }
 
+  const keyResolver = deps.identityClient
+    ? createIdentityClientOperatorKeyResolver(deps.identityClient)
+    : undefined;
+
   const bridge = new GatewayApprovalsBridge(
-    { operatorDid: config!.operatorDid!, agentDid: deps.did!, agentPrivateKeyHex: keypair.privateKeyHex },
+    {
+      operatorDid: config!.operatorDid!,
+      agentDid: deps.did!,
+      agentPrivateKeyHex: keypair.privateKeyHex,
+      requireOperatorCountersignature: config!.requireOperatorCountersignature ?? false,
+    },
     sources,
     kernel,
+    undefined,
+    keyResolver,
   );
 
   try {

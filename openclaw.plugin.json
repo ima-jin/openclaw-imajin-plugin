@@ -90,6 +90,10 @@
       "label": "Gateway Approvals Bridge: Skill Workshop Operator Scopes",
       "help": "Operator scopes (#35) to request on the skill-workshop source's OWN loopback Gateway connection, instead of the SDK's fixed operator.approvals-only default (insufficient for skills.proposals.list/apply/reject on a strict/token-mode gateway). Default [] (or omitted): unchanged SDK-default behaviour. Set [\"operator.read\", \"operator.admin\"] to grant exactly what skills.proposals.list/apply/reject require \u2014 this plugin then applies proposals with that authority, since it is the component that does so. Only known operator scopes (operator.read, operator.admin, operator.approvals, operator.write) are accepted; an unrecognized entry fails plugin startup with a clear error. See docs/approvals-bridge.md."
     },
+    "approvals.requireOperatorCountersignature": {
+      "label": "Gateway Approvals Bridge: Require Operator Countersignature",
+      "help": "Mirrors the kernel's OPERATOR_COUNTERSIGN_REQUIRED (#44, ima-jin/imajin-ai#2082). Default false: a decision missing operatorSignature is still applied (unchanged v1 behavior); any operatorSignature that IS supplied is ALWAYS verified directly against the operator DID's registered public key regardless of this flag. true: a decision (including a withdrawal) lacking a valid operatorSignature is rejected before it ever reaches a source. See README 'Operator countersignature' for the recommended rollout order."
+    },
     "wsNotifications.stateDir": {
       "label": "Notification State Directory",
       "help": "Directory for the ack-dedup LRU and pending-wake persistence files (#26). Defaults to a directory colocated with keypairPath."
@@ -285,10 +289,14 @@
                 "description": "Operator scopes to request on the skill-workshop source's own loopback Gateway connection (via createOperatorGatewayClient, #35), instead of the SDK's fixed ['operator.approvals']-only default client. Default [] means unchanged SDK-default behaviour. Set ['operator.read', 'operator.admin'] to grant exactly what skills.proposals.list/apply/reject require. An entry outside this enum fails plugin startup with a clear error rather than silently connecting with a scope the Gateway will reject."
               }
             }
+          },
+          "requireOperatorCountersignature": {
+            "type": "boolean",
+            "description": "Mirrors the kernel's OPERATOR_COUNTERSIGN_REQUIRED (#44, ima-jin/imajin-ai#2082). Default false: a decision missing operatorSignature is still applied (unchanged v1 behavior); a supplied operatorSignature is ALWAYS verified against the operator DID's registered public key regardless of this flag. true: a decision (including a withdrawal) lacking a valid operatorSignature is rejected before it ever reaches a source."
           }
         }
       }
-    },
-    "required": ["nodeUrl"]
-  }
+    }
+  },
+  "required": ["nodeUrl"]
 }
