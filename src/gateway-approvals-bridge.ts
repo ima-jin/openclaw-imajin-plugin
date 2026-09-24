@@ -473,6 +473,20 @@ interface TrackedProposal {
 
 export class GatewayApprovalsBridge {
   private readonly published = new Map<string, TrackedProposal>();
+  /**
+   * Synchronous publish-slot reservation (#48, fixing the #33 TOCTOU): keyed
+   * by proposalId, set the INSTANT `handleSourceRequested` decides to
+   * publish — before the first `await` (payload signing) — so that
+   * concurrent duplicate source events (the system-agent source fires
+   * several times per proposal, observed 6x within ~50ms) all observe the
+   * reservation and fall in behind it instead of each independently passing
+   * a stale `published.has()` check. Every caller that finds an existing
+   * reservation awaits it and returns without doing any work of its own —
+   * only the reserving caller signs/publishes. Deleted in a `finally` once
+   * that caller settles, so a genuine retry (next real event) after a
+   * publish failure sees no leftover reservation and can publish for real.
+   */
+  private readonly reservations = new Map<string, Promise<void>>();
   private readonly logger: Logger;
   private readonly unsubscribes: Unsubscribe[] = [];
 
@@ -532,40 +546,66 @@ export class GatewayApprovalsBridge {
   }
 
   private async handleSourceRequested(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
-    if (this.published.has(request.proposalId)) {
+    const proposalId = request.proposalId;
+    if (this.published.has(proposalId)) {
       // Dedup by proposalId (#24): a reconnect/replay of the same event, or a
       // reconcile racing a live event for the same proposal, must never
       // re-publish.
       return;
     }
-    let payload: KernelApprovalRequestedPayload;
-    try {
-      payload = await buildApprovalRequestedPayload(sourceId, request, {
-        did: this.config.agentDid,
-        privateKeyHex: this.config.agentPrivateKeyHex,
-      });
-    } catch (err) {
-      this.logger.error(`failed to sign operator.approval.requested for ${request.proposalId}: ${String(err)}`);
+    // #48 fix: check-and-reserve the slot SYNCHRONOUSLY, with no `await`
+    // between the `has`/`get` checks above/below and the `set` below. This
+    // is what actually closes the TOCTOU window — the old code reserved
+    // (`published.set`) only AFTER awaiting `buildApprovalRequestedPayload`
+    // (signing), so every concurrent duplicate observed the pre-reservation
+    // state and each proceeded to sign+publish independently.
+    const existingReservation = this.reservations.get(proposalId);
+    if (existingReservation) {
+      // Someone else is already reserving/publishing this exact proposal —
+      // await their outcome and skip; never sign or publish a second time.
+      await existingReservation;
       return;
     }
-    // Reserve before the network call: a concurrent duplicate (live event +
-    // reconcile racing) must never publish twice.
-    this.published.set(request.proposalId, {
-      sourceId,
-      kind: request.kind,
-      summary: request.summary,
-      detail: request.detail,
-      sourceRevision: request.sourceRevision,
-      contentHash: payload.contentHash,
+    let settleReservation!: () => void;
+    const reservation = new Promise<void>((resolve) => {
+      settleReservation = resolve;
     });
+    this.reservations.set(proposalId, reservation);
     try {
-      await this.kernel.publishApprovalRequested(payload);
-      this.logger.info(
-        `published operator.approval.requested for ${request.proposalId} (source=${sourceId}, kind=${payload.kind})`,
-      );
-    } catch (err) {
-      this.published.delete(request.proposalId);
-      this.logger.error(`failed to publish operator.approval.requested for ${request.proposalId}: ${String(err)}`);
+      let payload: KernelApprovalRequestedPayload;
+      try {
+        payload = await buildApprovalRequestedPayload(sourceId, request, {
+          did: this.config.agentDid,
+          privateKeyHex: this.config.agentPrivateKeyHex,
+        });
+      } catch (err) {
+        this.logger.error(`failed to sign operator.approval.requested for ${proposalId}: ${String(err)}`);
+        return;
+      }
+      this.published.set(proposalId, {
+        sourceId,
+        kind: request.kind,
+        summary: request.summary,
+        detail: request.detail,
+        sourceRevision: request.sourceRevision,
+        contentHash: payload.contentHash,
+      });
+      try {
+        await this.kernel.publishApprovalRequested(payload);
+        this.logger.info(
+          `published operator.approval.requested for ${proposalId} (source=${sourceId}, kind=${payload.kind})`,
+        );
+      } catch (err) {
+        // Clear BOTH the tracked proposal and (via the outer `finally`) the
+        // reservation, so the next real event for this proposalId is treated
+        // as brand new and gets a genuine retry instead of being deduped
+        // against a publish that never actually happened.
+        this.published.delete(proposalId);
+        this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
+      }
+    } finally {
+      this.reservations.delete(proposalId);
+      settleReservation();
     }
   }
 

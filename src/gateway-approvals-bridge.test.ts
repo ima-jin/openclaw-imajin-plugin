@@ -239,6 +239,35 @@ describe("GatewayApprovalsBridge", () => {
     expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
   });
 
+  it("fires the same source event 6x concurrently — exactly one publish (#48 TOCTOU)", async () => {
+    newBridge();
+    const record = makeRecord();
+    // Simulate the system-agent source firing several duplicate events for
+    // the same proposal within ~50ms (#48): all six calls happen
+    // synchronously, before the first call's async signing work resolves.
+    for (let i = 0; i < 6; i++) {
+      requestedHandler!(record);
+    }
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalled());
+    // Let any would-be duplicate publishes settle before asserting the count.
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
+  });
+
+  it("clears the reservation on publish failure so a later event can retry (#48)", async () => {
+    const bridge = newBridge();
+    const record = makeRecord();
+    kernel.publishApprovalRequested.mockRejectedValueOnce(new Error("kernel unreachable"));
+
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    expect(bridge.isPublished(record.id)).toBe(false);
+
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(2));
+    expect(bridge.isPublished(record.id)).toBe(true);
+  });
+
   it("startup reconcile publishes only proposals not already published", async () => {
     const bridge = newBridge();
     const already = makeRecord({ id: "system-agent:already" });
