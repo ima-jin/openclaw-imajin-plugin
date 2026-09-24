@@ -34,6 +34,17 @@ export interface ImajinIdentity {
   subtype: string;
   displayName?: string;
   tier?: string;
+  /**
+   * Hex-encoded Ed25519 public key currently registered for this DID (#44).
+   * Present on both `GET /registry/api/identity/:did` (`registry/api/
+   * identity/[did]/route.ts`'s `publicKey` compat field) and `GET /auth/api/
+   * identity/:did` in `ima-jin/imajin-ai` — the plugin's EXISTING DID
+   * resolution surface, reused by `src/operator-signature.ts`'s
+   * `createIdentityClientOperatorKeyResolver` to verify an operator's
+   * countersignature rather than adding a second resolver. Absent for a
+   * soft/stub identity (no real key yet).
+   */
+  publicKey?: string;
 }
 
 export interface ImajinAttestation {

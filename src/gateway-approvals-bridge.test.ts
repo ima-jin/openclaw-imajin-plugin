@@ -421,6 +421,294 @@ describe("GatewayApprovalsBridge", () => {
   });
 });
 
+describe("GatewayApprovalsBridge + operator countersignature (#44)", () => {
+  let agentPrivateKeyHex: string;
+  let operatorPrivateKeyHex: string;
+  let operatorPublicKeyHex: string;
+  let gateway: {
+    list: ReturnType<typeof vi.fn>;
+    get: ReturnType<typeof vi.fn>;
+    resolve: ReturnType<typeof vi.fn>;
+    onRequested: ReturnType<typeof vi.fn>;
+  };
+  let kernel: { publishApprovalRequested: ReturnType<typeof vi.fn>; publishMismatch: ReturnType<typeof vi.fn> };
+  let requestedHandler: ((record: SystemAgentApprovalRequestRecord) => void) | undefined;
+  let logger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
+
+  beforeEach(async () => {
+    agentPrivateKeyHex = (await generateKeypairHex()).privateKeyHex;
+    const operatorKeypair = await generateKeypairHex();
+    operatorPrivateKeyHex = operatorKeypair.privateKeyHex;
+    operatorPublicKeyHex = operatorKeypair.publicKeyHex;
+    requestedHandler = undefined;
+    gateway = {
+      list: vi.fn().mockResolvedValue([]),
+      get: vi.fn(),
+      resolve: vi.fn().mockResolvedValue({ applied: true }),
+      onRequested: vi.fn((handler: (record: SystemAgentApprovalRequestRecord) => void) => {
+        requestedHandler = handler;
+      }),
+    };
+    kernel = {
+      publishApprovalRequested: vi.fn().mockResolvedValue(undefined),
+      publishMismatch: vi.fn().mockResolvedValue(undefined),
+    };
+    logger = { info: vi.fn(), warn: vi.fn(), error: vi.fn() };
+  });
+
+  function resolverFor(publicKeyHex: string | null): { resolveOperatorPublicKey: ReturnType<typeof vi.fn> } {
+    return { resolveOperatorPublicKey: vi.fn().mockResolvedValue(publicKeyHex) };
+  }
+
+  function newBridge(
+    opts: {
+      requireOperatorCountersignature?: boolean;
+      keyResolver?: { resolveOperatorPublicKey: ReturnType<typeof vi.fn> };
+    } = {},
+  ): GatewayApprovalsBridge {
+    const source = createSystemAgentSource(gateway as unknown as GatewayApprovalsClient);
+    return new GatewayApprovalsBridge(
+      {
+        operatorDid: OPERATOR_DID,
+        agentDid: AGENT_DID,
+        agentPrivateKeyHex,
+        requireOperatorCountersignature: opts.requireOperatorCountersignature,
+      },
+      new Map<string, ApprovalSource>([["system-agent", source]]),
+      kernel as unknown as KernelNotifyClient,
+      logger,
+      (opts.keyResolver ?? resolverFor(operatorPublicKeyHex)) as unknown as ConstructorParameters<
+        typeof GatewayApprovalsBridge
+      >[4],
+    );
+  }
+
+  function pendingSnapshot(proposalHash: string): GatewayApprovalSnapshot {
+    return { status: "pending", presentation: { proposalHash } };
+  }
+
+  async function signDecision(
+    fields: { contentHash: string; decision: string; decidedAt: string },
+    privateKeyHex: string,
+  ): Promise<string> {
+    const { canonicalize } = await import("./approval-bridge.js");
+    const message = new TextEncoder().encode(canonicalize(fields));
+    const sig = await ed.signAsync(message, Uint8Array.from(Buffer.from(privateKeyHex, "hex")));
+    return Buffer.from(sig).toString("hex");
+  }
+
+  it("applies a decision carrying a valid operatorSignature", async () => {
+    const bridge = newBridge();
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
+
+    const decidedAt = new Date().toISOString();
+    const sig = await signDecision({ contentHash, decision: "approve", decidedAt }, operatorPrivateKeyHex);
+
+    await bridge.handleKernelDecision(
+      makeDecidedFrame({
+        payload: {
+          contentHash,
+          decidedAt,
+          operatorSignature: { keyId: operatorPublicKeyHex, alg: "ed25519", sig },
+        },
+      }),
+    );
+
+    expect(gateway.resolve).toHaveBeenCalledWith("system-agent:abc123", "allow-once");
+  });
+
+  it("still applies when operatorSignature is omitted and the require flag is off (today's v1 behavior)", async () => {
+    const bridge = newBridge({ requireOperatorCountersignature: false });
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
+
+    await bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash } }));
+
+    expect(gateway.resolve).toHaveBeenCalledWith("system-agent:abc123", "allow-once");
+  });
+
+  it("REJECTS a kernel-forged decision (valid witness signer, no operatorSignature) once the require flag is on", async () => {
+    const bridge = newBridge({ requireOperatorCountersignature: true });
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
+
+    await bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash } }));
+
+    expect(gateway.resolve).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("operatorSignature is required"));
+  });
+
+  it("REJECTS a kernel-forged decision (valid witness signer, operatorSignature from an unrelated key)", async () => {
+    const bridge = newBridge({ requireOperatorCountersignature: false });
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
+
+    const decidedAt = new Date().toISOString();
+    // A compromised kernel node forges its own keypair here — not the operator's.
+    const forger = await generateKeypairHex();
+    const sig = await signDecision({ contentHash, decision: "approve", decidedAt }, forger.privateKeyHex);
+
+    await bridge.handleKernelDecision(
+      makeDecidedFrame({
+        payload: {
+          contentHash,
+          decidedAt,
+          operatorSignature: { keyId: forger.publicKeyHex, alg: "ed25519", sig },
+        },
+      }),
+    );
+
+    expect(gateway.resolve).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("does not match"));
+  });
+
+  it("rejects a tampered decision value even under a validly-shaped signature computed for a different decision", async () => {
+    const bridge = newBridge();
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
+
+    const decidedAt = new Date().toISOString();
+    // Operator actually signed "reject" ...
+    const sig = await signDecision({ contentHash, decision: "reject", decidedAt }, operatorPrivateKeyHex);
+
+    // ... but the wire payload claims "approve".
+    await bridge.handleKernelDecision(
+      makeDecidedFrame({
+        payload: {
+          contentHash,
+          decision: "approve",
+          decidedAt,
+          operatorSignature: { keyId: operatorPublicKeyHex, alg: "ed25519", sig },
+        },
+      }),
+    );
+
+    expect(gateway.resolve).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("invalid operator signature"));
+  });
+
+  it("rejects a tampered decidedAt even with an otherwise-matching key and contentHash", async () => {
+    const bridge = newBridge();
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
+
+    const signedAt = new Date(Date.now() - 60_000).toISOString();
+    const sig = await signDecision({ contentHash, decision: "approve", decidedAt: signedAt }, operatorPrivateKeyHex);
+
+    await bridge.handleKernelDecision(
+      makeDecidedFrame({
+        payload: {
+          contentHash,
+          decidedAt: new Date().toISOString(), // different from what was actually signed
+          operatorSignature: { keyId: operatorPublicKeyHex, alg: "ed25519", sig },
+        },
+      }),
+    );
+
+    expect(gateway.resolve).not.toHaveBeenCalled();
+  });
+
+  it("rejects a malformed operatorSignature outright, regardless of the require flag", async () => {
+    const bridge = newBridge();
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
+
+    await bridge.handleKernelDecision(
+      makeDecidedFrame({
+        payload: { contentHash, operatorSignature: { keyId: "not-hex", alg: "ed25519", sig: "not-hex" } },
+      }),
+    );
+
+    expect(gateway.resolve).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("malformed operatorSignature"));
+  });
+
+  it("withdraw path: a valid operatorSignature over decision withdrawn is accepted as the documented no-op", async () => {
+    const bridge = newBridge();
+    requestedHandler!(makeRecord());
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+
+    const decidedAt = new Date().toISOString();
+    const sig = await signDecision({ contentHash, decision: "withdrawn", decidedAt }, operatorPrivateKeyHex);
+
+    await bridge.handleKernelDecision(
+      makeDecidedFrame({
+        payload: {
+          decision: "withdrawn",
+          contentHash,
+          decidedAt,
+          operatorSignature: { keyId: operatorPublicKeyHex, alg: "ed25519", sig },
+        },
+      }),
+    );
+
+    expect(gateway.get).not.toHaveBeenCalled();
+    expect(gateway.resolve).not.toHaveBeenCalled();
+    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining("no source action"));
+  });
+
+  it("withdraw path: REJECTS a kernel-forged withdrawal (no operatorSignature) once the require flag is on", async () => {
+    const bridge = newBridge({ requireOperatorCountersignature: true });
+    requestedHandler!(makeRecord());
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+
+    await bridge.handleKernelDecision(makeDecidedFrame({ payload: { decision: "withdrawn", contentHash } }));
+
+    expect(gateway.resolve).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("operatorSignature is required"));
+    expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining("no source action"));
+  });
+
+  it("rejects a supplied operatorSignature when the operator DID cannot be resolved to a public key", async () => {
+    const bridge = newBridge({ keyResolver: resolverFor(null) });
+    const record = makeRecord();
+    requestedHandler!(record);
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
+
+    const decidedAt = new Date().toISOString();
+    const sig = await signDecision({ contentHash, decision: "approve", decidedAt }, operatorPrivateKeyHex);
+
+    await bridge.handleKernelDecision(
+      makeDecidedFrame({
+        payload: {
+          contentHash,
+          decidedAt,
+          operatorSignature: { keyId: operatorPublicKeyHex, alg: "ed25519", sig },
+        },
+      }),
+    );
+
+    expect(gateway.resolve).not.toHaveBeenCalled();
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("could not resolve"));
+  });
+});
+
 describe("computeContentHash covers detail (#2084)", () => {
   it("mutating detail changes the digest even when everything else stays the same", async () => {
     const { buildDigestFields, computeContentHash } = await import("./gateway-approvals-bridge.js");

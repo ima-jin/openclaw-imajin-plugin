@@ -60,6 +60,7 @@ In `openclaw.json`:
   - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection(s); a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
   - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
   - **`approvals.skillWorkshop.operatorScopes`** — operator scopes (#35) for the `skill-workshop` source's OWN loopback Gateway connection; default `[]` (unchanged SDK-default, `operator.approvals` only); set `["operator.read", "operator.admin"]` to fix `FORBIDDEN: missing scope` on strict/token-mode gateways; see "Gateway approvals bridge" below
+  - **`approvals.requireOperatorCountersignature`** — mirrors the kernel's `OPERATOR_COUNTERSIGN_REQUIRED` (#44, `ima-jin/imajin-ai#2082`); default `false` (a decision missing `operatorSignature` is still applied, unchanged v1 behavior); `true` rejects any decision (including a withdrawal) that lacks a valid `operatorSignature` before it ever reaches a source — see "Operator countersignature" below
 - **`inferProxyBaseUrl`** (optional) — base URL of the local kernel inference proxy the `imajin` OpenClaw model provider discovers its catalog from (#36); defaults to `http://127.0.0.1:8787/openai/v1`; see "Kernel brains as OpenClaw models" below
 
 ### Turn-usage attestation
@@ -163,6 +164,7 @@ probe of the proxy's `GET /healthz` body.
 - [x] gateway-exec source — forward OpenClaw host-exec approvals to /jin, resolve allow-once/deny (#38)
 - [x] `imajin_vault` — owner→agent credential handoff via delegation grant, values kept out of model context (#40, kernel half ima-jin/imajin-ai#2231); see `docs/vault-handoff.md`
 - [x] `approvals.skillWorkshop.operatorScopes` — scope-parameterized loopback Gateway client for the skill-workshop source, fixing #35's `FORBIDDEN: missing scope` on strict/token-mode gateways
+- [x] Operator countersignature verification — `operator.approval.decided` is verified directly against the operator DID's own key, not just the kernel's witness signature (#44, kernel half `ima-jin/imajin-ai#2082`/`#2158`)
 
 ### Approval bridge (#1816)
 
@@ -244,10 +246,12 @@ diagrams, including the generic leg.
    before enabling" below). Before ever touching a source, it verifies the
    event's `issuer`/`subject`/`decidedBy` all equal the configured
    `approvals.operatorDid` exactly, then (#2084) checks the decided event's
-   own `contentHash` matches what was staged, refetches that source's
-   CURRENT state (`ApprovalSource.getCurrent`), and recomputes the digest
-   from the current `sourceRevision` + `detail` to confirm it STILL matches.
-   Only when both checks pass does it call
+   own `contentHash` matches what was staged, then (#44) verifies the
+   operator's own `operatorSignature` — see "Operator countersignature"
+   below — then refetches that source's CURRENT state
+   (`ApprovalSource.getCurrent`), and recomputes the digest from the
+   current `sourceRevision` + `detail` to confirm it STILL matches.
+   Only when every check passes does it call
    `source.resolve(id, decision, sourceRevision)` — for `system-agent`
    that maps `approve → allow-once`, `reject`/`deny → deny`; for
    `skill-workshop` that calls `skills.proposals.apply`/`reject` with the
@@ -257,6 +261,65 @@ diagrams, including the generic leg.
    behaviour) or evicts + immediately re-lists that one source so the
    operator sees a fresh card (`skill-workshop`, #33's "revision drift →
    no apply + re-stage").
+
+### Operator countersignature (#44, `ima-jin/imajin-ai#2082`/`#2158`)
+
+Before #44, this bridge trusted the kernel's own witness signature on the
+`operator.approval.decided` WS envelope (`issuer`/`subject`/`decidedBy` ==
+`approvals.operatorDid`) as the ONLY authority for a decision. That proves
+the kernel *recorded* a decision, never that the operator *actually made*
+it — a compromised kernel alone could forge an approval. The kernel now
+ships a second, independent signature (`operatorSignature`), produced
+client-side on /jin with the operator's OWN key, over
+`canonicalize({contentHash, decision, decidedAt})`. This bridge verifies
+that signature **directly against the operator DID's registered Ed25519
+public key** (resolved via this plugin's EXISTING DID resolver,
+`ImajinClient.getIdentity` — `GET /registry/api/identity/:did` — never a
+second resolver, and never the kernel's witness signature) before ever
+treating a decision as authoritative. This applies uniformly to every
+decision, including a withdrawal.
+
+**Who signs what:**
+
+| Field | Who signs it | Who verifies it (this plugin) |
+| --- | --- | --- |
+| `contentHash` (on the request) | This plugin's agent DID keypair, at publish time | The kernel, at ingest (400 on mismatch) |
+| Kernel witness `signature` (on the decided WS envelope) | The kernel's own node key | Channel/identity check only (`issuer`/`subject`/`decidedBy` == `approvals.operatorDid`) — proves the kernel recorded a decision, NOT that the operator made it |
+| `operatorSignature.sig` | The operator's own key, client-side on /jin | **This plugin**, directly against the operator DID's current registered public key — never the kernel's witness signature |
+| `operatorSignature.keyId` | — (identifies the signer) | Must equal the resolved operator public key exactly; a mismatch is treated identically to an unknown or revoked key |
+
+The fields verified (`contentHash`, `decision`, `decidedAt`) are
+reconstructed from THIS bridge's own `tracked.contentHash` — the value it
+itself published in the matching `operator.approval.requested` — never a
+value read off the wire event, since that is exactly what the operator's
+/jin client actually signed over.
+
+**Config knob** (`approvals.requireOperatorCountersignature`, mirrors the
+kernel's `OPERATOR_COUNTERSIGN_REQUIRED`): while `false` (default), a
+decision with no `operatorSignature` is still applied — unchanged v1
+behavior — but any `operatorSignature` that IS supplied is ALWAYS verified,
+and a malformed or invalid one is ALWAYS rejected regardless of this flag.
+Once `true`, a decision (including a withdrawal) lacking a valid
+`operatorSignature` is rejected before it ever reaches a source.
+
+**Rollout order** (do this before flipping anything):
+
+1. The kernel ships `operatorSignature` on every decision already, with its
+   own `OPERATOR_COUNTERSIGN_REQUIRED` off — nothing changes for an
+   unmigrated plugin (`ima-jin/imajin-ai#2158`).
+2. This plugin (#44) verifies `operatorSignature` against the operator
+   DID's public key on every decision it receives — live, regardless of
+   either flag.
+3. Once #44 is confirmed live and verifying correctly, set
+   `approvals.requireOperatorCountersignature: true` in this plugin's own
+   config, AND have the operator set `OPERATOR_COUNTERSIGN_REQUIRED=true`
+   on their kernel node (defense in depth — this plugin's own verification
+   never depends on that kernel flag being on).
+
+**Known gap**: there is no kernel route today that surfaces the kernel
+node's own `OPERATOR_COUNTERSIGN_REQUIRED` value, so
+`approvals.requireOperatorCountersignature` cannot "discover" and mirror it
+automatically — each side is set independently.
 
 **Fixed in #35 (interim, config-gated)**: the plugin SDK's only exported
 loopback-operator-connection factory (`createOperatorApprovalsGatewayClient`)

@@ -223,9 +223,6 @@ Kernel (/jin)                gateway-approvals-bridge.ts        OpenClaw Gateway
        |                              |  (else: reject, log, STOP —    |                       |
        |                              |   Gateway is never contacted)  |                       |
        |                              |                                |                       |
-       |                              |--if decision == withdrawn:     |                       |
-       |                              |  no-op (no Gateway analog)     |                       |
-       |                              |                                |                       |
        |                              |--proposalId tracked by this    |                       |
        |                              |  bridge? no -> no-op, log,     |                       |
        |                              |  STOP (idempotent: unknown/    |                       |
@@ -237,6 +234,20 @@ Kernel (/jin)                gateway-approvals-bridge.ts        OpenClaw Gateway
        |                              |  no -> drift (see below),      |                       |
        |                              |  STOP -----------------+       |                       |
        |                              |                         |     |                       |
+       |                              |--check 1.5 (#44): verify       |                       |
+       |                              |  operatorSignature directly    |                       |
+       |                              |  against the operator DID's    |                       |
+       |                              |  public key (GET /registry/    |                       |
+       |                              |  api/identity/:did) -- NEVER   |                       |
+       |                              |  the kernel witness sig above; |                       |
+       |                              |  applies to `withdrawn` too.   |                       |
+       |                              |  no -> reject, log, STOP ------+                       |
+       |                              |                         |     |                       |
+       |                              |--if decision == withdrawn:     |                       |
+       |                              |  no-op (no Gateway analog —    |                       |
+       |                              |  only reached once check 1 AND |                       |
+       |                              |  check 1.5 above both passed)  |                       |
+       |                              |                                |                       |
        |                              |--approval.get(proposalId)----->|                       |
        |                              |<--current snapshot-------------|                       |
        |                              |  {status, presentation.        |                       |
@@ -286,19 +297,25 @@ changed after the operator decided is caught even when the underlying
 ## Trust chain summary
 
 `plugin-signed request` → `kernel recomputes + verifies contentHash` →
-`operator decides on /jin` → `kernel witnesses` → `plugin verifies signer +
-hash (twice)` → `Gateway approval store`.
+`operator decides + countersigns on /jin` → `kernel witnesses` → `plugin
+verifies operator signature + hash (twice)` → `Gateway approval store`.
 
 The kernel (`ima-jin/imajin-ai#2154`) recomputes `contentHash` over the
 exact six-key canonical payload it received and rejects the request
 (400) on mismatch — so the /jin card the operator sees is provably bound
 to what this bridge published. It does NOT verify the plugin's Ed25519
-*signature* in v1 (`ima-jin/imajin-ai#2059`'s target-shape ruling defers
-that to the human-countersign follow-up); this bridge's own verification
-on the decision leg — kernel-witnessed transport, exact operator DID
-match, the decided event's own `contentHash` echoed back matching what was
-staged, AND a fresh digest recomputed from the source's current state
-still matching — is what stands in for it today. The bridge never bypasses
-a source's own backing store: it only ever relays a verified decision to
-it (`approval.resolve` for system-agent, `skills.proposals.apply`/`reject`
+*signature* on the REQUEST leg (`ima-jin/imajin-ai#2059`'s target-shape
+ruling defers that to a follow-up); this bridge's own verification on the
+decision leg — kernel-witnessed transport, exact operator DID match, the
+decided event's own `contentHash` echoed back matching what was staged, a
+fresh digest recomputed from the source's current state still matching,
+AND (#44, `ima-jin/imajin-ai#2082`) a valid `operatorSignature` verified
+directly against the operator DID's own registered public key — is what
+establishes trust on the decision leg. That last check is the load-bearing
+one: kernel-witnessed transport alone only proves the kernel *recorded* a
+decision, never that the operator *made* it, so a compromised kernel alone
+can no longer forge an approval once `operatorSignature` is required (see
+README "Operator countersignature"). The bridge never bypasses a source's
+own backing store: it only ever relays a verified decision to it
+(`approval.resolve` for system-agent, `skills.proposals.apply`/`reject`
 for Skill Workshop).
