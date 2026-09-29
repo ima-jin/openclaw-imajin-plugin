@@ -116,8 +116,9 @@ operator-approval-runtime-token shortcut, since that helper is not exported
 from the public plugin SDK). Only known operator scopes
 (`operator.read`/`operator.admin`/`operator.approvals`/`operator.write`)
 are accepted — an unrecognized entry fails plugin startup with a clear
-error. Off by default (`operatorScopes: []`): this is additive, config-
-gated, interim behaviour, pending an upstream scope-parameterized loopback
+error. Defaults to `["operator.read", "operator.admin"]` when omitted or
+`[]` (#53; set `["operator.approvals"]` to opt out): interim behaviour,
+pending an upstream scope-parameterized loopback
 factory (tracked as `openclaw/openclaw#TBD`) that will let
 `gateway-operator-client.ts` be deleted entirely. A missing-scope error is
 now logged exactly once per source instance (`createSkillWorkshopSource`'s
@@ -132,8 +133,9 @@ existing job (it is the thing `resolve()` already calls
 source does; only the connection's DECLARED scope set changes, from a value
 that made every one of its RPCs fail anyway to the value those RPCs already
 required server-side. The scope is confined to this one loopback
-connection and is never granted implicitly — it requires an explicit
-`approvals.skillWorkshop.operatorScopes` config entry.
+connection. Since #53 it is the default for this source when
+`approvals.skillWorkshop.operatorScopes` is omitted or empty (startup logs
+the defaulted scopes); an explicit `["operator.approvals"]` opts out.
 
 ### gateway-exec source (#38)
 
@@ -164,6 +166,35 @@ the Gateway reports an approved exec finished, to the kernel's `POST
 (`wireGatewayExecOutcomeReporting`), not part of the generic
 `ApprovalSource` contract — see `gateway-exec.ts`'s module doc for the full
 "which hook" rationale and the outcome-endpoint contract.
+
+## Reconnect leg — entitlement preflight + catch-up (#53)
+
+```
+ WS connected (auth ok)      gateway-approvals-bridge.ts                Kernel
+        |                              |                                  |
+        |--onConnected---------------->|                                  |
+        |                              |--GET /auth/api/events/           |
+        |                              |  subscriptions/catchup?cursor=0  |
+        |                              |  &limit=1  (as the agent itself)-->|
+        |                              |<-- entitledEventTypes -----------|
+        |                              |                                  |
+        |            operator.approval.decided NOT in entitledEventTypes?  |
+        |              -> ONE ERROR (agent DID, capability, exact grant),   |
+        |                 bridge DEGRADED: every publish also logs + sends   |
+        |                 "⚠ bridge cannot apply: agent lacks               |
+        |                 operator:approvals" via wsNotifications.directSend |
+        |                              |                                  |
+        |            entitled -> reconcile() pending items, then:          |
+        |                              |--GET .../catchup?cursor=<persisted>|
+        |                              |<-- events (oldest first) ---------|
+        |                              |   for each operator.approval.     |
+        |                              |   decided: handleKernelDecision   |
+        |                              |   (same path as the live frame)   |
+        |                              |   -> cursor advances only across  |
+        |                              |   terminal outcomes; persisted to |
+        |                              |   <stateDir>/approvals-decided-   |
+        |                              |   cursor.json                     |
+```
 
 ## Request leg — proposal staged → kernel notification (system-agent, concrete example)
 

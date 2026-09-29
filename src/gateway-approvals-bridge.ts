@@ -75,7 +75,21 @@
  * every function above it) can be unit tested with plain fakes.
  */
 import { readFile } from "node:fs/promises";
+import * as path from "node:path";
 import { canonicalize } from "./approval-bridge.js";
+import {
+  APPROVALS_CURSOR_FILENAME,
+  ApprovalsCursorStore,
+  buildDegradedPublishWarning,
+  checkApprovalsEntitlement,
+  describeMissingApprovalsGrant,
+  runApprovalsCatchUp,
+  type DecisionOutcome,
+  type EntitlementState,
+  type KernelHttp,
+} from "./approvals-catchup.js";
+import { sendDirectChannelMessage, type DirectSendConfig } from "./channel-notify.js";
+import { resolveStateDir } from "./notification-state-store.js";
 import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
 import {
   ApprovalContentDriftError,
@@ -354,9 +368,9 @@ export interface ApprovalsBridgePluginConfig {
    * Skill Workshop source config (#35). There is no separate `enabled`
    * flag here: whether the `skill-workshop` source runs at all is already
    * governed by `approvals.sources` (default on) — adding a second on/off
-   * switch would just create two ways to disable the same thing. Off by
-   * default (`operatorScopes: []` or omitted): unchanged SDK-default
-   * behaviour (today's dead-on-arrival-on-strict-gateways posture, #35).
+   * switch would just create two ways to disable the same thing.
+   * `operatorScopes` defaults to `["operator.read", "operator.admin"]` when
+   * omitted or empty (#53) — see `DEFAULT_SKILL_WORKSHOP_OPERATOR_SCOPES`.
    */
   skillWorkshop?: {
     /**
@@ -365,9 +379,11 @@ export interface ApprovalsBridgePluginConfig {
      * `["operator.approvals"]`-only default — see `gateway-operator-
      * client.ts`'s module doc for why this is necessary and
      * `docs/approvals-bridge.md` for the authority/security rationale.
-     * Default `[]`: behaviour is unchanged from before #35. Set
-     * `["operator.read", "operator.admin"]` to grant exactly what
-     * `skills.proposals.list`/`apply`/`reject` require. Only scopes in
+     * Default (omitted or `[]`, #53): `["operator.read", "operator.admin"]` —
+     * exactly what `skills.proposals.list`/`apply`/`reject` require; an empty
+     * value used to leave the source failing every poll with `FORBIDDEN:
+     * missing scope: operator.read` on strict/token-mode gateways. To opt out
+     * of the broader authority, set `["operator.approvals"]` explicitly. Only scopes in
      * `gateway-operator-client.ts`'s `KNOWN_OPERATOR_GATEWAY_SCOPES` are
      * accepted — an unrecognized entry fails plugin startup with a clear
      * error instead of silently opening a connection the Gateway will
@@ -398,6 +414,26 @@ export function isApprovalsBridgeConfigured(
   agentDid: string | undefined,
 ): boolean {
   return Boolean(config?.enabled && config?.operatorDid?.trim() && agentDid?.trim());
+}
+
+/**
+ * What the skill-workshop source's loopback Gateway connection requests when
+ * `approvals.skillWorkshop.operatorScopes` is omitted or empty (#53): exactly
+ * what `skills.proposals.list` (`operator.read`) and `apply`/`reject`
+ * (`operator.admin`) require server-side. Without it the source fails every
+ * poll with `FORBIDDEN: missing scope: operator.read` on token-mode gateways.
+ */
+export const DEFAULT_SKILL_WORKSHOP_OPERATOR_SCOPES: readonly string[] = ["operator.read", "operator.admin"];
+
+/** Resolves the configured skill-workshop scopes, defaulting an omitted/empty list (#53). */
+export function resolveSkillWorkshopOperatorScopes(configured: string[] | undefined): {
+  scopes: string[];
+  defaulted: boolean;
+} {
+  if (!configured || configured.length === 0) {
+    return { scopes: [...DEFAULT_SKILL_WORKSHOP_OPERATOR_SCOPES], defaulted: true };
+  }
+  return { scopes: configured, defaulted: false };
 }
 
 export const KNOWN_APPROVAL_SOURCE_IDS = [
@@ -487,6 +523,18 @@ export class GatewayApprovalsBridge {
    * publish failure sees no leftover reservation and can publish for real.
    */
   private readonly reservations = new Map<string, Promise<void>>();
+  /**
+   * In-flight `handleKernelDecision` runs keyed by proposalId (#53): a live
+   * WS push and a catch-up replay of the same decision share one run.
+   */
+  private readonly decisionsInFlight = new Map<string, Promise<DecisionOutcome>>();
+  /**
+   * Set while the kernel is known NOT to push `operator.approval.decided` to
+   * this agent (no active `operator:approvals` grant, #53). While set, every
+   * proposal publish also warns the operator that approving it cannot be
+   * applied, so a card that cannot be applied never looks applicable.
+   */
+  private degradedReason: string | undefined;
   private readonly logger: Logger;
   private readonly unsubscribes: Unsubscribe[] = [];
 
@@ -496,6 +544,8 @@ export class GatewayApprovalsBridge {
     private readonly kernel: KernelNotifyClient,
     logger?: Logger,
     private readonly keyResolver: OperatorKeyResolver = UNRESOLVED_OPERATOR_KEY_RESOLVER,
+    /** Human-facing warning channel (Telegram via `wsNotifications.directSend`); best-effort. */
+    private readonly notifyOperator?: (text: string) => Promise<void>,
   ) {
     this.logger = logger ?? defaultLogger();
     for (const source of this.sources.values()) {
@@ -511,6 +561,94 @@ export class GatewayApprovalsBridge {
   /** True once this bridge has published (and is tracking) the given proposal id. */
   isPublished(proposalId: string): boolean {
     return this.published.has(proposalId);
+  }
+
+  /** True while approvals cannot be applied because the kernel will not push decisions to this agent (#53). */
+  isDegraded(): boolean {
+    return this.degradedReason !== undefined;
+  }
+
+  markDegraded(reason: string): void {
+    this.degradedReason = reason;
+  }
+
+  clearDegraded(): void {
+    this.degradedReason = undefined;
+  }
+
+  /**
+   * Surfaces the degraded state on a publish (#53). The kernel's card contract
+   * (`operator.approval.requested`) has no unhashed note field — every card
+   * field is covered by `contentHash` and the signature, and the kernel
+   * ignores extras — and folding a warning into `summary` would make the hash
+   * depend on the bridge's state at publish time, breaking the #2084 echo
+   * check whenever a proposal is re-published after the state flips. So the
+   * warning travels the plugin's existing human-facing notify path
+   * (`wsNotifications.directSend`, Telegram by default) and the log instead.
+   */
+  private async warnDegradedPublish(proposalId: string, kind: string): Promise<void> {
+    const text = buildDegradedPublishWarning({ agentDid: this.config.agentDid, proposalId, kind });
+    this.logger.error(text);
+    if (!this.notifyOperator) return;
+    try {
+      await this.notifyOperator(text);
+    } catch (err) {
+      this.logger.error(`failed to send degraded-bridge warning for ${proposalId}: ${String(err)}`);
+    }
+  }
+
+  /**
+   * Runs on every WS (re)connect (#53), after the kernel confirmed auth:
+   *  1. re-checks whether this agent holds `operator:approvals` and flips
+   *     `degraded` accordingly (ONE ERROR log on the transition into
+   *     degraded, one info on recovery);
+   *  2. when entitled, re-reconciles pending source items (so a decision for
+   *     an item the startup `list()` missed is not silently skipped) and
+   *     replays missed `operator.approval.decided` events from the durable
+   *     kernel log since the persisted cursor.
+   * An inconclusive check (`unknown`) changes nothing and is retried on the
+   * next connect. Never throws.
+   */
+  async syncWithKernel(deps: {
+    http: KernelHttp;
+    cursorStore: ApprovalsCursorStore;
+    operatorDid: string;
+  }): Promise<EntitlementState> {
+    const entitlement = await this.runPreflight(deps.http, deps.operatorDid);
+    if (entitlement.state !== "entitled") return entitlement;
+    try {
+      await this.reconcile();
+      await runApprovalsCatchUp({
+        http: deps.http,
+        store: deps.cursorStore,
+        applyDecision: (frame) => this.handleKernelDecision(frame),
+        logger: this.logger,
+      });
+    } catch (err) {
+      this.logger.error(`approvals catch-up failed (will retry on next reconnect): ${String(err)}`);
+    }
+    return entitlement;
+  }
+
+  /** Preflight only (also used at startup, before the first reconcile publishes anything). Never throws. */
+  async runPreflight(http: KernelHttp, operatorDid: string): Promise<EntitlementState> {
+    const entitlement = await checkApprovalsEntitlement(http);
+    if (entitlement.state === "missing") {
+      if (!this.isDegraded()) {
+        this.logger.error(describeMissingApprovalsGrant({ agentDid: this.config.agentDid, operatorDid }));
+      }
+      this.markDegraded("agent lacks operator:approvals");
+    } else if (entitlement.state === "entitled") {
+      if (this.isDegraded()) {
+        this.logger.info("operator:approvals grant detected — bridge recovered, catching up missed decisions");
+      }
+      this.clearDegraded();
+    } else {
+      this.logger.warn(
+        `could not verify operator:approvals entitlement (${entitlement.reason}) — will re-check on the next reconnect`,
+      );
+    }
+    return entitlement;
   }
 
   /** Stops observing every source. Does not evict already-tracked proposals. */
@@ -595,6 +733,10 @@ export class GatewayApprovalsBridge {
         this.logger.info(
           `published operator.approval.requested for ${proposalId} (source=${sourceId}, kind=${payload.kind})`,
         );
+        if (this.isDegraded()) {
+          // Fire-and-forget: a slow notify CLI must never hold the publish reservation.
+          void this.warnDegradedPublish(proposalId, payload.kind);
+        }
       } catch (err) {
         // Clear BOTH the tracked proposal and (via the outer `finally`) the
         // reservation, so the next real event for this proposalId is treated
@@ -610,11 +752,30 @@ export class GatewayApprovalsBridge {
   }
 
   /**
-   * Handles one inbound kernel `bus_event` frame. Only ever acts on
-   * `operator.approval.decided`; every other event type is ignored.
+   * Handles one inbound kernel `bus_event` frame — from the live WS push OR
+   * from the durable catch-up read (#53); both go through this exact path.
+   * Only ever acts on `operator.approval.decided`; every other event type is
+   * ignored. Concurrent calls for the SAME proposal (a live push racing a
+   * catch-up replay) share one in-flight run, so a decision is applied at
+   * most once; a later replay finds the proposal no longer tracked/pending
+   * and is a no-op.
    */
-  async handleKernelDecision(frame: KernelBusEventFrame): Promise<void> {
-    if (frame.eventType !== "operator.approval.decided") return;
+  async handleKernelDecision(frame: KernelBusEventFrame): Promise<DecisionOutcome> {
+    if (frame.eventType !== "operator.approval.decided") return "noop";
+    const proposalId = (frame.payload as { proposalId?: unknown } | undefined)?.proposalId;
+    if (typeof proposalId !== "string" || proposalId.length === 0) {
+      return this.processKernelDecision(frame);
+    }
+    const inFlight = this.decisionsInFlight.get(proposalId);
+    if (inFlight) return inFlight;
+    const run = this.processKernelDecision(frame).finally(() => {
+      this.decisionsInFlight.delete(proposalId);
+    });
+    this.decisionsInFlight.set(proposalId, run);
+    return run;
+  }
+
+  private async processKernelDecision(frame: KernelBusEventFrame): Promise<DecisionOutcome> {
     const payload = frame.payload as
       | Partial<{
           proposalId: string;
@@ -628,7 +789,7 @@ export class GatewayApprovalsBridge {
     const proposalId = payload?.proposalId;
     if (typeof proposalId !== "string" || proposalId.length === 0) {
       this.logger.warn("dropped malformed operator.approval.decided (missing proposalId)");
-      return;
+      return "rejected";
     }
 
     // Auth (load-bearing, #24): the decided event must be kernel-witnessed
@@ -639,14 +800,24 @@ export class GatewayApprovalsBridge {
     // that the operator actually made it (#44/`ima-jin/imajin-ai#2082`): see
     // `verifyOperatorCountersignature` below, which is what actually
     // establishes that. A decision is never applied on either check alone.
+    //
+    // `subject` is the ADDRESSEE of one copy of the event: the kernel
+    // publishes the same signed decision once per recipient (ima-jin/imajin-
+    // ai#2337, `publishApprovalDecided`) — one addressed to the operator DID
+    // and one to the requesting agent's own DID. The agent's grant-bound
+    // subscription (self-audience) receives the agent-addressed copy, so
+    // both are legitimate; the authenticity fields (`issuer`, `decidedBy`,
+    // and the operator countersignature below) still must be the operator.
     const operatorDid = this.config.operatorDid;
     const isOperator =
-      frame.issuer === operatorDid && frame.subject === operatorDid && payload?.decidedBy === operatorDid;
+      frame.issuer === operatorDid &&
+      (frame.subject === operatorDid || frame.subject === this.config.agentDid) &&
+      payload?.decidedBy === operatorDid;
     if (!isOperator) {
       this.logger.warn(
         `rejected operator.approval.decided for ${proposalId}: signer is not the configured operator`,
       );
-      return;
+      return "rejected";
     }
 
     if (
@@ -658,7 +829,7 @@ export class GatewayApprovalsBridge {
       this.logger.warn(
         `ignoring operator.approval.decided for ${proposalId}: unrecognized decision ${String(payload?.decision)}`,
       );
-      return;
+      return "rejected";
     }
     // `payload` is narrowed non-undefined from here on (TS control-flow
     // analysis of the aliased `payload?.decision` checks above).
@@ -670,7 +841,7 @@ export class GatewayApprovalsBridge {
       // already resolved+evicted, or from a prior process lifetime that a
       // startup reconcile has not (yet) repopulated. No-op, one log line.
       this.logger.info(`operator.approval.decided for ${proposalId}: not tracked by this bridge — no-op`);
-      return;
+      return "noop";
     }
 
     const source = this.sources.get(tracked.sourceId);
@@ -679,7 +850,7 @@ export class GatewayApprovalsBridge {
       this.logger.error(
         `operator.approval.decided for ${proposalId}: source "${tracked.sourceId}" is no longer active — no-op`,
       );
-      return;
+      return "noop";
     }
 
     // #2084 check 1 (unchanged; applied uniformly to `withdrawn` too by
@@ -696,7 +867,7 @@ export class GatewayApprovalsBridge {
         proposalId,
         "operator.approval.decided contentHash does not match the staged proposal",
       );
-      return;
+      return "rejected";
     }
 
     // #44/`ima-jin/imajin-ai#2082`: verify the OPERATOR's own
@@ -708,7 +879,7 @@ export class GatewayApprovalsBridge {
     const signatureCheck = await this.verifyOperatorCountersignature(tracked, rawDecision, payload);
     if (!signatureCheck.ok) {
       this.logger.warn(`rejected operator.approval.decided for ${proposalId}: ${signatureCheck.error}`);
-      return;
+      return "rejected";
     }
 
     if (rawDecision === "withdrawn") {
@@ -718,7 +889,7 @@ export class GatewayApprovalsBridge {
       this.logger.info(
         `operator.approval.decided withdrawn for ${proposalId} — no source action (unsupported in v1)`,
       );
-      return;
+      return "noop";
     }
     const decision: ApprovalDecision = rawDecision === "approve" ? "approve" : "reject";
 
@@ -727,7 +898,9 @@ export class GatewayApprovalsBridge {
       current = await source.getCurrent(proposalId);
     } catch (err) {
       this.logger.error(`${tracked.sourceId}.getCurrent failed for ${proposalId}: ${String(err)}`);
-      return;
+      // Transient and BEFORE any state change: keep the proposal tracked and tell
+      // catch-up not to advance its cursor past this event (#53).
+      return "deferred";
     }
     if (!current || !current.pending) {
       // Idempotent (#24): already resolved/expired/unknown at the source.
@@ -735,7 +908,7 @@ export class GatewayApprovalsBridge {
         `operator.approval.decided for ${proposalId}: no longer pending at ${tracked.sourceId} — no-op`,
       );
       this.published.delete(proposalId);
-      return;
+      return "noop";
     }
 
     // #2084 check 2: recompute the FULL digest from the source's CURRENT
@@ -758,23 +931,25 @@ export class GatewayApprovalsBridge {
       : null;
     if (!recomputedHash || recomputedHash !== tracked.contentHash) {
       await this.handleDrift(source, tracked, proposalId, "contentHash no longer matches the staged proposal");
-      return;
+      return "rejected";
     }
 
     try {
       const result = await source.resolve(proposalId, decision, tracked.sourceRevision);
       this.logger.info(`applied ${decision} for ${proposalId} (source=${tracked.sourceId}, applied=${result.applied})`);
       this.published.delete(proposalId);
+      return "applied";
     } catch (err) {
       if (err instanceof ApprovalContentDriftError) {
         await this.handleDrift(source, tracked, proposalId, err.message);
-        return;
+        return "rejected";
       }
       // The Gateway/source treats a repeat of the SAME decision as
       // idempotent success and errors cleanly on a genuine conflict (#24) —
       // log, never crash the bridge.
       this.logger.warn(`approval.resolve failed for ${proposalId} (${decision}): ${String(err)}`);
       this.published.delete(proposalId);
+      return "rejected";
     }
   }
 
@@ -973,6 +1148,28 @@ export interface StartGatewayApprovalsBridgeDeps {
    * `verifyOperatorCountersignature`.
    */
   identityClient?: IdentityLookupClient;
+  /**
+   * Authenticated kernel HTTP access (this plugin's existing
+   * `ImajinClient.requestRaw`, same challenge-response session) used for the
+   * `operator:approvals` entitlement preflight and the decided-event
+   * catch-up read (#53). When omitted the bridge behaves exactly as before
+   * #53 (no preflight, no catch-up) and logs a warning.
+   */
+  kernelHttp?: KernelHttp;
+  /** `wsNotifications.stateDir` — where the catch-up cursor is persisted (defaults next to `keypairPath`, see `resolveStateDir`). */
+  stateDir?: string;
+  /** `wsNotifications.directSend` — the existing Telegram path, used for the degraded-bridge warning on each publish. */
+  directSend?: DirectSendConfig;
+}
+
+/** What `startGatewayApprovalsBridge` hands back to `index.ts`. */
+export interface StartedGatewayApprovalsBridge {
+  onKernelFrame: (frame: unknown) => void;
+  /** Call on every WS (re)connect, after the kernel's auth-ok: re-runs the entitlement preflight and the decided-event catch-up (#53). Never throws. */
+  onKernelConnected: () => Promise<void>;
+  /** True while the agent lacks `operator:approvals` (#53). */
+  isDegraded: () => boolean;
+  dispose: () => void;
 }
 
 /**
@@ -989,7 +1186,7 @@ export async function startGatewayApprovalsBridge(
   api: { runtime?: { config?: { current?: () => Record<string, unknown> } } },
   config: ApprovalsBridgePluginConfig | undefined,
   deps: StartGatewayApprovalsBridgeDeps,
-): Promise<{ onKernelFrame: (frame: unknown) => void; dispose: () => void } | undefined> {
+): Promise<StartedGatewayApprovalsBridge | undefined> {
   if (!isApprovalsBridgeConfigured(config, deps.did)) {
     if (config?.enabled) {
       console.warn(
@@ -1045,8 +1242,15 @@ export async function startGatewayApprovalsBridge(
 
   if (enabledSourceIds.has("skill-workshop")) {
     try {
-      const operatorScopes = config!.skillWorkshop?.operatorScopes ?? [];
+      const { scopes: operatorScopes, defaulted } = resolveSkillWorkshopOperatorScopes(
+        config!.skillWorkshop?.operatorScopes,
+      );
       assertKnownOperatorGatewayScopes(operatorScopes, "approvals.skillWorkshop.operatorScopes");
+      if (defaulted) {
+        console.log(
+          `[imajin-approvals-bridge] approvals.skillWorkshop.operatorScopes not set — defaulting to ${JSON.stringify(operatorScopes)} (set ["operator.approvals"] to opt out)`,
+        );
+      }
       const live = await createLiveSkillWorkshopConnection(api, {
         gatewayTokenOverride: gatewayTokenResult.value,
         clientDisplayName: "Imajin Gateway approvals bridge (skill-workshop)",
@@ -1129,13 +1333,50 @@ export async function startGatewayApprovalsBridge(
     kernel,
     undefined,
     keyResolver,
+    deps.directSend?.target ? (text) => sendDirectChannelMessage(deps.directSend, text) : undefined,
   );
+
+  const operatorDid = config!.operatorDid!;
+  const kernelHttp = deps.kernelHttp;
+  const stateDir = resolveStateDir(deps.stateDir, deps.keypairPath);
+  const cursorStore = new ApprovalsCursorStore(
+    stateDir ? path.join(stateDir, APPROVALS_CURSOR_FILENAME) : undefined,
+    { nodeUrl: deps.nodeUrl, agentDid: deps.did! },
+  );
+  await cursorStore.load();
+
+  if (kernelHttp) {
+    // #53 startup preflight: know whether the kernel will push decisions to this
+    // agent BEFORE the first reconcile publishes any card, so those cards are
+    // already surfaced as unappliable when the grant is missing.
+    await bridge.runPreflight(kernelHttp, operatorDid);
+  } else {
+    console.warn(
+      "[imajin-approvals-bridge] no kernel HTTP client wired — operator:approvals preflight and decided-event catch-up are disabled",
+    );
+  }
 
   try {
     await bridge.reconcile();
   } catch (err) {
     console.error(`[imajin-approvals-bridge] startup reconcile failed: ${String(err)}`);
   }
+
+  // Serialized: two reconnects in quick succession share one sync run.
+  let syncInFlight: Promise<void> | undefined;
+  const onKernelConnected = (): Promise<void> => {
+    if (!kernelHttp) return Promise.resolve();
+    syncInFlight ??= bridge
+      .syncWithKernel({ http: kernelHttp, cursorStore, operatorDid })
+      .then(() => undefined)
+      .catch((err: unknown) => {
+        console.error(`[imajin-approvals-bridge] connect-time sync failed: ${String(err)}`);
+      })
+      .finally(() => {
+        syncInFlight = undefined;
+      });
+    return syncInFlight;
+  };
 
   return {
     onKernelFrame: (frame: unknown) => {
@@ -1144,6 +1385,8 @@ export async function startGatewayApprovalsBridge(
         console.error(`[imajin-approvals-bridge] failed to handle kernel decision frame: ${String(err)}`);
       });
     },
+    onKernelConnected,
+    isDegraded: () => bridge.isDegraded(),
     dispose: () => {
       bridge.dispose();
       for (const stop of stoppers) stop();

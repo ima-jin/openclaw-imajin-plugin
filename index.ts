@@ -221,6 +221,11 @@ export default definePluginEntry({
         // operator's countersignature on `operator.approval.decided`
         // against their registered public key — never a second resolver.
         identityClient: client,
+        // #53: the same challenge-response session, reused for the
+        // `operator:approvals` entitlement preflight + decided-event catch-up.
+        kernelHttp: client,
+        stateDir: config.wsNotifications?.stateDir,
+        directSend: config.wsNotifications?.directSend,
         // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
         // enabled via `approvals.sources` alongside system-agent/skill-
         // workshop. Reads the config's live `modelPolicy.allow` on every
@@ -247,6 +252,15 @@ export default definePluginEntry({
           console.error("[imajin-approvals-bridge] failed to start:", err);
           return undefined;
         });
+
+      // #53: on EVERY (re)connect, after the kernel's auth-ok, re-verify the
+      // agent still holds `operator:approvals` and replay any
+      // `operator.approval.decided` the socket missed. Awaits bridge startup so
+      // a connect that races registration is not dropped.
+      wsService.onConnected(async () => {
+        const started = await approvalsBridgeReady;
+        await started?.onKernelConnected();
+      });
 
       wsService.onFrame((frame) => {
         if (frame.type === "notification") {

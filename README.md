@@ -59,7 +59,7 @@ In `openclaw.json`:
   - **`approvals.sources`** — which sources to drive: `"system-agent"` and/or `"skill-workshop"` (#33) default on when this array is omitted; `"imajin-catalog"` (opt-in per-model gating for newly discovered `imajin/*` models, #36) and `"gateway-exec"` (#38, OpenClaw host-exec approvals) are opt-in ONLY and must be listed explicitly — neither is ever included in that default; gateway-exec grants remote-execution-grade `operator.approvals` authority over live host-exec approvals. A source left out neither lists nor subscribes.
   - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection(s); a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
   - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
-  - **`approvals.skillWorkshop.operatorScopes`** — operator scopes (#35) for the `skill-workshop` source's OWN loopback Gateway connection; default `[]` (unchanged SDK-default, `operator.approvals` only); set `["operator.read", "operator.admin"]` to fix `FORBIDDEN: missing scope` on strict/token-mode gateways; see "Gateway approvals bridge" below
+  - **`approvals.skillWorkshop.operatorScopes`** — operator scopes (#35) for the `skill-workshop` source's OWN loopback Gateway connection; defaults to `["operator.read", "operator.admin"]` when omitted or `[]` (#53) — exactly what `skills.proposals.list`/`apply`/`reject` require, fixing `FORBIDDEN: missing scope: operator.read` on strict/token-mode gateways; set `["operator.approvals"]` to opt out of the broader authority; see "Gateway approvals bridge" below
   - **`approvals.requireOperatorCountersignature`** — mirrors the kernel's `OPERATOR_COUNTERSIGN_REQUIRED` (#44, `ima-jin/imajin-ai#2082`); default `false` (a decision missing `operatorSignature` is still applied, unchanged v1 behavior); `true` rejects any decision (including a withdrawal) that lacks a valid `operatorSignature` before it ever reaches a source — see "Operator countersignature" below
 - **`inferProxyBaseUrl`** (optional) — base URL of the local kernel inference proxy the `imajin` OpenClaw model provider discovers its catalog from (#36); defaults to `http://127.0.0.1:8787/openai/v1`; see "Kernel brains as OpenClaw models" below
 
@@ -165,6 +165,7 @@ probe of the proxy's `GET /healthz` body.
 - [x] `imajin_vault` — owner→agent credential handoff via delegation grant, values kept out of model context (#40, kernel half ima-jin/imajin-ai#2231); see `docs/vault-handoff.md`
 - [x] `approvals.skillWorkshop.operatorScopes` — scope-parameterized loopback Gateway client for the skill-workshop source, fixing #35's `FORBIDDEN: missing scope` on strict/token-mode gateways
 - [x] Operator countersignature verification — `operator.approval.decided` is verified directly against the operator DID's own key, not just the kernel's witness signature (#44, kernel half `ima-jin/imajin-ai#2082`/`#2158`)
+- [x] `operator:approvals` preflight, loud degraded mode, and `operator.approval.decided` catch-up on every WS (re)connect (#53)
 
 ### Approval bridge (#1816)
 
@@ -242,10 +243,15 @@ diagrams, including the generic leg.
    (`src/ws-service.ts`) for the resulting `operator.approval.decided` bus
    event (delivered via the kernel's #1884 grant-bound event-subscription
    fan-out — the agent's own DID needs an active delegation grant for the
-   `operator:approvals` capability on the kernel side; see "Live check
-   before enabling" below). Before ever touching a source, it verifies the
-   event's `issuer`/`subject`/`decidedBy` all equal the configured
-   `approvals.operatorDid` exactly, then (#2084) checks the decided event's
+   `operator:approvals` capability on the kernel side; the bridge checks
+   this at startup and on every reconnect and fails loudly when it is
+   missing, and replays anything the socket missed — see "Approvals grant
+   preflight, degraded mode, and catch-up (#53)" below; also "Live check
+   before enabling"). Before ever touching a source, it verifies the
+   event's `issuer` and `decidedBy` equal the configured
+   `approvals.operatorDid` exactly and its `subject` (the addressee of one
+   per-recipient copy) is the operator DID or this agent's own DID, then
+   (#2084) checks the decided event's
    own `contentHash` matches what was staged, then (#44) verifies the
    operator's own `operatorSignature` — see "Operator countersignature"
    below — then refetches that source's CURRENT state
@@ -261,6 +267,66 @@ diagrams, including the generic leg.
    behaviour) or evicts + immediately re-lists that one source so the
    operator sees a fresh card (`skill-workshop`, #33's "revision drift →
    no apply + re-stage").
+
+### Approvals grant preflight, degraded mode, and catch-up (#53)
+
+The kernel pushes `operator.approval.decided` over the agent's WebSocket
+ONLY to DIDs whose ACTIVE delegation grant carries the `operator:approvals`
+capability (`packages/bus/src/subscriptions.ts` / `packages/auth/src/grant-scopes.ts`
+in `ima-jin/imajin-ai`). Without it the kernel pushes nothing and raises no
+error: the /jin card sat at "approved — pending apply" forever. The plugin
+cannot self-grant this (the grant is the owner's to author, not the
+kernel's to auto-grant), so it now:
+
+1. **Preflights** the capability — once at bridge startup (before the first
+   reconcile publishes any card) and again after the kernel's auth-ok on
+   EVERY WS (re)connect. It reads the agent's own effective entitlement
+   from `GET /auth/api/events/subscriptions/catchup` (as the agent itself,
+   never through `actAs`): `entitledEventTypes` contains
+   `operator.approval.decided` exactly when an active grant carries
+   `operator:approvals`. No new kernel endpoint is used.
+2. **Fails loud**, once, when it is missing: a single ERROR log naming the
+   agent DID, the missing capability, and the exact grant the owner must
+   author —
+   `POST /auth/api/grants {"agentDid":"<agent>","capabilities":["operator:approvals"],"audience":{"type":"dids","values":["<operatorDid>","<agent>"]}}`
+   (or `PUT /auth/api/grants/{grantId}/capabilities/operator:approvals` on an
+   existing active grant). The audience must allow both the operator DID and
+   the agent DID: the kernel publishes each decision once per recipient.
+   The bridge is marked **degraded** and, for every proposal it publishes
+   while degraded, logs and sends (via `wsNotifications.directSend`, Telegram
+   by default) `⚠ bridge cannot apply: agent lacks operator:approvals …`.
+   The card contract has no unhashed note field (every card field —
+   including `summary` — is covered by `contentHash` and the signature), and
+   putting the warning in `summary` would make the hash depend on bridge
+   state at publish time, so the warning travels the notify path instead.
+   An inconclusive check (kernel unreachable) is NOT treated as degraded and
+   is retried on the next reconnect.
+3. **Catches up** on every (re)connect once entitled: re-reconciles pending
+   source items, then reads `operator.approval.decided` events from the
+   kernel's durable `kernel.event_subscription_log` (the same catch-up route)
+   since the persisted cursor and applies each through the SAME handler as
+   the live WS path — so operator identity, `contentHash` echo, operator
+   countersignature, and source-drift checks are identical. Applying an
+   already-applied decision is a no-op (the proposal is no longer tracked /
+   pending), and a live push racing a replay for the same proposal shares one
+   in-flight run. The cursor lives in
+   `<stateDir>/approvals-decided-cursor.json` (`wsNotifications.stateDir`,
+   default: `imajin-ws-state/` next to `keypairPath`), is scoped to node URL +
+   agent DID, only ever advances (never from a live frame — live pushes can
+   skip a seq, the durable read cannot), and stops at the first event whose
+   handling failed transiently so the next reconnect retries it. A missing or
+   corrupt cursor file just replays the retention window (safe, idempotent).
+
+The decided event addressed to the agent has `subject` = the agent DID (the
+kernel publishes one copy per recipient, `ima-jin/imajin-ai#2337`); the
+bridge accepts `subject` ∈ {operator DID, agent DID}, while `issuer`,
+`decidedBy`, and the countersignature must still be the operator.
+
+**Known limits**: the entitlement read is not audience-aware, so a grant
+that carries `operator:approvals` but whose audience excludes the operator/
+agent DID passes the preflight yet still receives nothing (catch-up applies
+nothing either). Cards published while degraded keep their original content
+after recovery; the grant simply makes them applicable.
 
 ### Operator countersignature (#44, `ima-jin/imajin-ai#2082`/`#2158`)
 
@@ -353,8 +419,11 @@ loopback connection the scopes it actually needs instead:
 }
 ```
 
-`operatorScopes` defaults to `[]` (unchanged SDK-default behaviour) — this
-is opt-in and off by default. Only `operator.read`, `operator.admin`,
+`operatorScopes` defaults to `["operator.read", "operator.admin"]` when
+omitted or `[]` (#53; it used to default to `[]`, which left the source
+failing every poll on token-mode gateways) — startup logs the defaulted
+scopes once. To opt out of the broader authority, set
+`["operator.approvals"]` (the SDK factory's own scope). Only `operator.read`, `operator.admin`,
 `operator.approvals`, and `operator.write` are accepted; an unrecognized
 entry fails plugin startup with a clear error rather than silently opening
 a connection the Gateway will reject anyway (`src/gateway-operator-
@@ -372,8 +441,8 @@ apply/reject Skill Workshop proposals — this is the intended authority,
 not scope creep: this bridge IS the component that applies a proposal once
 the operator approves it on /jin (see "What it does, per source" above and
 `docs/approvals-bridge.md`'s trust chain). The scope is confined to this
-one loopback connection, granted only when explicitly configured, and
-never includes the unrelated `operator.questions`/`operator.pairing`/
+one loopback connection, granted by default only to the `skill-workshop`
+source (#53) or as configured, and never includes the unrelated `operator.questions`/`operator.pairing`/
 `operator.talk`/`operator.talk.secrets` scopes the real Gateway also
 supports.
 
