@@ -16,6 +16,14 @@ import * as path from "node:path";
 import type { NotificationFrame } from "./ws-service.js";
 import { sendDirectChannelMessage } from "./channel-notify.js";
 import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
+import type { AgentEndEvent } from "./turn-usage-attestation.js";
+import {
+  parseReportTo,
+  WAKE_REPORT_HOOK_NAME,
+  WakeReporter,
+  type WakeReportDeliver,
+  type WakeRunSummary,
+} from "./wake-report.js";
 import {
   DEDUP_STATE_FILENAME,
   NotificationDedupStore,
@@ -93,6 +101,15 @@ export interface WsNotificationsConfig {
    * `keypairPath` (see `resolveStateDir` in `notification-state-store.ts`).
    */
   stateDir?: string;
+  /**
+   * Session keys (e.g. `agent:main:telegram:direct:<id>`) the wake worker
+   * discloses to (#47). After a wake turn completes in the wake session, its
+   * final assistant output — or "no output" plus the run state — is forwarded
+   * once per wake batch to each of these sessions, wrapped as a report from
+   * warp-events (informational, not a wake). Default empty = no reports.
+   * Invalid entries are logged once and ignored.
+   */
+  reportTo?: string[];
   /** Direct channel ping via the OpenClaw CLI — deterministic, no model turn. */
   directSend?: {
     /** Channel id, default `telegram`. */
@@ -299,6 +316,18 @@ function isFailureState(state: string): boolean {
   return FAILURE_STATE_RE.test(state);
 }
 
+/** Per-run `{ runId, state, title }` for a wake batch — what a #47 report names. */
+function summarizeWakeRuns(frames: NotificationFrame[]): WakeRunSummary[] {
+  return frames.map((nf) => {
+    const data = extractWakeRunData(nf);
+    return {
+      runId: data.runId ?? nf.id,
+      state: deriveWakeState(nf, data.state),
+      title: collapseNewlines(data.title ?? nf.title ?? nf.scope),
+    };
+  });
+}
+
 /** Collapses embedded newlines to a single space — a title is one line of evidence. */
 function collapseNewlines(value: string): string {
   return value.replace(/\s*[\r\n]+\s*/g, " ").trim();
@@ -464,6 +493,8 @@ async function postWakeHook(params: {
   sessionKey: string;
   message: string;
   idempotencyKey: string;
+  /** Hook run label; defaults to the wake's `imajin-wake`. */
+  name?: string;
 }): Promise<WakeHookResult> {
   const url = `http://127.0.0.1:${params.gatewayPort}${params.hooksPath}/agent`;
   const controller = new AbortController();
@@ -482,7 +513,7 @@ async function postWakeHook(params: {
         sessionMode: "persistent",
         sessionKey: params.sessionKey,
         deliver: true,
-        name: "imajin-wake",
+        name: params.name ?? "imajin-wake",
       }),
       signal: controller.signal,
     });
@@ -640,7 +671,16 @@ export function createNotificationInjector(
   api: any,
   wsNotifications: WsNotificationsConfig | undefined,
   deps: NotificationInjectorDeps = {},
-): { inject: (nf: NotificationFrame) => Promise<void>; dispose: () => void; ready: Promise<void> } {
+): {
+  inject: (nf: NotificationFrame) => Promise<void>;
+  dispose: () => void;
+  ready: Promise<void>;
+  /**
+   * `agent_end` hook handler for `wsNotifications.reportTo` (#47); `undefined`
+   * when no valid `reportTo` target is configured (nothing to register).
+   */
+  onAgentEnd?: (event: AgentEndEvent, ctx?: { sessionKey?: string }) => Promise<void>;
+} {
   const injectScopes = new Set(wsNotifications?.injectScopes ?? []);
   const targetSession = wsNotifications?.targetSession?.trim();
   const wakeSessionKey = wsNotifications?.wakeSessionKey?.trim() ?? targetSession;
@@ -664,6 +704,33 @@ export function createNotificationInjector(
     });
   const hooksPath = (wsNotifications?.hooksPath?.trim() || DEFAULT_HOOKS_PATH).replace(/\/+$/, "") || DEFAULT_HOOKS_PATH;
   const hookAgentId = wsNotifications?.hookAgentId?.trim() || DEFAULT_HOOK_AGENT_ID;
+
+  // #47: the wake worker discloses to `reportTo` sessions. Validated once here
+  // (invalid keys log once); no reporter at all when nothing valid is left.
+  const reportTargets = parseReportTo(wsNotifications?.reportTo, wakeSessionKey);
+  const deliverWakeReport: WakeReportDeliver = async (target, message, idempotencyKey) => {
+    await hookTokenReady;
+    if (!hookToken) {
+      return { ok: false, reason: "no hook token configured" };
+    }
+    return postWakeHookWithRetries({
+      gatewayPort: resolveGatewayPort(api),
+      hooksPath,
+      hookToken,
+      agentId: target.agentId,
+      sessionKey: target.sessionKey,
+      message,
+      idempotencyKey,
+      name: WAKE_REPORT_HOOK_NAME,
+    });
+  };
+  if (reportTargets.length > 0 && !wakeSessionKey) {
+    console.warn("[imajin-ws] wsNotifications.reportTo is set but there is no wake session — nothing to report on");
+  }
+  const wakeReporter =
+    reportTargets.length > 0 && wakeSessionKey
+      ? new WakeReporter({ wakeSessionKey, targets: reportTargets, deliver: deliverWakeReport })
+      : undefined;
 
   // Persisted state (#26): ack-dedup LRU + "wake owed" markers so a kernel
   // replay after a gateway restart is acked-but-not-reinjected, and any wake
@@ -919,6 +986,8 @@ export function createNotificationInjector(
 
     const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
     const gatewayPort = resolveGatewayPort(api);
+    // Tracked BEFORE the POST so a fast turn can't finish unmatched (#47).
+    wakeReporter?.track({ batchId: idempotencyKey, scope, runs: summarizeWakeRuns(frames) });
     const result = await postWakeHookWithRetries({
       gatewayPort,
       hooksPath,
@@ -928,6 +997,14 @@ export function createNotificationInjector(
       message,
       idempotencyKey,
     });
+
+    if (wakeReporter) {
+      if (result.ok || result.pending) {
+        wakeReporter.bindRun(idempotencyKey, result.runId);
+      } else {
+        wakeReporter.untrack(idempotencyKey); // never admitted: no turn to report on
+      }
+    }
 
     if (result.ok) {
       console.log(
@@ -1109,5 +1186,10 @@ export function createNotificationInjector(
     console.log(`[imajin-ws] warp wake: leading batched ${nf.id} (n=1, fires in ${wakeSettleMs}ms)`);
   }
 
-  return { inject, dispose, ready: stateReady };
+  return {
+    inject,
+    dispose,
+    ready: stateReady,
+    onAgentEnd: wakeReporter ? (event, ctx) => wakeReporter.onAgentEnd(event, ctx) : undefined,
+  };
 }

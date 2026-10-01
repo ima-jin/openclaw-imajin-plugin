@@ -52,6 +52,7 @@ In `openclaw.json`:
   - **`wsNotifications.wakeSettleMs`** — leading-edge settle window in ms (#25); default `10000` (10s); see "Coalescing" below
   - **`wsNotifications.wakeCoalesceMs`** — trailing coalesce window in ms (#25); default `30000` (30s, was `300000`/5min); see "Coalescing" below
   - **`wsNotifications.wakeOwedMaxAgeMs`** — age bound in ms (#30) for a persisted "wake owed" marker replayed at startup; older markers are dropped (their frames already reached the agent via the durable system-event queue) instead of firing a stale wake; default `3600000` (1h); see "Ack, dedup, and persisted wakes" below
+  - **`wsNotifications.reportTo`** — session keys the wake worker discloses its outcome to (#47); default `[]` (no reports); see "Wake reports (`reportTo`)" below
   - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
 - **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway proposals from one or more sources to the kernel and applies signed operator decisions from /jin (#24, generalized by #33); see "Gateway approvals bridge" below:
   - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
@@ -833,6 +834,58 @@ keeps the owed marker instead of escalating to the Telegram fallback. A
 later 2xx for the same scope (during this run, or on a future replay subject
 to `wakeOwedMaxAgeMs` above) clears it exactly like any other successful
 wake.
+
+#### Wake reports: the worker discloses (`wsNotifications.reportTo`, #47)
+
+A wake that runs in an isolated worker session (e.g. `targetSession:
+"agent:main:warp-events"`) has no channel binding, so its outcome — PR
+verdicts, `ev:` lines, DECISION cards — never reaches a human: the Gateway
+logs `status:"ok"`, `delivered:false`. `reportTo` keeps the worker isolated
+(own transcript, no DM noise mid-review) and makes it *disclose* instead of
+repointing it at a DM:
+
+```json
+"wsNotifications": {
+  "injectScopes": ["warp.run.completed"],
+  "targetSession": "agent:main:warp-events",
+  "reportTo": ["agent:main:telegram:direct:8321865723"]
+}
+```
+
+How it works:
+
+- The plugin hooks `agent_end`. When a turn ends in the wake session
+  (`wakeSessionKey`, else `targetSession`), it takes that turn's **final
+  assistant message** and posts it to each `reportTo` session via
+  `POST /hooks/agent` (`deliver: true`, run name `imajin-wake-report`, using
+  the same `hookToken`/`hooksPath` as wakes; the agent id is parsed from the
+  session key, so `hooks.allowedAgentIds` must permit it).
+- **One report per wake batch.** The batch id is the wake's idempotency key
+  (`imajin-wake:<scope>:<windowStart>:<leading|trailing>`); a batch is
+  reported at most once however many times it is replayed or `agent_end`
+  fires, and the per-target `Idempotency-Key` is
+  `imajin-wake-report:<batchId>:<sessionKey>`.
+- **Never silence.** A wake turn with no assistant output (or only
+  `NO_REPLY`) reports `no output` plus the Warp run state(s) and whether the
+  turn errored.
+- **Not a wake.** The report is wrapped as `[Report from warp-events — wake
+  batch …]` with an explicit "informational, do not start work" header, never
+  enters the wake queue/coalescer, and is never delivered to the wake
+  session (a `reportTo` entry equal to it is rejected, since that would loop).
+  `agent_end` for any session other than the wake session is ignored, so a
+  report's own turn is never reported on.
+- **Validation, never a crash.** Entries must look like `agent:<agentId>:…`;
+  anything else (and non-array values, duplicates, the wake session) is
+  logged once at startup and dropped. A gateway rejection of a key (e.g. an
+  unknown session) is logged once per key and never throws. Empty/omitted
+  `reportTo` registers no hook and changes nothing.
+
+Limits (by design): pending batches are tracked in memory only — a gateway
+restart between a wake being admitted and its turn ending loses that
+batch's report (the wake itself is unaffected); the output is clipped to
+3000 chars to fit a channel message; and a `reportTo` session's agent will
+run a normal delivery turn to relay the report, as `/hooks/agent` always
+does.
 
 ### Real-time notifications (#1904)
 

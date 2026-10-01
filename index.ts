@@ -47,6 +47,7 @@ import {
 } from "./src/tools.js";
 import {
   createTurnUsageAttestationHandler,
+  type AgentEndEvent,
   type TurnUsageAttestationConfig,
 } from "./src/turn-usage-attestation.js";
 import {
@@ -192,11 +193,28 @@ export default definePluginEntry({
 
       // WS notification → agent session injection (#1672), acked after the
       // durable enqueue step (#26) via `wsService.send` bound below.
-      const { inject: injector, dispose: disposeInjector } = createNotificationInjector(
-        api,
-        config.wsNotifications,
-        { sendFrame: (frame) => wsService.send(frame), keypairPath: config.keypairPath },
-      );
+      const {
+        inject: injector,
+        dispose: disposeInjector,
+        onAgentEnd: onWakeAgentEnd,
+      } = createNotificationInjector(api, config.wsNotifications, {
+        sendFrame: (frame) => wsService.send(frame),
+        keypairPath: config.keypairPath,
+      });
+
+      // wsNotifications.reportTo (#47): the wake worker session discloses its
+      // turn outcome. Only registered when a valid reportTo target exists, so
+      // an install without it behaves exactly as before. Fire-and-forget:
+      // the hook never blocks or fails the wake turn.
+      if (onWakeAgentEnd) {
+        api.on(
+          "agent_end",
+          (event: AgentEndEvent, ctx?: { sessionKey?: string }) => {
+            void onWakeAgentEnd(event, ctx);
+          },
+          { name: "wake-report" },
+        );
+      }
 
       // OpenClaw gateway approval bridge (#1816). Registered only when both a
       // signing identity (did + keypairPath, already required above for the WS
