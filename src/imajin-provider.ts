@@ -356,13 +356,9 @@ export class ImajinCatalogCache {
       this.logSuccess(models);
       return this.state;
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
       const failure =
-        err instanceof ImajinDiscoveryError
-          ? err
-          : new ImajinDiscoveryError(
-              "unreachable",
-              err instanceof Error ? err.message : String(err),
-            );
+        err instanceof ImajinDiscoveryError ? err : new ImajinDiscoveryError("unreachable", message);
       this.stale = false;
       this.state = {
         models: previous?.models ?? [],
@@ -577,7 +573,7 @@ export function classifyImajinTransportError(err: unknown): ImajinDiscoveryError
   const code = (err as { code?: unknown } | null)?.code;
   if (
     /^Auth (challenge|verify) failed/.test(message) ||
-    /^No keypairPath configured/.test(message) ||
+    message.startsWith("No keypairPath configured") ||
     code === "ENOENT" ||
     code === "EACCES" ||
     err instanceof SyntaxError
@@ -631,9 +627,10 @@ export function createImajinKernelModelsFetcher(
     }
     if (res.status < 200 || res.status >= 300) {
       const snippet = res.text.trim().slice(0, 200);
+      const detail = snippet ? `: ${snippet}` : "";
       throw new ImajinDiscoveryError(
         "route-error",
-        `GET ${path} returned ${res.status}${snippet ? `: ${snippet}` : ""}`,
+        `GET ${path} returned ${res.status}${detail}`,
         res.status,
       );
     }
@@ -725,7 +722,7 @@ export function registerImajinProvider(
     // successful discovery there is nothing to advertise.
     staticCatalog: {
       order: "simple",
-      run: async () => ({ provider: buildImajinProviderConfig({ baseUrl, models: [] }) }),
+      run: () => Promise.resolve({ provider: buildImajinProviderConfig({ baseUrl, models: [] }) }),
     },
   });
 

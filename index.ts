@@ -138,11 +138,11 @@ export default definePluginEntry({
     let discoveryHandle: ImajinDiscoveryHandle | undefined;
     api.registerService({
       id: "imajin-model-discovery",
-      start: async () => {
+      start: () => {
         discoveryHandle?.stop();
         discoveryHandle = imajinProvider.startDiscovery();
       },
-      stop: async () => {
+      stop: () => {
         discoveryHandle?.stop();
         discoveryHandle = undefined;
       },
@@ -336,7 +336,7 @@ export default definePluginEntry({
             console.error("[imajin-ws] service start failed:", err);
           }
         },
-        stop: async () => {
+        stop: () => {
           console.log("[imajin-ws] service stop called");
           wsService.stop();
           disposeInjector();
