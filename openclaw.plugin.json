@@ -64,6 +64,16 @@
       "help": "Base URL of the local kernel inference proxy the `imajin` OpenClaw model provider discovers its catalog from (#36). Default http://127.0.0.1:8787/openai/v1. Effective models endpoint is `<this>/models`; healthz is probed at the proxy root.",
       "placeholder": "http://127.0.0.1:8787/openai/v1"
     },
+    "modelDiscovery.refreshIntervalMs": {
+      "label": "Imajin Model Provider: Discovery Refresh Interval (ms)",
+      "help": "How often the plugin re-runs model discovery against the kernel's GET /infer/v1/models/usable (#55), in addition to the run at plugin start and the WS-driven refresh. Default 300000 (5 min); values below 10000 are raised to 10000; 0 disables the periodic refresh (start-up discovery still runs).",
+      "placeholder": "300000"
+    },
+    "modelDiscovery.modelsPath": {
+      "label": "Imajin Model Provider: Kernel Models Path",
+      "help": "Kernel route (relative to nodeUrl) the catalog is discovered from. Default /infer/v1/models/usable \u2014 the OpenAI-shaped list of the principal's usable brains (imajin-ai#2201). Note /infer/v1/models is the Anthropic model-catalog passthrough, not this list.",
+      "placeholder": "/infer/v1/models/usable"
+    },
     "approvals.enabled": {
       "label": "Gateway Approvals Bridge: Enabled",
       "help": "Publish staged Gateway system-agent proposals (restart / config mutation) to the kernel and apply signed operator decisions from /jin back to the Gateway (#24). Off by default; requires did + keypairPath + operatorDid + notifyWebhookSecret."
@@ -126,6 +136,21 @@
       "inferProxyBaseUrl": {
         "type": "string",
         "description": "Base URL of the local kernel inference proxy the imajin OpenClaw model provider discovers its catalog from (#36). Defaults to http://127.0.0.1:8787/openai/v1. The effective model-list endpoint is `<this>/models` (OpenAI list shape, ima-jin/imajin-ai#2201); `GET /healthz` is probed at the proxy root."
+      },
+      "modelDiscovery": {
+        "type": "object",
+        "description": "Model discovery for the imajin OpenClaw model provider (#55): GET <nodeUrl><modelsPath> with the agent's DID session at plugin start and every refreshIntervalMs.",
+        "additionalProperties": false,
+        "properties": {
+          "refreshIntervalMs": {
+            "type": "number",
+            "description": "Periodic re-discovery interval in ms. Default 300000 (5 min). Values below 10000 are raised to 10000. 0 disables the periodic refresh; discovery still runs at plugin start and on kernel connector notifications."
+          },
+          "modelsPath": {
+            "type": "string",
+            "description": "Kernel route (relative to nodeUrl) to discover against. Default /infer/v1/models/usable."
+          }
+        }
       },
       "wsNotifications": {
         "type": "object",

@@ -61,7 +61,10 @@ In `openclaw.json`:
   - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
   - **`approvals.skillWorkshop.operatorScopes`** — operator scopes (#35) for the `skill-workshop` source's OWN loopback Gateway connection; defaults to `["operator.read", "operator.admin"]` when omitted or `[]` (#53) — exactly what `skills.proposals.list`/`apply`/`reject` require, fixing `FORBIDDEN: missing scope: operator.read` on strict/token-mode gateways; set `["operator.approvals"]` to opt out of the broader authority; see "Gateway approvals bridge" below
   - **`approvals.requireOperatorCountersignature`** — mirrors the kernel's `OPERATOR_COUNTERSIGN_REQUIRED` (#44, `ima-jin/imajin-ai#2082`); default `false` (a decision missing `operatorSignature` is still applied, unchanged v1 behavior); `true` rejects any decision (including a withdrawal) that lacks a valid `operatorSignature` before it ever reaches a source — see "Operator countersignature" below
-- **`inferProxyBaseUrl`** (optional) — base URL of the local kernel inference proxy the `imajin` OpenClaw model provider discovers its catalog from (#36); defaults to `http://127.0.0.1:8787/openai/v1`; see "Kernel brains as OpenClaw models" below
+- **`inferProxyBaseUrl`** (optional) — base URL of the local kernel inference proxy every discovered `imajin/<id>` model is registered with (completions go through it, #36); defaults to `http://127.0.0.1:8787/openai/v1`; see "Kernel brains as OpenClaw models" below
+- **`modelDiscovery`** (optional, #55) — model discovery against the kernel; needs `nodeUrl` + `keypairPath`:
+  - **`modelDiscovery.refreshIntervalMs`** — periodic re-discovery interval; default `300000` (5 min), floor `10000`, `0` = start-up discovery only
+  - **`modelDiscovery.modelsPath`** — kernel route, default `/infer/v1/models/usable`
 
 ### Turn-usage attestation
 
@@ -83,31 +86,58 @@ the signed claim without the content ever leaving the agent's own machine.
 Sealing a connector card on `/jin` becomes the whole OpenClaw model
 provisioning act. The plugin registers `imajin` as a real OpenClaw model
 provider (`api.registerProvider`, not `models.providers` config): every
-usable (connector, model) pair the kernel's `GET /infer/v1/models`
-passthrough reports (`ima-jin/imajin-ai#2201`) shows up as `imajin/<id>`,
-named `<id> (via <connector>)`, with zero hand-edited provider config.
+usable (connector, model) pair the kernel reports
+(`GET /infer/v1/models/usable`, `ima-jin/imajin-ai#2201`) shows up as
+`imajin/<id>`, named `<id> (via <connector>)`, with zero hand-edited
+provider config.
 
-**The one config key**: `plugins.entries.imajin.config.inferProxyBaseUrl`
-(default `http://127.0.0.1:8787/openai/v1`) — the local kernel inference
-proxy's base URL. The provider discovers its catalog from `<this>/models`
-and probes `GET /healthz` (via `imajin_status`, see below) at the proxy
-root. There is no user credential to configure: the proxy authenticates to
-the kernel with its own app key, never a value you enter.
+**Two URLs, two jobs**:
 
-**Live discovery + refresh**: the catalog is fetched live and cached for
-60s (advisory — a proxy outage degrades straight to "no models", never a
-stale/wrong catalog; the static seed is intentionally empty). On a kernel
-notification whose scope is `connector.credential.sealed`,
-`connector.credential.unsealed`, or `connector.models.changed`
-(`IMAJIN_CATALOG_INVALIDATION_SCOPES`, `src/imajin-provider.ts` — confirmed
-against the landed kernel/proxy half `ima-jin/imajin-ai#2219`, closing
-`ima-jin/imajin-ai#2205`) arriving over the plugin's existing WS connection,
-the cache is invalidated immediately so the next model list reflects `/jin`
-within seconds instead of waiting out the TTL. These arrive as the kernel's
-existing generic notification envelope (`type: "notification"`, `scope`,
-`data`, `createdAt`) — the same shape the plugin already dispatches on via
-`nf.scope` — with `data: { provider }` on the two credential scopes and
-`data: { provider, hint }` on `connector.models.changed`.
+- *Discovery* (the catalog) goes straight to the **kernel**:
+  `GET <nodeUrl>/infer/v1/models/usable`, authenticated with the plugin's
+  existing agent-DID challenge-response session (plus `X-Acting-For` from
+  `actAs`, so the list is the principal's usable brains). No static bearer.
+  Needs `nodeUrl` + `keypairPath`; without them discovery reports
+  `unconfigured` and the plugin still starts. (The kernel's bare
+  `/infer/v1/models` is the Anthropic model-catalog passthrough — a different
+  shape — so it is deliberately not used; override with
+  `modelDiscovery.modelsPath` if that ever moves.)
+- *Completions* go through the local passthrough proxy —
+  `plugins.entries.imajin.config.inferProxyBaseUrl` (default
+  `http://127.0.0.1:8787/openai/v1`) is the `baseUrl` every discovered model is
+  registered with, and `GET /healthz` at the proxy root is probed by
+  `imajin_status`. There is no user credential to configure.
+
+**Live discovery + refresh (#55)**: discovery runs (1) at plugin start
+(the `imajin-model-discovery` service), (2) every
+`modelDiscovery.refreshIntervalMs` (default **5 minutes**, floor 10 s, `0`
+disables the periodic run), (3) immediately on a kernel notification whose
+scope is `connector.credential.sealed`, `connector.credential.unsealed`, or
+`connector.models.changed` (`IMAJIN_CATALOG_INVALIDATION_SCOPES`,
+`src/imajin-provider.ts` — confirmed against `ima-jin/imajin-ai#2219`) arriving
+over the plugin's existing WS connection, and (4) lazily when OpenClaw asks for
+the catalog and the 60 s cache has expired. A model added kernel-side therefore
+appears in the gateway without a config edit.
+
+Previously the cache was purely lazy — nothing fetched until OpenClaw happened
+to ask — so `imajin_status` showed `lastDiscovery.outcome: "never"` forever,
+and the only URL it could have tried was the proxy's `/openai/v1/models`
+(404, `imajin-ai#2453`) with no auth.
+
+**Failure behaviour**: discovery never crashes plugin start and never wipes the
+catalog. On any failure the **last good catalog keeps being served**,
+`lastDiscovery` records the failure, and it is logged **once per distinct
+failure** (plus one line on recovery). An empty but well-formed list is
+authoritative (e.g. the last connector was unsealed) and empties the catalog.
+Outcomes:
+
+- `ok` / `empty` — kernel answered with a list (`modelCount` > 0 / 0)
+- `unreachable` — kernel did not answer (connection refused, DNS, 5 s timeout,
+  or 502/503/504 from a front proxy)
+- `route-error` — kernel answered non-2xx (e.g. 404, 500); `httpStatus` is set
+- `auth-error` — 401/403, or the DID login/keypair failed
+- `malformed` — 2xx but not an OpenAI list
+- `unconfigured` — no `nodeUrl`/`keypairPath`
 
 **The allow-list step (one-time)**: OpenClaw's own
 `agents.defaults.modelPolicy.allow` accepts trailing prefix wildcards
@@ -145,9 +175,35 @@ Gateway config on any other path. Off by default: an install with no
 `modelPolicy.allow` configured never needs this (see above), and an install
 that never lists `"imajin-catalog"` in `approvals.sources` never starts it.
 
-**Doctor/status** (`imajin_status` tool): reports the current discovered
-`imajin/*` catalog, the last discovery result and timestamp, and a fresh
-probe of the proxy's `GET /healthz` body.
+**Doctor/status** (`imajin_status` tool): reports the discovered catalog as
+`imajin/<id>` refs, `lastDiscovery` `{ fetchedAt, outcome, modelCount, error?,
+httpStatus?, lastGoodAt }`, the kernel `discovery` URL + refresh interval, and a
+fresh probe of the proxy's `GET /healthz` body. Healthy looks like:
+
+```json
+{ "lastDiscovery": { "outcome": "ok", "modelCount": 3, "fetchedAt": "..." },
+  "catalog": [{ "ref": "imajin/grok-4", "connector": "xai" }, ...] }
+```
+
+**Retiring the static provider blocks (operator step)**: once `imajin_status`
+shows `outcome: ok` with your brains listed as `imajin/<id>`, the hand-wired
+`models.providers.imajin-xai` / `imajin-openai` blocks are redundant. This
+plugin never edits Gateway config — do it yourself:
+
+1. Confirm `imajin_status` → `lastDiscovery.outcome: ok` and that every model
+   those blocks exposed (e.g. `grok-4`, `gpt-6-astra`) appears as `imajin/<id>`.
+2. Add `"imajin/*"` to `agents.defaults.modelPolicy.allow` if you keep a
+   restrictive allow list (see below), and repoint anything that referenced
+   `imajin-xai/grok-4` / `imajin-openai/gpt-6-astra` (sub-agent `model:`
+   values, fallbacks) at `imajin/grok-4` / `imajin/gpt-6-astra`.
+3. Delete the `imajin-xai` and `imajin-openai` entries from
+   `models.providers` (and their `modelPolicy.allow` refs) and restart or
+   reload the Gateway.
+4. Re-run `imajin_status` and spawn one sub-agent on an `imajin/*` model to
+   confirm. To roll back, re-add the blocks — nothing else changed.
+
+Note completions still depend on the kernel passthrough proxy being healthy
+(`imajin-ai#2453`); discovery working does not by itself prove completions do.
 
 ## Roadmap
 

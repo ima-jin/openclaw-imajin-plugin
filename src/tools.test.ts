@@ -2,7 +2,14 @@ import { writeFileSync, unlinkSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ImajinChat } from "./chat.js";
 import type { ImajinClient } from "./client.js";
-import { createMediaTool, createAttestTool, createChatTool, createWarpTool } from "./tools.js";
+import { ImajinCatalogCache, ImajinDiscoveryError } from "./imajin-provider.js";
+import {
+  createMediaTool,
+  createAttestTool,
+  createChatTool,
+  createWarpTool,
+  createImajinStatusTool,
+} from "./tools.js";
 
 function makeMockClient(): ImajinClient {
   return {
@@ -480,5 +487,43 @@ describe("imajin_chat tool with onBehalfOf", () => {
       undefined,
       "did:imajin:principal",
     );
+  });
+});
+
+describe("imajin_status tool (#55)", () => {
+  const quiet = { info: vi.fn(), warn: vi.fn() };
+  const discovery = { modelsUrl: "https://k.example/infer/v1/models/usable", refreshIntervalMs: 300_000 };
+
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: "ok" }) }));
+  });
+
+  it("runs one discovery attempt when none has happened yet, and reports ok + imajin/<id> refs", async () => {
+    const fetcher = vi.fn().mockResolvedValue({
+      object: "list",
+      data: [{ id: "grok-4", imajin: { connector: "xai", servable: true } }],
+    });
+    const cache = new ImajinCatalogCache(fetcher, 60_000, Date.now, quiet);
+    const tool = createImajinStatusTool({ baseUrl: "http://127.0.0.1:8787/openai/v1", cache, discovery });
+
+    const result = await tool.execute();
+    const body = JSON.parse(result.content[0].text);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(body.lastDiscovery).toMatchObject({ outcome: "ok", modelCount: 1 });
+    expect(body.catalog[0]).toMatchObject({ ref: "imajin/grok-4", connector: "xai" });
+    expect(body.discovery).toEqual(discovery);
+  });
+
+  it("does not refetch when a state already exists, and reports a route-error with its status", async () => {
+    const fetcher = vi.fn().mockRejectedValue(new ImajinDiscoveryError("route-error", "GET x returned 404", 404));
+    const cache = new ImajinCatalogCache(fetcher, 60_000, Date.now, quiet);
+    await cache.refresh();
+    const tool = createImajinStatusTool({ baseUrl: "http://127.0.0.1:8787/openai/v1", cache });
+
+    const body = JSON.parse((await tool.execute()).content[0].text);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(body.lastDiscovery).toMatchObject({ outcome: "route-error", httpStatus: 404, modelCount: 0 });
   });
 });

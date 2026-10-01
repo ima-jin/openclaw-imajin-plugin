@@ -52,6 +52,8 @@ import {
 import {
   registerImajinProvider,
   isImajinCatalogInvalidationScope,
+  type ImajinDiscoveryHandle,
+  type ImajinModelDiscoveryConfig,
 } from "./src/imajin-provider.js";
 import { isImajinModelAllowedByPolicy } from "./src/sources/imajin-catalog.js";
 
@@ -92,29 +94,66 @@ export default definePluginEntry({
       approvalBridge?: ApprovalBridgeSettings;
       approvals?: ApprovalsBridgePluginConfig;
       inferProxyBaseUrl?: string;
+      modelDiscovery?: ImajinModelDiscoveryConfig;
     };
 
-    // Imajin model provider (#36): registers `imajin` as an OpenClaw model
-    // provider with a live kernel catalog. Independent of `nodeUrl`/`did` —
-    // it only ever talks to the local kernel inference proxy
-    // (`inferProxyBaseUrl`, default loopback) — so it works even on an
-    // otherwise-unconfigured install.
-    const imajinProvider = registerImajinProvider(api, { inferProxyBaseUrl: config?.inferProxyBaseUrl });
-    api.registerTool(createImajinStatusTool({ baseUrl: imajinProvider.baseUrl, cache: imajinProvider.cache }));
+    // The one kernel client (agent DID challenge-response session) shared by
+    // the primitive tools AND model discovery (#55). Built before the provider
+    // is registered because discovery authenticates through it.
+    const client = config?.nodeUrl
+      ? new ImajinClient({
+          nodeUrl: config.nodeUrl,
+          did: config.did,
+          keypairPath: config.keypairPath,
+          actAs: config.actAs,
+        })
+      : undefined;
 
-    if (!config?.nodeUrl) {
+    // Imajin model provider (#36): registers `imajin` as an OpenClaw model
+    // provider with a live kernel catalog. Completions use the local kernel
+    // inference proxy (`inferProxyBaseUrl`, default loopback); the catalog is
+    // discovered from the kernel's `GET /infer/v1/models/usable` with the
+    // agent's DID session (#55). Without nodeUrl + keypairPath discovery
+    // reports `unconfigured` rather than failing plugin start.
+    const imajinProvider = registerImajinProvider(
+      api,
+      { inferProxyBaseUrl: config?.inferProxyBaseUrl, modelDiscovery: config?.modelDiscovery },
+      {
+        client: config?.keypairPath ? client : undefined,
+        nodeUrl: config?.nodeUrl,
+      },
+    );
+    api.registerTool(
+      createImajinStatusTool({
+        baseUrl: imajinProvider.baseUrl,
+        cache: imajinProvider.cache,
+        discovery: imajinProvider.discovery,
+      }),
+    );
+
+    // Discovery at plugin start + periodic refresh (#55). This is the fix for
+    // "discovery never runs": the cache used to be purely lazy. A service so
+    // the timer is stopped with the plugin; `startDiscovery` never throws
+    // (failures are recorded in the cache and logged once).
+    let discoveryHandle: ImajinDiscoveryHandle | undefined;
+    api.registerService({
+      id: "imajin-model-discovery",
+      start: () => {
+        discoveryHandle?.stop();
+        discoveryHandle = imajinProvider.startDiscovery();
+      },
+      stop: () => {
+        discoveryHandle?.stop();
+        discoveryHandle = undefined;
+      },
+    });
+
+    if (!config?.nodeUrl || !client) {
       console.warn(
         "[imajin-plugin] no nodeUrl configured. Set plugins.entries.imajin.config.nodeUrl",
       );
       return;
     }
-
-    const client = new ImajinClient({
-      nodeUrl: config.nodeUrl,
-      did: config.did,
-      keypairPath: config.keypairPath,
-      actAs: config.actAs,
-    });
 
     // Register primitive tools
     api.registerTool(createIdentityTool(client));
@@ -274,9 +313,13 @@ export default definePluginEntry({
           // ai#2219) invalidates the imajin provider's discovery cache so the
           // NEXT `catalog.run` call refetches immediately instead of waiting
           // out the 60s TTL. See `IMAJIN_CATALOG_INVALIDATION_SCOPES`.
+          // Also refetches right away (#55) so a model added kernel-side
+          // shows up without waiting for the next periodic refresh;
+          // `refresh()` never rejects.
           if (isImajinCatalogInvalidationScope(nf.scope)) {
             console.log(`[imajin-plugin] invalidating imajin catalog cache (scope=${nf.scope})`);
             imajinProvider.cache.invalidate();
+            void imajinProvider.cache.refresh();
           }
           // The WS socket callback runs outside any agent turn, so injection is
           // fire-and-forget: never let a rejected promise reach the socket.
@@ -307,7 +350,7 @@ export default definePluginEntry({
             console.error("[imajin-ws] service start failed:", err);
           }
         },
-        stop: async () => {
+        stop: () => {
           console.log("[imajin-ws] service stop called");
           wsService.stop();
           disposeInjector();

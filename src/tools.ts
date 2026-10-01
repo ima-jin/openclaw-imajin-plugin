@@ -1251,26 +1251,40 @@ export function createChatTool(chat: ImajinChat) {
  * `imajin_*` tool surface and can be called on demand by the agent or an
  * operator without waiting for the 60s discovery cache to turn over —
  * `healthz` is always fetched fresh; the catalog/discovery fields reflect
- * the cache's last resolved state (`cache.peek()`), never forcing a fetch.
+ * the cache's last resolved state (`cache.peek()`). Only when discovery has
+ * not yet attempted at all (`peek()` is null) does the tool run one attempt
+ * itself (#55) so the report can never be a bare "never"; `refresh()` never
+ * rejects, so this cannot fail the tool. Reports the catalog as `imajin/<id>`
+ * refs plus `lastDiscovery` {fetchedAt, outcome, modelCount, error?} where a
+ * failed attempt distinguishes `unreachable` from `route-error`.
  */
-export function createImajinStatusTool(deps: { baseUrl: string; cache: ImajinCatalogCache }) {
+export function createImajinStatusTool(deps: {
+  baseUrl: string;
+  cache: ImajinCatalogCache;
+  discovery?: { modelsUrl: string; refreshIntervalMs: number };
+}) {
   return {
     name: "imajin_status",
     label: "Imajin Provider Status",
     description:
       "Report the imajin OpenClaw model provider's current status (#36): the discovered " +
-      "imajin/* catalog, the last discovery result and timestamp, and a fresh probe of the " +
+      "imajin/* catalog, the last discovery result and timestamp (outcome ok | empty | unreachable | " +
+      "route-error | auth-error | malformed | unconfigured), and a fresh probe of the " +
       "kernel inference proxy's GET /healthz.",
     parameters: {
       type: "object" as const,
       properties: {},
     },
     async execute(): Promise<ToolResult> {
+      if (deps.cache.peek() === null) {
+        await deps.cache.refresh();
+      }
       const healthz = await fetchImajinProxyHealthz(deps.baseUrl);
       const snapshot = buildImajinStatusSnapshot({
         baseUrl: deps.baseUrl,
         cacheState: deps.cache.peek(),
         healthz,
+        discovery: deps.discovery,
       });
       return jsonResult(snapshot);
     },

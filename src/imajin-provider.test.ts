@@ -11,7 +11,6 @@ import {
   registerImajinProvider,
   resolveImajinHealthzUrl,
   resolveImajinInferProxyBaseUrl,
-  resolveImajinModelsUrl,
   type ImajinModelsListResponse,
 } from "./imajin-provider.js";
 
@@ -102,13 +101,7 @@ describe("resolveImajinInferProxyBaseUrl", () => {
   });
 });
 
-describe("resolveImajinModelsUrl / resolveImajinHealthzUrl", () => {
-  it("builds the models endpoint relative to baseUrl", () => {
-    expect(resolveImajinModelsUrl("http://127.0.0.1:8787/openai/v1")).toBe(
-      "http://127.0.0.1:8787/openai/v1/models",
-    );
-  });
-
+describe("resolveImajinHealthzUrl", () => {
   it("builds healthz at the proxy root, not under /openai/v1", () => {
     expect(resolveImajinHealthzUrl("http://127.0.0.1:8787/openai/v1")).toBe(
       "http://127.0.0.1:8787/healthz",
@@ -159,30 +152,32 @@ describe("ImajinCatalogCache", () => {
     expect(second.models).toHaveLength(1);
   });
 
-  it("a proxy outage degrades to an EMPTY catalog, never a stale previously-successful one", async () => {
+  it("a kernel outage keeps the LAST GOOD catalog and records the failure (#55)", async () => {
     let now = 0;
+    const logger = { info: vi.fn(), warn: vi.fn() };
     const fetcher = vi
       .fn()
       .mockResolvedValueOnce(TWO_ROW_KERNEL_RESPONSE)
-      .mockRejectedValueOnce(new Error("kernel proxy unreachable"));
-    const cache = new ImajinCatalogCache(fetcher, 1_000, () => now);
+      .mockRejectedValueOnce(new Error("kernel unreachable"));
+    const cache = new ImajinCatalogCache(fetcher, 1_000, () => now, logger);
 
     const first = await cache.get();
     expect(first.models).toHaveLength(2);
-    expect(first.outcome).toBe("live");
+    expect(first.outcome).toBe("ok");
 
     // Past the TTL — forces a refetch, which fails.
     now = 2_000;
     const second = await cache.get();
 
-    expect(second.outcome).toBe("error");
-    expect(second.models).toEqual([]);
-    expect(second.error).toContain("kernel proxy unreachable");
+    expect(second.outcome).toBe("unreachable");
+    expect(second.models).toHaveLength(2);
+    expect(second.error).toContain("kernel unreachable");
+    expect(second.lastGoodAtMs).toBe(0);
   });
 
   it("peek() returns the last resolved state without forcing a fetch", async () => {
     const fetcher = vi.fn().mockResolvedValue(TWO_ROW_KERNEL_RESPONSE);
-    const cache = new ImajinCatalogCache(fetcher, 60_000);
+    const cache = new ImajinCatalogCache(fetcher, 60_000, Date.now, { info: vi.fn(), warn: vi.fn() });
 
     expect(cache.peek()).toBeNull();
     await cache.get();
@@ -291,12 +286,12 @@ describe("registerImajinProvider", () => {
   });
 
   it("catalog.run resolves models from the live cache", async () => {
-    (global.fetch as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: true,
-      json: async () => TWO_ROW_KERNEL_RESPONSE,
-    });
     const registerProvider = vi.fn();
-    registerImajinProvider({ registerProvider }, undefined);
+    registerImajinProvider(
+      { registerProvider },
+      undefined,
+      { fetcher: async () => TWO_ROW_KERNEL_RESPONSE, logger: { info: vi.fn(), warn: vi.fn() } },
+    );
     const definition = registerProvider.mock.calls[0][0] as {
       catalog: { run: () => Promise<{ provider: { models: unknown[] } }> };
     };
@@ -311,7 +306,8 @@ describe("buildImajinStatusSnapshot", () => {
     const cacheState = {
       models: projectImajinCatalogRows(TWO_ROW_KERNEL_RESPONSE),
       fetchedAtMs: 1_700_000_000_000,
-      outcome: "live" as const,
+      outcome: "ok" as const,
+      lastGoodAtMs: 1_700_000_000_000,
     };
     const snapshot = buildImajinStatusSnapshot({
       baseUrl: "http://127.0.0.1:8787/openai/v1",
@@ -320,10 +316,15 @@ describe("buildImajinStatusSnapshot", () => {
     });
 
     expect(snapshot.catalog).toEqual([
-      { id: "grok-4", name: "grok-4 (via xai)", connector: "xai" },
-      { id: "gpt-6-astra", name: "gpt-6-astra (via openai)", connector: "openai" },
+      { ref: "imajin/grok-4", id: "grok-4", name: "grok-4 (via xai)", connector: "xai" },
+      {
+        ref: "imajin/gpt-6-astra",
+        id: "gpt-6-astra",
+        name: "gpt-6-astra (via openai)",
+        connector: "openai",
+      },
     ]);
-    expect(snapshot.lastDiscovery).toMatchObject({ outcome: "live", modelCount: 2 });
+    expect(snapshot.lastDiscovery).toMatchObject({ outcome: "ok", modelCount: 2 });
     expect(snapshot.healthz).toEqual({ ok: true, status: 200, body: { status: "ok" } });
   });
 
