@@ -389,6 +389,71 @@ export function wireGatewayExecOutcomeReporting(
   return () => {};
 }
 
+// --- Gateway event handling (pure, unit-testable; used by the live wiring below) ---
+
+export interface GatewayExecEventHandlers {
+  onRequested: (record: GatewayExecApprovalRecord) => void;
+  onFinished: (outcome: GatewayExecOutcome) => void;
+}
+
+function toFinishedOutcome(payload: unknown): GatewayExecOutcome | undefined {
+  const outcome = payload as Partial<GatewayExecOutcome> | undefined;
+  if (
+    typeof outcome?.proposalId !== "string" ||
+    typeof outcome.durationMs !== "number" ||
+    typeof outcome.outputHash !== "string"
+  ) {
+    return undefined;
+  }
+  return {
+    proposalId: outcome.proposalId,
+    exitCode: typeof outcome.exitCode === "number" ? outcome.exitCode : null,
+    durationMs: outcome.durationMs,
+    outputHash: outcome.outputHash,
+  };
+}
+
+/** Key names only — never values: the payload carries the verbatim command line. */
+function describePayloadShape(payload: unknown): string {
+  if (!payload || typeof payload !== "object") return typeof payload;
+  const request = (payload as { request?: unknown }).request;
+  const requestKeys = request && typeof request === "object" ? Object.keys(request) : [];
+  return `keys=[${Object.keys(payload).join(",")}] request.keys=[${requestKeys.join(",")}]`;
+}
+
+/**
+ * Builds the `onEvent` callback for the loopback Gateway connection. A
+ * malformed `exec.approval.requested` payload is NEVER dropped silently (#52):
+ * the first one logs a single loud warning naming the payload shape, because
+ * a dropped record means an ask-gated exec waits with no /jin card.
+ */
+export function createGatewayExecEventHandler(
+  handlers: () => Partial<GatewayExecEventHandlers>,
+  logger: { warn: (msg: string) => void } = console,
+): (evt: { event: string; payload?: unknown }) => void {
+  let warnedMalformed = false;
+  return (evt) => {
+    if (evt.event === "exec.approval.requested") {
+      if (isValidRecord(evt.payload)) {
+        handlers().onRequested?.(evt.payload);
+      } else if (!warnedMalformed) {
+        warnedMalformed = true;
+        logger.warn(
+          `[imajin-approvals-bridge] gateway-exec: dropped an exec.approval.requested event with an unrecognized shape — ` +
+            `the approval will NOT appear on /jin (${describePayloadShape(evt.payload)}). Logged once per process.`,
+        );
+      }
+      return;
+    }
+    // TODO: best-effort/placeholder event name — STILL unconfirmed, see
+    // module doc's "Outcome reporting" section.
+    if (evt.event === "exec.approval.finished") {
+      const outcome = toFinishedOutcome(evt.payload);
+      if (outcome) handlers().onFinished?.(outcome);
+    }
+  };
+}
+
 // --- Live wiring (SDK/network — isolated from the pure adapter above) ---
 
 /**
@@ -402,14 +467,23 @@ export function wireGatewayExecOutcomeReporting(
  */
 export async function createLiveGatewayExecConnection(
   api: { runtime?: { config?: { current?: () => Record<string, unknown> } } },
-  opts: { gatewayTokenOverride?: string; clientDisplayName: string },
+  opts: {
+    gatewayTokenOverride?: string;
+    clientDisplayName: string;
+    /**
+     * Called on every Gateway (re)connect AFTER the first one (#52): a
+     * `exec.approval.requested` broadcast raised while the loopback socket
+     * was down is never replayed, so the caller re-lists pending approvals.
+     */
+    onReconnected?: () => void;
+  },
 ): Promise<{ client: GatewayExecApprovalsClient; start: () => Promise<void>; stop: () => void }> {
   const { createOperatorApprovalsGatewayClient, startGatewayClientWhenEventLoopReady } = await import(
     "openclaw/plugin-sdk/gateway-runtime"
   );
 
-  let requestedHandler: ((record: GatewayExecApprovalRecord) => void) | undefined;
-  let finishedHandler: ((outcome: GatewayExecOutcome) => void) | undefined;
+  const handlers: Partial<GatewayExecEventHandlers> = {};
+  let helloCount = 0;
 
   const baseConfig = (api.runtime?.config?.current?.() ?? {}) as Record<string, unknown> & {
     gateway?: Record<string, unknown> & { auth?: Record<string, unknown> };
@@ -427,32 +501,15 @@ export async function createLiveGatewayExecConnection(
   const gatewayClient = await createOperatorApprovalsGatewayClient({
     config: bootstrapConfig,
     clientDisplayName: opts.clientDisplayName,
-    onEvent: (evt) => {
-      if (evt.event === "exec.approval.requested") {
-        const record = evt.payload as GatewayExecApprovalRecord | undefined;
-        if (isValidRecord(record)) requestedHandler?.(record);
-        return;
-      }
-      // TODO: best-effort/placeholder event name — STILL unconfirmed, see
-      // module doc's "Outcome reporting" section.
-      if (evt.event === "exec.approval.finished") {
-        const outcome = evt.payload as Partial<GatewayExecOutcome> | undefined;
-        if (
-          typeof outcome?.proposalId === "string" &&
-          typeof outcome.durationMs === "number" &&
-          typeof outcome.outputHash === "string"
-        ) {
-          finishedHandler?.({
-            proposalId: outcome.proposalId,
-            exitCode: typeof outcome.exitCode === "number" ? outcome.exitCode : null,
-            durationMs: outcome.durationMs,
-            outputHash: outcome.outputHash,
-          });
-        }
-      }
+    onEvent: createGatewayExecEventHandler(() => handlers),
+    onHelloOk: () => {
+      helloCount += 1;
+      if (helloCount > 1) opts.onReconnected?.();
     },
     onConnectError: (err) => {
-      console.error(`[imajin-approvals-bridge] gateway-exec connect error: ${String(err)}`);
+      console.error(
+        `[imajin-approvals-bridge] gateway-exec connect error — ask-gated exec will NOT reach /jin until it reconnects: ${String(err)}`,
+      );
     },
     onClose: (code, reason) => {
       console.warn(`[imajin-approvals-bridge] gateway-exec connection closed (${code}): ${reason ?? ""}`);
@@ -469,10 +526,10 @@ export async function createLiveGatewayExecConnection(
       return { applied: result?.applied === true };
     },
     onRequested(handler) {
-      requestedHandler = handler;
+      handlers.onRequested = handler;
     },
     onFinished(handler) {
-      finishedHandler = handler;
+      handlers.onFinished = handler;
     },
   };
 

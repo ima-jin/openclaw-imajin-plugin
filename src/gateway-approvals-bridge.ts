@@ -117,6 +117,7 @@ import {
   createLiveGatewayExecConnection,
   wireGatewayExecOutcomeReporting,
 } from "./sources/gateway-exec.js";
+import { logExecApprovalPreflight } from "./exec-approval-preflight.js";
 
 // --- Wire types (kernel side, `docs/notify-operator-approvals-contract.md` in ima-jin/imajin-ai, generalized by #2152) ---
 
@@ -1223,8 +1224,12 @@ export async function startGatewayApprovalsBridge(
   });
 
   const enabledSourceIds = resolveEnabledApprovalSourceIds(config!.sources);
+  // #52: an ask-gated exec that never reaches /jin must not fail silently.
+  logExecApprovalPreflight(enabledSourceIds, api.runtime?.config?.current?.(), console);
   const sources = new Map<string, ApprovalSource>();
   const stoppers: Array<() => void> = [];
+  // Late-bound: the Gateway connection opens before the bridge exists.
+  let bridgeRef: GatewayApprovalsBridge | undefined;
 
   if (enabledSourceIds.has("system-agent")) {
     try {
@@ -1296,6 +1301,13 @@ export async function startGatewayApprovalsBridge(
       const live = await createLiveGatewayExecConnection(api, {
         gatewayTokenOverride: gatewayTokenResult.value,
         clientDisplayName: "Imajin Gateway approvals bridge (gateway-exec)",
+        // #52: broadcasts raised while the loopback socket was down are never
+        // replayed — re-list pending exec approvals (dedup keeps it to one card).
+        onReconnected: () => {
+          void bridgeRef?.reconcile().catch((err: unknown) => {
+            console.error(`[imajin-approvals-bridge] gateway-exec reconnect reconcile failed: ${String(err)}`);
+          });
+        },
       });
       await live.start();
       sources.set("gateway-exec", createGatewayExecSource(live.client, { agentDid: deps.did! }));
@@ -1309,7 +1321,9 @@ export async function startGatewayApprovalsBridge(
       });
       stoppers.push(wireGatewayExecOutcomeReporting(live.client, outcomeClient));
     } catch (err) {
-      console.error(`[imajin-approvals-bridge] failed to start gateway-exec source: ${String(err)}`);
+      console.error(
+        `[imajin-approvals-bridge] failed to start gateway-exec source — ask-gated exec will NOT reach /jin: ${String(err)}`,
+      );
     }
   }
 
@@ -1335,6 +1349,7 @@ export async function startGatewayApprovalsBridge(
     keyResolver,
     deps.directSend?.target ? (text) => sendDirectChannelMessage(deps.directSend, text) : undefined,
   );
+  bridgeRef = bridge;
 
   const operatorDid = config!.operatorDid!;
   const kernelHttp = deps.kernelHttp;
