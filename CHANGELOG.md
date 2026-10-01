@@ -3,6 +3,16 @@
 ## Unreleased
 
 ### Fixed
+- **Ask-gated `exec` never surfaced as a /jin card (#52).** The `gateway-exec`
+  source is opt-in and was skipped without a word when `approvals.sources`
+  omitted it, and the plugin said nothing when the Gateway's own config could
+  not raise an approval (sandbox exec host, or an `ask: off` baseline that
+  makes OpenClaw ignore a per-call `ask`). The bridge now logs ONE loud
+  warning at start naming the exact missing config, a malformed
+  `exec.approval.requested` payload is logged once instead of dropped, and
+  pending exec approvals are re-listed after every loopback Gateway reconnect
+  (broadcasts raised while the socket was down are never replayed). README
+  documents the required Gateway config under "gateway-exec source".
 - **Model discovery never ran; `imajin/*` catalog was empty (#55).** The
   provider's catalog cache was purely lazy and pointed at the passthrough
   proxy's `/openai/v1/models` (404 — `imajin-ai#2453`) with no auth, so
