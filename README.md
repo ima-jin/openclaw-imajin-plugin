@@ -52,7 +52,7 @@ In `openclaw.json`:
   - **`wsNotifications.wakeSettleMs`** — leading-edge settle window in ms (#25); default `10000` (10s); see "Coalescing" below
   - **`wsNotifications.wakeCoalesceMs`** — trailing coalesce window in ms (#25); default `30000` (30s, was `300000`/5min); see "Coalescing" below
   - **`wsNotifications.wakeOwedMaxAgeMs`** — age bound in ms (#30) for a persisted "wake owed" marker replayed at startup; older markers are dropped (their frames already reached the agent via the durable system-event queue) instead of firing a stale wake; default `3600000` (1h); see "Ack, dedup, and persisted wakes" below
-  - **`wsNotifications.reportTo`** — session keys the wake worker discloses its outcome to (#47); default `[]` (no reports); see "Wake reports (`reportTo`)" below
+  - **`wsNotifications.reportTo`** — session keys the wake worker discloses its outcome to (#47); default `[]` (no reports); see "Wake reports: the worker discloses" below
   - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
 - **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway proposals from one or more sources to the kernel and applies signed operator decisions from /jin (#24, generalized by #33); see "Gateway approvals bridge" below:
   - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
