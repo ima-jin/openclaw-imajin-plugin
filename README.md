@@ -545,6 +545,63 @@ and outcome reporting).
 }
 ```
 
+#### Required Gateway config for the exec rail (#52)
+
+The plugin can only forward an approval the Gateway actually raises. Beyond
+listing `gateway-exec` above, the **Gateway's own** `openclaw.json` needs
+host exec that asks:
+
+```json5
+// In the OpenClaw GATEWAY's own openclaw.json, not this plugin's config:
+{
+  tools: {
+    exec: {
+      host: "gateway", // or "node" — never "sandbox", never "auto" with a sandbox active
+      mode: "ask",     // ask-capable baseline; "full"/"allowlist"/unset never ask
+    },
+  },
+}
+// Prompt on EVERY command instead (no `mode` equivalent): replace `mode` with
+//   security: "full", ask: "always"   (and do not set `mode` alongside them)
+```
+
+Why each line matters (per OpenClaw's "Exec tool" / "Exec approvals" docs —
+Gateway behaviour this plugin cannot verify from its own process):
+
+- Host approvals are only evaluated for `gateway`/`node` execution. With
+  `host: "auto"` and a sandbox runtime active (`agents.defaults.sandbox.mode`
+  / `agents.entries.*.sandbox.mode` of `non-main` or `all`), exec stays in the
+  sandbox and **no approval is ever raised**, so there is nothing to forward.
+- A per-call `ask: "always"` can only *harden* the baseline, and is ignored for
+  channel-origin calls (e.g. a Telegram DM) when the effective host ask is
+  `off`. With no `tools.exec` block the baseline is `full`/`off`.
+- `askFallback: deny` (the ORDERING NOTE below) stays the safe default when no
+  approval client is reachable.
+
+**Fail loud, not silent.** At bridge start the plugin logs ONE
+`[imajin-approvals-bridge] exec approval rail will not surface ask-gated exec on /jin`
+warning if `gateway-exec` is missing from `approvals.sources`, or if the
+loaded Gateway config shows a sandbox exec host or an `ask`-less baseline,
+with the config above. A malformed `exec.approval.requested` payload is logged
+once (key names only, never the command), and a failed source start says
+"ask-gated exec will NOT reach /jin". After every loopback Gateway reconnect
+the plugin re-lists pending exec approvals (a broadcast raised while the socket
+was down is never replayed); the bridge's per-`proposalId` dedup keeps that to
+one card.
+
+**Manual repro** (run with the config above, from the main session):
+
+1. Ask the agent to run `exec` with `command: "echo hi"`, `ask: "always"`,
+   `timeoutSeconds: 900`.
+2. Within seconds `/jin` shows a pending `gateway-exec:command` card with
+   `command: echo hi`; the exec stays blocked.
+3. `Allow once` runs it (output `hi`); `Deny` returns a clean refusal, not a
+   SIGTERM. Gateway log: `published operator.approval.requested for <id>
+   (source=gateway-exec, kind=gateway-exec:command)`.
+4. No card? Check, in order: the startup warning above, the
+   `operator:approvals` preflight error (#53), then `openclaw approvals get`
+   for the effective ask policy.
+
 This source relies on OpenClaw's own **approval forwarding to chat/plugin
 channels** being reachable in principle (it observes the same underlying
 `exec.approval.*` Gateway surface that feature is built on), documented
