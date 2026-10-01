@@ -176,7 +176,8 @@ function formatRuns(runs: WakeRunSummary[]): string[] {
 /** Wraps a wake turn's outcome as a report from warp-events (see module doc). */
 export function buildWakeReport(batch: WakeBatch, turn: TurnSummary): string {
   const states = [...new Set(batch.runs.map((r) => r.state))].join(", ") || "UNKNOWN";
-  const turnLine = `Turn: ${turn.status}${turn.error ? ` (${clip(turn.error, 200)})` : ""}`;
+  const errorSuffix = turn.error ? ` (${clip(turn.error, 200)})` : "";
+  const turnLine = `Turn: ${turn.status}${errorSuffix}`;
   const body = turn.output
     ? `Output:\n${clip(turn.output, MAX_REPORT_OUTPUT_CHARS)}`
     : `Output: no output — the warp-events turn finished without any assistant output (${turnLine.toLowerCase()}; warp run state: ${states}).`;
