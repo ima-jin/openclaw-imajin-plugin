@@ -108,6 +108,11 @@
       "label": "Notification State Directory",
       "help": "Directory for the ack-dedup LRU and pending-wake persistence files (#26). Defaults to a directory colocated with keypairPath."
     },
+    "wsNotifications.reportTo": {
+      "label": "Wake Report Sessions",
+      "help": "Session keys (e.g. agent:main:telegram:direct:<id>) the wake worker session discloses to (#47). After a wake turn completes in the wake session, its final assistant output \u2014 or 'no output' plus the Warp run state \u2014 is forwarded once per wake batch to each key, wrapped as an informational report from warp-events (not a wake). Default empty = no reports. Invalid keys are logged once and ignored.",
+      "placeholder": "agent:main:telegram:direct:8321865723"
+    },
     "wsNotifications.wakeOwedMaxAgeMs": {
       "label": "Owed Wake Max Age (ms)",
       "help": "Age bound for a persisted 'wake owed' marker replayed at startup (#30). A marker older than this is dropped \u2014 already durably injected \u2014 instead of firing a stale wake. Default 3600000 (1h)."
@@ -204,6 +209,12 @@
           "hookAgentId": {
             "type": "string",
             "description": "Agent id to route the wake hook to (must be permitted by that Gateway's hooks.allowedAgentIds). Default main."
+          },
+          "reportTo": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "description": "Session keys (e.g. agent:main:telegram:direct:<id>) the wake worker session discloses to (#47). After a wake turn completes in the wake session, its final assistant output (or 'no output' plus the run state) is forwarded once per wake batch to each key as an informational report from warp-events \u2014 not a wake. Default empty = no reports. Entries are validated at runtime rather than by this schema: a malformed or unknown session key is logged once and ignored, never a startup failure."
           },
           "stateDir": {
             "type": "string",

@@ -38,6 +38,11 @@
   `ok` (was `live`).
 
 ### Added
+- **`wsNotifications.reportTo` (#47).** The isolated wake worker
+  (`targetSession`, e.g. `agent:main:warp-events`) now discloses: after a wake
+  turn ends, its final assistant output (or "no output" plus the Warp run
+  state) is forwarded once per wake batch to each `reportTo` session, wrapped
+  as an informational report from warp-events. Default empty = unchanged.
 - Config: `modelDiscovery.refreshIntervalMs`, `modelDiscovery.modelsPath`.
 
 ### Operator notes
