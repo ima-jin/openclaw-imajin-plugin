@@ -420,7 +420,7 @@ describe("GatewayApprovalsBridge", () => {
     gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
     gateway.resolve.mockRejectedValue(new Error("approval already resolved"));
 
-    await expect(bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash } }))).resolves.toBeUndefined();
+    await expect(bridge.handleKernelDecision(makeDecidedFrame({ payload: { contentHash } }))).resolves.toBe("rejected");
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("approval.resolve failed"));
   });
 

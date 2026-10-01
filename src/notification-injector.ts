@@ -14,6 +14,7 @@
 
 import * as path from "node:path";
 import type { NotificationFrame } from "./ws-service.js";
+import { sendDirectChannelMessage } from "./channel-notify.js";
 import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
 import {
   DEDUP_STATE_FILENAME,
@@ -826,15 +827,7 @@ export function createNotificationInjector(
    * nothing left to try, so callers must log the rejection themselves.
    */
   async function sendChannelMessage(text: string): Promise<void> {
-    if (!ds?.target) {
-      throw new Error("directSend not configured");
-    }
-    const { execFile } = await import("node:child_process");
-    const cli = ds.cliPath ?? "openclaw";
-    const args = ["message", "send", "--channel", ds.channel ?? "telegram", "--target", ds.target, "-m", text];
-    await new Promise<void>((resolve, reject) => {
-      execFile(cli, args, { timeout: 20_000 }, (err) => (err ? reject(err) : resolve()));
-    });
+    await sendDirectChannelMessage(ds, text);
   }
 
   let warnedMissingWakeKey = false;

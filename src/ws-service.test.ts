@@ -326,6 +326,75 @@ describe("ImajinWsService.send", () => {
   });
 });
 
+describe("ImajinWsService.onConnected (#53)", () => {
+  it("fires only on the kernel's `connected` frame, not on socket open or other frames", async () => {
+    vi.useFakeTimers();
+    const service = new ImajinWsService({ nodeUrl: NODE_URL, keypairPath: KEYPAIR_PATH }, silentLogger());
+    const onConnected = vi.fn();
+    service.onConnected(onConnected);
+    await service.start();
+
+    const socket = FakeSocket.instances[0];
+    socket.triggerOpen();
+    expect(onConnected).not.toHaveBeenCalled();
+    socket.triggerMessage(JSON.stringify({ type: "pong_ish" }));
+    expect(onConnected).not.toHaveBeenCalled();
+
+    socket.triggerMessage(JSON.stringify({ type: "connected" }));
+    expect(onConnected).toHaveBeenCalledTimes(1);
+    service.stop();
+  });
+
+  it("fires again after a reconnect (every connect, not just the first)", async () => {
+    vi.useFakeTimers();
+    const service = new ImajinWsService({ nodeUrl: NODE_URL, keypairPath: KEYPAIR_PATH }, silentLogger());
+    const onConnected = vi.fn();
+    service.onConnected(onConnected);
+    await service.start();
+
+    const first = FakeSocket.instances[0];
+    first.triggerOpen();
+    first.triggerMessage(JSON.stringify({ type: "connected" }));
+    expect(onConnected).toHaveBeenCalledTimes(1);
+
+    first.close(1006, "network");
+    await vi.advanceTimersByTimeAsync(2_000);
+    // connect() is async (cookie reuse, dynamic `ws` import failure, ws-token fetch).
+    await vi.waitFor(() => expect(FakeSocket.instances[1]).toBeDefined());
+    const second = FakeSocket.instances[1];
+    second.triggerOpen();
+    second.triggerMessage(JSON.stringify({ type: "connected" }));
+
+    expect(onConnected).toHaveBeenCalledTimes(2);
+    service.stop();
+  });
+
+  it("isolates a throwing or rejecting handler: it is logged and later handlers still run", async () => {
+    vi.useFakeTimers();
+    const logger = silentLogger();
+    const service = new ImajinWsService({ nodeUrl: NODE_URL, keypairPath: KEYPAIR_PATH }, logger);
+    const survivor = vi.fn();
+    service.onConnected(() => {
+      throw new Error("sync boom");
+    });
+    service.onConnected(async () => {
+      throw new Error("async boom");
+    });
+    service.onConnected(survivor);
+    await service.start();
+
+    const socket = FakeSocket.instances[0];
+    socket.triggerOpen();
+    expect(() => socket.triggerMessage(JSON.stringify({ type: "connected" }))).not.toThrow();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(survivor).toHaveBeenCalledTimes(1);
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("connected handler error"));
+    expect(logger.error).toHaveBeenCalledTimes(2);
+    service.stop();
+  });
+});
+
 describe("ImajinWsService reconnect and shutdown", () => {
   it("uses increasing delays when reconnects repeatedly fail", () => {
     vi.useFakeTimers();

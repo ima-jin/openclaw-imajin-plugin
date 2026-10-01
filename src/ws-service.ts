@@ -57,6 +57,13 @@ type InboundFrame = NotificationFrame | ChatMessageFrame | { type: string; [k: s
 
 export type FrameHandler = (frame: InboundFrame) => void;
 
+/**
+ * Fired every time the kernel confirms an authenticated socket (`connected`
+ * frame), on the first connect AND every reconnect (#53). Handlers must not
+ * throw synchronously into the socket; a rejected promise is logged.
+ */
+export type ConnectedHandler = () => void | Promise<void>;
+
 interface Keypair {
   did: string;
   publicKey: string;
@@ -153,6 +160,7 @@ export class ImajinWsService {
   private authRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
   private handlers: FrameHandler[] = [];
+  private connectedHandlers: ConnectedHandler[] = [];
   private logger: Logger;
 
   constructor(
@@ -169,6 +177,15 @@ export class ImajinWsService {
   /** Register a handler for inbound frames. */
   onFrame(handler: FrameHandler): void {
     this.handlers.push(handler);
+  }
+
+  /**
+   * Register a handler run after the kernel's `connected` (auth ok) frame on
+   * every (re)connect (#53) — e.g. the approvals bridge's entitlement
+   * preflight + `operator.approval.decided` catch-up.
+   */
+  onConnected(handler: ConnectedHandler): void {
+    this.connectedHandlers.push(handler);
   }
 
   /**
@@ -385,6 +402,7 @@ export class ImajinWsService {
 
         if (frame.type === "connected") {
           this.logger.info("auth ok");
+          this.notifyConnected();
           return;
         }
 
@@ -421,6 +439,18 @@ export class ImajinWsService {
       this.logger.error(`connect failed: ${err}`);
       this.sessionCookie = null; // Force re-auth on next attempt
       this.scheduleReconnect();
+    }
+  }
+
+  private notifyConnected(): void {
+    for (const handler of this.connectedHandlers) {
+      try {
+        void Promise.resolve(handler()).catch((err: unknown) => {
+          this.logger.error(`connected handler error: ${err}`);
+        });
+      } catch (err) {
+        this.logger.error(`connected handler error: ${err}`);
+      }
     }
   }
 
