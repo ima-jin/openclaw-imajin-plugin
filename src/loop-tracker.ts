@@ -349,6 +349,39 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     else if (event.action === "removed") cronRemoved(jobId);
   });
 
+  /** Runs this process opened whose job vanished or is no longer running. */
+  const closeStaleRuns = (
+    enabled: boolean,
+    byId: ReadonlyMap<string, CronJobSnapshot>,
+    budget: { left: number },
+  ): void => {
+    for (const [jobId, loopId] of cronRuns) {
+      const loop = open.get(loopId);
+      const job = byId.get(jobId);
+      const stillRunning = job?.state?.runningAtMs !== undefined && enabled;
+      if (loop && stillRunning) continue;
+      cronRuns.delete(jobId);
+      if (!loop) continue;
+      if (budget.left-- <= 0) return;
+      const state = job ? lastRunState(job.state?.lastRunStatus) : "cancelled";
+      finish(loop, state, `${loop.label} closed at cron reconcile`);
+    }
+  };
+
+  /** Fresh process: any run the persisted snapshot still marks running is orphaned. */
+  const closeOrphanedRuns = (
+    byId: ReadonlyMap<string, CronJobSnapshot>,
+    budget: { left: number },
+  ): void => {
+    for (const [jobId, job] of byId) {
+      const running = job.state?.runningAtMs;
+      if (running === undefined) continue;
+      if (budget.left-- <= 0) return;
+      const loop = cronLoop(jobId, job, running, {});
+      finish(loop, "interrupted", `${loop.label} interrupted by gateway restart`);
+    }
+  };
+
   /**
    * Backstop for runs whose `finished` never arrived (gateway restart / crash).
    * Stateless across restarts: a run's loop id is derived from its job id and
@@ -363,33 +396,9 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
         const id = str(job?.id);
         if (id) byId.set(id, job);
       }
-      let budget = MAX_RECONCILE_EMISSIONS;
-
-      // Runs this process opened whose job vanished or is no longer running.
-      for (const [jobId, loopId] of [...cronRuns]) {
-        const loop = open.get(loopId);
-        if (!loop) {
-          cronRuns.delete(jobId);
-          continue;
-        }
-        const job = byId.get(jobId);
-        const stillRunning = job?.state?.runningAtMs !== undefined;
-        if (stillRunning && event?.enabled !== false) continue;
-        if (budget-- <= 0) return;
-        cronRuns.delete(jobId);
-        const state = job ? lastRunState(job.state?.lastRunStatus) : "cancelled";
-        finish(loop, state, `${loop.label} closed at cron reconcile`);
-      }
-
-      if (event?.reason !== "startup") return;
-      // Fresh process: any run the snapshot still marks as running is orphaned.
-      for (const [jobId, job] of byId) {
-        const running = job.state?.runningAtMs;
-        if (running === undefined) continue;
-        if (budget-- <= 0) return;
-        const loop = cronLoop(jobId, job, running, {});
-        finish(loop, "interrupted", `${loop.label} interrupted by gateway restart`);
-      }
+      const budget = { left: MAX_RECONCILE_EMISSIONS };
+      closeStaleRuns(event?.enabled !== false, byId, budget);
+      if (event?.reason === "startup") closeOrphanedRuns(byId, budget);
     },
   );
 

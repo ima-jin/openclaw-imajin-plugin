@@ -120,7 +120,7 @@ export function deriveLoopId(publisherDid: string, kind: LoopKind, ...parts: str
 // --- Redaction / size caps ---
 
 const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
-  [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [redacted]"],
+  [/\bBearer\s+[A-Z0-9._~+/=-]{8,}/gi, "Bearer [redacted]"],
   [/\b(?:sk|pk|xox[a-z]|gh[pousr]|glpat|AKIA)[-_A-Za-z0-9]{12,}/g, "[redacted]"],
   [
     /\b((?:api[_-]?key|secret|token|password|passwd|authorization|private[_-]?key)\s*[=:]\s*)\S+/gi,

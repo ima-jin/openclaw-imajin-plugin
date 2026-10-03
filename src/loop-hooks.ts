@@ -38,9 +38,9 @@ export interface LoopHooksDeps {
   actAs?: string;
   config?: LoopsConfig;
   /** Test seams. */
-  fetchImpl?: LoopSenderOptions["fetchImpl"];
-  now?: LoopSenderOptions["now"];
-  logger?: LoopSenderOptions["logger"];
+  fetchImpl?: NonNullable<LoopSenderOptions["fetchImpl"]>;
+  now?: NonNullable<LoopSenderOptions["now"]>;
+  logger?: NonNullable<LoopSenderOptions["logger"]>;
 }
 
 interface HookApi {
