@@ -84,6 +84,15 @@
   `ok` (was `live`).
 
 ### Added
+- **Kernel MCP tools via the local passthrough `/mcp` (#50).** `imajin_status`
+  gains an `mcp` block: reachability (`initialize` + `tools/list`, sent with no
+  credential), tool count, whether an `mcp.servers` entry points at the
+  passthrough (read-only check; flags `headers`), and send/write allowlist
+  guidance (`allowlist.suggestedToolFilter`, `gatedToolsExposed`) for
+  `google_*` tools. New optional config `mcpUrl` (default: proxy root + `/mcp`).
+  README documents the one-line registration, the read-on / send-write-gated
+  policy, and the two-agent-identity note. The plugin sends no credential to
+  `/mcp` and never writes Gateway config.
 - **`wsNotifications.reportTo` (#47).** The isolated wake worker
   (`targetSession`, e.g. `agent:main:warp-events`) now discloses: after a wake
   turn ends, its final assistant output (or "no output" plus the Warp run
@@ -92,6 +101,12 @@
 - Config: `modelDiscovery.refreshIntervalMs`, `modelDiscovery.modelsPath`.
 
 ### Operator notes
+- #50: register the kernel MCP server once (no headers) and restart/reload the
+  Gateway if hot reload is off: `openclaw mcp add imajin --url
+  http://127.0.0.1:8787/mcp --transport streamable-http`; then set a
+  `toolFilter` from `imajin_status` → `mcp.allowlist.suggestedToolFilter`. The
+  passthrough needs an `mcp` route configured (imajin-ai#2368). No plugin
+  version bump is part of this change.
 - The static `imajin-xai` / `imajin-openai` provider blocks can be retired once
   `imajin_status` shows `outcome: ok` with your brains listed. This release does
   not touch Gateway config; see README "Retiring the static provider blocks".

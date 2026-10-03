@@ -66,6 +66,7 @@ In `openclaw.json`:
 - **`modelDiscovery`** (optional, #55) — model discovery against the kernel; needs `nodeUrl` + `keypairPath`:
   - **`modelDiscovery.refreshIntervalMs`** — periodic re-discovery interval; default `300000` (5 min), floor `10000`, `0` = start-up discovery only
   - **`modelDiscovery.modelsPath`** — kernel route, default `/infer/v1/models/usable`
+- **`mcpUrl`** (optional, #50) — local passthrough `/mcp` endpoint `imajin_status` probes; defaults to the `inferProxyBaseUrl` root + `/mcp` (`http://127.0.0.1:8787/mcp`); see "Kernel MCP tools" below
 
 ### Turn-usage attestation
 
@@ -206,6 +207,68 @@ plugin never edits Gateway config — do it yourself:
 Note completions still depend on the kernel passthrough proxy being healthy
 (`imajin-ai#2453`); discovery working does not by itself prove completions do.
 
+## Kernel MCP tools (#50)
+
+The kernel's MCP tools (`google_gmail_*`, `google_calendar_*`, `google_drive_*`,
+`google_meet_*`, …) reach the agent as ordinary OpenClaw tools through the
+local passthrough's `/mcp` (`ima-jin/imajin-ai#2368`, loopback `:8787`). The
+passthrough mints the user-delegated app token per call; **no credential ever
+lives in `openclaw.json` and none passes through this plugin.** The kernel never
+calls into the gateway — OpenClaw's own MCP client calls the passthrough, the
+passthrough calls the kernel.
+
+**Operator step — register the server (one line, no headers):**
+
+```bash
+openclaw mcp add imajin --url http://127.0.0.1:8787/mcp --transport streamable-http
+openclaw mcp doctor imajin --probe
+```
+
+Equivalent config: `mcp.servers.imajin = { url: "http://127.0.0.1:8787/mcp",
+transport: "streamable-http" }`. The plugin does not write Gateway config (same
+posture as the model allow-list above); it only reads it, so `imajin_status` can
+tell you when the entry is missing. The passthrough also needs an `mcp` route
+in its `INFER_PROXY_ROUTES_CONFIG` (see its README); without one `/mcp` answers
+`422 no_route_configured`, which status reports as `outcome: not-configured`.
+
+**`imajin_status` → `mcp` block** (next to the model catalog): `reachable`,
+`outcome` (`ok | unreachable | not-configured | auth-error | route-error |
+malformed`), `toolCount`, `googleToolCount`, `registration` (is an
+`mcp.servers` entry pointing at the URL, enabled, `streamable-http`, and — as a
+warning — whether it sets `headers`; values are never read), `allowlist`, and
+`warnings`. The probe is `initialize` + `tools/list` only, sent without any
+credential; it never calls a tool.
+
+**Tool allowlist guidance.** Read tools (`google_gmail_list_threads`,
+`google_gmail_get_message`, `google_calendar_list_events`,
+`google_calendar_free_busy`, `google_drive_*` reads, `google_meet_list_*`) are
+meant to be on by default when the attestation carries the matching read scope
+(e.g. `google:gmail:read`; the kernel enforces scope per tool call). Send/write
+tools — today `google_gmail_send`, `google_calendar_create_event`, and
+`google_gmail_watch` (arms a push subscription) — must be an explicit operator
+enable. OpenClaw's `mcp.servers.<name>.toolFilter` is the control, and
+`imajin_status` computes `allowlist.suggestedToolFilter` for you (a default-deny
+`include` list of every discovered tool except the gated ones; unrecognised
+`google_*` verbs count as gated). Paste it into the entry:
+
+```json5
+mcp: { servers: { imajin: {
+  url: "http://127.0.0.1:8787/mcp",
+  transport: "streamable-http",
+  toolFilter: { include: ["google_gmail_list_threads", "google_gmail_get_message", /* … */] },
+} } }
+```
+
+Without a `toolFilter` every tool the kernel lists is exposed, and status warns
+(`allowlist.gatedToolsExposed`). To enable a send tool deliberately, add its
+name to `include`. Re-run `imajin_status` after the kernel ships new tools: an
+exact-name allowlist never auto-enables them.
+
+**Two agent identities today** (flagged for unification, out of scope here):
+MCP calls ride the proxy's app-token lane (`azp=<app>`, `sub=<principal>`, the
+`4Mgu…` DID), while chat/media/warp/vault use this plugin's own agent DID
+(`ADEK…`). Attestations granted to one do not apply to the other.
+
 ## Roadmap
 
 - [ ] Memory corpus supplement — agent's attestation chain as searchable memory
@@ -223,6 +286,7 @@ Note completions still depend on the kernel passthrough proxy being healthy
 - [x] `approvals.skillWorkshop.operatorScopes` — scope-parameterized loopback Gateway client for the skill-workshop source, fixing #35's `FORBIDDEN: missing scope` on strict/token-mode gateways
 - [x] Operator countersignature verification — `operator.approval.decided` is verified directly against the operator DID's own key, not just the kernel's witness signature (#44, kernel half `ima-jin/imajin-ai#2082`/`#2158`)
 - [x] `operator:approvals` preflight, loud degraded mode, and `operator.approval.decided` catch-up on every WS (re)connect (#53)
+- [x] Kernel MCP tools (google_*, calendar, drive) via the local passthrough `/mcp` — registration one-liner, `imajin_status` MCP reachability + tool count, send/write allowlist guidance (#50, proxy half `ima-jin/imajin-ai#2368`)
 
 ### Approval bridge (#1816)
 

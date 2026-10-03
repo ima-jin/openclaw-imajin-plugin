@@ -58,6 +58,7 @@ import {
 } from "./src/imajin-provider.js";
 import { isImajinModelAllowedByPolicy } from "./src/sources/imajin-catalog.js";
 import { registerLoopLifecycle, type LoopsConfig } from "./src/loop-hooks.js";
+import { resolveImajinMcpUrl } from "./src/kernel-mcp.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -98,6 +99,7 @@ export default definePluginEntry({
       inferProxyBaseUrl?: string;
       modelDiscovery?: ImajinModelDiscoveryConfig;
       loops?: LoopsConfig;
+      mcpUrl?: string;
     };
 
     // The one kernel client (agent DID challenge-response session) shared by
@@ -131,6 +133,11 @@ export default definePluginEntry({
         baseUrl: imajinProvider.baseUrl,
         cache: imajinProvider.cache,
         discovery: imajinProvider.discovery,
+        // #50: kernel MCP tools arrive via OpenClaw's own `mcp.servers` entry
+        // pointing at the local passthrough `/mcp` (no headers — the proxy mints
+        // the token). The plugin only probes it and reads (never writes) config.
+        mcpUrl: resolveImajinMcpUrl(config, imajinProvider.baseUrl),
+        getConfig: () => api.runtime?.config?.current?.(),
       }),
     );
 
