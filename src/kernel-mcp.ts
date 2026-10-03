@@ -29,7 +29,7 @@ const CLIENT_INFO = { name: "openclaw-imajin-plugin", version: "0.1.0" };
 
 function trimTrailingSlashes(value: string): string {
   let end = value.length;
-  while (end > 0 && value.charCodeAt(end - 1) === 47 /* "/" */) end -= 1;
+  while (end > 0 && value.codePointAt(end - 1) === 47 /* "/" */) end -= 1;
   return value.slice(0, end);
 }
 
@@ -104,7 +104,7 @@ function globMatches(pattern: string, name: string): boolean {
   const parts = pattern.split("*");
   if (parts.length === 1) return pattern === name;
   const first = parts[0];
-  const last = parts[parts.length - 1];
+  const last = parts.at(-1) ?? "";
   if (!name.startsWith(first)) return false;
   let pos = first.length;
   for (const part of parts.slice(1, -1)) {
