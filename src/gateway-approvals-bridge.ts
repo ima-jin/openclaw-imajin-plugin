@@ -497,6 +497,26 @@ const UNRESOLVED_OPERATOR_KEY_RESOLVER: OperatorKeyResolver = {
   },
 };
 
+/** Backoff between publish attempts for a transient kernel failure (#52): 3 attempts, ~2.5s worst case, so a card still appears "within seconds". */
+const DEFAULT_PUBLISH_RETRY_DELAYS_MS: number[] = [500, 2000];
+
+/** A non-2xx reply from the kernel's `POST /notify/api/send`; `status` lets the bridge tell a permanent rejection from a transient one (#52). */
+export class KernelNotifyError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+  ) {
+    super(message);
+    this.name = "KernelNotifyError";
+  }
+}
+
+/** Network errors and 5xx/408/429 may succeed on retry; any other kernel 4xx is a deterministic rejection. */
+function isRetryablePublishError(err: unknown): boolean {
+  if (!(err instanceof KernelNotifyError)) return true;
+  return err.status >= 500 || err.status === 408 || err.status === 429;
+}
+
 interface TrackedProposal {
   sourceId: string;
   kind: string;
@@ -537,6 +557,7 @@ export class GatewayApprovalsBridge {
    */
   private degradedReason: string | undefined;
   private readonly logger: Logger;
+  private readonly publishRetryDelaysMs: number[];
   private readonly unsubscribes: Unsubscribe[] = [];
 
   constructor(
@@ -547,7 +568,9 @@ export class GatewayApprovalsBridge {
     private readonly keyResolver: OperatorKeyResolver = UNRESOLVED_OPERATOR_KEY_RESOLVER,
     /** Human-facing warning channel (Telegram via `wsNotifications.directSend`); best-effort. */
     private readonly notifyOperator?: (text: string) => Promise<void>,
+    options: { publishRetryDelaysMs?: number[] } = {},
   ) {
+    this.publishRetryDelaysMs = options.publishRetryDelaysMs ?? DEFAULT_PUBLISH_RETRY_DELAYS_MS;
     this.logger = logger ?? defaultLogger();
     for (const source of this.sources.values()) {
       const unsubscribe = source.subscribe((request) => {
@@ -720,6 +743,7 @@ export class GatewayApprovalsBridge {
       } catch (err) {
         this.logger.error(`failed to sign operator.approval.requested for ${proposalId}: ${String(err)}`);
         this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
+        await this.failClosedIfBlocking(sourceId, request, `could not sign the card (${String(err)})`);
         return;
       }
       this.published.set(proposalId, {
@@ -731,7 +755,7 @@ export class GatewayApprovalsBridge {
         contentHash: payload.contentHash,
       });
       try {
-        await this.kernel.publishApprovalRequested(payload);
+        await this.publishWithRetry(sourceId, proposalId, payload);
         this.logger.info(
           `published operator.approval.requested for ${proposalId} (source=${sourceId}, kind=${payload.kind})`,
         );
@@ -747,10 +771,69 @@ export class GatewayApprovalsBridge {
         this.published.delete(proposalId);
         this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
         this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
+        await this.failClosedIfBlocking(sourceId, request, `the kernel refused or could not receive the card (${String(err)})`);
       }
     } finally {
       this.reservations.delete(proposalId);
       settleReservation();
+    }
+  }
+
+  /**
+   * Publishes the card, retrying ONLY failures that can succeed on a retry
+   * (network error, 5xx, 408, 429) with `publishRetryDelaysMs` backoff.
+   * A deterministic kernel rejection (any other 4xx — e.g. a 400 on a
+   * malformed `detail`) is thrown immediately: retrying it only delays the
+   * operator-visible failure (#52).
+   */
+  private async publishWithRetry(sourceId: string, proposalId: string, payload: KernelApprovalRequestedPayload): Promise<void> {
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await this.kernel.publishApprovalRequested(payload);
+        return;
+      } catch (err) {
+        const delay = this.publishRetryDelaysMs[attempt];
+        if (delay === undefined || !isRetryablePublishError(err)) throw err;
+        this.logger.warn(
+          `publish of ${proposalId} (source=${sourceId}) failed transiently, retrying in ${delay}ms: ${String(err)}`,
+        );
+        if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      }
+    }
+  }
+
+  /**
+   * #52 fail-loud: a source flagged `failClosedOnPublishError` has a live
+   * caller blocked on this item (an ask-gated exec waiting on the Gateway).
+   * If its card cannot be published nobody can ever decide it, so the caller
+   * would sit until its own timeout and be SIGTERMed with no explanation.
+   * Instead the item is resolved with `reject` (a clean refusal), the ERROR
+   * log and the operator notice name the proposal id and the reason, and the
+   * exact command text is never included (it is shown on the card only).
+   * Never throws.
+   */
+  private async failClosedIfBlocking(sourceId: string, request: ApprovalSourceRequest, reason: string): Promise<void> {
+    const source = this.sources.get(sourceId);
+    if (!source?.failClosedOnPublishError) return;
+    const proposalId = request.proposalId;
+    let denied = false;
+    try {
+      await source.resolve(proposalId, "reject", request.sourceRevision);
+      denied = true;
+    } catch (err) {
+      this.logger.error(
+        `could not deny ${sourceId} approval ${proposalId} after its /jin card failed to publish: ${String(err)}`,
+      );
+    }
+    const text =
+      `[imajin-approvals-bridge] ${sourceId} approval ${proposalId} was ${denied ? "DENIED" : "left pending"} because its /jin card could not be published: ${reason}. ` +
+      (denied ? "The blocked caller received a refusal instead of timing out; re-run it once the bridge is healthy." : "The blocked caller will time out.");
+    this.logger.error(text);
+    if (!this.notifyOperator) return;
+    try {
+      await this.notifyOperator(text);
+    } catch (err) {
+      this.logger.error(`failed to notify the operator about the unpublished ${sourceId} approval ${proposalId}: ${String(err)}`);
     }
   }
 
@@ -1116,7 +1199,7 @@ export function createHttpKernelNotifyClient(opts: {
       body: JSON.stringify({ to: opts.operatorDid, scope, data }),
     });
     if (!res.ok) {
-      throw new Error(`kernel notify ${scope} failed (${res.status}): ${await res.text()}`);
+      throw new KernelNotifyError(res.status, `kernel notify ${scope} failed (${res.status}): ${await res.text()}`);
     }
   }
 

@@ -167,6 +167,17 @@ export interface ApprovalSource {
    * (#33's Skill Workshop requirement).
    */
   readonly onDriftPolicy?: "leave" | "restage";
+
+  /**
+   * Set by sources whose pending item BLOCKS a live caller until decided
+   * (gateway-exec, #52: an ask-gated exec waits on the Gateway). When the
+   * bridge cannot publish this source's card (after retrying transient
+   * failures) nobody will ever decide it, so the bridge fails loud instead:
+   * it resolves the item with `"reject"` and tells the operator, rather than
+   * leaving the caller to time out silently. Omitted/false (every other
+   * source): a failed publish is only logged and retried on the next event.
+   */
+  readonly failClosedOnPublishError?: boolean;
 }
 
 /**

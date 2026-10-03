@@ -209,6 +209,21 @@ export interface KernelExecOutcomeClient {
 const MAX_SUMMARY_LENGTH = 2000;
 
 /**
+ * Shown when the Gateway omits a context field. The kernel (`ima-jin/imajin-ai`
+ * `validateExecCommandDetail`) 400s a `gateway-exec:command` card unless
+ * `host`, `cwd`, `agentId` and `sessionKey` are all NON-EMPTY strings, and
+ * OpenClaw legitimately sends `cwd: null` (no explicit workdir) and may omit
+ * agent/session binding — so a null/empty value is rendered as this literal
+ * instead of being forwarded as `null` (#52: the 400 meant no card ever
+ * appeared). It is a visible "not provided" marker, never a guessed value.
+ */
+export const EXEC_DETAIL_UNSPECIFIED = "unspecified";
+
+function nonEmptyOr(value: string | null | undefined, fallback: string): string {
+  return typeof value === "string" && value.trim().length > 0 ? value : fallback;
+}
+
+/**
  * Namespaced `"<source>:<subkind>"` kernel kind, matching the convention
  * every other source uses (`ima-jin/imajin-ai#2221`/PR #2223) — see module
  * doc.
@@ -253,10 +268,10 @@ function toApprovalSourceRequest(
     sourceRevision: `${record.id}:${record.expiresAtMs}`,
     detail: {
       command,
-      host: host ?? "gateway",
-      cwd: cwd ?? null,
-      agentId: agentId ?? null,
-      sessionKey: sessionKey ?? null,
+      host: nonEmptyOr(host, "gateway"),
+      cwd: nonEmptyOr(cwd, EXEC_DETAIL_UNSPECIFIED),
+      agentId: nonEmptyOr(agentId, EXEC_DETAIL_UNSPECIFIED),
+      sessionKey: nonEmptyOr(sessionKey, EXEC_DETAIL_UNSPECIFIED),
       requestedBy: opts.agentDid,
       approvalId: record.id,
       expiresAt: new Date(record.expiresAtMs).toISOString(),
@@ -283,6 +298,9 @@ export function createGatewayExecSource(
   return {
     id: "gateway-exec",
     onDriftPolicy: "leave",
+    // An ask-gated exec blocks on the Gateway until decided (#52): a card that
+    // cannot be published must deny it, not leave it to time out (SIGTERM).
+    failClosedOnPublishError: true,
     decisionLabels: { approve: "Allow once", reject: "Deny" },
 
     async list(): Promise<ApprovalSourceRequest[]> {
