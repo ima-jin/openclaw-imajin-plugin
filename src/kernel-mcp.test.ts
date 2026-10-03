@@ -127,6 +127,10 @@ describe("toolPassesFilter", () => {
     ).toBe(false);
     expect(toolPassesFilter("a.b", { include: ["a.b"] })).toBe(true);
     expect(toolPassesFilter("axb", { include: ["a.b"] })).toBe(false);
+    expect(toolPassesFilter("google_gmail_get_message", { include: ["google_*_get_*"] })).toBe(true);
+    expect(toolPassesFilter("google_gmail_send", { include: ["google_*_get_*"] })).toBe(false);
+    expect(toolPassesFilter("ab", { include: ["ab*b"] })).toBe(false);
+    expect(toolPassesFilter("abb", { include: ["ab*b"] })).toBe(true);
   });
 });
 

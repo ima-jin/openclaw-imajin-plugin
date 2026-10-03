@@ -27,15 +27,24 @@ const CLIENT_INFO = { name: "openclaw-imajin-plugin", version: "0.1.0" };
 
 // --- URL resolution ---
 
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.charCodeAt(end - 1) === 47 /* "/" */) end -= 1;
+  return value.slice(0, end);
+}
+
+const OPENAI_V1_SUFFIX = "/openai/v1";
+
 /** Proxy root + `/mcp`, or an explicit `mcpUrl` override (trailing slash trimmed). */
 export function resolveImajinMcpUrl(
   config: { mcpUrl?: string } | undefined,
   proxyBaseUrl: string,
 ): string {
   const override = config?.mcpUrl?.trim();
-  if (override) return override.replace(/\/+$/, "");
-  const root = proxyBaseUrl.replace(/\/openai\/v1\/?$/, "").replace(/\/+$/, "");
-  return `${root}${IMAJIN_MCP_PATH}`;
+  if (override) return trimTrailingSlashes(override);
+  let root = trimTrailingSlashes(proxyBaseUrl);
+  if (root.endsWith(OPENAI_V1_SUFFIX)) root = root.slice(0, -OPENAI_V1_SUFFIX.length);
+  return `${trimTrailingSlashes(root)}${IMAJIN_MCP_PATH}`;
 }
 
 // --- Tool classification (allowlist guidance) ---
@@ -90,11 +99,20 @@ export function classifyGoogleMcpTool(name: string): McpToolAccess | undefined {
   return verbTokens.length > 0 && READ_VERBS.has(verbTokens[0]) ? "read" : "gated";
 }
 
-/** `*`-glob match, the same simple form OpenClaw's `toolFilter` uses. */
+/** `*`-glob match, the same simple form OpenClaw's `toolFilter` uses (no regex). */
 function globMatches(pattern: string, name: string): boolean {
-  if (!pattern.includes("*")) return pattern === name;
-  const parts = pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&"));
-  return new RegExp(`^${parts.join(".*")}$`).test(name);
+  const parts = pattern.split("*");
+  if (parts.length === 1) return pattern === name;
+  const first = parts[0];
+  const last = parts[parts.length - 1];
+  if (!name.startsWith(first)) return false;
+  let pos = first.length;
+  for (const part of parts.slice(1, -1)) {
+    const at = name.indexOf(part, pos);
+    if (at < 0) return false;
+    pos = at + part.length;
+  }
+  return name.length - last.length >= pos && name.endsWith(last);
 }
 
 export interface McpToolFilter {
@@ -154,11 +172,46 @@ export interface McpRegistrationReport {
 }
 
 function normalizeUrl(url: string): string {
-  return url.trim().replace(/\/+$/, "").toLowerCase();
+  return trimTrailingSlashes(url.trim()).toLowerCase();
 }
 
 function stringArray(value: unknown): string[] | undefined {
   return Array.isArray(value) ? value.filter((v): v is string => typeof v === "string") : undefined;
+}
+
+function readToolFilter(raw: unknown): McpToolFilter | undefined {
+  const filter = raw as { include?: unknown; exclude?: unknown } | undefined;
+  const include = stringArray(filter?.include);
+  const exclude = stringArray(filter?.exclude);
+  if (!include && !exclude) return undefined;
+  return { ...(include ? { include } : {}), ...(exclude ? { exclude } : {}) };
+}
+
+function describeServerEntry(name: string, server: Record<string, unknown>): McpRegistrationReport {
+  const warnings: string[] = [];
+  const headers = server.headers;
+  const hasHeaders =
+    typeof headers === "object" && headers !== null && Object.keys(headers).length > 0;
+  if (hasHeaders) {
+    warnings.push(
+      "mcp.servers entry sets headers — remove them: the passthrough mints the app token, " +
+        "no credential belongs in openclaw.json",
+    );
+  }
+  const transport = typeof server.transport === "string" ? server.transport : undefined;
+  if (transport !== undefined && transport !== "streamable-http") {
+    warnings.push(`mcp.servers transport is "${transport}" — use "streamable-http"`);
+  }
+  const toolFilter = readToolFilter(server.toolFilter);
+  return {
+    registered: true,
+    name,
+    enabled: server.enabled !== false,
+    ...(transport === undefined ? {} : { transport }),
+    hasHeaders,
+    warnings,
+    ...(toolFilter ? { toolFilter } : {}),
+  };
 }
 
 /** Finds the `mcp.servers` entry whose `url` is `mcpUrl` in an OpenClaw config object. */
@@ -170,36 +223,9 @@ export function inspectMcpRegistration(cfg: unknown, mcpUrl: string): McpRegistr
   const target = normalizeUrl(mcpUrl);
   for (const [name, entry] of Object.entries(servers as Record<string, unknown>)) {
     const server = entry as Record<string, unknown> | null;
-    if (typeof server?.url !== "string" || normalizeUrl(server.url) !== target) continue;
-    const warnings: string[] = [];
-    const headers = server.headers;
-    const hasHeaders =
-      typeof headers === "object" && headers !== null && Object.keys(headers).length > 0;
-    if (hasHeaders) {
-      warnings.push(
-        "mcp.servers entry sets headers — remove them: the passthrough mints the app token, " +
-          "no credential belongs in openclaw.json",
-      );
+    if (typeof server?.url === "string" && normalizeUrl(server.url) === target) {
+      return describeServerEntry(name, server);
     }
-    const enabled = server.enabled !== false;
-    const transport = typeof server.transport === "string" ? server.transport : undefined;
-    if (transport !== undefined && transport !== "streamable-http") {
-      warnings.push(`mcp.servers transport is "${transport}" — use "streamable-http"`);
-    }
-    const rawFilter = server.toolFilter as { include?: unknown; exclude?: unknown } | undefined;
-    const include = stringArray(rawFilter?.include);
-    const exclude = stringArray(rawFilter?.exclude);
-    return {
-      registered: true,
-      name,
-      enabled,
-      ...(transport === undefined ? {} : { transport }),
-      hasHeaders,
-      warnings,
-      ...(include || exclude
-        ? { toolFilter: { ...(include ? { include } : {}), ...(exclude ? { exclude } : {}) } }
-        : {}),
-    };
   }
   return { registered: false, warnings: [] };
 }
@@ -297,6 +323,95 @@ function classifyHttpFailure(status: number, text: string): McpProbeError {
   return new McpProbeError("route-error", `POST /mcp returned ${status}${suffix}`, status, code);
 }
 
+function toProbeError(err: unknown): McpProbeError {
+  if (err instanceof McpProbeError) return err;
+  return new McpProbeError("unreachable", err instanceof Error ? err.message : String(err));
+}
+
+interface RpcContext {
+  url: string;
+  fetchImpl: FetchLike;
+  timeoutMs: number;
+  sessionId?: string;
+}
+
+/** One JSON-RPC POST. Throws McpProbeError; never sends credentials. */
+async function sendRpc(
+  ctx: RpcContext,
+  body: Record<string, unknown>,
+  expectReply: boolean,
+): Promise<RpcReply> {
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json, text/event-stream",
+    "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+  };
+  if (ctx.sessionId) headers["Mcp-Session-Id"] = ctx.sessionId;
+  let res: Response;
+  try {
+    res = await ctx.fetchImpl(ctx.url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(ctx.timeoutMs),
+    });
+  } catch (err) {
+    throw toProbeError(err);
+  }
+  const text = await res.text().catch(() => "");
+  if (!res.ok) throw classifyHttpFailure(res.status, text);
+  const sessionId = res.headers.get("mcp-session-id") ?? undefined;
+  if (!expectReply) return { status: res.status, sessionId };
+  const message = parseRpcBody(text, res.headers.get("content-type") ?? "", body.id as number);
+  if (!message) throw new McpProbeError("malformed", "POST /mcp returned no JSON-RPC reply", res.status);
+  if (message.error) {
+    const detail = `MCP error ${message.error.code ?? ""}: ${message.error.message ?? "unknown"}`;
+    throw new McpProbeError("route-error", detail.slice(0, 240), res.status);
+  }
+  return { status: res.status, sessionId, message };
+}
+
+/** Paginated `tools/list`; returns tool names. */
+async function listToolNames(ctx: RpcContext, firstId: number): Promise<string[]> {
+  const tools: string[] = [];
+  let cursor: string | undefined;
+  for (let page = 0; page < MAX_TOOL_PAGES; page += 1) {
+    const reply = await sendRpc(
+      ctx,
+      {
+        jsonrpc: "2.0",
+        id: firstId + page,
+        method: "tools/list",
+        ...(cursor ? { params: { cursor } } : {}),
+      },
+      true,
+    );
+    const result = reply.message?.result as { tools?: unknown; nextCursor?: unknown } | undefined;
+    if (!Array.isArray(result?.tools)) {
+      throw new McpProbeError("malformed", "tools/list result has no `tools` array", reply.status);
+    }
+    for (const tool of result.tools as Array<{ name?: unknown }>) {
+      if (typeof tool?.name === "string") tools.push(tool.name);
+    }
+    if (typeof result.nextCursor !== "string" || !result.nextCursor) break;
+    cursor = result.nextCursor;
+  }
+  return tools;
+}
+
+function failedProbe(url: string, failure: McpProbeError): McpProbeResult {
+  return {
+    url,
+    outcome: failure.outcome,
+    ok: false,
+    ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
+    ...(failure.errorCode ? { errorCode: failure.errorCode } : {}),
+    error: failure.message,
+    toolCount: 0,
+    tools: [],
+  };
+}
+
 /**
  * Read-only reachability probe: `initialize` -> `notifications/initialized` ->
  * `tools/list` (paginated). Never sends credentials; `Mcp-Session-Id` is
@@ -307,84 +422,30 @@ export async function probeKernelMcp(
   url: string,
   options: { fetchImpl?: FetchLike; timeoutMs?: number } = {},
 ): Promise<McpProbeResult> {
-  const fetchImpl = options.fetchImpl ?? fetch;
-  const timeoutMs = options.timeoutMs ?? DEFAULT_MCP_PROBE_TIMEOUT_MS;
-  let nextId = 1;
-  let sessionId: string | undefined;
-
-  const post = async (body: Record<string, unknown>, expectReply: boolean): Promise<RpcReply> => {
-    const id = body.id as number | undefined;
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      Accept: "application/json, text/event-stream",
-      "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
-    };
-    if (sessionId) headers["Mcp-Session-Id"] = sessionId;
-    let res: Response;
-    try {
-      res = await fetchImpl(url, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(timeoutMs),
-      });
-    } catch (err) {
-      throw new McpProbeError("unreachable", err instanceof Error ? err.message : String(err));
-    }
-    const text = await res.text().catch(() => "");
-    if (!res.ok) throw classifyHttpFailure(res.status, text);
-    const newSession = res.headers.get("mcp-session-id") ?? undefined;
-    if (!expectReply) return { status: res.status, sessionId: newSession };
-    const message = parseRpcBody(text, res.headers.get("content-type") ?? "", id as number);
-    if (!message) throw new McpProbeError("malformed", "POST /mcp returned no JSON-RPC reply", res.status);
-    if (message.error) {
-      throw new McpProbeError(
-        "route-error",
-        `MCP error ${message.error.code ?? ""}: ${message.error.message ?? "unknown"}`.slice(0, 240),
-        res.status,
-      );
-    }
-    return { status: res.status, sessionId: newSession, message };
+  const ctx: RpcContext = {
+    url,
+    fetchImpl: options.fetchImpl ?? fetch,
+    timeoutMs: options.timeoutMs ?? DEFAULT_MCP_PROBE_TIMEOUT_MS,
   };
-
   try {
-    const init = await post(
+    const init = await sendRpc(
+      ctx,
       {
         jsonrpc: "2.0",
-        id: nextId++,
+        id: 1,
         method: "initialize",
         params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: CLIENT_INFO },
       },
       true,
     );
-    sessionId = init.sessionId;
+    ctx.sessionId = init.sessionId;
     const serverInfo = (init.message?.result as { serverInfo?: { name?: unknown } } | undefined)
       ?.serverInfo;
     const serverName = typeof serverInfo?.name === "string" ? serverInfo.name : undefined;
-    await post({ jsonrpc: "2.0", method: "notifications/initialized" }, false).catch(() => undefined);
-
-    const tools: string[] = [];
-    let cursor: string | undefined;
-    for (let page = 0; page < MAX_TOOL_PAGES; page += 1) {
-      const reply = await post(
-        {
-          jsonrpc: "2.0",
-          id: nextId++,
-          method: "tools/list",
-          ...(cursor ? { params: { cursor } } : {}),
-        },
-        true,
-      );
-      const result = reply.message?.result as { tools?: unknown; nextCursor?: unknown } | undefined;
-      if (!Array.isArray(result?.tools)) {
-        throw new McpProbeError("malformed", "tools/list result has no `tools` array", reply.status);
-      }
-      for (const tool of result.tools as Array<{ name?: unknown }>) {
-        if (typeof tool?.name === "string") tools.push(tool.name);
-      }
-      if (typeof result.nextCursor !== "string" || !result.nextCursor) break;
-      cursor = result.nextCursor;
-    }
+    await sendRpc(ctx, { jsonrpc: "2.0", method: "notifications/initialized" }, false).catch(
+      () => undefined,
+    );
+    const tools = await listToolNames(ctx, 2);
     return {
       url,
       outcome: "ok",
@@ -394,20 +455,7 @@ export async function probeKernelMcp(
       ...(serverName ? { serverName } : {}),
     };
   } catch (err) {
-    const failure =
-      err instanceof McpProbeError
-        ? err
-        : new McpProbeError("unreachable", err instanceof Error ? err.message : String(err));
-    return {
-      url,
-      outcome: failure.outcome,
-      ok: false,
-      ...(failure.httpStatus === undefined ? {} : { httpStatus: failure.httpStatus }),
-      ...(failure.errorCode ? { errorCode: failure.errorCode } : {}),
-      error: failure.message,
-      toolCount: 0,
-      tools: [],
-    };
+    return failedProbe(url, toProbeError(err));
   }
 }
 
