@@ -34,6 +34,8 @@ interface HandleEntry {
   name: string;
   value: string;
   expiresAtMs: number;
+  /** Grant this value came from, so an exec bridge can ack the outcome. Not a secret. */
+  grantId?: string;
 }
 
 const store = new Map<string, HandleEntry>();
@@ -59,6 +61,8 @@ export interface CreateSecretHandleInput {
    * case `DEFAULT_MAX_TTL_MS` alone determines the handle's TTL.
    */
   grantExpiresAt: string | number | Date | null;
+  /** Optional grant id, used only by `withSecretEnv`'s `ack` hook. */
+  grantId?: string;
 }
 
 export interface CreateSecretHandleResult {
@@ -86,8 +90,38 @@ export function createSecretHandle(input: CreateSecretHandleInput): CreateSecret
     : maxTtlExpiresMs;
 
   const handle = randomHandleId();
-  store.set(handle, { name: input.name, value: input.value, expiresAtMs });
+  store.set(handle, { name: input.name, value: input.value, expiresAtMs, grantId: input.grantId });
   return { handle, expiresAt: new Date(expiresAtMs).toISOString() };
+}
+
+/** Outcome an exec bridge reports for a handle redemption. Value-free by construction. */
+export interface SecretUseAck {
+  grantId: string;
+  outcome: "used" | "failed";
+}
+
+export interface WithSecretEnvOptions {
+  /**
+   * Called after the callback settles, only for a handle created with a
+   * `grantId`: `used` when it succeeded, `failed` when it threw. Wire it to
+   * `ackGrant` so the agent's signed record of use never depends on anyone
+   * remembering (`openclaw-imajin-plugin#42`). Best effort: an ack failure is
+   * swallowed so it can never change the exec result or surface a value.
+   */
+  ack?: (ack: SecretUseAck) => Promise<void> | void;
+}
+
+async function bestEffortAck(
+  entry: HandleEntry,
+  outcome: SecretUseAck["outcome"],
+  ack: WithSecretEnvOptions["ack"],
+): Promise<void> {
+  if (!ack || !entry.grantId) return;
+  try {
+    await ack({ grantId: entry.grantId, outcome });
+  } catch {
+    // Deliberately ignored — see `WithSecretEnvOptions.ack`.
+  }
 }
 
 /**
@@ -105,6 +139,7 @@ export function createSecretHandle(input: CreateSecretHandleInput): CreateSecret
 export async function withSecretEnv<T>(
   handle: string,
   fn: (env: Record<string, string>) => Promise<T> | T,
+  options: WithSecretEnvOptions = {},
 ): Promise<T> {
   const entry = store.get(handle);
   // Single-use: delete on first read, whether or not it's still valid.
@@ -112,13 +147,30 @@ export async function withSecretEnv<T>(
   if (!entry || entry.expiresAtMs <= Date.now()) {
     throw new HandleExpiredError();
   }
+  let result: T;
   try {
-    return await fn({ [entry.name]: entry.value });
+    result = await fn({ [entry.name]: entry.value });
   } catch {
+    await bestEffortAck(entry, "failed", options.ack);
     // Redact on failure (non-negotiable): never let a callback's own error
     // carry the value forward.
     throw new Error(`withSecretEnv: callback failed for handle (name=${entry.name})`);
   }
+  await bestEffortAck(entry, "used", options.ack);
+  return result;
+}
+
+/**
+ * True when `text` contains the value of any live (unexpired, unread) handle.
+ * Used by `imajin_vault ack` to refuse a note/evidence that would carry a
+ * secret into the signed record. Never returns or logs the value itself.
+ */
+export function containsLiveSecret(text: string): boolean {
+  const now = Date.now();
+  for (const entry of store.values()) {
+    if (entry.expiresAtMs > now && entry.value.length > 0 && text.includes(entry.value)) return true;
+  }
+  return false;
 }
 
 /** Test-only: clears all stored handles. Not exported from the package's public surface. */

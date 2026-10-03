@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+- **`imajin_vault` `ack` action (#42).** After `fetch`, the agent signs what it
+  did with the grant: `ack { grantId, outcome: 'used'|'failed'|'discarded',
+  evidence?: { kind, ref }, note? }` -> `POST
+  /api/vault/delegation/grants/{grantId}/ack` (kernel `imajin-ai#2235`). Same
+  value-free error mapping as `fetch` plus `grant_not_fetched` / `ack_conflict`
+  (409); inputs validated against the kernel limits; a note/evidence holding a
+  live handle's value is refused. `withSecretEnv` gained an optional `ack` hook
+  so the exec bridge can ack `used`/`failed` automatically once wired.
+
 ### Fixed
 - **Ask-gated `exec` never surfaced as a /jin card (#52).** The `gateway-exec`
   source is opt-in and was skipped without a word when `approvals.sources`

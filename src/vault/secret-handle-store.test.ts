@@ -4,6 +4,7 @@ import {
   withSecretEnv,
   HandleExpiredError,
   DEFAULT_MAX_TTL_MS,
+  containsLiveSecret,
   _resetSecretHandleStoreForTests,
 } from "./secret-handle-store.js";
 
@@ -113,5 +114,67 @@ describe("createSecretHandle / withSecretEnv", () => {
     }
     expect(caught).toBeInstanceOf(Error);
     expect((caught as Error).message).not.toContain(KNOWN_SECRET);
+  });
+});
+
+describe("withSecretEnv ack hook / containsLiveSecret", () => {
+  beforeEach(() => {
+    _resetSecretHandleStoreForTests();
+  });
+
+  it("acks 'used' after the callback succeeds, with the grantId and no value", async () => {
+    const { handle } = createSecretHandle({ name: "GH_TOKEN", value: KNOWN_SECRET, grantExpiresAt: null, grantId: "vdg_1" });
+    const ack = vi.fn();
+    await withSecretEnv(handle, () => "ok", { ack });
+    expect(ack.mock.calls).toEqual([[{ grantId: "vdg_1", outcome: "used" }]]);
+    expect(JSON.stringify(ack.mock.calls)).not.toContain(KNOWN_SECRET);
+  });
+
+  it("acks 'failed' when the callback throws, and still re-throws a value-free error", async () => {
+    const { handle } = createSecretHandle({ name: "GH_TOKEN", value: KNOWN_SECRET, grantExpiresAt: null, grantId: "vdg_1" });
+    const ack = vi.fn();
+    await expect(
+      withSecretEnv(
+        handle,
+        () => {
+          throw new Error(`boom ${KNOWN_SECRET}`);
+        },
+        { ack },
+      ),
+    ).rejects.toThrow(/callback failed/);
+    expect(ack.mock.calls).toEqual([[{ grantId: "vdg_1", outcome: "failed" }]]);
+  });
+
+  it("swallows a failing ack so it never changes the exec result", async () => {
+    const { handle } = createSecretHandle({ name: "N", value: "v", grantExpiresAt: null, grantId: "vdg_1" });
+    const ack = vi.fn().mockRejectedValue(new Error("kernel down"));
+    await expect(withSecretEnv(handle, () => "result", { ack })).resolves.toBe("result");
+  });
+
+  it("does not ack a handle with no grantId, or an expired handle", async () => {
+    const ack = vi.fn();
+    const { handle } = createSecretHandle({ name: "N", value: "v", grantExpiresAt: null });
+    await withSecretEnv(handle, () => 1, { ack });
+    await expect(withSecretEnv("sh_missing", () => 1, { ack })).rejects.toThrow(HandleExpiredError);
+    expect(ack).not.toHaveBeenCalled();
+  });
+
+  it("containsLiveSecret is true only while the handle is live and unread", async () => {
+    expect(containsLiveSecret(KNOWN_SECRET)).toBe(false);
+    const { handle } = createSecretHandle({ name: "N", value: KNOWN_SECRET, grantExpiresAt: null });
+    expect(containsLiveSecret(`prefix ${KNOWN_SECRET} suffix`)).toBe(true);
+    expect(containsLiveSecret("harmless")).toBe(false);
+    await withSecretEnv(handle, () => 1);
+    expect(containsLiveSecret(KNOWN_SECRET)).toBe(false);
+  });
+
+  it("containsLiveSecret ignores empty values and expired handles", () => {
+    vi.useFakeTimers();
+    createSecretHandle({ name: "E", value: "", grantExpiresAt: null });
+    createSecretHandle({ name: "N", value: KNOWN_SECRET, grantExpiresAt: null });
+    expect(containsLiveSecret("anything")).toBe(false);
+    vi.advanceTimersByTime(DEFAULT_MAX_TTL_MS + 1);
+    expect(containsLiveSecret(KNOWN_SECRET)).toBe(false);
+    vi.useRealTimers();
   });
 });
