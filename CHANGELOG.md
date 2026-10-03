@@ -3,6 +3,14 @@
 ## Unreleased
 
 ### Fixed
+- **Skill Workshop proposals never reached /jin (#33).** `skills.proposals.list`
+  is scoped to a single agent's workshop and, with several agents configured
+  and no single default, fails every call ("Pass agentId to select a configured
+  agent") — so the source never saw a proposal. It now lists every agent from
+  `agents.list`, remembers each proposal's owning agent for `apply`/`reject`,
+  and a failed publish to the kernel is logged and retried on the next poll
+  (`ApprovalSource.onPublishFailed`). Needs a gateway restart to load the new
+  plugin code; no config change.
 - **Ask-gated `exec` never surfaced as a /jin card (#52).** The `gateway-exec`
   source is opt-in and was skipped without a word when `approvals.sources`
   omitted it, and the plugin said nothing when the Gateway's own config could

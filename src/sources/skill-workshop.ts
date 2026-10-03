@@ -70,9 +70,23 @@ export interface SkillWorkshopListResult {
 
 /** Abstracts the plugin's own Gateway connection for `skills.proposals.*` RPCs. */
 export interface SkillWorkshopGatewayClient {
-  list(): Promise<SkillWorkshopListResult>;
-  apply(proposalId: string, expectedRevisionHash: string): Promise<{ applied?: boolean } | undefined>;
-  reject(proposalId: string, expectedRevisionHash: string): Promise<unknown>;
+  /**
+   * `skills.proposals.list` is scoped to ONE agent's workshop: the Gateway
+   * resolves an omitted `agentId` to the sole/default agent and fails with
+   * "Pass agentId to select a configured agent" when several agents are
+   * configured with no single default (verified against `openclaw@2026.9.3`,
+   * `skills-*.mjs` `resolveSkillsAgentWorkspace`). The source therefore lists
+   * once per agent from `listAgentIds` and passes `agentId` through.
+   */
+  list(agentId?: string): Promise<SkillWorkshopListResult>;
+  /** `agents.list` (scope `operator.read`) — every configured agent id. Optional: absent/empty means one unscoped list. */
+  listAgentIds?(): Promise<string[]>;
+  apply(
+    proposalId: string,
+    expectedRevisionHash: string,
+    agentId?: string,
+  ): Promise<{ applied?: boolean } | undefined>;
+  reject(proposalId: string, expectedRevisionHash: string, agentId?: string): Promise<unknown>;
 }
 
 const MAX_DETAIL_BYTES = 16 * 1024;
@@ -152,8 +166,11 @@ function isMissingScopeError(err: unknown): err is Error {
 /** How much longer `subscribe()`'s poll interval grows after a missing-scope error, so a persistently misconfigured connection stops hammering the Gateway with a request it already knows will fail (#35). */
 const MISSING_SCOPE_BACKOFF_MULTIPLIER = 10;
 
-async function currentPending(client: SkillWorkshopGatewayClient): Promise<SkillWorkshopProposalSummary[]> {
-  const result = await client.list();
+async function currentPending(
+  client: SkillWorkshopGatewayClient,
+  agentId?: string,
+): Promise<SkillWorkshopProposalSummary[]> {
+  const result = await (agentId ? client.list(agentId) : client.list());
   return (result.proposals ?? []).filter((proposal) => proposal.status === "pending");
 }
 
@@ -178,7 +195,10 @@ export function createSkillWorkshopSource(
 ): ApprovalSource {
   const pollIntervalMs = opts.pollIntervalMs ?? 15_000;
   const known = new Set<string>();
+  /** Which agent's workshop each listed proposal belongs to — apply/reject must target the same agent. */
+  const agentByProposal = new Map<string, string>();
   let missingScopeWarned = false;
+  let agentListWarned = false;
 
   function warnMissingScopeOnce(err: Error): void {
     if (missingScopeWarned) return;
@@ -191,20 +211,81 @@ export function createSkillWorkshopSource(
     );
   }
 
-  /** Wraps `currentPending` so every call site (list/subscribe/getCurrent) gets the one-time missing-scope warning without changing each call site's own error propagation. */
-  async function pending(): Promise<SkillWorkshopProposalSummary[]> {
+  /** Wraps one scoped list so every call site gets the one-time missing-scope warning without changing its own error propagation. */
+  async function pendingFor(agentId?: string): Promise<SkillWorkshopProposalSummary[]> {
     try {
-      return await currentPending(client);
+      return await currentPending(client, agentId);
     } catch (err) {
       if (isMissingScopeError(err)) warnMissingScopeOnce(err);
       throw err;
     }
   }
 
+  /** Configured agent ids, or `[]` to fall back to one unscoped list (older gateway / single agent). */
+  async function resolveAgentIds(): Promise<string[]> {
+    if (!client.listAgentIds) return [];
+    try {
+      return [...new Set((await client.listAgentIds()).filter((id) => id.length > 0))];
+    } catch (err) {
+      if (isMissingScopeError(err)) {
+        warnMissingScopeOnce(err);
+        throw err;
+      }
+      if (!agentListWarned) {
+        agentListWarned = true;
+        console.warn(
+          `[imajin-approvals-bridge] skill-workshop could not enumerate agents (agents.list): ${String(err)} — ` +
+            "falling back to the Gateway's default agent only",
+        );
+      }
+      return [];
+    }
+  }
+
+  /**
+   * Pending proposals across EVERY configured agent. One agent failing is
+   * logged loudly and does not hide the others; only when every agent fails
+   * does this throw (so the bridge logs the list failure).
+   */
+  async function pending(): Promise<SkillWorkshopProposalSummary[]> {
+    const agentIds = await resolveAgentIds();
+    if (agentIds.length === 0) return pendingFor();
+    const settled = await Promise.allSettled(agentIds.map((agentId) => pendingFor(agentId)));
+    const seen = new Set<string>();
+    const merged: SkillWorkshopProposalSummary[] = [];
+    let firstError: unknown;
+    let failures = 0;
+    settled.forEach((outcome, index) => {
+      if (outcome.status === "rejected") {
+        failures += 1;
+        firstError ??= outcome.reason;
+        if (!isMissingScopeError(outcome.reason)) {
+          console.error(
+            `[imajin-approvals-bridge] skill-workshop list failed for agent ${agentIds[index]}: ${String(outcome.reason)}`,
+          );
+        }
+        return;
+      }
+      for (const proposal of outcome.value) {
+        if (seen.has(proposal.id)) continue;
+        seen.add(proposal.id);
+        agentByProposal.set(proposal.id, agentIds[index]);
+        merged.push(proposal);
+      }
+    });
+    if (failures === agentIds.length) throw firstError;
+    return merged;
+  }
+
   return {
     id: "skill-workshop",
     onDriftPolicy: "restage",
     decisionLabels: { approve: "Apply", reject: "Reject" },
+
+    onPublishFailed(proposalId: string): void {
+      // Forget it so the next poll re-emits the proposal and the bridge retries the publish.
+      known.delete(proposalId);
+    },
 
     async list(): Promise<ApprovalSourceRequest[]> {
       const list = await pending();
@@ -254,7 +335,10 @@ export function createSkillWorkshopSource(
     },
 
     async getCurrent(proposalId: string): Promise<ApprovalSourceCurrentState | null> {
-      const list = await pending();
+      // Ask only the owning agent when known: a failure listing some OTHER
+      // agent must never make this proposal look resolved.
+      const owner = agentByProposal.get(proposalId);
+      const list = owner ? await pendingFor(owner) : await pending();
       const match = list.find((proposal) => proposal.id === proposalId);
       if (!match) return { pending: false, sourceRevision: null };
       // #2084: return the CURRENT `detail` too (built the same way `list()`
@@ -271,12 +355,17 @@ export function createSkillWorkshopSource(
       decision: ApprovalDecision,
       expectedSourceRevision: string,
     ): Promise<{ applied: boolean }> {
+      const agentId = agentByProposal.get(proposalId);
       try {
         if (decision === "approve") {
-          const result = await client.apply(proposalId, expectedSourceRevision);
+          const result = await (agentId
+            ? client.apply(proposalId, expectedSourceRevision, agentId)
+            : client.apply(proposalId, expectedSourceRevision));
           return { applied: result?.applied !== false };
         }
-        await client.reject(proposalId, expectedSourceRevision);
+        await (agentId
+          ? client.reject(proposalId, expectedSourceRevision, agentId)
+          : client.reject(proposalId, expectedSourceRevision));
         return { applied: true };
       } catch (err) {
         if (isRevisionChangedError(err)) {
@@ -309,18 +398,30 @@ export function createLiveSkillWorkshopGatewayClient(gatewayClient: {
   request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T>;
 }): SkillWorkshopGatewayClient {
   return {
-    async list() {
-      const result = await gatewayClient.request<SkillWorkshopListResult>("skills.proposals.list", {});
+    async list(agentId?: string) {
+      const result = await gatewayClient.request<SkillWorkshopListResult>(
+        "skills.proposals.list",
+        agentId ? { agentId } : {},
+      );
       return { proposals: result?.proposals ?? [] };
     },
-    async apply(proposalId: string, expectedRevisionHash: string) {
+    async listAgentIds() {
+      const result = await gatewayClient.request<{ agents?: Array<{ id?: unknown }> }>("agents.list", {});
+      return (result?.agents ?? []).flatMap((agent) => (typeof agent.id === "string" ? [agent.id] : []));
+    },
+    async apply(proposalId: string, expectedRevisionHash: string, agentId?: string) {
       return gatewayClient.request<{ applied?: boolean }>("skills.proposals.apply", {
         proposalId,
         expectedRevisionHash,
+        ...(agentId ? { agentId } : {}),
       });
     },
-    async reject(proposalId: string, expectedRevisionHash: string) {
-      return gatewayClient.request("skills.proposals.reject", { proposalId, expectedRevisionHash });
+    async reject(proposalId: string, expectedRevisionHash: string, agentId?: string) {
+      return gatewayClient.request("skills.proposals.reject", {
+        proposalId,
+        expectedRevisionHash,
+        ...(agentId ? { agentId } : {}),
+      });
     },
   };
 }

@@ -719,6 +719,7 @@ export class GatewayApprovalsBridge {
         });
       } catch (err) {
         this.logger.error(`failed to sign operator.approval.requested for ${proposalId}: ${String(err)}`);
+        this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
         return;
       }
       this.published.set(proposalId, {
@@ -745,6 +746,7 @@ export class GatewayApprovalsBridge {
         // against a publish that never actually happened.
         this.published.delete(proposalId);
         this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
+        this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
       }
     } finally {
       this.reservations.delete(proposalId);

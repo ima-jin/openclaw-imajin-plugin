@@ -100,6 +100,25 @@ proposals.apply`/`reject` (scope `operator.admin`) with the tracked
 an `ApprovalContentDriftError` so the bridge's generic mismatch/
 "restage" handling applies uniformly.
 
+**Per-agent scoping and publish retry (#33).** `skills.proposals.list`,
+`apply` and `reject` all act on ONE agent's workshop: when no `agentId` is
+passed the Gateway resolves the sole/default agent, and with several
+agents configured and no single default it fails every call with "Pass
+agentId to select a configured agent" (verified against
+`openclaw@2026.9.3`). The source therefore enumerates agents with
+`agents.list` (scope `operator.read`), lists each agent's workshop, remembers
+which agent owns each proposal id, and passes that `agentId` on `apply`/
+`reject` and on the decision-time `getCurrent` re-check. One agent failing
+to list is logged loudly and never hides the others; if `agents.list`
+itself is unavailable it falls back to a single unscoped list (default
+agent). Every existing pending proposal is published at startup
+(`list()` backfill, then again on each kernel reconnect); new ones within
+one poll interval (15 s). When a publish to the kernel fails the bridge logs
+an error and calls the source's optional `onPublishFailed(proposalId)`, so
+the next poll re-emits the proposal and the publish is retried instead of
+waiting for a restart. The kernel de-duplicates by `proposalId`, so a retry
+after an ambiguous failure never creates a second card.
+
 **Connection scopes (#35).** The plugin SDK's only loopback-operator-
 connection factory (`createOperatorApprovalsGatewayClient`) hardcodes
 `scopes: ["operator.approvals"]`, which is insufficient for the
