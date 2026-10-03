@@ -786,19 +786,22 @@ export class GatewayApprovalsBridge {
    * malformed `detail`) is thrown immediately: retrying it only delays the
    * operator-visible failure (#52).
    */
-  private async publishWithRetry(sourceId: string, proposalId: string, payload: KernelApprovalRequestedPayload): Promise<void> {
-    for (let attempt = 0; ; attempt++) {
-      try {
-        await this.kernel.publishApprovalRequested(payload);
-        return;
-      } catch (err) {
-        const delay = this.publishRetryDelaysMs[attempt];
-        if (delay === undefined || !isRetryablePublishError(err)) throw err;
-        this.logger.warn(
-          `publish of ${proposalId} (source=${sourceId}) failed transiently, retrying in ${delay}ms: ${String(err)}`,
-        );
-        if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
-      }
+  private async publishWithRetry(
+    sourceId: string,
+    proposalId: string,
+    payload: KernelApprovalRequestedPayload,
+    attempt = 0,
+  ): Promise<void> {
+    try {
+      await this.kernel.publishApprovalRequested(payload);
+    } catch (err) {
+      const delay = this.publishRetryDelaysMs[attempt];
+      if (delay === undefined || !isRetryablePublishError(err)) throw err;
+      this.logger.warn(
+        `publish of ${proposalId} (source=${sourceId}) failed transiently, retrying in ${delay}ms: ${String(err)}`,
+      );
+      if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      await this.publishWithRetry(sourceId, proposalId, payload, attempt + 1);
     }
   }
 
