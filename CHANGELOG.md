@@ -11,6 +11,17 @@
   (409); inputs validated against the kernel limits; a note/evidence holding a
   live handle's value is refused. `withSecretEnv` gained an optional `ack` hook
   so the exec bridge can ack `used`/`failed` automatically once wired.
+- **Loop lifecycle events to the kernel loops rail (#46).** Signed
+  `loop.started|progress|blocked|finished` events (`POST /api/loops`,
+  `imajin-ai#2295`) for visible primary sessions (`openclaw.session`), subagents
+  (`openclaw.subagent`), cron runs (`openclaw.automation`) and keepers
+  (`openclaw.keeper`), with `parentLoopId` lineage and a `cron_reconciled`
+  backstop for runs orphaned by a gateway restart. Lifecycle metadata only (no
+  transcript content), observe hooks only, failures logged and dropped. On by
+  default when `nodeUrl` + `did` + `keypairPath` are set; `loops.enabled: false`
+  opts out; `loops.keeperJobs` classifies keepers. Typed in-session events and
+  `refs.sessionId` need a kernel change: `imajin-ai#2552`. See README "Loop
+  lifecycle events".
 
 ### Fixed
 - **Skill Workshop proposals never reached /jin (#33).** `skills.proposals.list`
