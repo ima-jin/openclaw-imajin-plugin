@@ -517,6 +517,27 @@ function isRetryablePublishError(err: unknown): boolean {
   return err.status >= 500 || err.status === 408 || err.status === 429;
 }
 
+type FailClosedOutcome = "denied" | "already-resolved" | "deny-failed";
+
+/** Operator-facing wording for a fail-closed attempt (#52); never includes the command text. */
+function describeFailClosedOutcome(
+  sourceId: string,
+  proposalId: string,
+  outcome: FailClosedOutcome,
+  reason: string,
+): string {
+  const prefix = `[imajin-approvals-bridge] ${sourceId} approval ${proposalId}`;
+  const cause = `its /jin card could not be published: ${reason}.`;
+  switch (outcome) {
+    case "denied":
+      return `${prefix} was DENIED because ${cause} The blocked caller received a refusal instead of timing out; re-run it once the bridge is healthy.`;
+    case "already-resolved":
+      return `${prefix} was already resolved elsewhere (not denied by the bridge) when ${cause} The blocked caller got whatever that other decision was.`;
+    case "deny-failed":
+      return `${prefix} was left pending because ${cause} The deny failed, so the blocked caller will time out.`;
+  }
+}
+
 interface TrackedProposal {
   sourceId: string;
   kind: string;
@@ -813,31 +834,31 @@ export class GatewayApprovalsBridge {
    * Instead the item is resolved with `reject` (a clean refusal), the ERROR
    * log and the operator notice name the proposal id and the reason, and the
    * exact command text is never included (it is shown on the card only).
-   * Never throws.
+   * The deny is awaited, but the operator notify is fire-and-forget: a slow
+   * notify CLI must never hold the publish reservation. Never throws.
    */
   private async failClosedIfBlocking(sourceId: string, request: ApprovalSourceRequest, reason: string): Promise<void> {
     const source = this.sources.get(sourceId);
     if (!source?.failClosedOnPublishError) return;
     const proposalId = request.proposalId;
-    let denied = false;
+    let outcome: FailClosedOutcome;
     try {
-      await source.resolve(proposalId, "reject", request.sourceRevision);
-      denied = true;
+      // `applied: false` means the Gateway approval was already settled (e.g.
+      // the operator approved it on another surface) — the deny did NOT take effect.
+      const { applied } = await source.resolve(proposalId, "reject", request.sourceRevision);
+      outcome = applied ? "denied" : "already-resolved";
     } catch (err) {
+      outcome = "deny-failed";
       this.logger.error(
         `could not deny ${sourceId} approval ${proposalId} after its /jin card failed to publish: ${String(err)}`,
       );
     }
-    const text =
-      `[imajin-approvals-bridge] ${sourceId} approval ${proposalId} was ${denied ? "DENIED" : "left pending"} because its /jin card could not be published: ${reason}. ` +
-      (denied ? "The blocked caller received a refusal instead of timing out; re-run it once the bridge is healthy." : "The blocked caller will time out.");
+    const text = describeFailClosedOutcome(sourceId, proposalId, outcome, reason);
     this.logger.error(text);
     if (!this.notifyOperator) return;
-    try {
-      await this.notifyOperator(text);
-    } catch (err) {
+    void this.notifyOperator(text).catch((err: unknown) => {
       this.logger.error(`failed to notify the operator about the unpublished ${sourceId} approval ${proposalId}: ${String(err)}`);
-    }
+    });
   }
 
   /**

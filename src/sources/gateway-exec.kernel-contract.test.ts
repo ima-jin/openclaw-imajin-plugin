@@ -179,6 +179,75 @@ describe("a gateway-exec card that cannot be published fails loud, not silent (#
     expect(notify.mock.calls[0][0]).not.toContain("secret-command-text");
   });
 
+  const FAILING_RECORD: GatewayExecApprovalRecord = {
+    id: "approval-fail",
+    request: { command: "rm -rf /secret-command-text", host: "gateway", cwd: "/tmp", agentId: "main", sessionKey: "s" },
+    createdAtMs: Date.now(),
+    expiresAtMs: Date.now() + 60_000,
+  };
+  const rejectPublish = async () => {
+    throw new KernelNotifyError(400, "kernel notify operator.approval.requested failed (400): detail.cwd is required");
+  };
+
+  it("does NOT report DENIED when the deny did not take effect (already resolved elsewhere, applied: false)", async () => {
+    const { client, emit, logger, notify } = setup({ publish: rejectPublish });
+    vi.mocked(client.resolve).mockResolvedValue({ applied: false });
+    emit(FAILING_RECORD);
+
+    await vi.waitFor(() => expect(client.resolve).toHaveBeenCalledWith("approval-fail", "deny"));
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    const errors = logger.error.mock.calls.map((c) => String(c[0])).join("\n");
+    for (const text of [errors, String(notify.mock.calls[0][0])]) {
+      expect(text).toMatch(/already resolved elsewhere/);
+      expect(text).toMatch(/not denied by the bridge/);
+      expect(text).not.toMatch(/DENIED/);
+      expect(text).not.toContain("refusal");
+      expect(text).not.toContain("secret-command-text");
+    }
+  });
+
+  it("reports the deny as failed and left pending when resolve throws", async () => {
+    const { client, emit, logger, notify } = setup({ publish: rejectPublish });
+    vi.mocked(client.resolve).mockRejectedValue(new Error("gateway down"));
+    emit(FAILING_RECORD);
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    const text = String(notify.mock.calls[0][0]);
+    expect(text).toMatch(/left pending/);
+    expect(text).toMatch(/deny failed/);
+    expect(text).not.toMatch(/DENIED/);
+    expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toMatch(/could not deny/);
+  });
+
+  it("does not hold the publish reservation on a slow operator notify", async () => {
+    const { bridge, client, emit, notify } = setup({
+      publish: rejectPublish,
+      notify: () => new Promise<void>(() => {}), // never settles
+    });
+    emit(FAILING_RECORD);
+
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    // A second event for the same proposal must not be parked behind the hung notify:
+    // the reservation is released, so it is handled (and denied) for real.
+    emit(FAILING_RECORD);
+    await vi.waitFor(() => expect(client.resolve).toHaveBeenCalledTimes(2));
+    expect(bridge.isPublished("approval-fail")).toBe(false);
+  });
+
+  it("logs (does not throw) when the operator notify itself fails", async () => {
+    const { emit, logger, notify } = setup({
+      publish: rejectPublish,
+      notify: async () => {
+        throw new Error("notify cli exploded");
+      },
+    });
+    emit(FAILING_RECORD);
+    await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() =>
+      expect(logger.error.mock.calls.map((c) => String(c[0])).join("\n")).toMatch(/failed to notify the operator/),
+    );
+  });
+
   it("retries a transient (5xx / network) publish failure, then publishes with no deny", async () => {
     let calls = 0;
     const { client, emit, kernel } = setup({
