@@ -18,6 +18,7 @@ import {
   fetchImajinProxyHealthz,
   type ImajinCatalogCache,
 } from "./imajin-provider.js";
+import { buildMcpStatusBlock, probeKernelMcp, type McpProbeResult } from "./kernel-mcp.js";
 import { ackGrant, fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
 import { containsLiveSecret, createSecretHandle } from "./vault/secret-handle-store.js";
 
@@ -1314,6 +1315,16 @@ export function createImajinStatusTool(deps: {
   baseUrl: string;
   cache: ImajinCatalogCache;
   discovery?: { modelsUrl: string; refreshIntervalMs: number };
+  /**
+   * Local passthrough `/mcp` URL (#50). When set, status adds an `mcp` block:
+   * reachability, tool count, registration check, send/write allowlist
+   * guidance. Omitted = no `mcp` block (behaviour unchanged).
+   */
+  mcpUrl?: string;
+  /** Live OpenClaw config reader, for the read-only `mcp.servers` registration check. */
+  getConfig?: () => unknown;
+  /** Probe override (tests). */
+  probeMcp?: (url: string) => Promise<McpProbeResult>;
 }) {
   return {
     name: "imajin_status",
@@ -1321,8 +1332,10 @@ export function createImajinStatusTool(deps: {
     description:
       "Report the imajin OpenClaw model provider's current status (#36): the discovered " +
       "imajin/* catalog, the last discovery result and timestamp (outcome ok | empty | unreachable | " +
-      "route-error | auth-error | malformed | unconfigured), and a fresh probe of the " +
-      "kernel inference proxy's GET /healthz.",
+      "route-error | auth-error | malformed | unconfigured), a fresh probe of the " +
+      "kernel inference proxy's GET /healthz, and (#50) the kernel MCP passthrough: " +
+      "reachability, tool count, whether the `imajin` MCP server is registered, and which " +
+      "google_* send/write tools need an explicit operator enable.",
     parameters: {
       type: "object" as const,
       properties: {},
@@ -1338,7 +1351,20 @@ export function createImajinStatusTool(deps: {
         healthz,
         discovery: deps.discovery,
       });
-      return jsonResult(snapshot);
+      if (!deps.mcpUrl) return jsonResult(snapshot);
+      // Never throws: probeKernelMcp reports failures in its result, and a
+      // throwing config reader only downgrades the registration check.
+      const probe = await (deps.probeMcp ?? probeKernelMcp)(deps.mcpUrl);
+      let config: unknown;
+      try {
+        config = deps.getConfig?.();
+      } catch {
+        config = undefined;
+      }
+      return jsonResult({
+        ...snapshot,
+        mcp: buildMcpStatusBlock({ mcpUrl: deps.mcpUrl, probe, config }),
+      });
     },
   };
 }

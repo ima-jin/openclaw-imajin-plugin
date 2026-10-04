@@ -526,4 +526,70 @@ describe("imajin_status tool (#55)", () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
     expect(body.lastDiscovery).toMatchObject({ outcome: "route-error", httpStatus: 404, modelCount: 0 });
   });
+
+  describe("mcp block (#50)", () => {
+    const mcpUrl = "http://127.0.0.1:8787/mcp";
+    const okProbe = {
+      url: mcpUrl,
+      outcome: "ok" as const,
+      ok: true,
+      toolCount: 3,
+      tools: ["google_gmail_get_message", "google_gmail_send", "media_list"],
+    };
+    const makeCache = () =>
+      new ImajinCatalogCache(vi.fn().mockResolvedValue({ data: [] }), 60_000, Date.now, quiet);
+
+    it("omits the mcp block when no mcpUrl is wired (unchanged behaviour)", async () => {
+      const tool = createImajinStatusTool({ baseUrl: "http://127.0.0.1:8787/openai/v1", cache: makeCache() });
+      const body = JSON.parse((await tool.execute()).content[0].text);
+      expect(body.mcp).toBeUndefined();
+    });
+
+    it("reports MCP reachability + tool count alongside the model catalog", async () => {
+      const probeMcp = vi.fn().mockResolvedValue(okProbe);
+      const tool = createImajinStatusTool({
+        baseUrl: "http://127.0.0.1:8787/openai/v1",
+        cache: makeCache(),
+        mcpUrl,
+        probeMcp,
+        getConfig: () => ({ mcp: { servers: { imajin: { url: mcpUrl, transport: "streamable-http" } } } }),
+      });
+      const body = JSON.parse((await tool.execute()).content[0].text);
+      expect(probeMcp).toHaveBeenCalledWith(mcpUrl);
+      expect(body.lastDiscovery).toBeDefined();
+      expect(body.mcp).toMatchObject({
+        url: mcpUrl,
+        reachable: true,
+        toolCount: 3,
+        googleToolCount: 2,
+        registration: { registered: true, name: "imajin" },
+        allowlist: { gatedToolsExposed: ["google_gmail_send"] },
+      });
+    });
+
+    it("survives an unreadable config and a failed probe", async () => {
+      const tool = createImajinStatusTool({
+        baseUrl: "http://127.0.0.1:8787/openai/v1",
+        cache: makeCache(),
+        mcpUrl,
+        probeMcp: vi.fn().mockResolvedValue({
+          url: mcpUrl,
+          outcome: "unreachable",
+          ok: false,
+          error: "ECONNREFUSED",
+          toolCount: 0,
+          tools: [],
+        }),
+        getConfig: () => {
+          throw new Error("no config");
+        },
+      });
+      const body = JSON.parse((await tool.execute()).content[0].text);
+      expect(body.mcp).toMatchObject({
+        reachable: false,
+        outcome: "unreachable",
+        registration: { registered: null },
+      });
+    });
+  });
 });

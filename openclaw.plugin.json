@@ -64,6 +64,11 @@
       "help": "Base URL of the local kernel inference proxy the `imajin` OpenClaw model provider discovers its catalog from (#36). Default http://127.0.0.1:8787/openai/v1. Effective models endpoint is `<this>/models`; healthz is probed at the proxy root.",
       "placeholder": "http://127.0.0.1:8787/openai/v1"
     },
+    "mcpUrl": {
+      "label": "Kernel MCP Passthrough URL",
+      "help": "Local passthrough `/mcp` endpoint that fronts the kernel's MCP tools (google_*, calendar, drive; #50). Default: the inference proxy root + /mcp (http://127.0.0.1:8787/mcp). imajin_status probes it and checks that an `mcp.servers` entry points at it (streamable-http, NO headers \u2014 the proxy mints the app token). Register it (send/write tools excluded by default; to enable one, remove its glob or name from --exclude) with: openclaw mcp add imajin --url http://127.0.0.1:8787/mcp --transport streamable-http --exclude 'google_*_send*,google_*_create*,google_*_update*,google_*_delete*,google_*_trash*,google_*_untrash*,google_*_modify*,google_*_move*,google_*_copy*,google_*_share*,google_*_insert*,google_*_patch*,google_*_draft*,google_*_reply*,google_*_forward*,google_*_archive*,google_*_label*,google_*_upload*,google_*_import*,google_*_append*,google_*_set*,google_*_add*,google_*_remove*,google_*_cancel*,google_*_accept*,google_*_decline*,google_*_watch*,google_*_stop*,google_*_write*'",
+      "placeholder": "http://127.0.0.1:8787/mcp"
+    },
     "modelDiscovery.refreshIntervalMs": {
       "label": "Imajin Model Provider: Discovery Refresh Interval (ms)",
       "help": "How often the plugin re-runs model discovery against the kernel's GET /infer/v1/models/usable (#55), in addition to the run at plugin start and the WS-driven refresh. Default 300000 (5 min); values below 10000 are raised to 10000; 0 disables the periodic refresh (start-up discovery still runs).",
@@ -149,6 +154,10 @@
       "inferProxyBaseUrl": {
         "type": "string",
         "description": "Base URL of the local kernel inference proxy the imajin OpenClaw model provider discovers its catalog from (#36). Defaults to http://127.0.0.1:8787/openai/v1. The effective model-list endpoint is `<this>/models` (OpenAI list shape, ima-jin/imajin-ai#2201); `GET /healthz` is probed at the proxy root."
+      },
+      "mcpUrl": {
+        "type": "string",
+        "description": "Local passthrough /mcp endpoint for the kernel's MCP tools (#50). Defaults to the inferProxyBaseUrl root + /mcp. Used only by imajin_status (probe + registration check); the plugin never sends credentials to it."
       },
       "modelDiscovery": {
         "type": "object",
