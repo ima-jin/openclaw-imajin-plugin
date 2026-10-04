@@ -145,6 +145,15 @@ export interface ApprovalSource {
     expectedSourceRevision: string,
   ): Promise<{ applied: boolean }>;
 
+  /**
+   * Called by the bridge when publishing this proposal to the kernel failed
+   * (signing or POST). A source that remembers what it already reported
+   * (e.g. Skill Workshop's poll) forgets it here so its next poll re-emits
+   * the proposal and the bridge retries — otherwise a transient kernel
+   * outage would leave a pending item unpublished until restart.
+   */
+  onPublishFailed?(proposalId: string): void;
+
   /** Button labels for the /jin card. Omit for the default (Approve/Deny). */
   readonly decisionLabels?: { approve: string; reject: string };
 
