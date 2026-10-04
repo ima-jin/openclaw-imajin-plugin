@@ -66,7 +66,7 @@
     },
     "mcpUrl": {
       "label": "Kernel MCP Passthrough URL",
-      "help": "Local passthrough `/mcp` endpoint that fronts the kernel's MCP tools (google_*, calendar, drive; #50). Default: the inference proxy root + /mcp (http://127.0.0.1:8787/mcp). imajin_status probes it and checks that an `mcp.servers` entry points at it (streamable-http, NO headers \u2014 the proxy mints the app token). Register it with: openclaw mcp add imajin --url http://127.0.0.1:8787/mcp --transport streamable-http",
+      "help": "Local passthrough `/mcp` endpoint that fronts the kernel's MCP tools (google_*, calendar, drive; #50). Default: the inference proxy root + /mcp (http://127.0.0.1:8787/mcp). imajin_status probes it and checks that an `mcp.servers` entry points at it (streamable-http, NO headers \u2014 the proxy mints the app token). Register it (send/write tools excluded by default; to enable one, remove its glob or name from --exclude) with: openclaw mcp add imajin --url http://127.0.0.1:8787/mcp --transport streamable-http --exclude 'google_*_send*,google_*_create*,google_*_update*,google_*_delete*,google_*_trash*,google_*_untrash*,google_*_modify*,google_*_move*,google_*_copy*,google_*_share*,google_*_insert*,google_*_patch*,google_*_draft*,google_*_reply*,google_*_forward*,google_*_archive*,google_*_label*,google_*_upload*,google_*_import*,google_*_append*,google_*_set*,google_*_add*,google_*_remove*,google_*_cancel*,google_*_accept*,google_*_decline*,google_*_watch*,google_*_stop*,google_*_write*'",
       "placeholder": "http://127.0.0.1:8787/mcp"
     },
     "modelDiscovery.refreshIntervalMs": {

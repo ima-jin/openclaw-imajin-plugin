@@ -2,6 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import {
   buildMcpAllowlistGuidance,
   buildMcpStatusBlock,
+  GATED_TOOL_EXCLUDE_GLOBS,
+  buildMcpAddCommand,
   classifyGoogleMcpTool,
   inspectMcpRegistration,
   probeKernelMcp,
@@ -103,6 +105,29 @@ describe("classifyGoogleMcpTool", () => {
     expect(classifyGoogleMcpTool("google_gmail_get_and_delete")).toBe("gated");
     expect(classifyGoogleMcpTool("google_gmail")).toBe("gated");
     expect(classifyGoogleMcpTool("media_list")).toBeUndefined();
+  });
+});
+
+describe("GATED_TOOL_EXCLUDE_GLOBS", () => {
+  const exclude = { exclude: [...GATED_TOOL_EXCLUDE_GLOBS] };
+
+  it("denies every fixture tool gated by a write verb and passes every read tool", () => {
+    const gated = KERNEL_GOOGLE_TOOLS.filter((n) => classifyGoogleMcpTool(n) === "gated");
+    expect(gated.length).toBeGreaterThan(0);
+    for (const name of gated) expect(toolPassesFilter(name, exclude)).toBe(false);
+    const reads = KERNEL_GOOGLE_TOOLS.filter((n) => classifyGoogleMcpTool(n) === "read");
+    expect(reads.length).toBeGreaterThan(0);
+    for (const name of reads) expect(toolPassesFilter(name, exclude)).toBe(true);
+  });
+
+  it("covers send/create/watch and renders into the --exclude one-liner", () => {
+    expect(GATED_TOOL_EXCLUDE_GLOBS).toEqual(
+      expect.arrayContaining(["google_*_send*", "google_*_create*", "google_*_watch*"]),
+    );
+    expect(buildMcpAddCommand(URL_)).toBe(
+      `openclaw mcp add imajin --url ${URL_} --transport streamable-http ` +
+        `--exclude '${GATED_TOOL_EXCLUDE_GLOBS.join(",")}'`,
+    );
   });
 });
 
@@ -331,12 +356,36 @@ describe("buildMcpStatusBlock", () => {
   it("explains how to register when no entry exists, and when config is unreadable", () => {
     const missing = buildMcpStatusBlock({ mcpUrl: URL_, probe: okProbe, config: {} });
     expect(missing.registration.registered).toBe(false);
-    expect(missing.warnings.join(" ")).toContain(
-      `openclaw mcp add imajin --url ${URL_} --transport streamable-http`,
-    );
+    const warning = missing.warnings.join(" ");
+    expect(warning).toContain(`openclaw mcp add imajin --url ${URL_} --transport streamable-http`);
+    expect(warning).toContain("--exclude");
+    for (const glob of GATED_TOOL_EXCLUDE_GLOBS) expect(warning).toContain(glob);
+    expect(warning).toContain(buildMcpAddCommand(URL_));
     const unknown = buildMcpStatusBlock({ mcpUrl: URL_, probe: okProbe });
     expect(unknown.registration.registered).toBeNull();
     expect(unknown.allowlist.gatedToolsExposed).toEqual([]);
+  });
+
+  it("yields no exposed gated tools when the registration excludes the gated globs", () => {
+    const block = buildMcpStatusBlock({
+      mcpUrl: URL_,
+      probe: okProbe,
+      config: {
+        mcp: {
+          servers: {
+            imajin: { url: URL_, toolFilter: { exclude: [...GATED_TOOL_EXCLUDE_GLOBS] } },
+          },
+        },
+      },
+    });
+    expect(block.registration).toMatchObject({ registered: true });
+    expect(block.allowlist.gatedTools).toEqual([
+      "google_gmail_send",
+      "google_gmail_watch",
+      "google_calendar_create_event",
+    ]);
+    expect(block.allowlist.gatedToolsExposed).toEqual([]);
+    expect(block.warnings).toEqual([]);
   });
 
   it("carries probe failures through", () => {

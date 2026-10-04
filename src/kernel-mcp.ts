@@ -87,6 +87,26 @@ const WRITE_VERBS = new Set([
 ]);
 
 /**
+ * Registration-time default-deny for send/write tools: `*`-globs derived from
+ * `WRITE_VERBS`, for `openclaw mcp add --exclude` (the plugin never writes
+ * config). Enabling a gated tool means removing its glob or name from
+ * `exclude`. Globs cannot deny unrecognised verbs — `suggestedToolFilter`
+ * (exact-name include list) is the stricter follow-up.
+ */
+export const GATED_TOOL_EXCLUDE_GLOBS: readonly string[] = [...WRITE_VERBS].map(
+  (verb) => `google_*_${verb}*`,
+);
+
+/** The documented registration one-liner, gated at registration time. */
+export function buildMcpAddCommand(mcpUrl: string): string {
+  const globs = GATED_TOOL_EXCLUDE_GLOBS.join(",");
+  return (
+    `openclaw mcp add ${IMAJIN_MCP_SERVER_NAME} --url ${mcpUrl} ` +
+    `--transport streamable-http --exclude '${globs}'`
+  );
+}
+
+/**
  * `google_*` tools only. Default-deny: a write verb anywhere in the name, or a
  * name with no recognised read verb, is `gated` (needs explicit operator
  * enable). Returns `undefined` for non-google tools — they are not covered by
@@ -509,8 +529,8 @@ export function buildMcpStatusBlock(params: {
   const warnings: string[] = [];
   if (registration.registered === false) {
     warnings.push(
-      `no mcp.servers entry points at ${mcpUrl} — register it: ` +
-        `openclaw mcp add ${IMAJIN_MCP_SERVER_NAME} --url ${mcpUrl} --transport streamable-http`,
+      `no mcp.servers entry points at ${mcpUrl} — register it (send/write tools excluded by default; ` +
+        `to enable one, remove its glob or name from --exclude): ${buildMcpAddCommand(mcpUrl)}`,
     );
   }
   if (registration.registered === true) warnings.push(...registration.warnings);

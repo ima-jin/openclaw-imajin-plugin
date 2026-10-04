@@ -217,15 +217,22 @@ lives in `openclaw.json` and none passes through this plugin.** The kernel never
 calls into the gateway — OpenClaw's own MCP client calls the passthrough, the
 passthrough calls the kernel.
 
-**Operator step — register the server (one line, no headers):**
+**Operator step — register the server (one line, no headers, send/write tools
+excluded from the start):**
 
 ```bash
-openclaw mcp add imajin --url http://127.0.0.1:8787/mcp --transport streamable-http
+openclaw mcp add imajin --url http://127.0.0.1:8787/mcp --transport streamable-http --exclude 'google_*_send*,google_*_create*,google_*_update*,google_*_delete*,google_*_trash*,google_*_untrash*,google_*_modify*,google_*_move*,google_*_copy*,google_*_share*,google_*_insert*,google_*_patch*,google_*_draft*,google_*_reply*,google_*_forward*,google_*_archive*,google_*_label*,google_*_upload*,google_*_import*,google_*_append*,google_*_set*,google_*_add*,google_*_remove*,google_*_cancel*,google_*_accept*,google_*_decline*,google_*_watch*,google_*_stop*,google_*_write*'
 openclaw mcp doctor imajin --probe
 ```
 
-Equivalent config: `mcp.servers.imajin = { url: "http://127.0.0.1:8787/mcp",
-transport: "streamable-http" }`. The plugin does not write Gateway config (same
+The `--exclude` globs (`GATED_TOOL_EXCLUDE_GLOBS` in `src/kernel-mcp.ts`, derived
+from the write verbs the plugin gates) make send/write tools opt-in at
+registration time: `google_gmail_send`, `google_calendar_create_event` and
+`google_gmail_watch` never reach the agent until you enable them. **To enable a
+send tool, remove its glob or exact name from `exclude`** (e.g. drop
+`google_*_send*`). Equivalent config: `mcp.servers.imajin = { url:
+"http://127.0.0.1:8787/mcp", transport: "streamable-http", toolFilter: { exclude:
+[ … the globs above … ] } }`. The plugin does not write Gateway config (same
 posture as the model allow-list above); it only reads it, so `imajin_status` can
 tell you when the entry is missing. The passthrough also needs an `mcp` route
 in its `INFER_PROXY_ROUTES_CONFIG` (see its README); without one `/mcp` answers
@@ -259,9 +266,13 @@ mcp: { servers: { imajin: {
 } } }
 ```
 
-Without a `toolFilter` every tool the kernel lists is exposed, and status warns
-(`allowlist.gatedToolsExposed`). To enable a send tool deliberately, add its
-name to `include`. Re-run `imajin_status` after the kernel ships new tools: an
+Keep this as the stricter, exact-name follow-up to the `--exclude` registration:
+the exclude globs only match recognised write verbs and cannot deny an
+unrecognised new one, whereas the `include` list denies everything it does not
+name. Without any `toolFilter` (e.g. an entry registered without `--exclude`)
+every tool the kernel lists is exposed, and status warns
+(`allowlist.gatedToolsExposed`). To enable a send tool deliberately, remove its
+glob or name from `exclude` (or add its name to `include`). Re-run `imajin_status` after the kernel ships new tools: an
 exact-name allowlist never auto-enables them.
 
 **Two agent identities today** (flagged for unification, out of scope here):
