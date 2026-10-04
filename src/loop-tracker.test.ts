@@ -107,6 +107,36 @@ describe("openclaw.session", () => {
     tracker.onSessionStart({ sessionId: "s", sessionKey: MAIN });
     expect(events).toHaveLength(1);
   });
+
+  it("a new sessionId on the same sessionKey supersedes the previous open loop", () => {
+    const { tracker, events } = setup();
+    tracker.onSessionStart({ sessionId: "s1", sessionKey: MAIN });
+    tracker.onSessionStart({ sessionId: "s2", sessionKey: MAIN });
+
+    expect(tracker.openCount()).toBe(1);
+    expect(events.map((e) => `${e.type}|${e.state}|${e.loopId}`)).toEqual([
+      `loop.started|running|${sessionId("s1")}`,
+      `loop.finished|interrupted|${sessionId("s1")}`,
+      `loop.started|running|${sessionId("s2")}`,
+    ]);
+    expect(events[1]!.summary).toBe("session superseded");
+
+    // The key now maps to s2: turn progress and session_end follow it.
+    tracker.onAgentEnd({ success: true }, { sessionKey: MAIN });
+    expect(events.at(-1)!.loopId).toBe(sessionId("s2"));
+    tracker.onSessionEnd({ sessionId: "s2", sessionKey: MAIN, reason: "idle" });
+    expect(tracker.openCount()).toBe(0);
+  });
+
+  it("a late session_end for a superseded session does not close the newer one", () => {
+    const { tracker, events } = setup();
+    tracker.onSessionStart({ sessionId: "s1", sessionKey: MAIN });
+    tracker.onSessionStart({ sessionId: "s2", sessionKey: MAIN });
+    tracker.onSessionEnd({ sessionId: "s1", sessionKey: MAIN, reason: "reset" });
+
+    expect(tracker.openCount()).toBe(1);
+    expect(events.at(-1)!.loopId).toBe(sessionId("s1"));
+  });
 });
 
 describe("openclaw.subagent", () => {
@@ -195,6 +225,40 @@ describe("openclaw.subagent", () => {
       tracker.onSubagentSpawned({ childSessionKey: CHILD }, { requesterSessionKey: MAIN });
       tracker.onSessionEnd({ sessionKey: MAIN, reason: "idle" });
       expect(events.at(-1)!.loopId).toBe(events[0]!.loopId);
+    });
+
+    it("a lazily started parent finishes when session_end carries a sessionId", () => {
+      const { tracker, events } = setup();
+      const MAIN_KEY = "agent:main:main";
+      tracker.onSubagentSpawned({ childSessionKey: CHILD }, { requesterSessionKey: MAIN_KEY });
+      tracker.onSubagentEnded({ targetSessionKey: CHILD, outcome: "ok" });
+      expect(tracker.openCount()).toBe(1);
+
+      tracker.onSessionEnd({ sessionKey: MAIN_KEY, sessionId: "sess-1", reason: "idle" });
+
+      expect(tracker.openCount()).toBe(0);
+      const lazy = events[0]!;
+      expect(lazy.kind).toBe("openclaw.session");
+      const finished = events.at(-1)!;
+      expect(finished.type).toBe("loop.finished");
+      expect(finished.loopId).toBe(lazy.loopId);
+      expect(finished.loopId).not.toBe(sessionId("sess-1"));
+      // No second, never-started session loop id appears on the wire.
+      const sessionIds = new Set(
+        events.filter((e) => e.kind === "openclaw.session").map((e) => e.loopId),
+      );
+      expect(sessionIds.size).toBe(1);
+    });
+
+    it("a session_start with a sessionId after a lazy parent does not leave the lazy loop open", () => {
+      const { tracker, events } = setup();
+      tracker.onSubagentSpawned({ childSessionKey: CHILD }, { requesterSessionKey: MAIN });
+      tracker.onSessionStart({ sessionId: "sess-1", sessionKey: MAIN });
+      tracker.onSessionEnd({ sessionId: "sess-1", sessionKey: MAIN, reason: "idle" });
+      // Only the subagent loop remains open.
+      expect(tracker.openCount()).toBe(1);
+      const lazy = events[0]!;
+      expect(events.some((e) => e.type === "loop.finished" && e.loopId === lazy.loopId)).toBe(true);
     });
 
     it("no requester, or an unknown non-primary requester → root loop", () => {

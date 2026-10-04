@@ -402,23 +402,46 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     },
   );
 
+  /** The open loop a session key currently maps to (lazy or started), if any. */
+  const openLoopForKey = (key: string | undefined): OpenLoop | undefined => {
+    const loopId = key ? bySessionKey.get(key) : undefined;
+    return loopId ? open.get(loopId) : undefined;
+  };
+
   const onSessionStart = guard("session_start", (event: SessionStartEvent): void => {
     const key = str(event?.sessionKey);
     const id = str(event?.sessionId);
     if (key && !isPrimarySessionKey(key)) return;
     if (!key && !id) return;
     const loop = sessionLoop(key, id);
-    if (open.has(loop.loopId)) return;
+    const current = openLoopForKey(key);
+    if (current?.loopId === loop.loopId || open.has(loop.loopId)) return;
+    // A new session id on a key that still has an open loop: the previous
+    // session's end was never seen, so close it rather than orphan it.
+    if (current) finish(current, "interrupted", "session superseded");
     start(loop, "session started");
   });
+
+  /**
+   * The loop a session_end closes. A lazily started parent loop is keyed by
+   * sessionKey, not by the sessionId the event carries, so resolve through the
+   * session key. A mapped loop for a *different* sessionId is a newer session:
+   * a late session_end for the superseded one must not close it.
+   */
+  const loopToEnd = (key: string | undefined, id: string | undefined): OpenLoop => {
+    const fresh = sessionLoop(key, id);
+    const mapped = openLoopForKey(key);
+    const lazyId = sessionLoop(key, undefined).loopId;
+    if (mapped && (!id || mapped.loopId === lazyId || mapped.loopId === fresh.loopId)) return mapped;
+    return open.get(fresh.loopId) ?? fresh;
+  };
 
   const onSessionEnd = guard("session_end", (event: SessionEndEvent): void => {
     const key = str(event?.sessionKey);
     const id = str(event?.sessionId);
     if (key && !isPrimarySessionKey(key)) return;
     if (!key && !id) return;
-    const fresh = sessionLoop(key, id);
-    const loop = open.get(fresh.loopId) ?? fresh;
+    const loop = loopToEnd(key, id);
     const reason = str(event.reason) ?? "unknown";
     const state = SESSION_END_STATE[reason] ?? "succeeded";
     const duration = typeof event.durationMs === "number" ? `, ${event.durationMs}ms` : "";
@@ -428,9 +451,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
   const onAgentEnd = guard(
     "agent_end",
     (event: AgentEndLoopEvent, ctx?: { sessionKey?: string }): void => {
-      const key = str(ctx?.sessionKey);
-      const loopId = key ? bySessionKey.get(key) : undefined;
-      const loop = loopId ? open.get(loopId) : undefined;
+      const loop = openLoopForKey(str(ctx?.sessionKey));
       if (!loop) return;
       const outcome = event?.success === false ? "error" : "ok";
       const duration = typeof event?.durationMs === "number" ? `, ${event.durationMs}ms` : "";
