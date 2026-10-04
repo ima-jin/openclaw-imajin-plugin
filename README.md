@@ -1021,6 +1021,78 @@ plugin implements its half of that contract:
   (in-memory-only dedup/coalesce, no cross-restart durability) if `keypairPath`
   and `stateDir` are both unset.
 
+### Loop lifecycle events (#46)
+
+The plugin publishes signed `loop.started | loop.progress | loop.blocked |
+loop.finished` events to the kernel's loops rail (`POST /api/loops`,
+`ima-jin/imajin-ai#2295`), so the operator console's Runs lane can answer "what is
+running" without the kernel ever calling into the Gateway. The kernel's knowledge
+of a loop is these events only: ids, kind, state and a short redacted summary.
+**No transcript content is published** (assistant text, tool args/results).
+
+On by default once `nodeUrl`, `did` and `keypairPath` are configured; opt out
+with `loops.enabled: false`. Observe hooks only: a failed publish is logged
+(rate-limited, never with the payload) and dropped, never retried, and can
+never block or fail the session / subagent / cron run it describes.
+
+| Kind | started | progress | finished |
+| --- | --- | --- | --- |
+| `openclaw.session` (visible primary sessions) | `session_start` | `agent_end` (per turn) | `session_end` (`reason` → state) |
+| `openclaw.subagent` | `subagent_spawned` | `subagent_progress` | `subagent_ended` (`outcome` → state) |
+| `openclaw.automation` (cron) | `cron_changed` `started` | — | `cron_changed` `finished` / `removed` |
+| `openclaw.keeper` (cron, classified) | same as automation | — | same as automation |
+
+`loop.blocked` (and the return to running) is supported on every kind by
+`tracker.block({ sessionKey | jobId }, reason)` / `unblock(...)` in
+`src/loop-tracker.ts`; nothing calls it automatically yet (see below).
+
+- **Ids.** `loopId = <kind>:<sha256(agent DID, kind, session id | session key |
+  job id + run start)[0..32]>`: deterministic, but the OpenClaw key never *is* the
+  id. `refs.sessionKey` / `refs.runId` carry the OpenClaw ids (the kernel rejects
+  any other ref key, so `sessionId` is only used to derive the id).
+- **Lineage.** A subagent's `parentLoopId` is the loop of the session that spawned
+  it (`ctx.requesterSessionKey`): the operator's session, another subagent, or a
+  cron run. A requester session the plugin never saw start is started lazily so
+  the parent always exists.
+- **Keepers.** A keeper is a cron job listed in `loops.keeperJobs` (job id, name
+  or declarationKey) or named `keeper`, `keeper:*`, `keeper-*`, `keeper_*`,
+  `keeper/*`. Everything else scheduled is an automation.
+- **Restart backstop.** `cron_reconciled` (startup/reload) closes cron loops
+  that never saw a `finished`: runs the persisted snapshot still marks running
+  are finished as `interrupted`; in-flight loops whose job vanished are
+  `cancelled`. Session loops are closed by `session_end` (`shutdown` / `restart`
+  → `interrupted`). A crashed *subagent* has no backstop hook.
+- **Signing.** Ed25519 by the agent DID over `canonicalize({ type, payload })`,
+  exactly as `imajin-ai#2295` verifies; `keyId` is derived from the private key.
+
+```json
+{
+  "plugins": {
+    "entries": {
+      "imajin": {
+        "config": {
+          "actAs": "did:imajin:<operator>",
+          "loops": { "keeperJobs": ["inbox-keeper"] }
+        }
+      }
+    }
+  }
+}
+```
+
+**Operator step.** Loops belong to `actAs` when set (the operator, so the Runs
+lane shows them), else to the agent DID. The kernel only accepts a publisher DID
+that *is* the principal or holds an active `loops:publish` delegation grant from
+it (`imajin-ai#2358`): when `actAs` is set, grant the agent DID `loops:publish`
+from that principal, otherwise every publish is rejected with 403 (logged once a
+minute as `publish dropped ... HTTP 403`).
+
+**Not published (kernel gap).** Typed in-session events (assistant text,
+tool calls with args/results, approvals, model changes) and `refs.sessionId` have
+no place on the current rail contract; tracked in `ima-jin/imajin-ai#2552`.
+Automatic `loop.blocked` from exec/proposal approvals is a follow-up: it needs a
+hook in `gateway-approvals-bridge.ts`, which is deliberately untouched here.
+
 ## Development
 Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` / `src/gateway-approvals-bridge.ts` (dynamic — only on the SecretRef paths, #20, and the live Gateway/kernel wiring in `gateway-approvals-bridge.ts`'s `createLiveGatewayApprovalsClient`, #24) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
 

@@ -57,6 +57,7 @@ import {
   type ImajinModelDiscoveryConfig,
 } from "./src/imajin-provider.js";
 import { isImajinModelAllowedByPolicy } from "./src/sources/imajin-catalog.js";
+import { registerLoopLifecycle, type LoopsConfig } from "./src/loop-hooks.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -96,6 +97,7 @@ export default definePluginEntry({
       approvals?: ApprovalsBridgePluginConfig;
       inferProxyBaseUrl?: string;
       modelDiscovery?: ImajinModelDiscoveryConfig;
+      loops?: LoopsConfig;
     };
 
     // The one kernel client (agent DID challenge-response session) shared by
@@ -177,6 +179,17 @@ export default definePluginEntry({
         console.error("[imajin-plugin] failed to register chat tool:", err);
       }
     }
+
+    // Loop lifecycle → kernel loops rail (#46): signed loop.* events for
+    // primary sessions, subagents, cron automations and keepers. Observe hooks
+    // only; a publish failure is logged and dropped, never surfaced to the loop.
+    registerLoopLifecycle(api, {
+      nodeUrl: config.nodeUrl,
+      did: config.did,
+      keypairPath: config.keypairPath,
+      actAs: config.actAs,
+      config: config.loops,
+    });
 
     // Background WebSocket service for real-time notifications (#1653)
     console.log("[imajin-plugin] keypairPath:", config.keypairPath ? "configured" : "missing");

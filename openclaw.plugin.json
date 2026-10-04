@@ -74,6 +74,14 @@
       "help": "Kernel route (relative to nodeUrl) the catalog is discovered from. Default /infer/v1/models/usable \u2014 the OpenAI-shaped list of the principal's usable brains (imajin-ai#2201). Note /infer/v1/models is the Anthropic model-catalog passthrough, not this list.",
       "placeholder": "/infer/v1/models/usable"
     },
+    "loops.enabled": {
+      "label": "Loop Lifecycle Events: Enabled",
+      "help": "Publish signed loop.started/progress/blocked/finished events for primary sessions, subagents, cron automations and keepers to the kernel loops rail (POST /api/loops, #46). Default on when nodeUrl + did + keypairPath are configured; set false to opt out. Lifecycle metadata only \u2014 never transcript content. When actAs names a principal other than the agent DID, the kernel requires an active loops:publish delegation grant from that principal."
+    },
+    "loops.keeperJobs": {
+      "label": "Loop Lifecycle Events: Keeper Cron Jobs",
+      "help": "Cron jobs (matched on job id, name or declarationKey) to publish as kind openclaw.keeper instead of openclaw.automation. Jobs named keeper, keeper:*, keeper-*, keeper_* or keeper/* are always keepers."
+    },
     "approvals.enabled": {
       "label": "Gateway Approvals Bridge: Enabled",
       "help": "Publish staged Gateway system-agent proposals (restart / config mutation) to the kernel and apply signed operator decisions from /jin back to the Gateway (#24). Off by default; requires did + keypairPath + operatorDid + notifyWebhookSecret."
@@ -154,6 +162,23 @@
           "modelsPath": {
             "type": "string",
             "description": "Kernel route (relative to nodeUrl) to discover against. Default /infer/v1/models/usable."
+          }
+        }
+      },
+      "loops": {
+        "type": "object",
+        "description": "Loop lifecycle publisher (#46): signed loop.* events to the kernel loops rail (imajin-ai#2295). Lifecycle metadata only.",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Explicit opt-out. Defaults to true when nodeUrl + did + keypairPath are configured."
+          },
+          "keeperJobs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "default": [],
+            "description": "Cron jobs (job id, name or declarationKey) published as openclaw.keeper rather than openclaw.automation."
           }
         }
       },
