@@ -35,6 +35,18 @@ record of the handoff** — there is no separate audit trail to keep in sync.
    read, whether or not the command succeeds.
 5. The grant now shows `consumedAt` (one-time) or is expired — nothing
    sensitive ever appeared in a transcript.
+6. **`ack`** (#42, kernel `ima-jin/imajin-ai#2235`, implemented in #2236) —
+   after using the value the agent signs what it did:
+   `ack { grantId, outcome: 'used'|'failed'|'discarded', evidence?: { kind, ref }, note? }`
+   -> `POST /api/vault/delegation/grants/{grantId}/ack`. Returns only
+   `{ grantId, outcome, ackedAt }`. This is the agent's honest record of
+   *use* (e.g. evidence `{ kind: 'gha-runner', ref: 'imajin-gx10' }`, note
+   `runner registered` / `exec failed, value discarded`) — **never the
+   value**. Limits mirror the kernel: `note` <= 280, `evidence.kind` <= 100,
+   `evidence.ref` <= 120. The grant must have been fetched by this agent
+   first; repeating the same outcome is idempotent, a different outcome is
+   `ack_conflict`. The owner sees fetched + acked on `/jin`, and the kernel
+   audits `vault.delegation.acked` (outcome + evidence `kind` only).
 
 ## Security invariants
 
@@ -50,8 +62,24 @@ record of the handoff** — there is no separate audit trail to keep in sync.
   `src/vault/kernel-contract.ts` — the raw upstream response body is never
   included in a thrown error, a tool result, or a log line.
 - `withSecretEnv` redacts any callback failure into a value-free error.
+- `ack` has no value parameter and sends only `{ outcome, note?, evidence? }`.
+  A `note` / `evidence` containing the value of a still-live handle is
+  refused before any kernel call (a value already redeemed is gone from
+  memory and cannot be checked — the tool description tells the agent never
+  to put secret material there, and the kernel never echoes `note` /
+  `evidence.ref` into the audit event). Ack error codes are fixed and
+  value-free: `grant_not_found` (404, unknown/not-yours),
+  `grant_not_fetched` / `ack_conflict` (409), `invalid_ack` (client-side
+  validation), `vault_request_failed`.
 
 ## Follow-ups
+
+- Automatic ack from the exec bridge: `withSecretEnv(handle, fn, { ack })`
+  calls `ack({ grantId, outcome: 'used' | 'failed' })` once the callback
+  settles (best effort; an ack failure never changes the exec result). A
+  handle created by `fetch` carries its `grantId`. The bridge only has to
+  pass `ack: ({ grantId, outcome }) => ackGrant(client, grantId, { outcome })
+  .then(() => undefined)` — still to be wired when the exec bridge lands.
 
 - The Gateway exec bridge that actually calls `withSecretEnv` to run the
   one command needing the secret is not wired in this PR — `fetch` stops

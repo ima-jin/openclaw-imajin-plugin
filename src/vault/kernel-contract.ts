@@ -32,6 +32,16 @@
  *   `consumedAt IS NULL` guard before decrypting), so every fetch after the
  *   first successful one returns 410.
  *
+ *   POST /api/vault/delegation/grants/{grantId}/ack   (kernel `imajin-ai#2235`, PR #2236)
+ *     body { outcome: 'used'|'failed'|'discarded', note?: string (<=280),
+ *            evidence?: { kind: string (<=100), ref: string (<=120) } }
+ *     -> { ok: true, grantId, outcome, ackedAt }
+ *        Idempotent per grant+outcome (same outcome again -> 200, original ackedAt).
+ *        404 grant unknown OR belongs to a different agent (same anti-enumeration as fetch)
+ *        409 `grant_not_fetched` (never fetched by this agent) OR `ack_conflict`
+ *            (already acked with a DIFFERENT outcome; body carries ackOutcome/ackedAt)
+ *        400 invalid body (never reached for input this module validated first)
+ *
  * Every function here authenticates via the SAME `ImajinClient` challenge-
  * response session every other tool uses (`client.requestRaw`, which reuses
  * `authHeaders`/`X-Acting-For`) — there is no separate auth path for vault
@@ -68,7 +78,37 @@ export interface VaultGrantValue {
   expiresAt: string | null;
 }
 
-export type VaultErrorCode = "grant_not_found" | "grant_not_active" | "grant_already_consumed" | "vault_request_failed";
+/** What the agent did with a fetched grant, as recorded by `POST .../ack`. */
+export type VaultAckOutcome = "used" | "failed" | "discarded";
+
+export const VAULT_ACK_OUTCOMES: readonly VaultAckOutcome[] = ["used", "failed", "discarded"];
+
+/** Kernel limits for the ack body (`ack/route.ts`); validated client-side so a bad call never leaves the process. */
+export const ACK_MAX_NOTE_LENGTH = 280;
+export const ACK_MAX_EVIDENCE_KIND_LENGTH = 100;
+export const ACK_MAX_EVIDENCE_REF_LENGTH = 120;
+
+/** Free-form pointer to what the agent did with the value, e.g. `{ kind: "gha-runner", ref: "imajin-gx10" }`. Never the value. */
+export interface VaultAckEvidence {
+  kind: string;
+  ref: string;
+}
+
+/** Kernel's receipt for a recorded ack. Carries no secret material. */
+export interface VaultAckReceipt {
+  grantId: string;
+  outcome: VaultAckOutcome;
+  ackedAt: string | null;
+}
+
+export type VaultErrorCode =
+  | "grant_not_found"
+  | "grant_not_active"
+  | "grant_already_consumed"
+  | "grant_not_fetched"
+  | "ack_conflict"
+  | "invalid_ack"
+  | "vault_request_failed";
 
 /** A clear, value-free error for every vault kernel-request failure mode. */
 export class VaultError extends Error {
@@ -104,6 +144,26 @@ function errorForStatus(status: number, action: string): VaultError {
     default:
       return new VaultError("vault_request_failed", `Vault ${action} request failed (${status}).`);
   }
+}
+
+const grantAckPath = (grantId: string): string =>
+  `/api/vault/delegation/grants/${encodeURIComponent(grantId)}/ack`;
+
+/**
+ * Maps a non-2xx ack status to a value-free `VaultError`. The kernel returns
+ * 409 for two distinct reasons (`grant_not_fetched`, `ack_conflict`); the body
+ * is consulted ONLY to pick between those two fixed codes — it is matched
+ * against a whitelist and never copied into the message.
+ */
+function errorForAckStatus(status: number, text: string): VaultError {
+  if (status === 409) {
+    const parsed = safeJsonParse(text) as { error?: unknown } | null;
+    if (parsed?.error === "grant_not_fetched") {
+      return new VaultError("grant_not_fetched", "Grant has not been fetched by this agent; nothing to acknowledge yet.");
+    }
+    return new VaultError("ack_conflict", "Grant was already acknowledged with a different outcome.");
+  }
+  return errorForStatus(status, "ack");
 }
 
 function safeJsonParse(text: string): unknown {
@@ -170,5 +230,75 @@ export async function fetchGrantValue(
     // passed straight through to the handle store rather than fabricated into
     // a fake timestamp; the handle store's own 15-min cap is the fallback TTL.
     expiresAt: typeof parsed.expiresAt === "string" ? parsed.expiresAt : null,
+  };
+}
+
+/**
+ * Validates and normalizes the ack body against the kernel's limits. Throws a
+ * value-free `invalid_ack` error (messages name the field only, never echo
+ * the offending input).
+ */
+export function validateAckInput(input: {
+  outcome: unknown;
+  note?: unknown;
+  evidence?: unknown;
+}): { outcome: VaultAckOutcome; note?: string; evidence?: VaultAckEvidence } {
+  if (typeof input.outcome !== "string" || !(VAULT_ACK_OUTCOMES as readonly string[]).includes(input.outcome)) {
+    throw new VaultError("invalid_ack", "ack requires 'outcome' to be one of 'used', 'failed', 'discarded'.");
+  }
+  const result: { outcome: VaultAckOutcome; note?: string; evidence?: VaultAckEvidence } = {
+    outcome: input.outcome as VaultAckOutcome,
+  };
+  if (input.note !== undefined && input.note !== null) {
+    if (typeof input.note !== "string" || input.note.length === 0 || input.note.length > ACK_MAX_NOTE_LENGTH) {
+      throw new VaultError("invalid_ack", `ack 'note' must be a non-empty string of at most ${ACK_MAX_NOTE_LENGTH} characters.`);
+    }
+    result.note = input.note;
+  }
+  if (input.evidence !== undefined && input.evidence !== null) {
+    const ev = input.evidence;
+    if (typeof ev !== "object" || Array.isArray(ev)) {
+      throw new VaultError("invalid_ack", "ack 'evidence' must be an object with 'kind' and 'ref'.");
+    }
+    const { kind, ref } = ev as Record<string, unknown>;
+    if (typeof kind !== "string" || kind.length === 0 || kind.length > ACK_MAX_EVIDENCE_KIND_LENGTH) {
+      throw new VaultError("invalid_ack", `ack 'evidence.kind' must be a non-empty string of at most ${ACK_MAX_EVIDENCE_KIND_LENGTH} characters.`);
+    }
+    if (typeof ref !== "string" || ref.length === 0 || ref.length > ACK_MAX_EVIDENCE_REF_LENGTH) {
+      throw new VaultError("invalid_ack", `ack 'evidence.ref' must be a non-empty string of at most ${ACK_MAX_EVIDENCE_REF_LENGTH} characters.`);
+    }
+    result.evidence = { kind, ref };
+  }
+  return result;
+}
+
+/**
+ * Signs what the agent did with a grant it already fetched: the agent-side
+ * companion to `fetchGrantValue` (`openclaw-imajin-plugin#42`, kernel
+ * `imajin-ai#2235`). Sends ONLY `{ outcome, note?, evidence? }` — it takes no
+ * value parameter, so a secret cannot be forwarded by construction. The caller
+ * (`../tools.ts`) additionally rejects a note/evidence that contains a live
+ * handle value. Returns the kernel's receipt, whitelisted field-by-field.
+ */
+export async function ackGrant(
+  client: ImajinClient,
+  grantId: string,
+  input: { outcome: unknown; note?: unknown; evidence?: unknown },
+  opts: { onBehalfOf?: string } = {},
+): Promise<VaultAckReceipt> {
+  const body = validateAckInput(input);
+  const { status, text } = await client.requestRaw(grantAckPath(grantId), {
+    method: "POST",
+    body,
+    onBehalfOf: opts.onBehalfOf,
+  });
+  if (status < 200 || status >= 300) throw errorForAckStatus(status, text);
+  const parsed = safeJsonParse(text) as { outcome?: unknown; ackedAt?: unknown } | null;
+  return {
+    grantId,
+    outcome: (VAULT_ACK_OUTCOMES as readonly unknown[]).includes(parsed?.outcome)
+      ? (parsed!.outcome as VaultAckOutcome)
+      : body.outcome,
+    ackedAt: typeof parsed?.ackedAt === "string" ? parsed.ackedAt : null,
   };
 }

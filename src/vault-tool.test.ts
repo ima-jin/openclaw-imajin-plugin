@@ -49,8 +49,8 @@ describe("imajin_vault tool — grep-proof value safety", () => {
     }
   }
 
-  it("only supports list_grants and fetch — ack_consumed is not a valid action", async () => {
-    expect(tool.parameters.properties.action.enum).toEqual(["list_grants", "fetch"]);
+  it("only supports list_grants, fetch and ack — ack_consumed is not a valid action", async () => {
+    expect(tool.parameters.properties.action.enum).toEqual(["list_grants", "fetch", "ack"]);
     const result = await tool.execute("1", { action: "ack_consumed" } as never);
     expect(result.content[0].text).toMatch(/Unknown action/);
   });
@@ -190,5 +190,143 @@ describe("imajin_vault tool — grep-proof value safety", () => {
     expect(result.content[0].text).not.toContain(KNOWN_SECRET);
     expect(result.content[0].text).not.toContain(upstreamBody);
     assertNoLeak(result);
+  });
+});
+
+describe("imajin_vault ack", () => {
+  let client: ImajinClient;
+  let tool: ReturnType<typeof createVaultTool>;
+  let consoleSpies: ReturnType<typeof vi.spyOn>[];
+
+  beforeEach(() => {
+    _resetSecretHandleStoreForTests();
+    client = new ImajinClient({ nodeUrl: "https://test.imajin.ai", did: "did:imajin:agent" });
+    tool = createVaultTool(client);
+    consoleSpies = [
+      vi.spyOn(console, "log").mockImplementation(() => {}),
+      vi.spyOn(console, "error").mockImplementation(() => {}),
+      vi.spyOn(console, "warn").mockImplementation(() => {}),
+      vi.spyOn(console, "info").mockImplementation(() => {}),
+    ];
+  });
+
+  afterEach(() => {
+    for (const spy of consoleSpies) spy.mockRestore();
+    vi.restoreAllMocks();
+  });
+
+  function ackCall(): { url: string; init: RequestInit } {
+    const calls = vi.mocked(global.fetch).mock.calls;
+    const [url, init] = calls[calls.length - 1];
+    return { url: String(url), init: (init ?? {}) as RequestInit };
+  }
+
+  it("POSTs { outcome, evidence, note } to the ack path and returns only the receipt", async () => {
+    global.fetch = mockFetch({ ok: true, grantId: "vdg_1", outcome: "used", ackedAt: "2026-09-22T00:00:00.000Z" });
+    const result = await tool.execute("1", {
+      action: "ack",
+      grantId: "vdg_1",
+      outcome: "used",
+      evidence: { kind: "gha-runner", ref: "imajin-gx10" },
+      note: "runner registered",
+    });
+    const { url, init } = ackCall();
+    expect(url).toBe("https://test.imajin.ai/api/vault/delegation/grants/vdg_1/ack");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      outcome: "used",
+      note: "runner registered",
+      evidence: { kind: "gha-runner", ref: "imajin-gx10" },
+    });
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      grantId: "vdg_1",
+      outcome: "used",
+      ackedAt: "2026-09-22T00:00:00.000Z",
+    });
+  });
+
+  it("requires grantId and outcome, and rejects an unknown outcome without a kernel call", async () => {
+    global.fetch = mockFetch({});
+    expect((await tool.execute("1", { action: "ack", outcome: "used" })).content[0].text).toMatch(/requires 'grantId'/);
+    expect((await tool.execute("1", { action: "ack", grantId: "vdg_1" })).content[0].text).toMatch(/requires 'outcome'/);
+    const bad = await tool.execute("1", { action: "ack", grantId: "vdg_1", outcome: "consumed" });
+    expect(bad.content[0].text).toMatch(/invalid_ack/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("enforces the kernel's note / evidence limits client-side", async () => {
+    global.fetch = mockFetch({});
+    const longNote = await tool.execute("1", { action: "ack", grantId: "g", outcome: "used", note: "x".repeat(281) });
+    expect(longNote.content[0].text).toMatch(/invalid_ack/);
+    const badEvidence = await tool.execute("1", {
+      action: "ack",
+      grantId: "g",
+      outcome: "used",
+      evidence: { kind: "k", ref: "" },
+    });
+    expect(badEvidence.content[0].text).toMatch(/invalid_ack/);
+    expect(global.fetch).not.toHaveBeenCalled();
+  });
+
+  it("maps 404 to grant_not_found, 409 to grant_not_fetched / ack_conflict, 500 to vault_request_failed", async () => {
+    global.fetch = mockFetch({ error: "grant_not_found" }, 404);
+    expect((await tool.execute("1", { action: "ack", grantId: "g", outcome: "used" })).content[0].text).toMatch(
+      /grant_not_found/,
+    );
+    global.fetch = mockFetch({ error: "grant_not_fetched" }, 409);
+    expect((await tool.execute("1", { action: "ack", grantId: "g", outcome: "used" })).content[0].text).toMatch(
+      /grant_not_fetched/,
+    );
+    global.fetch = mockFetch({ error: "ack_conflict", ackOutcome: "failed", ackedAt: "2026-09-22T00:00:00.000Z" }, 409);
+    expect((await tool.execute("1", { action: "ack", grantId: "g", outcome: "used" })).content[0].text).toMatch(
+      /ack_conflict/,
+    );
+    global.fetch = mockFetch({ error: `boom ${KNOWN_SECRET}` }, 500);
+    const r = await tool.execute("1", { action: "ack", grantId: "g", outcome: "used" });
+    expect(r.content[0].text).toMatch(/vault_request_failed/);
+    expect(r.content[0].text).not.toContain(KNOWN_SECRET);
+  });
+
+  it("refuses a note or evidence containing a live handle's value, and never calls the kernel", async () => {
+    global.fetch = mockFetch({ ok: true, field: "F", value: KNOWN_SECRET, purpose: null, oneTime: true, expiresAt: null });
+    await tool.execute("1", { action: "fetch", grantId: "vdg_1", name: "GH_TOKEN" });
+    const fetchSpy = vi.fn();
+    global.fetch = fetchSpy;
+    for (const args of [
+      { note: `registered with ${KNOWN_SECRET}` },
+      { evidence: { kind: "gha-runner", ref: KNOWN_SECRET } },
+      { evidence: { kind: KNOWN_SECRET, ref: "r" } },
+    ]) {
+      const result = await tool.execute("1", { action: "ack", grantId: "vdg_1", outcome: "used", ...args });
+      expect(result.content[0].text).toMatch(/ack refused/);
+      expect(JSON.stringify(result)).not.toContain(KNOWN_SECRET);
+    }
+    expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("fetch -> exec -> ack: the whole flow never leaks the value into results, requests or logs", async () => {
+    global.fetch = mockFetch({ ok: true, field: "F", value: KNOWN_SECRET, purpose: null, oneTime: true, expiresAt: null });
+    const fetched = JSON.parse((await tool.execute("1", { action: "fetch", grantId: "vdg_1", name: "GH_TOKEN" })).content[0].text);
+    await withSecretEnv(fetched.handle, (env) => env.GH_TOKEN.length);
+
+    global.fetch = mockFetch({ ok: true, grantId: "vdg_1", outcome: "used", ackedAt: "2026-09-22T00:00:00.000Z" });
+    const result = await tool.execute("1", {
+      action: "ack",
+      grantId: "vdg_1",
+      outcome: "used",
+      evidence: { kind: "gha-runner", ref: "imajin-gx10" },
+      note: "runner registered",
+    });
+    expect(JSON.stringify(result)).not.toContain(KNOWN_SECRET);
+    expect(String(ackCall().init.body)).not.toContain(KNOWN_SECRET);
+    for (const spy of consoleSpies) {
+      for (const call of spy.mock.calls) expect(JSON.stringify(call)).not.toContain(KNOWN_SECRET);
+    }
+  });
+
+  it("has no parameter that could carry a value, and its description says it signs what the agent did, never the value", () => {
+    expect(Object.keys(tool.parameters.properties)).not.toContain("value");
+    expect(tool.description).toMatch(/SIGN what you did/);
+    expect(tool.description).toMatch(/NEVER the value/);
   });
 });

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ImajinClient } from "../client.js";
-import { listGrantsMine, fetchGrantValue, VaultError } from "./kernel-contract.js";
+import { listGrantsMine, fetchGrantValue, ackGrant, validateAckInput, VaultError } from "./kernel-contract.js";
 
 const KNOWN_SECRET = "ghp_super-secret-runner-registration-token-do-not-leak";
 
@@ -188,5 +188,134 @@ describe("fetchGrantValue", () => {
       text: JSON.stringify({ ok: true, oneTime: true }),
     });
     await expect(fetchGrantValue(client, "vdg_1")).rejects.toMatchObject({ code: "vault_request_failed" });
+  });
+});
+
+describe("ackGrant", () => {
+  let client: ReturnType<typeof makeMockClient>;
+
+  beforeEach(() => {
+    client = makeMockClient();
+  });
+
+  const ok = (outcome = "used") => ({
+    status: 200,
+    contentType: "application/json",
+    text: JSON.stringify({ ok: true, grantId: "vdg_1", outcome, ackedAt: "2026-09-22T00:00:00.000Z" }),
+  });
+
+  it("POSTs only { outcome, note, evidence } to /api/vault/delegation/grants/{grantId}/ack", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValue(ok());
+    const receipt = await ackGrant(
+      client,
+      "vdg_1",
+      { outcome: "used", note: "runner registered", evidence: { kind: "gha-runner", ref: "imajin-gx10", extra: "dropped" } },
+      { onBehalfOf: "did:imajin:owner" },
+    );
+    expect(receipt).toEqual({ grantId: "vdg_1", outcome: "used", ackedAt: "2026-09-22T00:00:00.000Z" });
+    const [path, opts] = vi.mocked(client.requestRaw).mock.calls[0];
+    expect(path).toBe("/api/vault/delegation/grants/vdg_1/ack");
+    expect(opts).toEqual({
+      method: "POST",
+      body: { outcome: "used", note: "runner registered", evidence: { kind: "gha-runner", ref: "imajin-gx10" } },
+      onBehalfOf: "did:imajin:owner",
+    });
+  });
+
+  it("omits note and evidence when not provided", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValue(ok("discarded"));
+    await ackGrant(client, "vdg_1", { outcome: "discarded" });
+    expect(vi.mocked(client.requestRaw).mock.calls[0][1]).toMatchObject({ body: { outcome: "discarded" } });
+  });
+
+  it("URL-encodes the grantId", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValue(ok());
+    await ackGrant(client, "g/1", { outcome: "used" });
+    expect(vi.mocked(client.requestRaw).mock.calls[0][0]).toBe("/api/vault/delegation/grants/g%2F1/ack");
+  });
+
+  it("tolerates a receipt body without outcome/ackedAt", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValue({ status: 200, contentType: "", text: "not json" });
+    expect(await ackGrant(client, "vdg_1", { outcome: "failed" })).toEqual({
+      grantId: "vdg_1",
+      outcome: "failed",
+      ackedAt: null,
+    });
+  });
+
+  it("maps 404 -> grant_not_found", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValue({ status: 404, contentType: "", text: "" });
+    await expect(ackGrant(client, "vdg_1", { outcome: "used" })).rejects.toMatchObject({ code: "grant_not_found" });
+  });
+
+  it("maps 409 grant_not_fetched and 409 ack_conflict to distinct codes", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValueOnce({
+      status: 409,
+      contentType: "application/json",
+      text: JSON.stringify({ error: "grant_not_fetched" }),
+    });
+    await expect(ackGrant(client, "vdg_1", { outcome: "used" })).rejects.toMatchObject({ code: "grant_not_fetched" });
+    vi.mocked(client.requestRaw).mockResolvedValueOnce({
+      status: 409,
+      contentType: "application/json",
+      text: JSON.stringify({ error: "ack_conflict", ackOutcome: "failed", ackedAt: "2026-09-22T00:00:00.000Z" }),
+    });
+    await expect(ackGrant(client, "vdg_1", { outcome: "used" })).rejects.toMatchObject({ code: "ack_conflict" });
+    vi.mocked(client.requestRaw).mockResolvedValueOnce({ status: 409, contentType: "", text: "garbage" });
+    await expect(ackGrant(client, "vdg_1", { outcome: "used" })).rejects.toMatchObject({ code: "ack_conflict" });
+  });
+
+  it("redacts an upstream 500 / 409 body from the error message", async () => {
+    vi.mocked(client.requestRaw).mockResolvedValue({ status: 500, contentType: "text/html", text: `dump ${KNOWN_SECRET}` });
+    await expect(ackGrant(client, "vdg_1", { outcome: "used" })).rejects.toMatchObject({ code: "vault_request_failed" });
+    vi.mocked(client.requestRaw).mockResolvedValue({
+      status: 409,
+      contentType: "application/json",
+      text: JSON.stringify({ error: KNOWN_SECRET }),
+    });
+    let caught: unknown;
+    try {
+      await ackGrant(client, "vdg_1", { outcome: "used" });
+    } catch (err) {
+      caught = err;
+    }
+    expect((caught as VaultError).message).not.toContain(KNOWN_SECRET);
+  });
+
+  it("rejects invalid input before any request, with messages that never echo the input", async () => {
+    await expect(ackGrant(client, "vdg_1", { outcome: "nope" })).rejects.toMatchObject({ code: "invalid_ack" });
+    expect(client.requestRaw).not.toHaveBeenCalled();
+  });
+});
+
+describe("validateAckInput", () => {
+  it("accepts every outcome and boundary lengths", () => {
+    for (const outcome of ["used", "failed", "discarded"]) expect(validateAckInput({ outcome }).outcome).toBe(outcome);
+    expect(
+      validateAckInput({
+        outcome: "used",
+        note: "n".repeat(280),
+        evidence: { kind: "k".repeat(100), ref: "r".repeat(120) },
+      }).evidence,
+    ).toEqual({ kind: "k".repeat(100), ref: "r".repeat(120) });
+  });
+
+  it.each([
+    [{ outcome: 1 }],
+    [{ outcome: "used", note: "" }],
+    [{ outcome: "used", note: 5 }],
+    [{ outcome: "used", note: "n".repeat(281) }],
+    [{ outcome: "used", evidence: "x" }],
+    [{ outcome: "used", evidence: [] }],
+    [{ outcome: "used", evidence: { kind: "", ref: "r" } }],
+    [{ outcome: "used", evidence: { kind: "k".repeat(101), ref: "r" } }],
+    [{ outcome: "used", evidence: { kind: "k", ref: 1 } }],
+    [{ outcome: "used", evidence: { kind: "k", ref: "r".repeat(121) } }],
+  ])("rejects %j", (input) => {
+    expect(() => validateAckInput(input as never)).toThrow(VaultError);
+  });
+
+  it("treats null note/evidence as absent", () => {
+    expect(validateAckInput({ outcome: "used", note: null, evidence: null })).toEqual({ outcome: "used" });
   });
 });

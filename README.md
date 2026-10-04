@@ -13,7 +13,7 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_transact` | Settlement  | Check MJNx/MJN balances, view transaction history            |
 | `imajin_fair`     | Attribution | Inspect .fair manifests — who made what and who gets paid    |
 | `imajin_discover` | Discovery   | Search the network for people, businesses, events, stubs     |
-| `imajin_vault`    | Vault       | Fetch owner-granted secrets (delegation grants) as protected handles — values never enter model context (#40) |
+| `imajin_vault`    | Vault       | Fetch owner-granted secrets (delegation grants) as protected handles — values never enter model context (#40); `ack` signs what the agent did with a fetched grant (#42) |
 
 ## Configuration
 

@@ -18,8 +18,8 @@ import {
   fetchImajinProxyHealthz,
   type ImajinCatalogCache,
 } from "./imajin-provider.js";
-import { fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
-import { createSecretHandle } from "./vault/secret-handle-store.js";
+import { ackGrant, fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
+import { containsLiveSecret, createSecretHandle } from "./vault/secret-handle-store.js";
 
 type ToolContent = { type: "text"; text: string };
 type ToolResult = {
@@ -129,13 +129,21 @@ export function createVaultTool(client: ImajinClient) {
       "the handle). Returns ONLY { handle, name, expiresAt, oneTime } — redeem the handle via a " +
       "follow-up exec bridge, never by asking this tool to print the value. A one-time grant is " +
       "consumed ATOMICALLY by the kernel as part of this fetch — there is no separate consume " +
-      "step; a repeat fetch of an already-consumed one-time grant fails with grant_already_consumed).",
+      "step; a repeat fetch of an already-consumed one-time grant fails with grant_already_consumed), " +
+      "ack (after you have used — or failed to use, or discarded — a fetched grant, SIGN what you " +
+      "did: { grantId, outcome: 'used'|'failed'|'discarded', evidence?: { kind, ref }, note? }. " +
+      "This records YOUR honest action against the grant (e.g. evidence { kind: 'gha-runner', ref: " +
+      "'imajin-gx10' }, note 'runner registered' / 'exec failed, value discarded') — it is the agent " +
+      "signing what it did, NEVER the value: never put a secret, token, or any part of one in note " +
+      "or evidence (note ≤280 chars, evidence.kind ≤100, evidence.ref ≤120). Requires the grant to " +
+      "have been fetched by this agent first; repeating the same outcome is idempotent, a different " +
+      "outcome fails with ack_conflict). Returns only { grantId, outcome, ackedAt }.",
     parameters: {
       type: "object" as const,
       properties: {
         action: {
           type: "string" as const,
-          enum: ["list_grants", "fetch"],
+          enum: ["list_grants", "fetch", "ack"],
           description: "Action to perform",
         },
         purpose: {
@@ -144,7 +152,25 @@ export function createVaultTool(client: ImajinClient) {
         },
         grantId: {
           type: "string" as const,
-          description: "Grant id, as returned by list_grants (for fetch)",
+          description: "Grant id, as returned by list_grants (for fetch and ack)",
+        },
+        outcome: {
+          type: "string" as const,
+          enum: ["used", "failed", "discarded"],
+          description: "What you did with the fetched value (for ack). Required.",
+        },
+        evidence: {
+          type: "object" as const,
+          properties: {
+            kind: { type: "string" as const, description: "Evidence label, e.g. 'gha-runner' (≤100 chars)" },
+            ref: { type: "string" as const, description: "Evidence reference, e.g. 'imajin-gx10' (≤120 chars). Never a secret." },
+          },
+          required: ["kind", "ref"],
+          description: "Optional pointer to what the value was used for (for ack). Never the value.",
+        },
+        note: {
+          type: "string" as const,
+          description: "Optional free-text, ≤280 chars, e.g. 'runner registered' (for ack). Never the value.",
         },
         as: {
           type: "string" as const,
@@ -176,6 +202,9 @@ export function createVaultTool(client: ImajinClient) {
         grantId?: string;
         as?: string;
         name?: string;
+        outcome?: string;
+        evidence?: { kind: string; ref: string };
+        note?: string;
         onBehalfOf?: string;
       },
     ): Promise<ToolResult> {
@@ -219,9 +248,32 @@ export function createVaultTool(client: ImajinClient) {
               name: params.name,
               value: grantValue.value,
               grantExpiresAt: grantValue.expiresAt,
+              grantId: params.grantId,
             });
             // Only the handle + metadata are ever returned — never grantValue.value.
             return jsonResult({ handle, name: params.name, expiresAt, oneTime: grantValue.oneTime });
+          }
+          case "ack": {
+            if (!params.grantId) return errorResult("ack requires 'grantId'");
+            if (!params.outcome) return errorResult("ack requires 'outcome'");
+            // Refuse (value-free message) anything that would write a still-live handle's
+            // secret into the signed record. The ack payload is built from outcome/note/
+            // evidence only — there is no code path that reads a handle's value.
+            const free = [params.note, params.evidence?.kind, params.evidence?.ref];
+            if (free.some((t) => typeof t === "string" && containsLiveSecret(t))) {
+              return errorResult("ack refused: note/evidence must describe what you did, never contain a secret value.");
+            }
+            try {
+              const receipt = await ackGrant(
+                client,
+                params.grantId,
+                { outcome: params.outcome, note: params.note, evidence: params.evidence },
+                { onBehalfOf: params.onBehalfOf },
+              );
+              return jsonResult(receipt);
+            } catch (err) {
+              return vaultErrorResult(err);
+            }
           }
           default:
             return errorResult(`Unknown action: ${params.action}`);
