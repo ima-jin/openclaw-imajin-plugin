@@ -1044,7 +1044,7 @@ never block or fail the session / subagent / cron run it describes.
 
 `loop.blocked` (and the return to running) is supported on every kind by
 `tracker.block({ sessionKey | jobId }, reason)` / `unblock(...)` in
-`src/loop-tracker.ts`; nothing calls it automatically yet (see below).
+`src/loop-tracker.ts`. The approvals bridge is the producer (#64, see "Blocked on an operator approval" below).
 
 - **Ids.** `loopId = <kind>:<sha256(agent DID, kind, session id | session key |
   job id + run start)[0..32]>`: deterministic, but the OpenClaw key never *is* the
@@ -1090,8 +1090,30 @@ minute as `publish dropped ... HTTP 403`).
 **Not published (kernel gap).** Typed in-session events (assistant text,
 tool calls with args/results, approvals, model changes) and `refs.sessionId` have
 no place on the current rail contract; tracked in `ima-jin/imajin-ai#2552`.
-Automatic `loop.blocked` from exec/proposal approvals is a follow-up: it needs a
-hook in `gateway-approvals-bridge.ts`, which is deliberately untouched here.
+
+#### Blocked on an operator approval (#64)
+
+While an approval card is pending, the session (or cron run) that owns it is
+waiting on an operator. When the approvals bridge has published a card whose
+source knows the owning session key (`gateway-exec` and `system-agent` read it
+from the Gateway request; `skill-workshop` and `imajin-catalog` have none), it
+calls `tracker.block({ sessionKey }, "awaiting operator approval (<kind>)")` →
+`loop.blocked`. It calls `unblock` (→ `loop.progress`, state `running`) when the
+approval is settled: the decision is applied, the item is no longer pending at
+its source, applying it fails, or its `expiresAtMs` passes with no decision.
+
+- Blocks only after the card is published, so a card that never reached /jin
+  never shows the loop as blocked.
+- Several pending approvals for one session block it once and unblock it only
+  when the last is settled. A rejected/unverifiable decision, drift, or a
+  `withdrawn` decision leaves the approval pending, so the loop stays blocked.
+- The reason carries the card `kind` only, never the command text. The owner and
+  expiry ride on the in-process `ApprovalSourceRequest`, not in the card `detail`,
+  so `contentHash` and the kernel contract are unchanged.
+- Observe-only (`src/approval-loop-blocker.ts`): a throwing `block` / `unblock`
+  is logged and dropped and never affects publishing or applying a decision.
+  With the loops feature off (`loops.enabled: false` or unconfigured) nothing is
+  wired and the bridge behaves exactly as before.
 
 ## Development
 Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` / `src/gateway-approvals-bridge.ts` (dynamic — only on the SecretRef paths, #20, and the live Gateway/kernel wiring in `gateway-approvals-bridge.ts`'s `createLiveGatewayApprovalsClient`, #24) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.

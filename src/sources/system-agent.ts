@@ -92,11 +92,14 @@ function truncateSummary(summary: string): string {
 }
 
 function toApprovalSourceRequest(record: SystemAgentApprovalRequestRecord): ApprovalSourceRequest {
+  const sessionKey = record.request.sessionKey;
   return {
     proposalId: record.id,
     kind: `system-agent:${deriveProposalKind(record.request)}`,
     summary: truncateSummary(record.request.description || record.request.title || record.id),
     sourceRevision: record.request.proposalHash,
+    ...(typeof sessionKey === "string" && sessionKey.trim().length > 0 ? { owner: { sessionKey } } : {}),
+    ...(typeof record.expiresAtMs === "number" ? { expiresAtMs: record.expiresAtMs } : {}),
   };
 }
 

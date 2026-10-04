@@ -276,6 +276,8 @@ function toApprovalSourceRequest(
       approvalId: record.id,
       expiresAt: new Date(record.expiresAtMs).toISOString(),
     },
+    ...(typeof sessionKey === "string" && sessionKey.trim().length > 0 ? { owner: { sessionKey } } : {}),
+    expiresAtMs: record.expiresAtMs,
   };
 }
 
