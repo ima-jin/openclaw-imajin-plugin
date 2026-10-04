@@ -21,6 +21,23 @@
   and a failed publish to the kernel is logged and retried on the next poll
   (`ApprovalSource.onPublishFailed`). Needs a gateway restart to load the new
   plugin code; no config change.
+- **Ask-gated `exec` card was rejected by the kernel, and the failure was
+  silent (#52).** The `gateway-exec` card sent `detail.cwd` / `agentId` /
+  `sessionKey` as `null` when the Gateway omitted them (OpenClaw sends
+  `cwd: null` when no workdir is given), but the kernel's
+  `validateExecCommandDetail` 400s unless `host`, `cwd`, `agentId` and
+  `sessionKey` are non-empty strings — so no card ever appeared, the plugin
+  only logged the 400, and the exec waited until its timeout and was SIGTERMed.
+  Missing fields are now sent as the visible marker `unspecified`. A
+  `gateway-exec` card that still cannot be published (after retrying
+  network/5xx/408/429 failures) now denies the Gateway approval so the exec
+  gets a clean refusal, logs an ERROR with the proposal id and reason, and
+  notifies the operator via `directSend` (never including the command).
+  The operator notice distinguishes denied / already resolved elsewhere (not
+  denied by the bridge) / deny failed, left pending, and never awaits the notify
+  CLI inside the publish reservation. With fail-closed, a kernel outage now
+  denies every ask-gated exec within ~2.5s instead of leaving it pending.
+  **Operator step:** reload/restart the plugin (gateway restart) to pick it up.
 - **Ask-gated `exec` never surfaced as a /jin card (#52).** The `gateway-exec`
   source is opt-in and was skipped without a word when `approvals.sources`
   omitted it, and the plugin said nothing when the Gateway's own config could

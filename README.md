@@ -589,6 +589,23 @@ the plugin re-lists pending exec approvals (a broadcast raised while the socket
 was down is never replayed); the bridge's per-`proposalId` dedup keeps that to
 one card.
 
+**Card contract and publish failures (#52).** The kernel rejects a
+`gateway-exec:command` card with `400` unless `detail.host`, `cwd`, `agentId`
+and `sessionKey` are all non-empty strings (`validateExecCommandDetail`,
+`ima-jin/imajin-ai`). OpenClaw sends `cwd: null` for an exec with no explicit
+workdir and may omit the agent/session binding, which used to be forwarded as
+`null` → `400` → the failure was only logged and the exec waited until its own
+timeout (SIGTERM, no card). The source now renders any missing field as the
+visible marker `unspecified` (never a guessed value; the command is never
+altered). Separately, when a `gateway-exec` card still cannot be published
+(transient kernel errors — network, 5xx, 408, 429 — are retried at 0.5 s and
+2 s; any other 4xx is permanent and not retried), the bridge now **denies the
+Gateway approval** (`exec.approval.resolve` → `deny`, so the exec returns a
+clean refusal instead of a timeout), logs an ERROR naming the proposal id and
+reason, and sends the same notice through `wsNotifications.directSend`. The
+command text is never included in that log or notice. Other sources keep the
+old log-and-retry-on-next-event behavior.
+
 **Manual repro** (run with the config above, from the main session):
 
 1. Ask the agent to run `exec` with `command: "echo hi"`, `ask: "always"`,

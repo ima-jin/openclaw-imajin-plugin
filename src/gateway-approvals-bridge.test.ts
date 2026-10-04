@@ -3,6 +3,7 @@ import * as ed from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha2.js";
 import {
   GatewayApprovalsBridge,
+  KernelNotifyError,
   buildApprovalRequestedPayload,
   isApprovalsBridgeConfigured,
   isKernelBusEventFrame,
@@ -257,15 +258,26 @@ describe("GatewayApprovalsBridge", () => {
   it("clears the reservation on publish failure so a later event can retry (#48)", async () => {
     const bridge = newBridge();
     const record = makeRecord();
-    kernel.publishApprovalRequested.mockRejectedValueOnce(new Error("kernel unreachable"));
+    // A permanent (4xx) rejection is not retried inside one publish (#52), so the
+    // reservation is cleared and a later real event gets a fresh attempt.
+    kernel.publishApprovalRequested.mockRejectedValueOnce(new KernelNotifyError(400, "kernel rejected the card"));
 
     requestedHandler!(record);
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
+    await vi.waitFor(() => expect(logger.error).toHaveBeenCalled());
     expect(bridge.isPublished(record.id)).toBe(false);
 
     requestedHandler!(record);
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(2));
     expect(bridge.isPublished(record.id)).toBe(true);
+  });
+
+  it("a failed publish never auto-denies a source that does not block a live caller (#52 is scoped to gateway-exec)", async () => {
+    newBridge();
+    kernel.publishApprovalRequested.mockRejectedValueOnce(new KernelNotifyError(400, "kernel rejected the card"));
+    requestedHandler!(makeRecord());
+    await vi.waitFor(() => expect(logger.error).toHaveBeenCalled());
+    expect(gateway.resolve).not.toHaveBeenCalled();
   });
 
   it("startup reconcile publishes only proposals not already published", async () => {

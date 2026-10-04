@@ -77,6 +77,11 @@ async function makeBridge(client: SkillWorkshopGatewayClient, kernel: ReturnType
     new Map<string, ApprovalSource>([["skill-workshop", source]]),
     kernel as unknown as KernelNotifyClient,
     logger,
+    undefined,
+    undefined,
+    // This suite exercises the SOURCE's own re-poll retry (#33); the bridge's
+    // in-line transient-publish retry (#52) would sleep on the fake timers.
+    { publishRetryDelaysMs: [] },
   );
   return { bridge, logger };
 }
