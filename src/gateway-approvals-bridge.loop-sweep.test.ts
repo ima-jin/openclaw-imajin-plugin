@@ -177,7 +177,7 @@ describe("GatewayApprovalsBridge → stale approval block sweep (#66)", () => {
     expect(vi.getTimerCount()).toBe(0);
     const getCalls = gateway.get.mock.calls.length;
     await vi.advanceTimersByTimeAsync(SWEEP_MS * 3);
-    expect(gateway.get.mock.calls.length).toBe(getCalls);
+    expect(gateway.get.mock.calls).toHaveLength(getCalls);
     expect(tracker.unblock).toHaveBeenCalledTimes(1);
   });
 
