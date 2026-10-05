@@ -117,6 +117,11 @@
       "label": "Gateway Approvals Bridge: Require Operator Countersignature",
       "help": "Mirrors the kernel's OPERATOR_COUNTERSIGN_REQUIRED (#44, ima-jin/imajin-ai#2082). Default false: a decision missing operatorSignature is still applied (unchanged v1 behavior); any operatorSignature that IS supplied is ALWAYS verified directly against the operator DID's registered public key regardless of this flag. true: a decision (including a withdrawal) lacking a valid operatorSignature is rejected before it ever reaches a source. See README 'Operator countersignature' for the recommended rollout order."
     },
+    "approvals.loopBlockSweepIntervalMs": {
+      "label": "Gateway Approvals Bridge: Stale Loop-Block Sweep Interval (ms)",
+      "help": "How often the bridge re-checks the approvals it holds a loop block for (#66), clearing the block of any approval settled outside /jin (gateway UI / CLI) that has no expiry. Default 60000 (1 min); values below 5000 are raised to 5000; 0 disables the sweep. Observe-only: a failing check is logged and dropped.",
+      "placeholder": "60000"
+    },
     "wsNotifications.stateDir": {
       "label": "Notification State Directory",
       "help": "Directory for the ack-dedup LRU and pending-wake persistence files (#26). Defaults to a directory colocated with keypairPath."
@@ -359,6 +364,10 @@
                 "description": "Operator scopes to request on the skill-workshop source's own loopback Gateway connection (via createOperatorGatewayClient, #35), instead of the SDK's fixed ['operator.approvals']-only default client. Default (omitted or []) is ['operator.read', 'operator.admin'], exactly what skills.proposals.list/apply/reject require; set ['operator.approvals'] to opt out of the broader authority. An entry outside this enum fails plugin startup with a clear error rather than silently connecting with a scope the Gateway will reject."
               }
             }
+          },
+          "loopBlockSweepIntervalMs": {
+            "type": "number",
+            "description": "Stale loop-block sweep interval in ms (#66): how often the bridge re-checks, via getCurrent, the approvals it holds a loop block for and unblocks any no longer pending (e.g. settled in the gateway UI/CLI with no expiry). Default 60000. Values below 5000 are raised to 5000. 0 disables the sweep."
           },
           "requireOperatorCountersignature": {
             "type": "boolean",

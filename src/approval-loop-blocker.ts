@@ -33,6 +33,8 @@ export interface ApprovalLoopBlocker {
   dispose(): void;
   /** Number of approvals currently holding a loop blocked. Exposed for tests. */
   pendingCount(): number;
+  /** Ids of the approvals currently holding a loop blocked (#66): what the bridge's stale-block sweep walks. */
+  heldProposalIds(): string[];
 }
 
 interface Held {
@@ -111,5 +113,6 @@ export function createApprovalLoopBlocker(
       for (const entry of held.values()) if (entry.timer) clearTimeout(entry.timer);
     },
     pendingCount: () => held.size,
+    heldProposalIds: () => [...held.keys()],
   };
 }

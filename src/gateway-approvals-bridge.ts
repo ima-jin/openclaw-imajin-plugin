@@ -404,6 +404,32 @@ export interface ApprovalsBridgePluginConfig {
    * order and the README "Operator countersignature" section.
    */
   requireOperatorCountersignature?: boolean;
+  /**
+   * How often (ms) the bridge re-checks, via `getCurrent`, the approvals it
+   * holds a loop block for (#66), so a block whose approval was settled
+   * outside /jin (gateway UI / CLI) and has no expiry is cleared. Default
+   * 60000; values below 5000 are raised to 5000; `0` disables the sweep.
+   * See `resolveLoopBlockSweepIntervalMs`.
+   */
+  loopBlockSweepIntervalMs?: number;
+}
+
+/** Default interval of the stale-loop-block sweep (#66): conservative, one `getCurrent` per held approval per minute. */
+export const DEFAULT_LOOP_BLOCK_SWEEP_INTERVAL_MS = 60_000;
+/** Floor for a configured sweep interval, so a typo cannot hammer the Gateway. */
+export const MIN_LOOP_BLOCK_SWEEP_INTERVAL_MS = 5000;
+
+/**
+ * Resolves `approvals.loopBlockSweepIntervalMs` (#66): omitted / non-finite /
+ * negative → default, `0` → disabled, anything else → floored at
+ * `MIN_LOOP_BLOCK_SWEEP_INTERVAL_MS`.
+ */
+export function resolveLoopBlockSweepIntervalMs(configured: number | undefined): number {
+  if (typeof configured !== "number" || !Number.isFinite(configured) || configured < 0) {
+    return DEFAULT_LOOP_BLOCK_SWEEP_INTERVAL_MS;
+  }
+  if (configured === 0) return 0;
+  return Math.max(Math.floor(configured), MIN_LOOP_BLOCK_SWEEP_INTERVAL_MS);
 }
 
 /**
@@ -583,6 +609,11 @@ export class GatewayApprovalsBridge {
   private readonly unsubscribes: Unsubscribe[] = [];
   /** Marks the owning loop blocked while a card is pending (#64); observe-only, never throws. */
   private readonly loopBlocker?: ReturnType<typeof createApprovalLoopBlocker>;
+  /** Stale-block sweep (#66): started lazily on the first held block, stopped when none remain and on `dispose()`. */
+  private readonly loopSweepIntervalMs: number;
+  private sweepTimer?: ReturnType<typeof setInterval>;
+  private sweeping = false;
+  private disposed = false;
 
   constructor(
     private readonly config: GatewayApprovalsBridgeConfig,
@@ -592,9 +623,15 @@ export class GatewayApprovalsBridge {
     private readonly keyResolver: OperatorKeyResolver = UNRESOLVED_OPERATOR_KEY_RESOLVER,
     /** Human-facing warning channel (Telegram via `wsNotifications.directSend`); best-effort. */
     private readonly notifyOperator?: (text: string) => Promise<void>,
-    options: { publishRetryDelaysMs?: number[]; loopTracker?: ApprovalLoopTracker } = {},
+    options: {
+      publishRetryDelaysMs?: number[];
+      loopTracker?: ApprovalLoopTracker;
+      /** Stale-loop-block sweep interval in ms (#66); `0` disables. Used as given — clamp config with `resolveLoopBlockSweepIntervalMs`. */
+      loopBlockSweepIntervalMs?: number;
+    } = {},
   ) {
     this.publishRetryDelaysMs = options.publishRetryDelaysMs ?? DEFAULT_PUBLISH_RETRY_DELAYS_MS;
+    this.loopSweepIntervalMs = options.loopBlockSweepIntervalMs ?? DEFAULT_LOOP_BLOCK_SWEEP_INTERVAL_MS;
     if (options.loopTracker) this.loopBlocker = createApprovalLoopBlocker(options.loopTracker);
     this.logger = logger ?? defaultLogger();
     for (const source of this.sources.values()) {
@@ -702,6 +739,8 @@ export class GatewayApprovalsBridge {
 
   /** Stops observing every source. Does not evict already-tracked proposals. */
   dispose(): void {
+    this.disposed = true;
+    this.stopSweepTimer();
     for (const unsubscribe of this.unsubscribes) unsubscribe();
     this.loopBlocker?.dispose();
   }
@@ -709,6 +748,67 @@ export class GatewayApprovalsBridge {
   /** Stops tracking a proposal and unblocks its owning loop (#64). */
   private forget(proposalId: string): void {
     this.published.delete(proposalId);
+    this.loopBlocker?.release(proposalId);
+  }
+
+  private ensureSweepTimer(): void {
+    if (this.disposed || this.sweepTimer || !this.loopBlocker || this.loopBlocker.pendingCount() === 0) return;
+    if (!Number.isFinite(this.loopSweepIntervalMs) || this.loopSweepIntervalMs <= 0) return;
+    this.sweepTimer = setInterval(() => {
+      void this.sweepStaleLoopBlocks();
+    }, this.loopSweepIntervalMs);
+    this.sweepTimer.unref?.();
+  }
+
+  private stopSweepTimer(): void {
+    if (!this.sweepTimer) return;
+    clearInterval(this.sweepTimer);
+    this.sweepTimer = undefined;
+  }
+
+  /**
+   * Stale-block sweep (#66). Sources have no "resolved elsewhere" push signal,
+   * so an approval settled locally (gateway UI / CLI) with no `expiresAtMs`
+   * would keep its loop blocked until the session ends. Re-checks, via
+   * `getCurrent`, every proposal this bridge holds a block for and releases
+   * the ones no longer pending. Observe-only: only ever unblocks; a failing
+   * `getCurrent` is logged and the block is kept for the next sweep. Never
+   * throws, never overlaps itself, and touches nothing the publish/decision
+   * paths depend on.
+   */
+  async sweepStaleLoopBlocks(): Promise<void> {
+    const blocker = this.loopBlocker;
+    if (!blocker || this.sweeping || this.disposed) return;
+    this.sweeping = true;
+    try {
+      for (const proposalId of blocker.heldProposalIds()) {
+        await this.sweepOne(proposalId);
+        if (this.disposed) return;
+      }
+    } catch (err) {
+      this.logger.warn(`loop block sweep failed (ignored): ${String(err)}`);
+    } finally {
+      this.sweeping = false;
+      if (blocker.pendingCount() === 0) this.stopSweepTimer();
+    }
+  }
+
+  private async sweepOne(proposalId: string): Promise<void> {
+    // No tracked entry means a restage is in flight (#66): its own path decides.
+    const tracked = this.published.get(proposalId);
+    const source = tracked ? this.sources.get(tracked.sourceId) : undefined;
+    if (!tracked || !source) return;
+    let current: ApprovalSourceCurrentState | null;
+    try {
+      current = await source.getCurrent(proposalId);
+    } catch (err) {
+      this.logger.warn(`loop block sweep: ${tracked.sourceId}.getCurrent failed for ${proposalId} (ignored): ${String(err)}`);
+      return;
+    }
+    if (current?.pending) return;
+    // Decided / restaged while the check was in flight: that path owns the block.
+    if (this.published.get(proposalId) !== tracked) return;
+    this.logger.info(`loop block sweep: ${proposalId} is no longer pending at ${tracked.sourceId} — unblocking its loop`);
     this.loopBlocker?.release(proposalId);
   }
 
@@ -799,6 +899,7 @@ export class GatewayApprovalsBridge {
           `awaiting operator approval (${payload.kind})`,
           request.expiresAtMs,
         );
+        this.ensureSweepTimer();
         if (this.isDegraded()) {
           // Fire-and-forget: a slow notify CLI must never hold the publish reservation.
           void this.warnDegradedPublish(proposalId, payload.kind);
@@ -1151,8 +1252,17 @@ export class GatewayApprovalsBridge {
       this.logger.error(`failed to publish operator.approval.mismatch for ${proposalId}: ${String(err)}`);
     }
     if (source.onDriftPolicy === "restage") {
-      this.forget(proposalId);
-      await this.reconcileSource(source);
+      // Keep the loop-block hold across the restage (#66): only the tracked
+      // entry is evicted so the re-list republishes the card, and the re-block
+      // is idempotent — the Runs lane sees one continuous block instead of an
+      // unblock→block pair. If the item did not come back (resolved meanwhile)
+      // the hold is released; a failed republish releases it via `forget`.
+      this.published.delete(proposalId);
+      try {
+        await this.reconcileSource(source);
+      } finally {
+        if (!this.published.has(proposalId)) this.loopBlocker?.release(proposalId);
+      }
     }
     // "leave" (default, #24 parity): keep the stale entry tracked until a
     // full reconcile/reconnect naturally repopulates it.
@@ -1482,7 +1592,10 @@ export async function startGatewayApprovalsBridge(
     undefined,
     keyResolver,
     deps.directSend?.target ? (text) => sendDirectChannelMessage(deps.directSend, text) : undefined,
-    { loopTracker: deps.loopTracker },
+    {
+      loopTracker: deps.loopTracker,
+      loopBlockSweepIntervalMs: resolveLoopBlockSweepIntervalMs(config!.loopBlockSweepIntervalMs),
+    },
   );
   bridgeRef = bridge;
 
