@@ -97,6 +97,15 @@ export interface ApprovalSourceRequest {
    * changes the digest.
    */
   detail?: Record<string, unknown>;
+  /**
+   * The OpenClaw session (or cron job) waiting on this approval, when the
+   * source knows it (#64). Never sent to the kernel and not part of
+   * `contentHash`: it only lets the bridge mark that loop blocked on the loops
+   * rail while the approval is pending. Omit when unknown.
+   */
+  owner?: { sessionKey?: string; jobId?: string };
+  /** Epoch ms after which the item can no longer be decided; the owning loop is unblocked then (#64). Not sent to the kernel. */
+  expiresAtMs?: number;
 }
 
 /** A source's current, live view of one proposal — used only for the anti-tamper check before resolving a decision. */

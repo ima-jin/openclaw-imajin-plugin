@@ -118,6 +118,7 @@ import {
   wireGatewayExecOutcomeReporting,
 } from "./sources/gateway-exec.js";
 import { logExecApprovalPreflight } from "./exec-approval-preflight.js";
+import { createApprovalLoopBlocker, type ApprovalLoopTracker } from "./approval-loop-blocker.js";
 
 // --- Wire types (kernel side, `docs/notify-operator-approvals-contract.md` in ima-jin/imajin-ai, generalized by #2152) ---
 
@@ -580,6 +581,8 @@ export class GatewayApprovalsBridge {
   private readonly logger: Logger;
   private readonly publishRetryDelaysMs: number[];
   private readonly unsubscribes: Unsubscribe[] = [];
+  /** Marks the owning loop blocked while a card is pending (#64); observe-only, never throws. */
+  private readonly loopBlocker?: ReturnType<typeof createApprovalLoopBlocker>;
 
   constructor(
     private readonly config: GatewayApprovalsBridgeConfig,
@@ -589,9 +592,10 @@ export class GatewayApprovalsBridge {
     private readonly keyResolver: OperatorKeyResolver = UNRESOLVED_OPERATOR_KEY_RESOLVER,
     /** Human-facing warning channel (Telegram via `wsNotifications.directSend`); best-effort. */
     private readonly notifyOperator?: (text: string) => Promise<void>,
-    options: { publishRetryDelaysMs?: number[] } = {},
+    options: { publishRetryDelaysMs?: number[]; loopTracker?: ApprovalLoopTracker } = {},
   ) {
     this.publishRetryDelaysMs = options.publishRetryDelaysMs ?? DEFAULT_PUBLISH_RETRY_DELAYS_MS;
+    if (options.loopTracker) this.loopBlocker = createApprovalLoopBlocker(options.loopTracker);
     this.logger = logger ?? defaultLogger();
     for (const source of this.sources.values()) {
       const unsubscribe = source.subscribe((request) => {
@@ -699,6 +703,13 @@ export class GatewayApprovalsBridge {
   /** Stops observing every source. Does not evict already-tracked proposals. */
   dispose(): void {
     for (const unsubscribe of this.unsubscribes) unsubscribe();
+    this.loopBlocker?.dispose();
+  }
+
+  /** Stops tracking a proposal and unblocks its owning loop (#64). */
+  private forget(proposalId: string): void {
+    this.published.delete(proposalId);
+    this.loopBlocker?.release(proposalId);
   }
 
   /**
@@ -780,6 +791,14 @@ export class GatewayApprovalsBridge {
         this.logger.info(
           `published operator.approval.requested for ${proposalId} (source=${sourceId}, kind=${payload.kind})`,
         );
+        // The owning session / cron run now waits on an operator (#64). The
+        // reason names the kind only — never the command text.
+        this.loopBlocker?.block(
+          proposalId,
+          request.owner,
+          `awaiting operator approval (${payload.kind})`,
+          request.expiresAtMs,
+        );
         if (this.isDegraded()) {
           // Fire-and-forget: a slow notify CLI must never hold the publish reservation.
           void this.warnDegradedPublish(proposalId, payload.kind);
@@ -789,7 +808,7 @@ export class GatewayApprovalsBridge {
         // reservation, so the next real event for this proposalId is treated
         // as brand new and gets a genuine retry instead of being deduped
         // against a publish that never actually happened.
-        this.published.delete(proposalId);
+        this.forget(proposalId);
         this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
         this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
         await this.failClosedIfBlocking(sourceId, request, `the kernel refused or could not receive the card (${String(err)})`);
@@ -1017,7 +1036,7 @@ export class GatewayApprovalsBridge {
       this.logger.info(
         `operator.approval.decided for ${proposalId}: no longer pending at ${tracked.sourceId} — no-op`,
       );
-      this.published.delete(proposalId);
+      this.forget(proposalId);
       return "noop";
     }
 
@@ -1047,7 +1066,7 @@ export class GatewayApprovalsBridge {
     try {
       const result = await source.resolve(proposalId, decision, tracked.sourceRevision);
       this.logger.info(`applied ${decision} for ${proposalId} (source=${tracked.sourceId}, applied=${result.applied})`);
-      this.published.delete(proposalId);
+      this.forget(proposalId);
       return "applied";
     } catch (err) {
       if (err instanceof ApprovalContentDriftError) {
@@ -1058,7 +1077,7 @@ export class GatewayApprovalsBridge {
       // idempotent success and errors cleanly on a genuine conflict (#24) —
       // log, never crash the bridge.
       this.logger.warn(`approval.resolve failed for ${proposalId} (${decision}): ${String(err)}`);
-      this.published.delete(proposalId);
+      this.forget(proposalId);
       return "rejected";
     }
   }
@@ -1132,7 +1151,7 @@ export class GatewayApprovalsBridge {
       this.logger.error(`failed to publish operator.approval.mismatch for ${proposalId}: ${String(err)}`);
     }
     if (source.onDriftPolicy === "restage") {
-      this.published.delete(proposalId);
+      this.forget(proposalId);
       await this.reconcileSource(source);
     }
     // "leave" (default, #24 parity): keep the stale entry tracked until a
@@ -1270,6 +1289,12 @@ export interface StartGatewayApprovalsBridgeDeps {
   stateDir?: string;
   /** `wsNotifications.directSend` — the existing Telegram path, used for the degraded-bridge warning on each publish. */
   directSend?: DirectSendConfig;
+  /**
+   * The loops-rail tracker (#46/#64). When set, the loop owning a pending
+   * approval is marked blocked until the approval is decided or expires.
+   * Observe-only: a failing block/unblock never affects the approval flow.
+   */
+  loopTracker?: ApprovalLoopTracker;
 }
 
 /** What `startGatewayApprovalsBridge` hands back to `index.ts`. */
@@ -1457,6 +1482,7 @@ export async function startGatewayApprovalsBridge(
     undefined,
     keyResolver,
     deps.directSend?.target ? (text) => sendDirectChannelMessage(deps.directSend, text) : undefined,
+    { loopTracker: deps.loopTracker },
   );
   bridgeRef = bridge;
 

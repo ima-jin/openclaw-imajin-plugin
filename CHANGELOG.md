@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Added
+- **Approvals bridge marks the owning loop blocked (#64).** When a `gateway-exec`
+  or `system-agent` approval card is published, the session that owns it is
+  marked `loop.blocked` (`tracker.block`) until the approval is applied,
+  settled at the source, or expires (`tracker.unblock` → `loop.progress`).
+  Observe-only: a failing block/unblock never affects the approval flow, the
+  reason names the card kind (never the command), and card `contentHash` and
+  wire contract are unchanged.
 - **`imajin_vault` `ack` action (#42).** After `fetch`, the agent signs what it
   did with the grant: `ack { grantId, outcome: 'used'|'failed'|'discarded',
   evidence?: { kind, ref }, note? }` -> `POST

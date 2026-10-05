@@ -190,7 +190,7 @@ export default definePluginEntry({
     // Loop lifecycle → kernel loops rail (#46): signed loop.* events for
     // primary sessions, subagents, cron automations and keepers. Observe hooks
     // only; a publish failure is logged and dropped, never surfaced to the loop.
-    registerLoopLifecycle(api, {
+    const loopLifecycle = registerLoopLifecycle(api, {
       nodeUrl: config.nodeUrl,
       did: config.did,
       keypairPath: config.keypairPath,
@@ -303,6 +303,8 @@ export default definePluginEntry({
         kernelHttp: client,
         stateDir: config.wsNotifications?.stateDir,
         directSend: config.wsNotifications?.directSend,
+        // #64: a pending approval blocks its owning loop on the loops rail.
+        loopTracker: loopLifecycle?.tracker,
         // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
         // enabled via `approvals.sources` alongside system-agent/skill-
         // workshop. Reads the config's live `modelPolicy.allow` on every
