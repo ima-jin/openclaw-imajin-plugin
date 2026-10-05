@@ -31,6 +31,19 @@
   lifecycle events".
 
 ### Fixed
+- **Stale "blocked on you" loops after an approval settled outside /jin (#66).**
+  An approval without `expiresAtMs` that was decided in the gateway UI / CLI left
+  its loop `blocked` until the session ended (sources have no "resolved
+  elsewhere" signal). The approvals bridge now sweeps every
+  `approvals.loopBlockSweepIntervalMs` (new; default 60000, floor 5000, `0` =
+  off) with `getCurrent` over the approvals it holds a block for and unblocks any
+  no longer pending. Sweep failures are logged and dropped; the interval runs
+  only while a block is held and is cleared on dispose.
+- **Unblock→block flicker on drift restage (#66).** A restaged proposal
+  (`onDriftPolicy: "restage"`) briefly released and re-took its loop block. The
+  hold is now kept across the re-publish of the same `proposalId`, so the Runs
+  lane sees one continuous block; it is still released if the item is gone or
+  its re-publish fails. Observe-only, as in #64.
 - **Skill Workshop proposals never reached /jin (#33).** `skills.proposals.list`
   is scoped to a single agent's workshop and, with several agents configured
   and no single default, fails every call ("Pass agentId to select a configured

@@ -61,6 +61,7 @@ In `openclaw.json`:
   - **`approvals.gatewayToken`** — optional bearer override for the plugin's own loopback Gateway operator connection(s); a plain string or a SecretRef object; Gateway auth otherwise resolves automatically from the host's own config
   - **`approvals.notifyWebhookSecret`** — bearer value for the kernel's `POST /notify/api/send` `x-webhook-secret` header; a plain string or a SecretRef object; falls back to the `IMAJIN_NOTIFY_WEBHOOK_SECRET` env var; required for the bridge to publish anything
   - **`approvals.skillWorkshop.operatorScopes`** — operator scopes (#35) for the `skill-workshop` source's OWN loopback Gateway connection; defaults to `["operator.read", "operator.admin"]` when omitted or `[]` (#53) — exactly what `skills.proposals.list`/`apply`/`reject` require, fixing `FORBIDDEN: missing scope: operator.read` on strict/token-mode gateways; set `["operator.approvals"]` to opt out of the broader authority; see "Gateway approvals bridge" below
+  - **`approvals.loopBlockSweepIntervalMs`** — how often (ms) the bridge re-checks the approvals it holds a loop block for and clears blocks whose approval was settled outside /jin (#66); default `60000`, floor `5000`, `0` disables; see "Blocked on an operator approval" below
   - **`approvals.requireOperatorCountersignature`** — mirrors the kernel's `OPERATOR_COUNTERSIGN_REQUIRED` (#44, `ima-jin/imajin-ai#2082`); default `false` (a decision missing `operatorSignature` is still applied, unchanged v1 behavior); `true` rejects any decision (including a withdrawal) that lacks a valid `operatorSignature` before it ever reaches a source — see "Operator countersignature" below
 - **`inferProxyBaseUrl`** (optional) — base URL of the local kernel inference proxy every discovered `imajin/<id>` model is registered with (completions go through it, #36); defaults to `http://127.0.0.1:8787/openai/v1`; see "Kernel brains as OpenClaw models" below
 - **`modelDiscovery`** (optional, #55) — model discovery against the kernel; needs `nodeUrl` + `keypairPath`:
@@ -1189,6 +1190,23 @@ its source, applying it fails, or its `expiresAtMs` passes with no decision.
   is logged and dropped and never affects publishing or applying a decision.
   With the loops feature off (`loops.enabled: false` or unconfigured) nothing is
   wired and the bridge behaves exactly as before.
+- **Settled outside /jin (#66).** Sources have no "resolved elsewhere" push
+  signal, so an approval answered in the gateway UI / CLI that has no
+  `expiresAtMs` would leave its loop blocked until the session ends. The bridge
+  therefore runs a periodic sweep: every `approvals.loopBlockSweepIntervalMs`
+  (default `60000`; values below `5000` are raised to `5000`; `0` disables it) it
+  calls `getCurrent` for each approval it holds a block for and unblocks the ones
+  no longer pending (or unknown to the source), so the block clears within one
+  interval. The sweep only ever unblocks; a failing `getCurrent` is logged and
+  dropped (the block stays, the next sweep retries) and never affects publishing
+  or applying a decision. The interval exists only while a block is held and is
+  cleared on shutdown / unregister.
+- **No flicker on restage (#66).** When a source's drift policy re-stages a
+  proposal (`onDriftPolicy: "restage"`), the bridge keeps the block held across
+  the re-publish of the same `proposalId`, so the Runs lane sees one continuous
+  block rather than `loop.progress` (running) immediately followed by
+  `loop.blocked`. If the item does not come back (resolved meanwhile) or its
+  re-publish fails, the block is released as before.
 
 ## Development
 Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` / `src/gateway-approvals-bridge.ts` (dynamic — only on the SecretRef paths, #20, and the live Gateway/kernel wiring in `gateway-approvals-bridge.ts`'s `createLiveGatewayApprovalsClient`, #24) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
