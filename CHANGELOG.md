@@ -3,6 +3,17 @@
 ## Unreleased
 
 ### Added
+- **Session command executor (#51).** Signed, DID-addressed `session.send` /
+  `session.approve` / `session.deny` / `session.abort` / `session.spawn` commands
+  arrive over the existing outbound kernel WS, are verified (pinned kernel
+  signature, addressed to this agent DID, principal in `serviceOf`, principal
+  countersignature, time window, replay), executed against the local gateway
+  (`chat.send`, `exec`/`plugin.approval.resolve`, `chat.abort`,
+  `sessions.create`), and attested back as signed `loop.session.<verb>.completed|failed`
+  frames. Rejection is also an attestation — never silent. Opt-in via
+  `sessionCommands.enabled` + `sessionCommands.kernelPublicKeyHex`. Adds
+  `ImajinClient.getServiceOf`. Wire contract and kernel-side assumptions in
+  `docs/session-commands.md`.
 - **Approvals bridge marks the owning loop blocked (#64).** When a `gateway-exec`
   or `system-agent` approval card is published, the session that owns it is
   marked `loop.blocked` (`tracker.block`) until the approval is applied,

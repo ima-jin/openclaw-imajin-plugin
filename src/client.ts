@@ -394,6 +394,23 @@ export class ImajinClient {
     return ((res as Record<string, unknown>).identity as ImajinIdentity) ?? null;
   }
 
+  /**
+   * `serviceOf` for an agent DID (RFC-31 v2, ima-jin/imajin-ai#2407): the
+   * principal DIDs this agent is bound to. `GET /auth/api/identity/:agentDid`
+   * only returns the field to an authenticated party to the relation (the
+   * agent itself, called here with its own session), so an absent field is
+   * `null` (unverifiable), never `[]`. Used by the session command executor
+   * (#51) to confirm a command's principal is really served by this agent.
+   */
+  async getServiceOf(agentDid: string): Promise<string[] | null> {
+    const res = await this.get(`/auth/api/identity/${encodeURIComponent(agentDid)}`);
+    const record = res as Record<string, unknown>;
+    const identity = (record.identity as Record<string, unknown> | undefined) ?? record;
+    const serviceOf = identity.serviceOf;
+    if (!Array.isArray(serviceOf)) return null;
+    return serviceOf.filter((entry): entry is string => typeof entry === "string");
+  }
+
   async getConnections(did: string): Promise<ImajinIdentity[]> {
     const res = await this.get(`/connections/api/connections/${encodeURIComponent(did)}`);
     return ((res as Record<string, unknown>).connections as ImajinIdentity[]) ?? [];

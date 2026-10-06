@@ -87,6 +87,23 @@
       "label": "Loop Lifecycle Events: Keeper Cron Jobs",
       "help": "Cron jobs (matched on job id, name or declarationKey) to publish as kind openclaw.keeper instead of openclaw.automation. Jobs named keeper, keeper:*, keeper-*, keeper_* or keeper/* are always keepers."
     },
+    "sessionCommands.enabled": {
+      "label": "Session Commands: Enabled",
+      "help": "Accept signed, DID-addressed session commands (session.send/approve/deny/abort/spawn) over the kernel WebSocket, execute them against the local gateway, and attest every outcome as a signed loop.session.* event (#51). Off by default; requires did + keypairPath + sessionCommands.kernelPublicKeyHex. See docs/session-commands.md."
+    },
+    "sessionCommands.kernelPublicKeyHex": {
+      "label": "Session Commands: Pinned Kernel Public Key",
+      "help": "Ed25519 public key (hex) of the kernel's session-command signer. The only key whose grant is accepted; channel/WS auth alone never executes a command."
+    },
+    "sessionCommands.kernelDid": {
+      "label": "Session Commands: Kernel DID",
+      "help": "Optional. When set, a command's issuer must equal this DID in addition to the pinned key.",
+      "placeholder": "did:imajin:..."
+    },
+    "sessionCommands.requirePrincipalCountersignature": {
+      "label": "Session Commands: Require Principal Countersignature",
+      "help": "Default true: a command must also carry the principal's own signature (wish-and-grant, imajin-ai#2084), verified against the principal's registered key. false skips only this check; the kernel grant and serviceOf binding are always required."
+    },
     "approvals.enabled": {
       "label": "Gateway Approvals Bridge: Enabled",
       "help": "Publish staged Gateway system-agent proposals (restart / config mutation) to the kernel and apply signed operator decisions from /jin back to the Gateway (#24). Off by default; requires did + keypairPath + operatorDid + notifyWebhookSecret."

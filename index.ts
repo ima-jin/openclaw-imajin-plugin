@@ -59,6 +59,14 @@ import {
 import { isImajinModelAllowedByPolicy } from "./src/sources/imajin-catalog.js";
 import { registerLoopLifecycle, type LoopsConfig } from "./src/loop-hooks.js";
 import { resolveImajinMcpUrl } from "./src/kernel-mcp.js";
+import { createIdentityClientOperatorKeyResolver } from "./src/operator-signature.js";
+import {
+  createSessionCommandAttester,
+  createSessionCommandExecutor,
+  isSessionCommandFrame,
+  type SessionCommandExecutor,
+} from "./src/session-commands.js";
+import { createLoopbackSessionGateway, type LoopbackSessionGateway } from "./src/session-command-gateway.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -69,6 +77,21 @@ interface ApprovalBridgeSettings {
    * valid signature from exactly this key.
    */
   pinnedApproverPublicKeyHex?: string;
+}
+
+/**
+ * `plugins.entries.imajin.config.sessionCommands` (openclaw.json, #51).
+ * Opt-in: a signed command can steer sessions and resolve approvals, so it is
+ * never on by default.
+ */
+interface SessionCommandsSettings {
+  enabled?: boolean;
+  /** Ed25519 public key (hex) pinned as the only trusted kernel command signer. Required. */
+  kernelPublicKeyHex?: string;
+  /** When set, a command's `issuer` must equal this DID. */
+  kernelDid?: string;
+  /** Default true. false skips the principal countersignature (the kernel grant is always required). */
+  requirePrincipalCountersignature?: boolean;
 }
 
 /** approve -> allow-once (single-shot); reject -> deny. allow-always (standing
@@ -99,6 +122,7 @@ export default definePluginEntry({
       inferProxyBaseUrl?: string;
       modelDiscovery?: ImajinModelDiscoveryConfig;
       loops?: LoopsConfig;
+      sessionCommands?: SessionCommandsSettings;
       mcpUrl?: string;
     };
 
@@ -282,6 +306,47 @@ export default definePluginEntry({
         );
       }
 
+      // Session command executor (#51): signed, DID-addressed session commands
+      // arrive over this same outbound WS, are verified, executed against the
+      // local gateway, and attested back as signed `loop.session.*` frames.
+      // Opt-in; needs the agent DID + a pinned kernel command-signing key.
+      let sessionCommandExecutor: SessionCommandExecutor | undefined;
+      let sessionGateway: LoopbackSessionGateway | undefined;
+      if (config.sessionCommands?.enabled === true) {
+        const settings = config.sessionCommands;
+        if (!config.did || !settings.kernelPublicKeyHex) {
+          console.warn(
+            "[imajin-plugin] sessionCommands.enabled needs an agent `did` and " +
+              "sessionCommands.kernelPublicKeyHex — session commands will not be accepted",
+          );
+        } else {
+          const keyResolver = createIdentityClientOperatorKeyResolver(client);
+          sessionGateway = createLoopbackSessionGateway({
+            getConfig: () => (api.runtime?.config?.current?.() ?? {}) as Record<string, unknown>,
+          });
+          sessionCommandExecutor = createSessionCommandExecutor(
+            {
+              agentDid: config.did,
+              kernelPublicKeyHex: settings.kernelPublicKeyHex,
+              kernelDid: settings.kernelDid,
+              allowedPrincipal: config.actAs,
+              requirePrincipalCountersignature: settings.requirePrincipalCountersignature,
+            },
+            {
+              gateway: sessionGateway.gateway,
+              attest: createSessionCommandAttester({
+                did: config.did,
+                keypairPath: config.keypairPath,
+                send: (frame) => wsService.send(frame),
+              }),
+              resolveServiceOf: (agentDid) => client.getServiceOf(agentDid),
+              resolvePublicKey: (did) => keyResolver.resolveOperatorPublicKey(did),
+            },
+          );
+          console.log("[imajin-plugin] session command executor enabled");
+        }
+      }
+
       // Gateway approvals bridge (#24): publishes staged Gateway system-agent
       // proposals to the kernel and applies signed operator decisions back to
       // the Gateway. Off unless `approvals.enabled` + `approvals.operatorDid`
@@ -370,6 +435,11 @@ export default definePluginEntry({
           void approvalBridge.handleFrame(frame).catch((err: unknown) => {
             console.error(`[imajin-approval] handleFrame failed for ${frame.requestId}:`, err);
           });
+        } else if (sessionCommandExecutor && isSessionCommandFrame(frame)) {
+          // handleFrame never throws and always attests; the catch is belt and braces.
+          void sessionCommandExecutor.handleFrame(frame).catch((err: unknown) => {
+            console.error(`[imajin-session-commands] handleFrame failed for ${frame.type}:`, err);
+          });
         } else if (frame.type === "bus_event") {
           // Kernel bus-event fan-out (#1884) — currently only consumed by the
           // gateway approvals bridge's `operator.approval.decided` handler.
@@ -394,6 +464,7 @@ export default definePluginEntry({
           console.log("[imajin-ws] service stop called");
           wsService.stop();
           disposeInjector();
+          sessionGateway?.dispose();
           void approvalsBridgeReady.then((started) => started?.dispose());
         },
       });
