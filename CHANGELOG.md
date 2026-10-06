@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+- **`wsNotifications.injectScopes` now covers failed/timed-out Warp runs (#70).**
+  The manifest default and README examples listed only `warp.run.completed`, so
+  the terminal `warp.run.failed` / `warp.run.timeout` events never reached the
+  agent session. Config-only; injector logic unchanged.
+
 ### Added
 - **Approvals bridge marks the owning loop blocked (#64).** When a `gateway-exec`
   or `system-agent` approval card is published, the session that owns it is

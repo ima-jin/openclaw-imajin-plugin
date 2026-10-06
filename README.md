@@ -860,7 +860,7 @@ config and this plugin's config:
       "imajin": {
         "config": {
           "wsNotifications": {
-            "injectScopes": ["warp.run.completed"],
+            "injectScopes": ["warp.run.completed", "warp.run.failed", "warp.run.timeout"],
             "wakeSessionKey": "agent:main:telegram:direct:8321865723",
             "hookToken": { "source": "store", "provider": "default", "id": "OPENCLAW_HOOKS_TOKEN" }
           }
@@ -996,7 +996,7 @@ repointing it at a DM:
 
 ```json
 "wsNotifications": {
-  "injectScopes": ["warp.run.completed"],
+  "injectScopes": ["warp.run.completed", "warp.run.failed", "warp.run.timeout"],
   "targetSession": "agent:main:warp-events",
   "reportTo": ["agent:main:telegram:direct:8321865723"]
 }
