@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Fixed
+- **`wsNotifications.injectScopes` now covers failed/timed-out Warp runs (#70).**
+  The manifest default and README examples listed only `warp.run.completed`, so
+  the terminal `warp.run.failed` / `warp.run.timeout` events never reached the
+  agent session. Config-only; injector logic unchanged.
+
 ### Added
 - **Session command executor (#51).** Signed, DID-addressed `session.send` /
   `session.approve` / `session.deny` / `session.abort` / `session.spawn` commands

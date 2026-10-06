@@ -320,6 +320,31 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
     dispose();
   });
 
+  it.each(["warp.run.failed", "warp.run.timeout"])(
+    "injects a %s frame into the session when the scope is in injectScopes",
+    async (scope) => {
+      stubExecFile("ok");
+      setImpl(async () => jsonResponse(200, { runId: "run-1" }));
+      const { api, enqueueSystemEvent } = makeApi();
+      const { inject, dispose } = createNotificationInjector(api, {
+        ...CONFIG,
+        injectScopes: ["warp.run.completed", "warp.run.failed", "warp.run.timeout"],
+      });
+
+      await inject(frameWithScope("1", scope));
+
+      expect(enqueueSystemEvent).toHaveBeenCalledTimes(1);
+      expect(enqueueSystemEvent.mock.calls[0][1]).toMatchObject({
+        sessionKey: SESSION,
+        contextKey: `imajin-ws:${scope}`,
+      });
+
+      await vi.advanceTimersByTimeAsync(COALESCE_MS);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      dispose();
+    },
+  );
+
   it("keeps the newest notification when coalescing three completions", async () => {
     stubExecFile("ok");
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));

@@ -220,7 +220,8 @@
           "injectScopes": {
             "type": "array",
             "items": { "type": "string" },
-            "description": "Notification scopes that trigger agent wake-up (e.g. warp.run.completed)"
+            "default": ["warp.run.completed", "warp.run.failed", "warp.run.timeout"],
+            "description": "Notification scopes that trigger agent wake-up. Include every terminal Warp run scope (warp.run.completed, warp.run.failed, warp.run.timeout) so failed and timed-out runs reach the agent session."
           },
           "targetSession": {
             "type": "string",
