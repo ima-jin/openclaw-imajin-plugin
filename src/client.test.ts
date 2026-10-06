@@ -455,3 +455,33 @@ describe("ImajinClient Warp post-dispatch run control (#1639, plugin surface #1)
     expect(url.searchParams.get("ancestorRunId")).toBe("run-ancestor-1");
   });
 });
+
+describe("ImajinClient.getServiceOf (#51)", () => {
+  const client = new ImajinClient({ nodeUrl: BASE_URL, did: "did:imajin:agent" });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("GETs /auth/api/identity/:did and returns the serviceOf principals", async () => {
+    global.fetch = mockFetch({ did: "did:imajin:agent", subtype: "agent", serviceOf: ["did:imajin:p1", "did:imajin:p2"] });
+    expect(await client.getServiceOf("did:imajin:agent")).toEqual(["did:imajin:p1", "did:imajin:p2"]);
+    const [req] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    expect(req).toBe(`${BASE_URL}/auth/api/identity/did%3Aimajin%3Aagent`);
+  });
+
+  it("reads serviceOf from a nested identity object too", async () => {
+    global.fetch = mockFetch({ identity: { serviceOf: ["did:imajin:p1"] } });
+    expect(await client.getServiceOf("did:imajin:agent")).toEqual(["did:imajin:p1"]);
+  });
+
+  it("returns null (unverifiable, not empty) when the kernel omits serviceOf", async () => {
+    global.fetch = mockFetch({ did: "did:imajin:agent", subtype: "agent" });
+    expect(await client.getServiceOf("did:imajin:agent")).toBeNull();
+  });
+
+  it("propagates HTTP errors so callers can fail closed", async () => {
+    global.fetch = mockFetch({ error: "nope" }, 500);
+    await expect(client.getServiceOf("did:imajin:agent")).rejects.toThrow(/500/);
+  });
+});

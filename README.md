@@ -1208,6 +1208,21 @@ its source, applying it fails, or its `expiresAtMs` passes with no decision.
   `loop.blocked`. If the item does not come back (resolved meanwhile) or its
   re-publish fails, the block is released as before.
 
+### Session commands (#51)
+
+Signed, DID-addressed `session.send` / `session.approve` / `session.deny` /
+`session.abort` / `session.spawn` commands arrive over the existing outbound
+kernel WS, are verified, executed against the local gateway (`chat.send`,
+`exec`/`plugin.approval.resolve`, `chat.abort`, `sessions.create`), and attested
+back as signed `loop.session.<verb>.completed|failed` frames. Rejection (unsigned,
+misaddressed, bad signature, expired, replayed, principal not in `serviceOf`,
+missing countersignature, bad payload) is also an attestation, never silent.
+
+Off by default; enable with `sessionCommands.enabled: true` and pin the kernel's
+command-signing key in `sessionCommands.kernelPublicKeyHex`. Wire contract,
+verification order, attestation shape and the kernel-side assumptions are in
+[`docs/session-commands.md`](docs/session-commands.md).
+
 ## Development
 Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` / `src/gateway-approvals-bridge.ts` (dynamic — only on the SecretRef paths, #20, and the live Gateway/kernel wiring in `gateway-approvals-bridge.ts`'s `createLiveGatewayApprovalsClient`, #24) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.
 
