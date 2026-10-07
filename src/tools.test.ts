@@ -8,6 +8,7 @@ import {
   createAttestTool,
   createChatTool,
   createWarpTool,
+  createUsageTool,
   createImajinStatusTool,
 } from "./tools.js";
 
@@ -409,6 +410,72 @@ describe("imajin_warp tool post-dispatch control (#1639, plugin surface #1)", ()
     expect(result.content[0].text).toMatch(/No Warp runs found/);
   });
 
+  describe("list_runs compact (#72)", () => {
+    const fullRun = {
+      runId: "r1",
+      state: "SUCCEEDED",
+      sessionLink: null,
+      title: "t",
+      configName: "o-jin",
+      requestUsage: { inferenceCost: 1.5, computeCost: 0.5, platformCost: null },
+      statusMessage: { message: "x".repeat(3000), errorCode: null, retryable: null },
+      artifacts: [
+        { artifactType: "PULL_REQUEST", createdAt: "2026-10-07T00:00:00Z", data: { url: "https://x" } },
+      ],
+    };
+
+    it("drops statusMessage and artifact data but keeps the rest", async () => {
+      vi.mocked(client.listWarpRuns).mockResolvedValue({
+        runs: [fullRun as never],
+        hasNextPage: true,
+        nextCursor: "cur",
+      });
+      const result = await tool.execute("1", { action: "list_runs", compact: true, limit: 500 });
+      const body = JSON.parse(result.content[0].text);
+      expect(body.runs[0]).not.toHaveProperty("statusMessage");
+      expect(body.runs[0].artifacts).toEqual([
+        { artifactType: "PULL_REQUEST", createdAt: "2026-10-07T00:00:00Z", data: null },
+      ]);
+      expect(body.runs[0].requestUsage).toEqual(fullRun.requestUsage);
+      expect(body.runs[0].runId).toBe("r1");
+      expect(body.nextCursor).toBe("cur");
+      expect(result.content[0].text.length).toBeLessThan(JSON.stringify(fullRun).length);
+    });
+
+    it("does not pass `compact` to the kernel call", async () => {
+      vi.mocked(client.listWarpRuns).mockResolvedValue({ runs: [], hasNextPage: false, nextCursor: null });
+      await tool.execute("1", { action: "list_runs", compact: true, limit: 5 });
+      expect(client.listWarpRuns).toHaveBeenCalledWith({ limit: 5 }, undefined);
+    });
+
+    it("is off by default: full runs are returned", async () => {
+      vi.mocked(client.listWarpRuns).mockResolvedValue({
+        runs: [fullRun as never],
+        hasNextPage: false,
+        nextCursor: null,
+      });
+      const result = await tool.execute("1", { action: "list_runs" });
+      expect(JSON.parse(result.content[0].text).runs[0]).toEqual(fullRun);
+    });
+
+    it("shows more than the default 20-run cap when compact", async () => {
+      const runs = Array.from({ length: 30 }, (_, i) => ({ ...fullRun, runId: `r${i}` }));
+      vi.mocked(client.listWarpRuns).mockResolvedValue({
+        runs: runs as never,
+        hasNextPage: false,
+        nextCursor: null,
+      });
+      const compact = await tool.execute("1", { action: "list_runs", compact: true });
+      expect(JSON.parse(compact.content[0].text).runs).toHaveLength(30);
+      const full = await tool.execute("1", { action: "list_runs" });
+      expect(JSON.parse(full.content[0].text).runs).toHaveLength(21); // 20 + truncation marker
+    });
+
+    it("exposes compact in the schema", () => {
+      expect(tool.parameters.properties.compact).toMatchObject({ type: "boolean" });
+    });
+  });
+
   it("list_runs forwards ancestorRunId (#1939)", async () => {
     vi.mocked(client.listWarpRuns).mockResolvedValue({ runs: [], hasNextPage: false, nextCursor: null });
     await tool.execute("1", { action: "list_runs", ancestorRunId: "run-ancestor-1" });
@@ -591,5 +658,153 @@ describe("imajin_status tool (#55)", () => {
         registration: { registered: null },
       });
     });
+  });
+});
+
+describe("imajin_usage tool (#72, read-only)", () => {
+  const PRINCIPAL = "did:imajin:principal";
+
+  function makeMockUsageClient(): ImajinClient {
+    return {
+      getUsageSummary: vi.fn(),
+      getUsageRollup: vi.fn(),
+      resolveActingDid: vi.fn(),
+    } as unknown as ImajinClient;
+  }
+
+  let client: ReturnType<typeof makeMockUsageClient>;
+  let tool: ReturnType<typeof createUsageTool>;
+
+  beforeEach(() => {
+    client = makeMockUsageClient();
+    tool = createUsageTool(client as unknown as ImajinClient);
+    vi.useRealTimers();
+  });
+
+  it("is read-only: only summary and rollup actions exist", () => {
+    const actionProp = tool.parameters.properties.action as { enum: string[] };
+    expect(actionProp.enum).toEqual(["summary", "rollup"]);
+  });
+
+  it("summary (totals only) calls the kernel once with the range window and onBehalfOf", async () => {
+    vi.mocked(client.getUsageSummary).mockResolvedValue({
+      incurred: { total: 12.5, byProvider: { anthropic: 10, warp: 2.5 } },
+      billed: { total: 9, byVendor: { anthropic: 9 }, bySource: { api: 9 } },
+      drift: 3.5,
+      currency: "USD",
+    });
+    const result = await tool.execute("1", {
+      action: "summary",
+      from: "2026-10-01",
+      to: "2026-10-07",
+      daily: false,
+      onBehalfOf: PRINCIPAL,
+    });
+    expect(client.getUsageSummary).toHaveBeenCalledTimes(1);
+    expect(client.getUsageSummary).toHaveBeenCalledWith("2026-10-01..2026-10-07", PRINCIPAL);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.totals.incurred.byProvider).toEqual({ anthropic: 10, warp: 2.5 });
+    expect(body.totals.incurred.label).toMatch(/^INCURRED/);
+    expect(body.totals.billed.byVendor).toEqual({ anthropic: 9 });
+    expect(body.totals.billed.label).toMatch(/^BILLED/);
+    expect(body.totals.drift).toBe(3.5);
+    expect(body).not.toHaveProperty("days");
+  });
+
+  it("summary defaults to a per-day breakdown, one single-day window per elapsed day", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-07T12:00:00Z"));
+    vi.mocked(client.getUsageSummary).mockImplementation(async (window: string) => ({
+      incurred: { total: window === "2026-10-06..2026-10-06" ? 4 : 0, byProvider: {} },
+      billed: { total: 0, byVendor: {}, bySource: {} },
+      drift: 0,
+    }));
+    const result = await tool.execute("1", { action: "summary", from: "2026-10-05" });
+    const calledWindows = vi.mocked(client.getUsageSummary).mock.calls.map((c) => c[0]);
+    expect(calledWindows).toEqual([
+      "2026-10-05..2026-10-07",
+      "2026-10-05..2026-10-05",
+      "2026-10-06..2026-10-06",
+      "2026-10-07..2026-10-07",
+    ]);
+    const body = JSON.parse(result.content[0].text);
+    expect(body.days.map((d: { date: string }) => d.date)).toEqual(["2026-10-06"]);
+    expect(body.daysWithNoUsage).toBe(2);
+  });
+
+  it("summary with no params reads the current UTC month and never sends a did", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-01T12:00:00Z"));
+    vi.mocked(client.getUsageSummary).mockResolvedValue({});
+    await tool.execute("1", { action: "summary", daily: false });
+    expect(client.getUsageSummary).toHaveBeenCalledWith("2026-10-01..2026-10-31", undefined);
+  });
+
+  it("summary rejects bad ranges without calling the kernel", async () => {
+    const result = await tool.execute("1", { action: "summary", from: "nope" });
+    expect(result.content[0].text).toMatch(/Invalid 'from'/);
+    expect(result.details).toEqual({ error: true });
+    expect(client.getUsageSummary).not.toHaveBeenCalled();
+  });
+
+  it("rejects an invalid onBehalfOf DID", async () => {
+    const result = await tool.execute("1", { action: "summary", onBehalfOf: "nope" });
+    expect(result.content[0].text).toMatch(/Invalid DID format for onBehalfOf/);
+    expect(client.getUsageSummary).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a kernel 403 (agent not delegated) with a delegation hint", async () => {
+    vi.mocked(client.getUsageSummary).mockRejectedValue(
+      new Error('Imajin API 403: {"error":"Forbidden - can only access your own usage summary"}'),
+    );
+    const result = await tool.execute("1", { action: "summary", daily: false });
+    expect(result.content[0].text).toMatch(/^Error: Imajin API 403/);
+    expect(result.content[0].text).toMatch(/actingFor/);
+    expect(result.details).toEqual({ error: true });
+  });
+
+  it("surfaces a non-auth kernel error verbatim", async () => {
+    vi.mocked(client.getUsageSummary).mockRejectedValue(new Error("Imajin API 500: unavailable"));
+    const result = await tool.execute("1", { action: "summary", daily: false });
+    expect(result.content[0].text).toBe("Error: Imajin API 500: unavailable");
+  });
+
+  it("rollup defaults did to the acting principal", async () => {
+    vi.mocked(client.resolveActingDid).mockResolvedValue(PRINCIPAL);
+    vi.mocked(client.getUsageRollup).mockResolvedValue({ id: "att_1", type: "usage.rollup" });
+    const result = await tool.execute("1", { action: "rollup", day: "2026-10-06" });
+    expect(client.resolveActingDid).toHaveBeenCalledWith(undefined);
+    expect(client.getUsageRollup).toHaveBeenCalledWith(PRINCIPAL, "2026-10-06", undefined);
+    expect(JSON.parse(result.content[0].text).id).toBe("att_1");
+  });
+
+  it("rollup honors an explicit did and skips resolution", async () => {
+    vi.mocked(client.getUsageRollup).mockResolvedValue({ id: "att_2" });
+    await tool.execute("1", { action: "rollup", did: "did:imajin:other", onBehalfOf: PRINCIPAL });
+    expect(client.resolveActingDid).not.toHaveBeenCalled();
+    expect(client.getUsageRollup).toHaveBeenCalledWith("did:imajin:other", undefined, PRINCIPAL);
+  });
+
+  it("rollup validates did and day, and needs a resolvable DID", async () => {
+    const badDid = await tool.execute("1", { action: "rollup", did: "nope" });
+    expect(badDid.content[0].text).toMatch(/Invalid DID format for did/);
+    const badDay = await tool.execute("1", { action: "rollup", did: PRINCIPAL, day: "yesterday" });
+    expect(badDay.content[0].text).toMatch(/Invalid day/);
+    vi.mocked(client.resolveActingDid).mockResolvedValue(undefined);
+    const none = await tool.execute("1", { action: "rollup" });
+    expect(none.content[0].text).toMatch(/requires 'did'/);
+    expect(client.getUsageRollup).not.toHaveBeenCalled();
+  });
+
+  it("rollup surfaces a kernel 404", async () => {
+    vi.mocked(client.resolveActingDid).mockResolvedValue(PRINCIPAL);
+    vi.mocked(client.getUsageRollup).mockRejectedValue(new Error("Imajin API 404: none"));
+    const result = await tool.execute("1", { action: "rollup" });
+    expect(result.content[0].text).toMatch(/404/);
+  });
+
+  it("rejects an unknown action", async () => {
+    const result = await tool.execute("1", { action: "record" });
+    expect(result.content[0].text).toMatch(/Unknown action: record/);
   });
 });

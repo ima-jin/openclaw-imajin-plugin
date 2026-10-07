@@ -14,6 +14,8 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_fair`     | Attribution | Inspect .fair manifests — who made what and who gets paid    |
 | `imajin_discover` | Discovery   | Search the network for people, businesses, events, stubs     |
 | `imajin_vault`    | Vault       | Fetch owner-granted secrets (delegation grants) as protected handles — values never enter model context (#40); `ack` signs what the agent did with a fetched grant (#42) |
+| `imajin_usage`    | Usage       | Read-only spend: `summary` (UTC range → totals + per-day, per provider/vendor/source; **incurred** = our meter and **billed** = counterparty statement kept separate and labeled, plus drift) and `rollup` (public signed `usage.rollup` attestation). Acts for `onBehalfOf` (default `actAs`); the kernel's 401/403 surface as errors (#72) |
+| `imajin_warp`     | Warp        | Dispatch/inspect Warp cloud agents; `list_runs` takes `compact: true` to drop `statusMessage` + artifact `data` per run (plugin-side, kernel call unchanged) for wide spend/volume pulls (#72) |
 
 ## Configuration
 
