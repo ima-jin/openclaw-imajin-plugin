@@ -44,7 +44,6 @@ export interface UsageRangeInput {
 
 export const MAX_DAILY_DAYS = 31;
 export const MAX_RANGE_DAYS = 366;
-const DAILY_CONCURRENCY = 5;
 const DAY_MS = 86_400_000;
 const DAY_PATTERN = /^\d{4}-\d{2}-\d{2}$/;
 const MONTH_PATTERN = /^\d{4}-\d{2}$/;
@@ -167,12 +166,10 @@ export async function buildUsageReport(
 
   const totals = await fetchSummary(windowParam(range.from, range.to));
 
-  const perDay: Array<{ date: string; summary: UsageSummary }> = [];
-  for (let i = 0; i < days.length; i += DAILY_CONCURRENCY) {
-    const batch = days.slice(i, i + DAILY_CONCURRENCY);
-    const results = await Promise.all(batch.map((day) => fetchSummary(windowParam(day, day))));
-    batch.forEach((date, index) => perDay.push({ date, summary: results[index] }));
-  }
+  // At most MAX_DAILY_DAYS (31) concurrent reads — the cap above bounds the fan-out.
+  const perDay = await Promise.all(
+    days.map(async (date) => ({ date, summary: await fetchSummary(windowParam(date, date)) })),
+  );
 
   const report = {
     window: { from: range.from, to: range.to, timezone: "UTC" },
