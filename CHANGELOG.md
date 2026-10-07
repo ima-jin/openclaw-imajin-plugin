@@ -9,6 +9,21 @@
   agent session. Config-only; injector logic unchanged.
 
 ### Added
+- **`imajin_usage` read-only tool + compact `imajin_warp list_runs` (#72).**
+  `summary` reads the kernel usage service's `GET /usage/api/summary?window=`
+  for a UTC range (`month` or `from`/`to`; default the current month): range
+  totals plus — by default, max 31 days — one entry per day with usage, built
+  from one single-day window call per day (the kernel has no per-day field).
+  `incurred` (our meter, per provider) and `billed` (counterparty statement, per
+  vendor and source) are kept separate and labeled, never summed; `drift` is
+  passed through. `rollup` reads the public signed `usage.rollup` attestation
+  (`GET /usage/api/rollup/{did}/latest`). Same auth as the other tools (agent
+  DID session, `onBehalfOf` defaulting to `actAs`; no `did` is sent to
+  `/summary`, so the kernel's own principal/actingFor rule applies and its
+  401/403 surface as errors). `list_runs` gains `compact: true`, which drops
+  each run's `statusMessage` and each artifact's `data` **plugin-side** (the
+  kernel call is unchanged) and lifts the 20-run display cap to the kernel's
+  500-run page ceiling.
 - **Session command executor (#51).** Signed, DID-addressed `session.send` /
   `session.approve` / `session.deny` / `session.abort` / `session.spawn` commands
   arrive over the existing outbound kernel WS, are verified (pinned kernel

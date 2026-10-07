@@ -6,6 +6,7 @@
  */
 
 import { readFile } from "node:fs/promises";
+import type { UsageRollupAttestation, UsageSummary } from "./usage.js";
 
 const DID_PATTERN = /^did:imajin:[A-Za-z0-9:_-]+$/;
 
@@ -148,6 +149,18 @@ export interface WarpAgentRun {
   sessionLink: string | null;
   title: string | null;
   configName: string | null;
+  /**
+   * The kernel's list/get responses also carry these (see `WarpAgentRun` in
+   * ima-jin/imajin-ai `apps/kernel/src/lib/warp/dispatch.ts`); only the two the
+   * compact `list_runs` view drops are typed here; any other field the kernel
+   * returns is passed through untouched.
+   */
+  statusMessage?: { message: string; errorCode: string | null; retryable: boolean | null } | null;
+  artifacts?: Array<{
+    artifactType: string | null;
+    createdAt: string | null;
+    data: Record<string, unknown> | null;
+  }>;
 }
 
 // --- Warp post-dispatch run control (#1639, plugin surface #1) ---
@@ -871,6 +884,53 @@ export class ImajinClient {
    */
   async sealWarpKey(agentKey: string, onBehalfOf?: string): Promise<Record<string, unknown>> {
     return this.post(`/warp/api/seal`, { agentKey }, { onBehalfOf });
+  }
+
+  // --- Usage (read-only, #72) ---
+
+  /**
+   * Read one usage summary window (`GET /usage/api/summary?window=`). `did` is
+   * deliberately NOT sent: the kernel defaults it to the caller's effective DID
+   * (the principal named by `X-Acting-For`, else the agent itself) and 403s any
+   * other value. A non-delegated agent therefore gets the kernel's 403, which
+   * surfaces as a thrown error — nothing is worked around here.
+   */
+  async getUsageSummary(window: string, onBehalfOf?: string): Promise<UsageSummary> {
+    return this.get<UsageSummary>(`/usage/api/summary?window=${encodeURIComponent(window)}`, {
+      onBehalfOf,
+    });
+  }
+
+  /**
+   * The newest (or, with `window` = `YYYY-MM-DD`, that day's) signed
+   * `usage.rollup` attestation for a DID (`GET /usage/api/rollup/{did}/latest`).
+   * Public on the kernel side; sent through the normal session anyway.
+   */
+  async getUsageRollup(
+    did: string,
+    window?: string,
+    onBehalfOf?: string,
+  ): Promise<UsageRollupAttestation> {
+    const query = window === undefined ? "" : `?window=${encodeURIComponent(window)}`;
+    return this.get<UsageRollupAttestation>(
+      `/usage/api/rollup/${encodeURIComponent(did)}/latest${query}`,
+      { onBehalfOf },
+    );
+  }
+
+  /**
+   * The DID a request with this `onBehalfOf` acts as: the delegation target
+   * (explicit, else the configured `actAs`), or the agent's own DID for "self" /
+   * no delegation. Mirrors the `authHeaders` resolution.
+   */
+  async resolveActingDid(onBehalfOf?: string): Promise<string | undefined> {
+    const target = onBehalfOf === "self" ? undefined : (onBehalfOf ?? this.actAs);
+    if (target) {
+      if (!validateDid(target)) throw new Error(`Invalid DID format for onBehalfOf: ${target}`);
+      return target;
+    }
+    if (!this.did && this.keypairPath) await this.loadKeypair();
+    return this.did;
   }
 
   // --- Intention inference (#1620 / the app-as-inference-engine primitive) ---

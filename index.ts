@@ -41,6 +41,7 @@ import {
   createMediaTool,
   createWarpTool,
   createInferTool,
+  createUsageTool,
   createChatTool,
   createImajinStatusTool,
   createVaultTool,
@@ -198,6 +199,7 @@ export default definePluginEntry({
     api.registerTool(createMediaTool(client));
     api.registerTool(createWarpTool(client));
     api.registerTool(createInferTool(client));
+    api.registerTool(createUsageTool(client));
     api.registerTool(createVaultTool(client));
 
     // Chat — requires keypair for auth

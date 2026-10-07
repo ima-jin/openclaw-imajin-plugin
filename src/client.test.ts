@@ -485,3 +485,60 @@ describe("ImajinClient.getServiceOf (#51)", () => {
     await expect(client.getServiceOf("did:imajin:agent")).rejects.toThrow(/500/);
   });
 });
+
+describe("ImajinClient usage reads (#72)", () => {
+  const ACTING = "did:imajin:owner";
+  let client: ImajinClient;
+
+  beforeEach(() => {
+    client = new ImajinClient({ nodeUrl: BASE_URL, did: "did:imajin:agent", actAs: ACTING });
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("getUsageSummary GETs /usage/api/summary?window= with X-Acting-For and no did param", async () => {
+    const summary = { incurred: { total: 1, byProvider: { warp: 1 } }, currency: "USD" };
+    global.fetch = mockFetch(summary);
+    const result = await client.getUsageSummary("2026-10-01..2026-10-07");
+    expect(result).toEqual(summary);
+    const [req, init] = (global.fetch as ReturnType<typeof vi.fn>).mock.calls[0];
+    const url = new URL(req as string);
+    expect(url.pathname).toBe("/usage/api/summary");
+    expect(url.searchParams.get("window")).toBe("2026-10-01..2026-10-07");
+    expect(url.searchParams.has("did")).toBe(false);
+    expect(init?.method ?? "GET").toBe("GET");
+    expect((init.headers as Record<string, string>)["X-Acting-For"]).toBe(ACTING);
+  });
+
+  it("getUsageSummary honors per-call onBehalfOf, including 'self'", async () => {
+    global.fetch = mockFetch({});
+    await client.getUsageSummary("2026-10", "did:imajin:other");
+    await client.getUsageSummary("2026-10", "self");
+    const calls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls;
+    expect((calls[0][1].headers as Record<string, string>)["X-Acting-For"]).toBe("did:imajin:other");
+    expect((calls[1][1].headers as Record<string, string>)["X-Acting-For"]).toBeUndefined();
+  });
+
+  it("getUsageSummary propagates a kernel 403 as a thrown error", async () => {
+    global.fetch = mockFetch({ error: "Forbidden" }, 403);
+    await expect(client.getUsageSummary("2026-10")).rejects.toThrow(/403/);
+  });
+
+  it("getUsageRollup GETs the URL-encoded DID path, with optional day window", async () => {
+    global.fetch = mockFetch({ id: "att_1" });
+    await client.getUsageRollup("did:imajin:owner");
+    await client.getUsageRollup("did:imajin:owner", "2026-10-06");
+    const calls = (global.fetch as ReturnType<typeof vi.fn>).mock.calls;
+    expect(calls[0][0]).toBe(`${BASE_URL}/usage/api/rollup/did%3Aimajin%3Aowner/latest`);
+    expect(calls[1][0]).toBe(`${BASE_URL}/usage/api/rollup/did%3Aimajin%3Aowner/latest?window=2026-10-06`);
+  });
+
+  it("resolveActingDid: onBehalfOf > actAs > own DID, 'self' means own DID", async () => {
+    expect(await client.resolveActingDid("did:imajin:other")).toBe("did:imajin:other");
+    expect(await client.resolveActingDid()).toBe(ACTING);
+    expect(await client.resolveActingDid("self")).toBe("did:imajin:agent");
+    await expect(client.resolveActingDid("not-a-did")).rejects.toThrow(/Invalid DID format/);
+  });
+});

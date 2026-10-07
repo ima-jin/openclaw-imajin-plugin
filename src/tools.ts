@@ -12,13 +12,14 @@
 import { readFile } from "node:fs/promises";
 import type { ImajinChat } from "./chat.js";
 import { validateDid } from "./client.js";
-import type { ImajinClient } from "./client.js";
+import type { ImajinClient, WarpAgentRun } from "./client.js";
 import {
   buildImajinStatusSnapshot,
   fetchImajinProxyHealthz,
   type ImajinCatalogCache,
 } from "./imajin-provider.js";
 import { buildMcpStatusBlock, probeKernelMcp, type McpProbeResult } from "./kernel-mcp.js";
+import { buildUsageReport, formatDay, parseDay, resolveUsageRange } from "./usage.js";
 import { ackGrant, fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
 import { containsLiveSecret, createSecretHandle } from "./vault/secret-handle-store.js";
 
@@ -39,6 +40,26 @@ function errorResult(msg: string): ToolResult {
 function jsonResult(data: unknown): ToolResult {
   return textResult(JSON.stringify(data, null, 2));
 }
+
+/**
+ * Compact view of a Warp run (#72): drops `statusMessage` (~3KB/run) and each
+ * artifact's `data` blob, keeping `artifactType`/`createdAt`. Applied plugin-side
+ * to the page the kernel returns — the kernel call is unchanged.
+ */
+export function compactWarpRun(run: WarpAgentRun): WarpAgentRun {
+  const compact: WarpAgentRun = { ...run };
+  delete compact.statusMessage;
+  if (Array.isArray(run.artifacts)) {
+    compact.artifacts = run.artifacts.map(({ artifactType, createdAt }) => ({
+      artifactType,
+      createdAt,
+      data: null,
+    }));
+  }
+  return compact;
+}
+
+const KERNEL_MAX_RUNS_PAGE = 500;
 
 function truncateResults(data: unknown[], max = 20): unknown[] {
   if (data.length <= max) return data;
@@ -510,7 +531,8 @@ export function createWarpTool(client: ImajinClient) {
       "continues it via Warp's cloud-to-cloud handoff), " +
       "list_runs (list the principal's own runs, newest-updated first, with optional name/states/ " +
       "environmentId/createdAfter/limit/cursor/ancestorRunId filters — ancestorRunId lists every " +
-      "run spawned, directly or transitively, from that run's parentRunId lineage (#1939)), " +
+      "run spawned, directly or transitively, from that run's parentRunId lineage (#1939); " +
+      "compact: true drops statusMessage + artifact data per run for wide pulls (#72)), " +
       "get_transcript (read a run's raw transcript by runId — the self-diagnosis path for a failed run; " +
       "optional maxChars caps the returned text), " +
       "seal_key (seal a Warp Agent API key for the principal as a delegation-grant vault field — " +
@@ -631,6 +653,13 @@ export function createWarpTool(client: ImajinClient) {
             "Optional run id (#1939) — lists every run spawned, directly or transitively, from " +
             "this ancestor's parentRunId lineage (for list_runs)",
         },
+        compact: {
+          type: "boolean" as const,
+          description:
+            "Drop each run's statusMessage and each artifact's data (keeps artifactType/createdAt, " +
+            "requestUsage and the rest) — ~3KB less per run; applied plugin-side, the kernel call is " +
+            "unchanged. Use for wide spend/volume pulls (for list_runs)",
+        },
         maxChars: {
           type: "number" as const,
           description: "Optional cap on transcript characters returned (for get_transcript)",
@@ -675,6 +704,7 @@ export function createWarpTool(client: ImajinClient) {
         limit?: number;
         cursor?: string;
         ancestorRunId?: string;
+        compact?: boolean;
         maxChars?: number;
         agentKey?: string;
         onBehalfOf?: string;
@@ -755,7 +785,13 @@ export function createWarpTool(client: ImajinClient) {
               params.onBehalfOf,
             );
             if (!page.runs.length) return textResult("No Warp runs found");
-            return jsonResult({ ...page, runs: truncateResults(page.runs) });
+            // Compact runs are small, so the display cap rises to the kernel's own
+            // 500-run page ceiling — that is what lets one call cover a wide spend pull.
+            const runs = params.compact ? page.runs.map(compactWarpRun) : page.runs;
+            return jsonResult({
+              ...page,
+              runs: truncateResults(runs, params.compact ? KERNEL_MAX_RUNS_PAGE : undefined),
+            });
           }
           case "get_transcript": {
             if (!params.runId) return errorResult("get_transcript requires 'runId'");
@@ -780,6 +816,143 @@ export function createWarpTool(client: ImajinClient) {
       }
     },
   };
+}
+
+// --- Usage tool (#72, read-only) ---
+
+function usageErrorMessage(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err);
+  if (/\b(401|403)\b/.test(message)) {
+    return (
+      `${message} — the usage service only serves the principal's own usage to the principal or ` +
+      "a registered agent delegated to it (actingFor); check onBehalfOf / actAs."
+    );
+  }
+  return message;
+}
+
+export function createUsageTool(client: ImajinClient) {
+  return {
+    name: "imajin_usage",
+    label: "Imajin Usage",
+    description:
+      "Read-only spend/usage from the Imajin kernel usage service (#72). Answers 'what did we " +
+      "spend on Anthropic and Warp this week'. Actions: " +
+      "summary (totals for a UTC date range plus, by default, one entry per day with usage: " +
+      "INCURRED = our own meter per provider, BILLED = the counterparty's statement per vendor and " +
+      "source (api/manual/document), and drift between them — incurred and billed are kept separate " +
+      "and labeled, never summed together; amounts are USD. Range = month (YYYY-MM) or from[/to] " +
+      "(YYYY-MM-DD, inclusive); default is the current UTC month. The daily breakdown costs one " +
+      "kernel call per day and is capped at 31 days — pass daily: false for totals only), " +
+      "rollup (the newest public signed usage.rollup attestation for a DID, or a specific day's " +
+      "via day). The acting principal is onBehalfOf (default the configured actAs); the kernel only " +
+      "serves a principal's usage to that principal or an agent delegated to it, and its 401/403 " +
+      "refusals surface as errors.",
+    parameters: {
+      type: "object" as const,
+      properties: {
+        action: {
+          type: "string" as const,
+          enum: ["summary", "rollup"],
+          description: "Action to perform",
+        },
+        month: {
+          type: "string" as const,
+          description: "Calendar month, YYYY-MM (UTC). Mutually exclusive with from/to (for summary)",
+        },
+        from: {
+          type: "string" as const,
+          description: "First day, YYYY-MM-DD (UTC, inclusive) (for summary)",
+        },
+        to: {
+          type: "string" as const,
+          description: "Last day, YYYY-MM-DD (UTC, inclusive); defaults to today. Requires from (for summary)",
+        },
+        daily: {
+          type: "boolean" as const,
+          description:
+            "Include the per-day breakdown (default true; max 31 days, one kernel call per day). " +
+            "false returns range totals only (for summary)",
+        },
+        did: {
+          type: "string" as const,
+          description:
+            "Principal DID whose rollup to read; defaults to the acting principal (for rollup)",
+        },
+        day: {
+          type: "string" as const,
+          description: "YYYY-MM-DD (UTC) — that day's rollup instead of the newest (for rollup)",
+        },
+        onBehalfOf: {
+          type: "string" as const,
+          description:
+            'DID to act on behalf of (agent delegation), or "self" to act as the agent itself with no delegation (#1545). ' +
+            "Usage is read for this principal. Defaults to the client's configured actAs.",
+        },
+      },
+      required: ["action"],
+    },
+    async execute(
+      _id: string,
+      params: {
+        action: string;
+        month?: string;
+        from?: string;
+        to?: string;
+        daily?: boolean;
+        did?: string;
+        day?: string;
+        onBehalfOf?: string;
+      },
+    ): Promise<ToolResult> {
+      if (params.onBehalfOf && params.onBehalfOf !== "self" && !validateDid(params.onBehalfOf)) {
+        return errorResult(`Invalid DID format for onBehalfOf: ${params.onBehalfOf}`);
+      }
+      try {
+        switch (params.action) {
+          case "summary":
+            return await usageSummary(client, params);
+          case "rollup":
+            return await usageRollup(client, params);
+          default:
+            return errorResult(`Unknown action: ${params.action}`);
+        }
+      } catch (err: unknown) {
+        return errorResult(usageErrorMessage(err));
+      }
+    },
+  };
+}
+
+async function usageSummary(
+  client: ImajinClient,
+  params: { month?: string; from?: string; to?: string; daily?: boolean; onBehalfOf?: string },
+): Promise<ToolResult> {
+  const now = new Date();
+  const range = resolveUsageRange(params, now);
+  if ("error" in range) return errorResult(range.error);
+  const report = await buildUsageReport(
+    (window) => client.getUsageSummary(window, params.onBehalfOf),
+    range,
+    { daily: params.daily !== false, today: formatDay(now.getTime()) },
+  );
+  return jsonResult(report);
+}
+
+async function usageRollup(
+  client: ImajinClient,
+  params: { did?: string; day?: string; onBehalfOf?: string },
+): Promise<ToolResult> {
+  if (params.did !== undefined && !validateDid(params.did)) {
+    return errorResult(`Invalid DID format for did: ${params.did}`);
+  }
+  if (params.day !== undefined && parseDay(params.day) === null) {
+    return errorResult(`Invalid day '${params.day}' — expected YYYY-MM-DD`);
+  }
+  const did = params.did ?? (await client.resolveActingDid(params.onBehalfOf));
+  if (!did) return errorResult("rollup requires 'did' (no acting DID is configured)");
+  const rollup = await client.getUsageRollup(did, params.day, params.onBehalfOf);
+  return jsonResult(rollup);
 }
 
 export function createInferTool(client: ImajinClient) {
