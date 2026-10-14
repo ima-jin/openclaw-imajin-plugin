@@ -34,6 +34,7 @@ export interface ImajinIdentity {
   scope: string;
   subtype: string;
   displayName?: string;
+  name?: string | null;
   tier?: string;
   /**
    * Hex-encoded Ed25519 public key currently registered for this DID (#44).
@@ -84,12 +85,22 @@ export interface FairManifest {
 
 export interface SearchResult {
   did: string;
-  type: string;
+  type?: string;
   displayName?: string;
-  handle?: string;
+  name?: string | null;
+  handle?: string | null;
   scope: string;
-  subtype: string;
-  relevance: number;
+  subtype: string | null;
+  relevance?: number;
+}
+
+export interface ImajinConnection {
+  did: string;
+  podId: string;
+  joinedAt: string;
+  podName: string;
+  handle: string | null;
+  name: string | null;
 }
 
 export interface MediaAsset {
@@ -398,8 +409,25 @@ export class ImajinClient {
   // --- Identity ---
 
   async lookupIdentity(query: string): Promise<ImajinIdentity | null> {
-    const res = await this.get(`/registry/api/identity/lookup?q=${encodeURIComponent(query)}`);
-    return ((res as Record<string, unknown>).identity as ImajinIdentity) ?? null;
+    const target = query.trim();
+    if (validateDid(target)) return this.lookupIdentityByDid(target);
+    if (target.startsWith("did:")) throw new Error(`Invalid DID format: ${target}`);
+    const results = await this.search(target);
+    const normalized = target.toLowerCase();
+    const match = results.find((row) => row.handle?.toLowerCase() === normalized)
+      ?? results.find((row) => row.name?.toLowerCase() === normalized)
+      ?? results[0];
+    return match ? this.lookupIdentityByDid(match.did) : null;
+  }
+
+  private async lookupIdentityByDid(did: string): Promise<ImajinIdentity | null> {
+    const res = await this.requestRaw(`/auth/api/lookup/${encodeURIComponent(did)}`);
+    if (res.status === 404) return null;
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(`Imajin API ${res.status}: ${res.text}`);
+    }
+    const identity = JSON.parse(res.text) as ImajinIdentity;
+    return { ...identity, displayName: identity.name ?? identity.displayName };
   }
 
   async getIdentity(did: string): Promise<ImajinIdentity | null> {
@@ -424,9 +452,19 @@ export class ImajinClient {
     return serviceOf.filter((entry): entry is string => typeof entry === "string");
   }
 
-  async getConnections(did: string): Promise<ImajinIdentity[]> {
-    const res = await this.get(`/connections/api/connections/${encodeURIComponent(did)}`);
-    return ((res as Record<string, unknown>).connections as ImajinIdentity[]) ?? [];
+  async getConnections(did: string, onBehalfOf?: string): Promise<ImajinConnection[]> {
+    if (!validateDid(did)) throw new Error(`Invalid DID format: ${did}`);
+    const actingDid = await this.resolveActingDid(onBehalfOf);
+    if (onBehalfOf !== undefined && actingDid !== did) {
+      throw new Error("connections query must match the onBehalfOf principal");
+    }
+    // The list route reads the effective principal, not a DID path/query parameter.
+    // The kernel enforces connections:read delegation for another principal.
+    const principal = actingDid === did ? onBehalfOf : did;
+    const res = await this.get<{ connections?: ImajinConnection[] }>(
+      "/connections/api/connections", { onBehalfOf: principal },
+    );
+    return res.connections ?? [];
   }
 
   // --- Attestation ---
@@ -504,10 +542,10 @@ export class ImajinClient {
   // --- Discovery ---
 
   async search(query: string, type?: string): Promise<SearchResult[]> {
-    const params = new URLSearchParams({ q: query });
-    if (type) params.set("type", type);
-    const res = await this.get(`/registry/api/search?${params}`);
-    return ((res as Record<string, unknown>).results as SearchResult[]) ?? [];
+    const params = new URLSearchParams({ q: query, limit: "20" });
+    const res = await this.get<{ results?: SearchResult[] }>(`/auth/api/search?${params}`);
+    const results = res.results ?? [];
+    return type ? results.filter((row) => row.scope === type || row.subtype === type) : results;
   }
 
   // --- Fair ---

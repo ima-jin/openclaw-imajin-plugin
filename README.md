@@ -12,12 +12,22 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_attest`   | Attestation | List and create signed attestations                          |
 | `imajin_transact` | Settlement  | Check MJNx/MJN balances, view transaction history            |
 | `imajin_fair`     | Attribution | Inspect .fair manifests — who made what and who gets paid    |
-| `imajin_discover` | Discovery   | Search the network for people, businesses, events, stubs     |
+| `imajin_discover` | Discovery   | Search non-soft identities by handle/name/DID fragment; no events, market, or stub search |
 | `imajin_vault`    | Vault       | Fetch owner-granted secrets (delegation grants) as protected handles — values never enter model context (#40); `ack` signs what the agent did with a fetched grant (#42) |
 | `imajin_usage`    | Usage       | Read-only spend: `summary` (UTC range → totals + per-day, per provider/vendor/source; **incurred** = our meter and **billed** = counterparty statement kept separate and labeled, plus drift) and `rollup` (public signed `usage.rollup` attestation). Acts for `onBehalfOf` (default `actAs`); the kernel's 401/403 surface as errors (#72) |
 | `imajin_warp`     | Warp        | Dispatch/inspect Warp cloud agents; `list_runs` takes `compact: true` to drop `statusMessage` + artifact `data` per run (plugin-side, kernel call unchanged) for wide spend/volume pulls (#72) |
 
 ## Configuration
+
+Identity lookup uses `GET /auth/api/lookup/{did}`. Handles/names first resolve via
+`GET /auth/api/search?q=...&limit=20` (exact handle preferred, then exact name,
+then the first fuzzy match). Discovery uses the same search route: minimum two
+characters, up to 20 non-soft identities; `type` filters that page locally by
+exact scope/subtype (for example `business` or `human`).
+Connections uses `GET /connections/api/connections` for the queried DID as the
+effective principal. It requires that DID's session or authorized
+`connections:read` delegation; it is not a public arbitrary-DID graph endpoint.
+An explicit `onBehalfOf` must agree with the query DID.
 
 In `openclaw.json`:
 
