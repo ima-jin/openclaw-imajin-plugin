@@ -6,7 +6,7 @@
  * 2. imajin_attest    — create and verify attestations
  * 3. imajin_transact  — check balances, view transactions, initiate payments
  * 4. imajin_fair      — inspect .fair attribution manifests
- * 5. imajin_discover  — search the network (people, events, market, stubs)
+ * 5. imajin_discover  — search non-soft identities by handle or name
  */
 
 import { readFile } from "node:fs/promises";
@@ -74,7 +74,8 @@ export function createIdentityTool(client: ImajinClient) {
     label: "Imajin Identity",
     description:
       "Look up identities on the Imajin network. Actions: lookup (by handle/name/DID), " +
-      "connections (get trust graph connections for a DID).",
+      "connections (list a DID's trust graph connections; requires its session or " +
+      "connections:read delegation, not public access to arbitrary DIDs).",
     parameters: {
       type: "object" as const,
       properties: {
@@ -110,7 +111,7 @@ export function createIdentityTool(client: ImajinClient) {
             return jsonResult(identity);
           }
           case "connections": {
-            const connections = await client.getConnections(params.query);
+            const connections = await client.getConnections(params.query, params.onBehalfOf);
             if (!connections.length) return textResult(`No connections found for: ${params.query}`);
             return jsonResult(connections);
           }
@@ -481,8 +482,9 @@ export function createDiscoverTool(client: ImajinClient) {
     name: "imajin_discover",
     label: "Imajin Discovery",
     description:
-      "Search the Imajin network for people, businesses, events, market items, communities, and stubs. " +
-      "Optional type filter: person, business, community, event, market, stub.",
+      "Search non-soft Imajin identities by handle, name, or DID fragment (minimum two characters). " +
+      "Returns up to 20 matches. Does not search events, market items, or soft/stub identities. " +
+      "Optional type filters the returned page locally by exact identity scope or subtype.",
     parameters: {
       type: "object" as const,
       properties: {
@@ -492,8 +494,7 @@ export function createDiscoverTool(client: ImajinClient) {
         },
         type: {
           type: "string" as const,
-          enum: ["person", "business", "community", "event", "market", "stub"],
-          description: "Filter by type (optional)",
+          description: "Exact identity scope or subtype, e.g. business, actor, or human (optional; local page filter)",
         },
       },
       required: ["query"],
