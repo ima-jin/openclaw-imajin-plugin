@@ -441,6 +441,9 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     const key = str(event?.sessionKey);
     const id = str(event?.sessionId);
     if (key && !isPrimarySessionKey(key)) return;
+    // A compatibility command or late key-only observation is not evidence
+    // of a new session. Only a fresh native sessionId may reuse a retired key.
+    if (key && !id && endedSessionKeys.has(key)) return;
     if (!key && !id) return;
     const loop = sessionLoop(key, id);
     const current = openLoopForKey(key);

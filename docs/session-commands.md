@@ -188,6 +188,15 @@ signature/authorization/content checks. A converted proposal cannot execute on
 both rails, including when live events, catch-up and commands race.
 Invalid commands do not consume approval claims.
 
+For a proposal converted into `session.send`, `session.abort` or
+`session.spawn`, include its native `approvalId` in the signed payload too.
+These verbs claim the **same** registry immediately before their gateway RPC,
+not just approve/deny. A bound conversion must target the owning loop (or use
+it as spawn's parent); a mismatched destination is rejected before claiming.
+The full command signatures cover this association and the new executable
+payload. Omitting the association means an ordinary session command, not an
+approval conversion.
+
 Claims are retained for the process lifetime, without eviction or release even
 when an execution response is lost. The legacy rail skips a previously claimed
 approval; the session rail attests `approval_already_executed` rather than

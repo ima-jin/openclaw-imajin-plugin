@@ -341,6 +341,21 @@ describe("loop-addressed commands", () => {
     expect(h.gateway.send).not.toHaveBeenCalled();
   });
 
+  it("does not resurrect an ended loop through a legacy sessionKey fallback", async () => {
+    const h = harness();
+    const target = start(h);
+    h.loops.onSessionEnd({ sessionKey: target.sessionKey, sessionId: "native-session" });
+    expect(await h.handle(await signedFrame("session.send", {
+      sessionKey: target.sessionKey, message: "late",
+    }))).toMatchObject({ reason: "loop_not_found" });
+    expect(h.gateway.send).not.toHaveBeenCalled();
+    expect(h.loops.lookupSession(target.sessionKey)).toBeUndefined();
+    h.loops.onSessionStart({ sessionKey: target.sessionKey, sessionId: "fresh-native-session" });
+    expect(await h.handle(await signedFrame("session.send", {
+      loopId: h.loops.lookupSession(target.sessionKey)!.loopId, message: "fresh",
+    }))).toMatchObject({ ok: true });
+  });
+
   it("forwards spawn group/model and signs the child and parent lineage with the agent identity", async () => {
     const h = harness();
     const parent = start(h);
@@ -407,7 +422,9 @@ describe("loop-addressed commands", () => {
 });
 
 describe("real approval executor single rail", () => {
-  it.each(["legacy-first", "session-first", "concurrent"])("%s", async (order) => {
+  const cases = (["session.approve", "session.send", "session.abort", "session.spawn"] as const)
+    .flatMap((type) => ["legacy-first", "session-first", "concurrent"].map((order) => ({ type, order })));
+  it.each(cases)("$type: $order", async ({ type, order }) => {
     const h = harness();
     h.loops.onSessionStart({ sessionKey: "owner" });
     const target = h.loops.lookupSession("owner")!;
@@ -436,9 +453,10 @@ describe("real approval executor single rail", () => {
         subject: AGENT, scope: "operator",
         payload: { proposalId: request.proposalId, decision: "approve", decidedBy: PRINCIPAL, contentHash: card!.contentHash },
       };
-      const command = await signedFrame("session.approve", {
-        approvalId: request.proposalId, loopId: target.loopId, kind: "exec",
-      });
+      const payload = type === "session.spawn"
+        ? { approvalId: request.proposalId, parentLoopId: target.loopId, task: "converted task" }
+        : { approvalId: request.proposalId, loopId: target.loopId, kind: "exec", message: "converted message" };
+      const command = await signedFrame(type, payload);
       if (order === "legacy-first") {
         expect(await bridge.handleKernelDecision(legacy)).toBe("applied");
         expect(await h.handle(command)).toMatchObject({ reason: "approval_already_executed" });
@@ -448,7 +466,10 @@ describe("real approval executor single rail", () => {
       } else {
         await Promise.all([bridge.handleKernelDecision(legacy), h.handle(command)]);
       }
-      expect(vi.mocked(source.resolve).mock.calls.length + h.gateway.resolveApproval.mock.calls.length).toBe(1);
+      expect(
+        vi.mocked(source.resolve).mock.calls.length + h.gateway.resolveApproval.mock.calls.length +
+        h.gateway.send.mock.calls.length + h.gateway.abort.mock.calls.length + h.gateway.spawn.mock.calls.length,
+      ).toBe(1);
     } finally {
       bridge.dispose();
     }

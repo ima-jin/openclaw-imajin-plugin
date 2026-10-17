@@ -497,6 +497,7 @@ export function createSessionCommandExecutor(
     if (!optional(p.agentId)) invalid("agentId must be a short string");
     const target = resolveTarget(p.loopId, p.sessionKey);
     address(result, target);
+    claimConvertedApproval(command, p, result);
     const { runId } = await deps.gateway.send({
       sessionKey: target.sessionKey,
       message: p.message,
@@ -518,6 +519,17 @@ export function createSessionCommandExecutor(
     }
     address(result, resolveTarget(binding.loopId, undefined));
   }
+  function claimConvertedApproval(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): void {
+    if (p.approvalId === undefined) return;
+    if (!nonEmpty(p.approvalId)) invalid("approvalId must be a short string");
+    const binding = approvals.getBinding(p.approvalId);
+    if (binding && result.loopId !== binding.loopId) throw new Rejection("approval_binding_mismatch");
+    // A converted send/spawn is still a full principal wish, not a reused
+    // signature over the legacy decision. Share its claim before any RPC.
+    addressApproval(command, p, result);
+    result.approvalId = p.approvalId;
+    if (!approvals.claim(p.approvalId)) throw new Rejection("approval_already_executed");
+  }
 
   async function resolveApproval(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
     if (!nonEmpty(p.approvalId)) invalid("approvalId is required");
@@ -535,10 +547,11 @@ export function createSessionCommandExecutor(
     result.approvalKind = resolved.kind;
   }
 
-  async function abort(_command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
+  async function abort(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
     if (!optional(p.runId)) invalid("runId must be a short string");
     const target = resolveTarget(p.loopId, p.sessionKey);
     address(result, target);
+    claimConvertedApproval(command, p, result);
     const { aborted } = await deps.gateway.abort({
       sessionKey: target.sessionKey,
       runId: p.runId as string | undefined,
@@ -556,6 +569,7 @@ export function createSessionCommandExecutor(
     const parent = p.parentLoopId !== undefined || p.parentSessionKey !== undefined
       ? resolveTarget(p.parentLoopId, p.parentSessionKey) : undefined;
     if (parent) address(result, parent);
+    claimConvertedApproval(command, p, result);
     const { sessionKey } = await deps.gateway.spawn({
       task: p.task,
       parentSessionKey: parent?.sessionKey,
