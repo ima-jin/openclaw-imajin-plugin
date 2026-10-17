@@ -46,6 +46,8 @@ export interface SessionGateway {
     task: string;
     label?: string;
     agentId?: string;
+    group?: string;
+    model?: string;
     idempotencyKey: string;
   }): Promise<{ sessionKey?: string }>;
 }
@@ -100,7 +102,7 @@ export function createSessionGateway(request: GatewayRequest): SessionGateway {
       return { applied: await resolveOne("plugin", id, decision), kind: "plugin" };
     },
 
-    async spawn({ parentSessionKey, task, label, agentId, idempotencyKey }) {
+    async spawn({ parentSessionKey, task, label, agentId, group, model, idempotencyKey }) {
       const result = asRecord(
         await request("sessions.create", {
           task,
@@ -108,6 +110,8 @@ export function createSessionGateway(request: GatewayRequest): SessionGateway {
           ...(parentSessionKey ? { parentSessionKey } : {}),
           ...(label ? { label } : {}),
           ...(agentId ? { agentId } : {}),
+          ...(group ? { group } : {}),
+          ...(model ? { model } : {}),
         }),
       );
       return { sessionKey: optionalString(result.key) ?? optionalString(result.sessionKey) };

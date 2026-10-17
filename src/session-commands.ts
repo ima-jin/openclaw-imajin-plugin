@@ -49,6 +49,8 @@ import { canonicalize, signMessage, type SignedMessage } from "./approval-bridge
 import { sanitizeSummary } from "./loop-publisher.js";
 import { parseOperatorSignature, type OperatorCountersignature } from "./operator-signature.js";
 import type { SessionGateway, SessionApprovalKind } from "./session-command-gateway.js";
+import { createLoopTracker, type LoopTracker, type LocalLoopTarget, isPrimarySessionKey } from "./loop-tracker.js";
+import { ApprovalExecutionRegistry } from "./approval-execution.js";
 
 export const SESSION_COMMAND_TYPES = [
   "session.send",
@@ -90,6 +92,10 @@ export type SessionCommandFailureReason =
   | SessionCommandRejectionReason
   | "gateway_error"
   | "approval_not_found"
+  | "approval_already_executed"
+  | "approval_binding_mismatch"
+  | "loop_not_found"
+  | "loop_target_mismatch"
   | "nothing_to_abort";
 
 export const DEFAULT_COMMAND_TTL_MS = 5 * 60_000;
@@ -220,7 +226,10 @@ export interface SessionCommandAttestationPayload {
   at: string;
   reason?: SessionCommandFailureReason;
   detail?: string;
-  sessionKey?: string;
+  agentDid?: string;
+  loopId?: string;
+  childLoopId?: string;
+  parentLoopId?: string | null;
   runId?: string;
   approvalId?: string;
   approvalKind?: SessionApprovalKind;
@@ -294,6 +303,10 @@ export interface SessionCommandExecutorConfig {
 
 export interface SessionCommandExecutorDeps {
   gateway: SessionGateway;
+  /** The plugin's live, local-only lifecycle registry. */
+  loopTracker?: LoopTracker;
+  /** MUST be the same instance the legacy approval executors use. */
+  executionRegistry?: ApprovalExecutionRegistry;
   attest: SessionCommandAttester;
   /** `serviceOf` for the agent DID; `null` = unverifiable (fail closed). */
   resolveServiceOf: (agentDid: string) => Promise<string[] | null>;
@@ -333,7 +346,9 @@ function invalid(detail: string): never {
 }
 
 interface ExecutionResult {
-  sessionKey?: string;
+  loopId?: string;
+  childLoopId?: string;
+  parentLoopId?: string | null;
   runId?: string;
   approvalId?: string;
   approvalKind?: SessionApprovalKind;
@@ -354,6 +369,8 @@ export function createSessionCommandExecutor(
     error: (m) => console.error(`[imajin-session-commands] ${m}`),
   };
   const now = deps.now ?? Date.now;
+  const loops = deps.loopTracker ?? createLoopTracker({ did: config.agentDid, emit: () => undefined });
+  const approvals = deps.executionRegistry ?? new ApprovalExecutionRegistry();
   const requireCountersignature = config.requirePrincipalCountersignature !== false;
   const seen = new Map<string, number>();
 
@@ -447,81 +464,144 @@ export function createSessionCommandExecutor(
     return command;
   }
 
-  async function execute(command: SessionCommandFrame): Promise<ExecutionResult> {
-    const p = (command.payload && typeof command.payload === "object" ? command.payload : {}) as Record<string, unknown>;
-    switch (command.type) {
-      case "session.send": {
-        if (!nonEmpty(p.sessionKey, 512)) invalid("sessionKey is required");
-        if (!nonEmpty(p.message, MAX_TEXT_LENGTH)) invalid("message is required");
-        if (!optional(p.agentId)) invalid("agentId must be a short string");
-        const { runId } = await deps.gateway.send({
-          sessionKey: p.sessionKey,
-          message: p.message,
-          agentId: p.agentId as string | undefined,
-          idempotencyKey: command.commandId,
-        });
-        return { sessionKey: p.sessionKey, runId };
-      }
-      case "session.approve":
-      case "session.deny": {
-        if (!nonEmpty(p.approvalId)) invalid("approvalId is required");
-        if (p.kind !== undefined && p.kind !== "exec" && p.kind !== "plugin") invalid("kind must be exec or plugin");
-        const result = await deps.gateway.resolveApproval({
-          id: p.approvalId,
-          kind: p.kind as SessionApprovalKind | undefined,
-          decision: command.type === "session.approve" ? "allow-once" : "deny",
-        });
-        if (!result.applied) {
-          throw new Rejection("approval_not_found", "no pending approval with that id was resolved");
-        }
-        return { approvalId: p.approvalId, approvalKind: result.kind };
-      }
-      case "session.abort": {
-        if (!nonEmpty(p.sessionKey, 512)) invalid("sessionKey is required");
-        if (!optional(p.runId)) invalid("runId must be a short string");
-        const { aborted } = await deps.gateway.abort({
-          sessionKey: p.sessionKey,
-          runId: p.runId as string | undefined,
-        });
-        if (!aborted) throw new Rejection("nothing_to_abort", "the session had no active run to abort");
-        return { sessionKey: p.sessionKey, runId: p.runId as string | undefined };
-      }
-      case "session.spawn": {
-        if (!nonEmpty(p.task, MAX_TEXT_LENGTH)) invalid("task is required");
-        if (!optional(p.parentSessionKey, 512) || !optional(p.label) || !optional(p.agentId)) {
-          invalid("parentSessionKey/label/agentId must be short strings");
-        }
-        const { sessionKey } = await deps.gateway.spawn({
-          task: p.task,
-          parentSessionKey: p.parentSessionKey as string | undefined,
-          label: p.label as string | undefined,
-          agentId: p.agentId as string | undefined,
-          idempotencyKey: command.commandId,
-        });
-        return { sessionKey };
-      }
+  function resolveTarget(loopId: unknown, sessionKey: unknown): LocalLoopTarget {
+    if (!optional(loopId) || !optional(sessionKey, 512)) invalid("loopId/sessionKey must be short strings");
+    if (loopId !== undefined) {
+      const target = loops.resolveLoop(loopId as string);
+      if (!target || target.agentDid !== config.agentDid) throw new Rejection("loop_not_found");
+      if (sessionKey !== undefined && sessionKey !== target.sessionKey) throw new Rejection("loop_target_mismatch");
+      return target;
     }
+    if (!nonEmpty(sessionKey, 512)) invalid("loopId or local sessionKey is required");
+    // Compatibility for local key callers only. Never infer a key from a loop
+    // id and never fall back to a supplied key after a failed loop lookup.
+    let target = loops.lookupSession(sessionKey);
+    if (!target) {
+      if (isPrimarySessionKey(sessionKey)) loops.onSessionStart({ sessionKey });
+      else loops.onSubagentSpawned({ childSessionKey: sessionKey });
+      target = loops.lookupSession(sessionKey);
+    }
+    if (!target || target.agentDid !== config.agentDid) throw new Rejection("loop_not_found");
+    return target;
+  }
+
+  function address(result: ExecutionResult, target: LocalLoopTarget): void {
+    result.loopId = target.loopId;
+    result.parentLoopId = target.parentLoopId;
+  }
+
+  type CommandPayload = Record<string, unknown>;
+
+  async function send(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
+    if (!nonEmpty(p.message, MAX_TEXT_LENGTH)) invalid("message is required");
+    if (!optional(p.agentId)) invalid("agentId must be a short string");
+    const target = resolveTarget(p.loopId, p.sessionKey);
+    address(result, target);
+    const { runId } = await deps.gateway.send({
+      sessionKey: target.sessionKey,
+      message: p.message,
+      agentId: p.agentId as string | undefined,
+      idempotencyKey: command.commandId,
+    });
+    result.runId = runId;
+  }
+
+  function addressApproval(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): void {
+    const binding = approvals.getBinding(p.approvalId as string);
+    if (!binding) {
+      if (p.loopId !== undefined) throw new Rejection("approval_binding_mismatch");
+      return; // Legacy native-ID-only local callers remain supported.
+    }
+    if (binding.agentDid !== config.agentDid || binding.principalDid !== command.principal ||
+        (p.loopId !== undefined && p.loopId !== binding.loopId)) {
+      throw new Rejection("approval_binding_mismatch");
+    }
+    address(result, resolveTarget(binding.loopId, undefined));
+  }
+
+  async function resolveApproval(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
+    if (!nonEmpty(p.approvalId)) invalid("approvalId is required");
+    if (p.kind !== undefined && p.kind !== "exec" && p.kind !== "plugin") invalid("kind must be exec or plugin");
+    if (!optional(p.loopId)) invalid("loopId must be a short string");
+    addressApproval(command, p, result);
+    result.approvalId = p.approvalId;
+    if (!approvals.claim(p.approvalId)) throw new Rejection("approval_already_executed");
+    const resolved = await deps.gateway.resolveApproval({
+      id: p.approvalId,
+      kind: p.kind as SessionApprovalKind | undefined,
+      decision: command.type === "session.approve" ? "allow-once" : "deny",
+    });
+    if (!resolved.applied) throw new Rejection("approval_not_found", "no pending approval with that id was resolved");
+    result.approvalKind = resolved.kind;
+  }
+
+  async function abort(_command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
+    if (!optional(p.runId)) invalid("runId must be a short string");
+    const target = resolveTarget(p.loopId, p.sessionKey);
+    address(result, target);
+    const { aborted } = await deps.gateway.abort({
+      sessionKey: target.sessionKey,
+      runId: p.runId as string | undefined,
+    });
+    if (!aborted) throw new Rejection("nothing_to_abort", "the session had no active run to abort");
+    result.runId = p.runId as string | undefined;
+  }
+
+  async function spawn(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
+    if (!nonEmpty(p.task, MAX_TEXT_LENGTH)) invalid("task is required");
+    if (!optional(p.parentSessionKey, 512) || !optional(p.parentLoopId) ||
+        !optional(p.label) || !optional(p.agentId) || !optional(p.group) || !optional(p.model)) {
+      invalid("parentLoopId/parentSessionKey/label/agentId/group/model must be short strings");
+    }
+    const parent = p.parentLoopId !== undefined || p.parentSessionKey !== undefined
+      ? resolveTarget(p.parentLoopId, p.parentSessionKey) : undefined;
+    if (parent) address(result, parent);
+    const { sessionKey } = await deps.gateway.spawn({
+      task: p.task,
+      parentSessionKey: parent?.sessionKey,
+      label: p.label as string | undefined,
+      agentId: p.agentId as string | undefined,
+      group: p.group as string | undefined,
+      model: p.model as string | undefined,
+      idempotencyKey: command.commandId,
+    });
+    if (!nonEmpty(sessionKey, 512)) throw new Rejection("gateway_error", "spawn returned no child session");
+    const child = loops.registerSpawn({ sessionKey, parentLoopId: parent?.loopId });
+    address(result, child);
+    result.childLoopId = child.loopId;
+  }
+
+  const handlers = {
+    "session.send": send, "session.abort": abort, "session.spawn": spawn,
+    "session.approve": resolveApproval, "session.deny": resolveApproval,
+  } satisfies Record<SessionCommandType, (command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult) => Promise<void>>;
+
+  async function execute(command: SessionCommandFrame, result: ExecutionResult): Promise<void> {
+    const p = (command.payload && typeof command.payload === "object" ? command.payload : {}) as CommandPayload;
+    await handlers[command.type](command, p, result);
   }
 
   async function handleFrame(frame: { type: SessionCommandType; [k: string]: unknown }): Promise<SessionCommandOutcome> {
     const type = frame.type;
     const verb = VERBS[type];
-    let result: ExecutionResult = {};
+    const result: ExecutionResult = {};
     let failure: { reason: SessionCommandFailureReason; detail?: string } | undefined;
 
     try {
       const command = await verify(frame);
       try {
-        result = await execute(command);
+        await execute(command, result);
       } catch (err) {
         if (err instanceof Rejection) throw err;
-        throw new Rejection("gateway_error", err instanceof Error ? err.message : String(err));
+        // Gateway messages may contain harness keys or task text. Neither is
+        // part of the kernel contract, even in a signed failure.
+        throw new Rejection("gateway_error", "local gateway execution failed");
       }
     } catch (err) {
       failure =
         err instanceof Rejection
           ? { reason: err.reason, detail: err.detail }
-          : { reason: "gateway_error", detail: err instanceof Error ? err.message : String(err) };
+          : { reason: "gateway_error", detail: "local command execution failed" };
     }
 
     const eventType = `loop.session.${verb}.${failure ? "failed" : "completed"}` as SessionCommandEventType;
@@ -531,6 +611,7 @@ export function createSessionCommandExecutor(
       command: type,
       outcome: failure ? "failed" : "completed",
       principal: cap(frame.principal),
+      agentDid: config.agentDid,
       issuer: cap(frame.issuer),
       payloadHash: hashPayload(frame.payload),
       at: new Date(now()).toISOString(),

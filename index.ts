@@ -69,6 +69,7 @@ import {
   type SessionCommandExecutor,
 } from "./src/session-commands.js";
 import { createLoopbackSessionGateway, type LoopbackSessionGateway } from "./src/session-command-gateway.js";
+import { ApprovalExecutionRegistry } from "./src/approval-execution.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -276,6 +277,7 @@ export default definePluginEntry({
       // signing identity (did + keypairPath, already required above for the WS
       // itself) and a pinned approver public key are configured — an install
       // with neither behaves exactly as before.
+      const approvalExecutions = new ApprovalExecutionRegistry();
       let approvalBridge: ApprovalBridge | undefined;
       if (config.did && config.approvalBridge?.pinnedApproverPublicKeyHex) {
         approvalBridge = new ApprovalBridge(
@@ -296,6 +298,7 @@ export default definePluginEntry({
         // so custody checks that key off a channel/accountId/senderId triple
         // don't apply here; omitting all three is the documented no-reviewer form.
         approvalBridge.onResolved(async (requestId, decision, kind: GatewayApprovalKind) => {
+          if (!approvalExecutions.claim(requestId)) return;
           try {
             const result = await resolveApprovalOverGateway({
               cfg: api.config,
@@ -346,6 +349,8 @@ export default definePluginEntry({
             },
             {
               gateway: sessionGateway.gateway,
+              loopTracker: loopLifecycle?.tracker,
+              executionRegistry: approvalExecutions,
               attest: createSessionCommandAttester({
                 did: config.did,
                 keypairPath: config.keypairPath,
@@ -382,6 +387,10 @@ export default definePluginEntry({
         directSend: config.wsNotifications?.directSend,
         // #64: a pending approval blocks its owning loop on the loops rail.
         loopTracker: loopLifecycle?.tracker,
+        executionRegistry: approvalExecutions,
+        publishApprovalBinding: async (attestation) => {
+          wsService.send({ type: "loop.approval.bound", attestation });
+        },
         // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
         // enabled via `approvals.sources` alongside system-agent/skill-
         // workshop. Reads the config's live `modelPolicy.allow` on every
