@@ -361,6 +361,7 @@ export class ImajinWsService {
         ws = new WebSocket(wsUrl);
       }
 
+      let expectingAuthPrompt = wsToken !== null;
       ws.addEventListener("open", () => {
         this.logger.info("connected");
         this.reconnectAttempt = 0;
@@ -370,18 +371,6 @@ export class ImajinWsService {
         if (wsToken) {
           ws.send(JSON.stringify({ type: "auth", token: wsToken }));
         }
-
-        // Register for actAs DID notifications too (#1545 pattern).
-        // When the agent acts on behalf of a principal, it needs to
-        // receive that principal's notifications.
-        if (this.config.actAs) {
-          this.logger.info(`registering actAs DID: ${this.config.actAs}`);
-          ws.send(JSON.stringify({
-            type: "register_also",
-            did: this.config.actAs,
-          }));
-        }
-
         this.startHeartbeat(ws);
         this.scheduleAuthRefresh();
       });
@@ -401,8 +390,22 @@ export class ImajinWsService {
         }
 
         if (frame.type === "connected") {
+          expectingAuthPrompt = false;
           this.logger.info("auth ok");
+          // The native fallback's auth message is processed asynchronously
+          // by the kernel. Register only after auth-ok, never racing auth
+          // from the socket-open callback (#68 principal reach delivery).
+          if (this.config.actAs) {
+            ws.send(JSON.stringify({ type: "register_also", did: this.config.actAs }));
+          }
           this.notifyConnected();
+          return;
+        }
+
+        // Native sockets receive one initial prompt even though the token is
+        // already in flight. Later prompts/auth errors remain real failures.
+        if (frame.type === "auth_required" && expectingAuthPrompt) {
+          expectingAuthPrompt = false;
           return;
         }
 

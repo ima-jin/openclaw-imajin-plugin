@@ -14,6 +14,7 @@
 
 import * as path from "node:path";
 import type { NotificationFrame } from "./ws-service.js";
+import { isReachFrame, isReachScope, type ReachEventsConfig } from "./reach-events.js";
 import { sendDirectChannelMessage } from "./channel-notify.js";
 import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
 import type { AgentEndEvent } from "./turn-usage-attestation.js";
@@ -36,6 +37,8 @@ import {
 
 /** `plugins.entries.imajin.config.wsNotifications` (openclaw.json). */
 export interface WsNotificationsConfig {
+  /** Signed reach events use a separate untrusted adapter, never the Warp wake pipeline. */
+  reach?: ReachEventsConfig;
   /** Notification scopes that should wake the agent, e.g. `warp.run.completed`. */
   injectScopes?: string[];
   /** Exact session key to inject into, e.g. `agent:main:telegram:direct:8321865723`. */
@@ -803,6 +806,12 @@ export function createNotificationInjector(
     .then(async () => {
       const owedByScope = new Map<string, OwedEntry[]>();
       for (const [key, owed] of pendingWakeStore.all()) {
+        // Legacy/misconfigured reach records must never re-enter the generic
+        // action-oriented wake or automatic channel fallback pipeline.
+        if (isReachScope(owed.scope)) {
+          await pendingWakeStore.delete(key);
+          continue;
+        }
         const list = owedByScope.get(owed.scope) ?? [];
         list.push({ key, owed });
         owedByScope.set(owed.scope, list);
@@ -1084,6 +1093,7 @@ export function createNotificationInjector(
   }
 
   async function inject(nf: NotificationFrame): Promise<void> {
+    if (isReachFrame(nf)) return;
     if (!injectScopes.has(nf.scope) || !targetSession) {
       return;
     }
