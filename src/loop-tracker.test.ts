@@ -22,6 +22,192 @@ function setup(options: { keeperJobs?: string[]; emit?: (t: LoopTransition) => v
 
 const sessionId = (key: string) => deriveLoopId(DID, "openclaw.session", key);
 const subagentId = (key: string) => deriveLoopId(DID, "openclaw.subagent", key);
+describe("local loop target registry", () => {
+  it("resolves only observed local active loops and returns detached local metadata", () => {
+    const { tracker } = setup();
+    expect(tracker.resolveLoop(sessionId("s"))).toBeUndefined();
+    expect(tracker.lookupSession(MAIN)).toBeUndefined();
+    tracker.onSessionStart({ sessionId: "s", sessionKey: MAIN });
+    const target = { loopId: sessionId("s"), sessionKey: MAIN, parentLoopId: null, agentDid: DID };
+    expect(tracker.resolveLoop(target.loopId)).toEqual(target);
+    expect(tracker.lookupSession(MAIN)).toEqual(target);
+    expect(tracker.lookupRef({ sessionKey: MAIN })).toEqual(target);
+    expect(tracker.resolveLoop(deriveLoopId("did:imajin:foreign", "openclaw.session", "s"))).toBeUndefined();
+    expect(tracker.resolveLoop(MAIN)).toBeUndefined();
+    expect(tracker.resolveLoop("openclaw.session:unknown")).toBeUndefined();
+    tracker.resolveLoop(target.loopId)!.sessionKey = "tampered";
+    expect(tracker.resolveLoop(target.loopId)).toEqual(target);
+    tracker.onSessionEnd({ sessionKey: MAIN, sessionId: "s", reason: "idle" });
+    expect(tracker.resolveLoop(target.loopId)).toBeUndefined();
+    expect(tracker.lookupSession(MAIN)).toBeUndefined();
+    expect(tracker.lookupRef({ sessionKey: MAIN })).toBeUndefined();
+  });
+
+  it("does not expose loops without an actionable session key", () => {
+    const { tracker, events } = setup();
+    tracker.onSessionStart({ sessionId: "no-key" });
+    tracker.onCronChanged({ action: "started", jobId: "j", runAtMs: 1 });
+    expect(tracker.resolveLoop(events[0]!.loopId)).toBeUndefined();
+    expect(tracker.lookupRef({ jobId: "j" })).toBeUndefined();
+  });
+
+  it("looks up approval refs for active cron targets and excludes superseded keys", () => {
+    const { tracker, events } = setup();
+    const key = "agent:main:cron:j";
+    tracker.onCronChanged({ action: "started", jobId: "j", runAtMs: 1, sessionKey: key });
+    const first = events[0]!.loopId;
+    expect(tracker.lookupRef({ jobId: "j" })?.loopId).toBe(first);
+    tracker.onCronChanged({ action: "started", jobId: "j", runAtMs: 2, sessionKey: key });
+    expect(tracker.resolveLoop(first)).toBeUndefined();
+    expect(tracker.lookupSession(key)?.loopId).toBe(events.at(-1)!.loopId);
+    tracker.onCronChanged({ action: "finished", jobId: "j" });
+    expect(tracker.lookupRef({ jobId: "j" })).toBeUndefined();
+  });
+
+  it("rejects an old loop even when another open loop has taken its session key", () => {
+    const { tracker, events } = setup();
+    tracker.onCronChanged({ action: "started", jobId: "first", runAtMs: 1, sessionKey: MAIN });
+    const oldId = events[0]!.loopId;
+    tracker.onCronChanged({ action: "started", jobId: "second", runAtMs: 2, sessionKey: MAIN });
+    expect(tracker.resolveLoop(oldId)).toBeUndefined();
+    expect(tracker.lookupRef({ jobId: "first" })).toBeUndefined();
+    expect(tracker.lookupSession(MAIN)?.loopId).toBe(events.at(-1)!.loopId);
+  });
+
+  it("registers a root by key and retains that identity through session hooks", () => {
+    const { tracker, events } = setup();
+    const root = tracker.registerSpawn({ sessionKey: MAIN });
+    expect(root).toEqual({ loopId: sessionId(MAIN), sessionKey: MAIN, parentLoopId: null, agentDid: DID });
+    tracker.onSessionStart({ sessionKey: MAIN, sessionId: "spawned-session" });
+    tracker.onSessionStart({ sessionKey: MAIN, sessionId: "spawned-session" });
+    expect(events).toHaveLength(1);
+    expect(tracker.registerSpawn({ sessionKey: MAIN })).toEqual(root);
+    tracker.onAgentEnd({ success: true }, { sessionKey: MAIN });
+    tracker.onSessionEnd({ sessionKey: MAIN, sessionId: "spawned-session", reason: "idle" });
+    expect(events.map((e) => e.loopId)).toEqual([root.loopId, root.loopId, root.loopId]);
+    expect(tracker.resolveLoop(root.loopId)).toBeUndefined();
+    expect(() => tracker.registerSpawn({ sessionKey: MAIN })).toThrow("already ended");
+    tracker.onSessionStart({ sessionKey: MAIN, sessionId: "spawned-session" });
+    expect(tracker.lookupSession(MAIN)).toBeUndefined();
+  });
+
+  it("rejects spawn registration when an end hook raced ahead of the create response", () => {
+    const { tracker } = setup();
+    const parent = tracker.registerSpawn({ sessionKey: MAIN });
+    tracker.onSubagentEnded({ targetSessionKey: CHILD, outcome: "ok" });
+    expect(() => tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: parent.loopId })).toThrow("already ended");
+    tracker.onSessionEnd({ sessionKey: "agent:other:main", sessionId: "other" });
+    expect(() => tracker.registerSpawn({ sessionKey: "agent:other:main" })).toThrow("already ended");
+    expect(tracker.lookupSession(CHILD)).toBeUndefined();
+    expect(tracker.lookupSession("agent:other:main")).toBeUndefined();
+  });
+
+  it("registers a child before hooks without duplicate starts or changed lineage", () => {
+    const { tracker, events } = setup();
+    const root = tracker.registerSpawn({ sessionKey: MAIN });
+    const child = tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: root.loopId });
+    expect(child).toEqual({ loopId: subagentId(CHILD), sessionKey: CHILD, parentLoopId: root.loopId, agentDid: DID });
+    tracker.onSubagentSpawned({ childSessionKey: CHILD, runId: "run" });
+    tracker.onSubagentSpawned({ childSessionKey: CHILD }, { requesterSessionKey: "other-parent" });
+    tracker.onSessionStart({ sessionKey: CHILD, sessionId: "child-session" });
+    expect(events.map((e) => e.type)).toEqual(["loop.started", "loop.started"]);
+    expect(tracker.resolveLoop(child.loopId)).toEqual(child);
+    tracker.onSubagentProgress({ childSessionKey: CHILD, phase: "started" });
+    tracker.onSubagentEnded({ targetSessionKey: CHILD, outcome: "ok" });
+    expect(events.at(-1)).toMatchObject({
+      loopId: child.loopId, parentLoopId: root.loopId, refs: { sessionKey: CHILD, runId: "run" },
+    });
+    expect(tracker.resolveLoop(child.loopId)).toBeUndefined();
+    tracker.onSubagentSpawned({ childSessionKey: CHILD });
+    expect(tracker.lookupSession(CHILD)).toBeUndefined();
+    expect(events.filter((e) => e.loopId === child.loopId && e.type === "loop.started")).toHaveLength(1);
+  });
+
+  it("reconciles hooks racing ahead of the spawn result and attests missing lineage", () => {
+    const { tracker, events } = setup();
+    const root = tracker.registerSpawn({ sessionKey: MAIN });
+    tracker.onSubagentSpawned({ childSessionKey: CHILD, runId: "run" });
+    const child = tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: root.loopId });
+    expect(child.loopId).toBe(subagentId(CHILD));
+    expect(child.parentLoopId).toBe(root.loopId);
+    expect(events.map((e) => e.type)).toEqual(["loop.started", "loop.started", "loop.progress"]);
+    expect(events.at(-1)!.parentLoopId).toBe(root.loopId);
+    tracker.onSubagentSpawned({ childSessionKey: CHILD });
+    expect(tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: root.loopId })).toEqual(child);
+    expect(events).toHaveLength(3);
+  });
+
+  it("reuses a hook-observed root without changing its published ID", () => {
+    const { tracker, events } = setup();
+    tracker.onSessionStart({ sessionKey: MAIN, sessionId: "already-observed" });
+    expect(tracker.registerSpawn({ sessionKey: MAIN }).loopId).toBe(sessionId("already-observed"));
+    expect(events).toHaveLength(1);
+  });
+
+  it("preserves nested spawn lineage after the parent ends", () => {
+    const { tracker } = setup();
+    const root = tracker.registerSpawn({ sessionKey: MAIN });
+    const child = tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: root.loopId });
+    const grandchild = tracker.registerSpawn({ sessionKey: GRANDCHILD, parentLoopId: child.loopId });
+    tracker.onSubagentEnded({ targetSessionKey: CHILD, outcome: "ok" });
+    expect(tracker.resolveLoop(grandchild.loopId)).toEqual(grandchild);
+    tracker.onSubagentSpawned({ childSessionKey: GRANDCHILD }, { requesterSessionKey: MAIN });
+    expect(tracker.resolveLoop(grandchild.loopId)?.parentLoopId).toBe(child.loopId);
+  });
+
+  it("rejects invalid, unknown, foreign, ended and conflicting parents", () => {
+    const { tracker } = setup();
+    const root = tracker.registerSpawn({ sessionKey: MAIN });
+    expect(() => tracker.registerSpawn({ sessionKey: "" })).toThrow(TypeError);
+    expect(() => tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: "" })).toThrow(TypeError);
+    for (const parentLoopId of ["unknown", deriveLoopId("foreign", "openclaw.session", MAIN)]) {
+      expect(() => tracker.registerSpawn({ sessionKey: CHILD, parentLoopId })).toThrow("active local");
+    }
+    tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: root.loopId });
+    expect(() => tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: subagentId(CHILD) })).toThrow("own parent");
+    const other = tracker.registerSpawn({ sessionKey: "agent:other:main" });
+    expect(() => tracker.registerSpawn({ sessionKey: CHILD, parentLoopId: other.loopId })).toThrow("lineage");
+    tracker.onSessionEnd({ sessionKey: MAIN });
+    expect(() => tracker.registerSpawn({ sessionKey: GRANDCHILD, parentLoopId: root.loopId })).toThrow("active local");
+    expect(tracker.lookupSession(GRANDCHILD)).toBeUndefined();
+  });
+
+  it("keeps superseded spawn aliases closed and ignores their late hooks", () => {
+    const { tracker } = setup();
+    const original = tracker.registerSpawn({ sessionKey: MAIN });
+    tracker.onSessionStart({ sessionKey: MAIN, sessionId: "s1" });
+    tracker.onSessionStart({ sessionKey: MAIN, sessionId: "s2" });
+    expect(tracker.resolveLoop(original.loopId)).toBeUndefined();
+    tracker.onSessionStart({ sessionKey: MAIN, sessionId: "s1" });
+    tracker.onSessionEnd({ sessionKey: MAIN, sessionId: "s1" });
+    expect(tracker.lookupSession(MAIN)?.loopId).toBe(sessionId("s2"));
+    expect(tracker.resolveLoop(original.loopId)).toBeUndefined();
+  });
+
+  it("does not reopen an ended requester lazily through child observations", () => {
+    const { tracker, events } = setup();
+    tracker.onSessionStart({ sessionKey: MAIN, sessionId: "s" });
+    tracker.onSessionEnd({ sessionKey: MAIN, sessionId: "s" });
+    tracker.onSubagentSpawned({ childSessionKey: CHILD }, { requesterSessionKey: MAIN });
+    expect(events.at(-1)!.parentLoopId).toBeNull();
+    expect(tracker.lookupSession(MAIN)).toBeUndefined();
+  });
+
+  it("registers successful spawns even when publishing throws, without new wire fields", () => {
+    const { tracker, logger } = setup({ emit: () => { throw new Error("offline"); } });
+    const root = tracker.registerSpawn({ sessionKey: MAIN });
+    expect(tracker.resolveLoop(root.loopId)).toEqual(root);
+    expect(logger.warn).toHaveBeenCalled();
+    const healthy = setup();
+    healthy.tracker.registerSpawn({ sessionKey: MAIN });
+    expect(Object.keys(healthy.events[0]!).sort()).toEqual([
+      "kind", "loopId", "parentLoopId", "refs", "state", "summary", "type",
+    ]);
+    expect(healthy.events[0]!.refs).toEqual({ sessionKey: MAIN });
+    expect(healthy.events[0]).not.toHaveProperty("sessionKey");
+    expect(healthy.events[0]).not.toHaveProperty("agentDid");
+  });
+});
 
 describe("openclaw.session", () => {
   it("session_start → started, agent_end → progress, session_end → finished", () => {

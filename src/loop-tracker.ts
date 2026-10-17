@@ -128,6 +128,8 @@ interface OpenLoop {
   refs: LoopRefs;
   parentLoopId: string | null;
   label: string;
+  /** Learnt from hooks even when initially registered by session key. */
+  sessionId?: string;
 }
 
 const MAX_RECONCILE_EMISSIONS = 200;
@@ -182,8 +184,21 @@ export interface LoopRef {
   sessionKey?: string;
   jobId?: string;
 }
+/** Plugin-local execution target. Never include this object in wire payloads. */
+export interface LocalLoopTarget {
+  loopId: string;
+  sessionKey: string;
+  parentLoopId: string | null;
+  agentDid: string;
+}
 
 export interface LoopTracker {
+  /** Only resolves locally observed, currently active execution targets. */
+  resolveLoop(loopId: string): LocalLoopTarget | undefined;
+  lookupSession(sessionKey: string): LocalLoopTarget | undefined;
+  lookupRef(ref: LoopRef): LocalLoopTarget | undefined;
+  /** Registers a successful sessions.create result before returning its outcome. */
+  registerSpawn(input: { sessionKey: string; parentLoopId?: string | null }): LocalLoopTarget;
   onSessionStart(event: SessionStartEvent): void;
   onSessionEnd(event: SessionEndEvent): void;
   onAgentEnd(event: AgentEndLoopEvent, ctx?: { sessionKey?: string }): void;
@@ -214,6 +229,9 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
   const bySessionKey = new Map<string, string>();
   /** cron jobId → loopId of its in-flight run. */
   const cronRuns = new Map<string, string>();
+  /** Late hooks must not resurrect a finished identity. */
+  const ended = new Set<string>();
+  const endedSessionKeys = new Set<string>();
 
   const guard =
     <A extends unknown[]>(name: string, fn: (...args: A) => void) =>
@@ -243,15 +261,24 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
   };
 
   const start = (loop: OpenLoop, summary: string): void => {
+    if (open.has(loop.loopId) || ended.has(loop.loopId)) return;
     open.set(loop.loopId, loop);
-    if (loop.refs.sessionKey) bySessionKey.set(loop.refs.sessionKey, loop.loopId);
+    if (loop.refs.sessionKey) {
+      bySessionKey.set(loop.refs.sessionKey, loop.loopId);
+      endedSessionKeys.delete(loop.refs.sessionKey);
+    }
     send("loop.started", loop, "running", summary);
   };
 
   const finish = (loop: OpenLoop, state: string, summary: string): void => {
     open.delete(loop.loopId);
-    if (loop.refs.sessionKey && bySessionKey.get(loop.refs.sessionKey) === loop.loopId) {
+    ended.add(loop.loopId);
+    if (loop.sessionId) ended.add(deriveLoopId(did, "openclaw.session", loop.sessionId));
+    if (loop.refs.sessionKey && (
+      !bySessionKey.has(loop.refs.sessionKey) || bySessionKey.get(loop.refs.sessionKey) === loop.loopId
+    )) {
       bySessionKey.delete(loop.refs.sessionKey);
+      endedSessionKeys.add(loop.refs.sessionKey);
     }
     send("loop.finished", loop, state, summary);
   };
@@ -262,6 +289,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     refs: { sessionKey },
     parentLoopId: null,
     label: "session",
+    sessionId,
   });
 
   /** Resolves the loop a requester session belongs to, starting a primary one lazily. */
@@ -269,6 +297,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     if (!requesterSessionKey) return null;
     const known = bySessionKey.get(requesterSessionKey);
     if (known) return known;
+    if (endedSessionKeys.has(requesterSessionKey)) return null;
     if (!isPrimarySessionKey(requesterSessionKey)) return null;
     const loop = sessionLoop(requesterSessionKey, undefined);
     start(loop, "session observed");
@@ -415,6 +444,13 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     if (!key && !id) return;
     const loop = sessionLoop(key, id);
     const current = openLoopForKey(key);
+    // A sessions.create response or lazy observation already established the
+    // identity. Learn its first hook sessionId without replacing the loop.
+    if (current && (!id || !current.sessionId || current.sessionId === id)) {
+      if (current.kind === "openclaw.session" && id) current.sessionId = id;
+      return;
+    }
+    if (ended.has(loop.loopId)) return;
     if (current?.loopId === loop.loopId || open.has(loop.loopId)) return;
     // A new session id on a key that still has an open loop: the previous
     // session's end was never seen, so close it rather than orphan it.
@@ -431,8 +467,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
   const loopToEnd = (key: string | undefined, id: string | undefined): OpenLoop => {
     const fresh = sessionLoop(key, id);
     const mapped = openLoopForKey(key);
-    const lazyId = sessionLoop(key, undefined).loopId;
-    if (mapped && (!id || mapped.loopId === lazyId || mapped.loopId === fresh.loopId)) return mapped;
+    if (mapped && (!id || !mapped.sessionId || mapped.sessionId === id)) return mapped;
     return open.get(fresh.loopId) ?? fresh;
   };
 
@@ -464,6 +499,15 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     (event: SubagentSpawnedEvent, ctx?: SubagentContext): void => {
       const childKey = str(event?.childSessionKey) ?? str(ctx?.childSessionKey);
       if (!childKey) return;
+      const existing = openLoopForKey(childKey);
+      if (existing) {
+        existing.refs = {
+          ...existing.refs,
+          runId: str(event.runId) ?? str(ctx?.runId) ?? existing.refs.runId,
+        };
+        return;
+      }
+      if (endedSessionKeys.has(childKey) || ended.has(subagentLoopId(childKey))) return;
       const label = str(event.label) ?? str(event.agentId) ?? "subagent";
       const loop: OpenLoop = {
         loopId: subagentLoopId(childKey),
@@ -480,7 +524,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     "subagent_progress",
     (event: SubagentProgressEvent, ctx?: SubagentContext): void => {
       const childKey = str(event?.childSessionKey) ?? str(ctx?.childSessionKey);
-      const loop = childKey ? open.get(subagentLoopId(childKey)) : undefined;
+      const loop = openLoopForKey(childKey);
       if (!loop) return;
       const summary =
         event.phase === "ended" ? `run ended (${str(event.outcome) ?? "unknown"})` : "run started";
@@ -493,7 +537,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     const childKey = str(event?.targetSessionKey);
     if (!childKey) return;
     const loopId = subagentLoopId(childKey);
-    const loop: OpenLoop = open.get(loopId) ?? {
+    const loop: OpenLoop = openLoopForKey(childKey) ?? {
       loopId,
       kind: "openclaw.subagent",
       refs: { sessionKey: childKey, runId: str(event.runId) },
@@ -522,8 +566,64 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     const loop = findOpen(ref);
     if (loop) send("loop.progress", loop, "running", "unblocked");
   });
+  const localTarget = (loop: OpenLoop | undefined): LocalLoopTarget | undefined => {
+    const key = loop?.refs.sessionKey;
+    if (!loop || !key || bySessionKey.get(key) !== loop.loopId) return undefined;
+    return { loopId: loop.loopId, sessionKey: key, parentLoopId: loop.parentLoopId, agentDid: did };
+  };
+
+  const registerSpawn = (input: {
+    sessionKey: string;
+    parentLoopId?: string | null;
+  }): LocalLoopTarget => {
+    const key = str(input?.sessionKey);
+    if (!key) throw new TypeError("Spawn requires a local session key");
+    if (input.parentLoopId != null && !str(input.parentLoopId)) {
+      throw new TypeError("Spawn parent must be a non-empty loop id");
+    }
+    const parentLoopId = input.parentLoopId ?? null;
+    if (parentLoopId && !localTarget(open.get(parentLoopId))) {
+      throw new Error("Spawn parent is not an active local loop");
+    }
+    const existing = openLoopForKey(key);
+    const expectedId = parentLoopId ? subagentLoopId(key) : sessionLoop(key, undefined).loopId;
+    if (existing) {
+      if (parentLoopId === existing.loopId) {
+        throw new Error("Spawn cannot be its own parent");
+      }
+      // A hook can race ahead of the sessions.create response. Only that
+      // authoritative response may fill in missing parent lineage.
+      if (parentLoopId && existing.loopId !== expectedId) {
+        throw new Error("Spawn conflicts with an existing local loop");
+      }
+      if (parentLoopId && existing.parentLoopId && existing.parentLoopId !== parentLoopId) {
+        throw new Error("Spawn conflicts with existing loop lineage");
+      }
+      if (parentLoopId && !existing.parentLoopId) {
+        existing.parentLoopId = parentLoopId;
+        guard("register_spawn", () => send("loop.progress", existing, "running", "spawn lineage observed"))();
+      }
+      return localTarget(existing)!;
+    }
+    if (ended.has(expectedId) || endedSessionKeys.has(key)) {
+      throw new Error("Spawn session has already ended");
+    }
+    const loop: OpenLoop = parentLoopId ? {
+      loopId: expectedId,
+      kind: "openclaw.subagent",
+      refs: { sessionKey: key },
+      parentLoopId,
+      label: "subagent",
+    } : sessionLoop(key, undefined);
+    guard("register_spawn", () => start(loop, parentLoopId ? "subagent spawned" : "session spawned"))();
+    return localTarget(loop)!;
+  };
 
   return {
+    resolveLoop: (loopId) => localTarget(open.get(loopId)),
+    lookupSession: (sessionKey) => localTarget(openLoopForKey(sessionKey)),
+    lookupRef: (ref) => localTarget(findOpen(ref)),
+    registerSpawn,
     onSessionStart,
     onSessionEnd,
     onAgentEnd,
