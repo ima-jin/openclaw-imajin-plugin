@@ -129,6 +129,8 @@ Configure `plugins.entries.imajin.config.wsNotifications`:
   key via the existing DID resolver. Both require matching
   subject/principal/context fields. Unsigned, altered, wrong-signer, malformed,
   and metadata-only/redacted events are dropped before injection or escalation.
+  The client accepts the current flat public DID document as well as legacy
+  `{identity}` resolver responses.
 - Jin receives a delimited `UNTRUSTED_REACH_CONTENT` data block: sender label,
   topic, **UNVERIFIED** onBehalfOf claim, and a bounded verbatim message excerpt
   (the gist, not a model-generated summary). All foreign values are quoted and

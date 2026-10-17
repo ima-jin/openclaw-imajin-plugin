@@ -196,6 +196,7 @@ export function createReachEventHandler(
     const event = await verifiedEvent(frame, deps.principalDid, config, deps.identityClient);
     if (!event || disposed) return;
     await ready;
+    if (disposed) return;
     const id = `${event.type}:${deps.principalDid}:${String(event.payload.reachId)}`;
     const ack = () => {
       const nf = record(frame);

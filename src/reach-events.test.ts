@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { sendDirectChannelMessage } from "./channel-notify.js";
+import { ImajinClient } from "./client.js";
 import { createNotificationInjector } from "./notification-injector.js";
 import {
   createReachEventHandler, isReachFrame, MAX_REACH_TEXT_CHARS, type ReachEventsConfig,
@@ -159,6 +160,25 @@ describe("signed reach events to Jin", () => {
     await h.handle(busFrame(signed()));
     expect(h.enqueue).toHaveBeenCalledOnce();
     expect(h.getIdentity).not.toHaveBeenCalled(); // node issuer is deliberately unregistered
+  });
+
+  it("verifies a reply with the real client and the kernel's flat public DID document", async () => {
+    const fetchMock = vi.fn(async () => ({
+      ok: true, status: 200,
+      json: async () => ({
+        "@context": ["https://www.w3.org/ns/did/v1"],
+        id: PRINCIPAL, did: PRINCIPAL, publicKey: PRINCIPAL_PUBLIC,
+      }),
+    }));
+    vi.stubGlobal("fetch", fetchMock);
+    const client = new ImajinClient({ nodeUrl: "https://kernel.test", did: "did:imajin:jin" });
+    const h = harness(undefined, { identityClient: client });
+    await h.handle(busFrame());
+    expect(h.enqueue).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledWith(
+      `https://kernel.test/registry/api/identity/${encodeURIComponent(PRINCIPAL)}`,
+      expect.anything(),
+    );
   });
 
   const invalidCases: Array<[string, () => unknown]> = [
