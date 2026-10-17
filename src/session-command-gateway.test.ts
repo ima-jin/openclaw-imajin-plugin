@@ -81,6 +81,8 @@ describe("createSessionGateway", () => {
       parentSessionKey: "agent:main:main",
       label: "thing",
       agentId: "ops",
+      group: "operators",
+      model: "imajin/model",
       idempotencyKey: "cmd-7",
     });
     expect(request).toHaveBeenCalledWith("sessions.create", {
@@ -89,6 +91,8 @@ describe("createSessionGateway", () => {
       parentSessionKey: "agent:main:main",
       label: "thing",
       agentId: "ops",
+      group: "operators",
+      model: "imajin/model",
     });
     expect(result).toEqual({ sessionKey: "agent:main:child-7" });
   });

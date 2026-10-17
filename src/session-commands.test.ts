@@ -13,6 +13,11 @@ import {
   type SessionCommandType,
 } from "./session-commands.js";
 import type { SessionGateway } from "./session-command-gateway.js";
+import { createLoopTracker, type LoopTracker } from "./loop-tracker.js";
+import { deriveLoopId } from "./loop-publisher.js";
+import { ApprovalExecutionRegistry } from "./approval-execution.js";
+import { GatewayApprovalsBridge, type KernelApprovalRequestedPayload, type KernelBusEventFrame } from "./gateway-approvals-bridge.js";
+import type { ApprovalSource } from "./sources/types.js";
 
 vi.mock("node:fs/promises", () => ({
   readFile: vi.fn(async () => JSON.stringify({ did: "did:imajin:agent", privateKey: "33".repeat(32) })),
@@ -63,6 +68,8 @@ function fakeGateway(): SessionGateway & {
 }
 
 interface Harness {
+  loops: LoopTracker;
+  approvals: ApprovalExecutionRegistry;
   gateway: ReturnType<typeof fakeGateway>;
   attestations: Array<{ eventType: string; payload: SessionCommandAttestationPayload }>;
   handle: ReturnType<typeof createSessionCommandExecutor>["handleFrame"];
@@ -74,6 +81,8 @@ function harness(
   overrides: { serviceOf?: string[] | null | Error; principalKey?: string | null } = {},
 ): Harness {
   const gateway = fakeGateway();
+  const loops = createLoopTracker({ did: AGENT, emit: vi.fn() });
+  const approvals = new ApprovalExecutionRegistry();
   const attestations: Harness["attestations"] = [];
   const resolveServiceOf = vi.fn(async () => {
     if (overrides.serviceOf instanceof Error) throw overrides.serviceOf;
@@ -83,6 +92,8 @@ function harness(
     { agentDid: AGENT, kernelPublicKeyHex: kernelPub, kernelDid: KERNEL, ...config },
     {
       gateway,
+      loopTracker: loops,
+      executionRegistry: approvals,
       attest: async (eventType, payload) => {
         attestations.push({ eventType, payload });
       },
@@ -92,7 +103,7 @@ function harness(
       now: () => NOW,
     },
   );
-  return { gateway, attestations, handle: executor.handleFrame, resolveServiceOf };
+  return { gateway, attestations, handle: executor.handleFrame, resolveServiceOf, loops, approvals };
 }
 
 let counter = 0;
@@ -158,7 +169,8 @@ describe("session.send", () => {
       principal: PRINCIPAL,
       issuer: KERNEL,
       payloadHash: hashPayload(payload),
-      sessionKey: "agent:main:main",
+      agentDid: AGENT,
+      loopId: deriveLoopId(AGENT, "openclaw.session", "agent:main:main"),
       runId: "run-1",
     });
     expect(att.reason).toBeUndefined();
@@ -187,7 +199,7 @@ describe("session.send", () => {
     expect(outcome).toMatchObject({ ok: false, reason: "gateway_error" });
     const att = h.attestations[0].payload;
     expect(att.eventType).toBe("loop.session.send.failed");
-    expect(att.detail).toContain("boom");
+    expect(att.detail).toBe("local gateway execution failed");
     expect(att.detail).not.toContain("abcdef1234567890abcdef");
   });
 });
@@ -231,7 +243,9 @@ describe("session.abort", () => {
     const outcome = await h.handle(await signedFrame("session.abort", { sessionKey: "agent:main:main", runId: "run-9" }));
     expect(outcome).toEqual({ ok: true, eventType: "loop.session.abort.completed" });
     expect(h.gateway.abort).toHaveBeenCalledWith({ sessionKey: "agent:main:main", runId: "run-9" });
-    expect(h.attestations[0].payload).toMatchObject({ sessionKey: "agent:main:main", runId: "run-9" });
+    expect(h.attestations[0].payload).toMatchObject({
+      loopId: deriveLoopId(AGENT, "openclaw.session", "agent:main:main"), runId: "run-9",
+    });
   });
 
   it("attests nothing_to_abort when the session had no active run", async () => {
@@ -243,7 +257,7 @@ describe("session.abort", () => {
 });
 
 describe("session.spawn", () => {
-  it("creates a child session and attests its key", async () => {
+  it("creates a child session and attests its loop lineage, never its key", async () => {
     const h = harness();
     const frame = await signedFrame("session.spawn", {
       task: "triage the backlog",
@@ -257,9 +271,17 @@ describe("session.spawn", () => {
       parentSessionKey: "agent:main:main",
       label: "triage",
       agentId: undefined,
+      group: undefined,
+      model: undefined,
       idempotencyKey: frame.commandId,
     });
-    expect(h.attestations[0].payload.sessionKey).toBe("agent:main:child-1");
+    expect(h.attestations[0].payload).toMatchObject({
+      loopId: deriveLoopId(AGENT, "openclaw.subagent", "agent:main:child-1"),
+      childLoopId: deriveLoopId(AGENT, "openclaw.subagent", "agent:main:child-1"),
+      parentLoopId: deriveLoopId(AGENT, "openclaw.session", "agent:main:main"),
+      agentDid: AGENT,
+    });
+    expect(h.attestations[0].payload).not.toHaveProperty("sessionKey");
   });
 
   it("rejects a spawn without a task", async () => {
@@ -270,6 +292,204 @@ describe("session.spawn", () => {
       reason: "invalid_payload",
     });
     expect(h.gateway.spawn).not.toHaveBeenCalled();
+  });
+});
+
+describe("loop-addressed commands", () => {
+  function start(h: Harness, key = "agent:main:main") {
+    h.loops.onSessionStart({ sessionKey: key, sessionId: "native-session" });
+    return h.loops.lookupSession(key)!;
+  }
+
+  it("resolves send and abort inside the plugin without a supplied sessionKey", async () => {
+    const h = harness();
+    const target = start(h);
+    expect(await h.handle(await signedFrame("session.send", { loopId: target.loopId, message: "hi" }))).toMatchObject({ ok: true });
+    expect(await h.handle(await signedFrame("session.abort", { loopId: target.loopId }))).toMatchObject({ ok: true });
+    expect(h.gateway.send).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: target.sessionKey }));
+    expect(h.gateway.abort).toHaveBeenCalledWith({ sessionKey: target.sessionKey, runId: undefined });
+    for (const { payload } of h.attestations) {
+      expect(payload).toMatchObject({ loopId: target.loopId, parentLoopId: null, agentDid: AGENT });
+      expect(payload).not.toHaveProperty("sessionKey");
+    }
+  });
+
+  it.each(["session.send", "session.abort", "session.spawn"] as const)(
+    "%s fails closed for unknown, foreign and ended loops, even with a fallback key",
+    async (type) => {
+      const h = harness();
+      const ended = start(h);
+      h.loops.onSessionEnd({ sessionKey: ended.sessionKey });
+      for (const loopId of ["unknown", deriveLoopId("did:imajin:foreign", "openclaw.session", "native-session"), ended.loopId]) {
+        const payload = type === "session.spawn"
+          ? { parentLoopId: loopId, parentSessionKey: "fallback", task: "t" }
+          : { loopId, sessionKey: "fallback", message: "m" };
+        expect(await h.handle(await signedFrame(type, payload))).toMatchObject({ ok: false, reason: "loop_not_found" });
+      }
+      expect(h.gateway.send).not.toHaveBeenCalled();
+      expect(h.gateway.abort).not.toHaveBeenCalled();
+      expect(h.gateway.spawn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("rejects a conflicting local key instead of changing the loop destination", async () => {
+    const h = harness();
+    const target = start(h);
+    expect(await h.handle(await signedFrame("session.send", {
+      loopId: target.loopId, sessionKey: "other", message: "m",
+    }))).toMatchObject({ reason: "loop_target_mismatch" });
+    expect(h.gateway.send).not.toHaveBeenCalled();
+  });
+
+  it("does not resurrect an ended loop through a legacy sessionKey fallback", async () => {
+    const h = harness();
+    const target = start(h);
+    h.loops.onSessionEnd({ sessionKey: target.sessionKey, sessionId: "native-session" });
+    expect(await h.handle(await signedFrame("session.send", {
+      sessionKey: target.sessionKey, message: "late",
+    }))).toMatchObject({ reason: "loop_not_found" });
+    expect(h.gateway.send).not.toHaveBeenCalled();
+    expect(h.loops.lookupSession(target.sessionKey)).toBeUndefined();
+    h.loops.onSessionStart({ sessionKey: target.sessionKey, sessionId: "fresh-native-session" });
+    expect(await h.handle(await signedFrame("session.send", {
+      loopId: h.loops.lookupSession(target.sessionKey)!.loopId, message: "fresh",
+    }))).toMatchObject({ ok: true });
+  });
+
+  it("forwards spawn group/model and signs the child and parent lineage with the agent identity", async () => {
+    const h = harness();
+    const parent = start(h);
+    const frames: Array<{ type: string; attestation: SignedMessage<SessionCommandAttestationPayload> }> = [];
+    const attest = createSessionCommandAttester({
+      did: AGENT, keypairPath: "/fake", send: (frame) => frames.push(frame as typeof frames[number]),
+    });
+    const executor = createSessionCommandExecutor(
+      { agentDid: AGENT, kernelPublicKeyHex: kernelPub },
+      {
+        gateway: h.gateway, loopTracker: h.loops, executionRegistry: h.approvals, attest,
+        resolveServiceOf: async () => [PRINCIPAL], resolvePublicKey: async () => principalPub,
+        now: () => NOW, logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+      },
+    );
+    expect(await executor.handleFrame(await signedFrame("session.spawn", {
+      task: "t", parentLoopId: parent.loopId, group: "team", model: "imajin/model",
+    }))).toMatchObject({ ok: true });
+    expect(h.gateway.spawn).toHaveBeenCalledWith(expect.objectContaining({
+      parentSessionKey: parent.sessionKey, group: "team", model: "imajin/model",
+    }));
+    const { attestation } = frames[0];
+    expect(attestation.payload).toMatchObject({
+      loopId: h.loops.lookupSession("agent:main:child-1")!.loopId,
+      childLoopId: h.loops.lookupSession("agent:main:child-1")!.loopId,
+      parentLoopId: parent.loopId, agentDid: AGENT,
+    });
+    expect(JSON.stringify(attestation)).not.toContain("agent:main:");
+    expect(await verifyMessage(attestation, agentPub)).toBe(true);
+    expect(await verifyMessage({
+      ...attestation, payload: { ...attestation.payload, parentLoopId: "forged" },
+    }, agentPub)).toBe(false);
+  });
+
+  it("attests the resolved loop even when the gateway fails", async () => {
+    const h = harness();
+    const target = start(h);
+    h.gateway.send.mockRejectedValueOnce(new Error("offline"));
+    await h.handle(await signedFrame("session.send", { loopId: target.loopId, message: "m" }));
+    expect(h.attestations[0].payload).toMatchObject({ reason: "gateway_error", loopId: target.loopId });
+  });
+
+  it("uses the native approval binding, rejecting client-selected destinations before claiming", async () => {
+    const h = harness();
+    const target = start(h);
+    h.approvals.bind({ approvalId: "bound", agentDid: AGENT, principalDid: PRINCIPAL, loopId: target.loopId });
+    expect(await h.handle(await signedFrame("session.approve", {
+      approvalId: "bound", loopId: "client-selected",
+    }))).toMatchObject({ reason: "approval_binding_mismatch" });
+    expect(await h.handle(await signedFrame("session.approve", { approvalId: "bound" }))).toMatchObject({ ok: true });
+    expect(h.attestations[1].payload).toMatchObject({ loopId: target.loopId, approvalId: "bound" });
+    expect(await h.handle(await signedFrame("session.deny", { approvalId: "bound" }))).toMatchObject({ reason: "approval_already_executed" });
+    expect(h.gateway.resolveApproval).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects converted payload/owner mismatches before consuming the approval claim", async () => {
+    const h = harness();
+    const target = start(h);
+    h.approvals.bind({ approvalId: "bound", agentDid: AGENT, principalDid: PRINCIPAL, loopId: target.loopId });
+    h.loops.onSessionStart({ sessionKey: "other" });
+    const other = h.loops.lookupSession("other")!;
+    expect(await h.handle(await signedFrame("session.spawn", {
+      approvalId: "bound", parentLoopId: other.loopId, task: "wrong parent",
+    }))).toMatchObject({ reason: "approval_binding_mismatch" });
+    expect(await h.handle(await signedFrame("session.send", {
+      approvalId: "bound", loopId: target.loopId, message: "",
+    }))).toMatchObject({ reason: "invalid_payload" });
+    expect(h.approvals.claim("bound")).toBe(true);
+    expect(h.gateway.send).not.toHaveBeenCalled();
+    expect(h.gateway.spawn).not.toHaveBeenCalled();
+  });
+
+  it("retains the shared execution claim after ambiguous gateway errors", async () => {
+    const h = harness();
+    h.gateway.resolveApproval.mockRejectedValueOnce(new Error("response lost"));
+    expect(await h.handle(await signedFrame("session.approve", { approvalId: "a" }))).toMatchObject({ reason: "gateway_error" });
+    expect(h.approvals.claim("a")).toBe(false);
+    expect(await h.handle(await signedFrame("session.deny", { approvalId: "a" }))).toMatchObject({ reason: "approval_already_executed" });
+    expect(h.gateway.resolveApproval).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("real approval executor single rail", () => {
+  const cases = (["session.approve", "session.send", "session.abort", "session.spawn"] as const)
+    .flatMap((type) => ["legacy-first", "session-first", "concurrent"].map((order) => ({ type, order })));
+  it.each(cases)("$type: $order", async ({ type, order }) => {
+    const h = harness();
+    h.loops.onSessionStart({ sessionKey: "owner" });
+    const target = h.loops.lookupSession("owner")!;
+    const request = {
+      proposalId: "native-approval", kind: "gateway-exec:command", summary: "safe",
+      sourceRevision: "revision", detail: { approvalId: "native-approval" },
+      owner: { sessionKey: target.sessionKey },
+    };
+    const source: ApprovalSource = {
+      id: "gateway-exec", list: async () => [request], subscribe: () => () => {},
+      getCurrent: async () => ({ pending: true, sourceRevision: "revision", detail: request.detail }),
+      resolve: vi.fn(async () => ({ applied: true })),
+    };
+    let card: KernelApprovalRequestedPayload | undefined;
+    const bridge = new GatewayApprovalsBridge(
+      { agentDid: AGENT, operatorDid: PRINCIPAL, agentPrivateKeyHex: AGENT_PRIV },
+      new Map([[source.id, source]]),
+      { publishApprovalRequested: async (payload) => { card = payload; }, publishMismatch: async () => {} },
+      { info: vi.fn(), warn: vi.fn(), error: vi.fn() }, undefined, undefined,
+      { executionRegistry: h.approvals, loopTracker: h.loops, loopBlockSweepIntervalMs: 0 },
+    );
+    try {
+      await bridge.reconcile();
+      const legacy: KernelBusEventFrame = {
+        type: "bus_event", eventType: "operator.approval.decided", issuer: PRINCIPAL,
+        subject: AGENT, scope: "operator",
+        payload: { proposalId: request.proposalId, decision: "approve", decidedBy: PRINCIPAL, contentHash: card!.contentHash },
+      };
+      const payload = type === "session.spawn"
+        ? { approvalId: request.proposalId, parentLoopId: target.loopId, task: "converted task" }
+        : { approvalId: request.proposalId, loopId: target.loopId, kind: "exec", message: "converted message" };
+      const command = await signedFrame(type, payload);
+      if (order === "legacy-first") {
+        expect(await bridge.handleKernelDecision(legacy)).toBe("applied");
+        expect(await h.handle(command)).toMatchObject({ reason: "approval_already_executed" });
+      } else if (order === "session-first") {
+        expect(await h.handle(command)).toMatchObject({ ok: true });
+        expect(await bridge.handleKernelDecision(legacy)).toBe("noop");
+      } else {
+        await Promise.all([bridge.handleKernelDecision(legacy), h.handle(command)]);
+      }
+      expect(
+        vi.mocked(source.resolve).mock.calls.length + h.gateway.resolveApproval.mock.calls.length +
+        h.gateway.send.mock.calls.length + h.gateway.abort.mock.calls.length + h.gateway.spawn.mock.calls.length,
+      ).toBe(1);
+    } finally {
+      bridge.dispose();
+    }
   });
 });
 

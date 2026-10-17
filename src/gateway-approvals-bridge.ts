@@ -76,7 +76,9 @@
  */
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
-import { canonicalize } from "./approval-bridge.js";
+import { canonicalize, signMessage, type SignedMessage } from "./approval-bridge.js";
+import { ApprovalExecutionRegistry, type ApprovalLoopBinding } from "./approval-execution.js";
+export type { ApprovalLoopBinding } from "./approval-execution.js";
 import {
   APPROVALS_CURSOR_FILENAME,
   ApprovalsCursorStore,
@@ -567,6 +569,7 @@ function describeFailClosedOutcome(
 
 interface TrackedProposal {
   sourceId: string;
+  owner?: NonNullable<ApprovalSourceRequest["owner"]>;
   kind: string;
   summary: string;
   detail?: Record<string, unknown>;
@@ -575,7 +578,6 @@ interface TrackedProposal {
   /** The composite digest signed and published to the kernel for this proposal (#2084). */
   contentHash: string;
 }
-
 export class GatewayApprovalsBridge {
   private readonly published = new Map<string, TrackedProposal>();
   /**
@@ -597,6 +599,9 @@ export class GatewayApprovalsBridge {
    * WS push and a catch-up replay of the same decision share one run.
    */
   private readonly decisionsInFlight = new Map<string, Promise<DecisionOutcome>>();
+  private readonly executionRegistry: ApprovalExecutionRegistry;
+  private readonly loopTracker?: ApprovalLoopTracker;
+  private readonly publishApprovalBinding?: (binding: SignedMessage<ApprovalLoopBinding>) => Promise<void>;
   /**
    * Set while the kernel is known NOT to push `operator.approval.decided` to
    * this agent (no active `operator:approvals` grant, #53). While set, every
@@ -626,11 +631,18 @@ export class GatewayApprovalsBridge {
     options: {
       publishRetryDelaysMs?: number[];
       loopTracker?: ApprovalLoopTracker;
+      /** MUST be the same instance used by session commands and other approval callbacks in live wiring. */
+      executionRegistry?: ApprovalExecutionRegistry;
+      /** Live wiring sends {type: "loop.approval.bound", attestation: binding} over the existing WS. */
+      publishApprovalBinding?: (binding: SignedMessage<ApprovalLoopBinding>) => Promise<void>;
       /** Stale-loop-block sweep interval in ms (#66); `0` disables. Used as given — clamp config with `resolveLoopBlockSweepIntervalMs`. */
       loopBlockSweepIntervalMs?: number;
     } = {},
   ) {
     this.publishRetryDelaysMs = options.publishRetryDelaysMs ?? DEFAULT_PUBLISH_RETRY_DELAYS_MS;
+    this.executionRegistry = options.executionRegistry ?? new ApprovalExecutionRegistry();
+    this.loopTracker = options.loopTracker;
+    this.publishApprovalBinding = options.publishApprovalBinding;
     this.loopSweepIntervalMs = options.loopBlockSweepIntervalMs ?? DEFAULT_LOOP_BLOCK_SWEEP_INTERVAL_MS;
     if (options.loopTracker) this.loopBlocker = createApprovalLoopBlocker(options.loopTracker);
     this.logger = logger ?? defaultLogger();
@@ -841,6 +853,12 @@ export class GatewayApprovalsBridge {
 
   private async handleSourceRequested(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
     const proposalId = request.proposalId;
+    // Native exec ids are also session.approve/session.deny claim keys. Do not
+    // permit aliases to split one approval across two execution registries.
+    if (sourceId === "gateway-exec" && request.detail?.approvalId !== proposalId) {
+      this.logger.error(`refused gateway-exec proposal ${proposalId}: native approvalId must equal proposalId`);
+      return;
+    }
     if (this.published.has(proposalId)) {
       // Dedup by proposalId (#24): a reconnect/replay of the same event, or a
       // reconcile racing a live event for the same proposal, must never
@@ -880,6 +898,7 @@ export class GatewayApprovalsBridge {
       }
       this.published.set(proposalId, {
         sourceId,
+        owner: request.owner,
         kind: request.kind,
         summary: request.summary,
         detail: request.detail,
@@ -900,6 +919,7 @@ export class GatewayApprovalsBridge {
           request.expiresAtMs,
         );
         this.ensureSweepTimer();
+        await this.publishNativeApprovalBinding(request);
         if (this.isDegraded()) {
           // Fire-and-forget: a slow notify CLI must never hold the publish reservation.
           void this.warnDegradedPublish(proposalId, payload.kind);
@@ -917,6 +937,46 @@ export class GatewayApprovalsBridge {
     } finally {
       this.reservations.delete(proposalId);
       settleReservation();
+    }
+  }
+
+  /** Authenticated reconnect replay: closed sockets may have dropped startup bindings. */
+  async republishApprovalBindings(): Promise<void> {
+    await Promise.all(Array.from(this.published, ([proposalId, tracked]) =>
+      this.publishNativeApprovalBinding({ proposalId, owner: tracked.owner }, true),
+    ));
+  }
+
+  /** Publishes a signed public binding from the local owner's active loop only. */
+  private async publishNativeApprovalBinding(
+    request: Pick<ApprovalSourceRequest, "proposalId" | "owner">,
+    replay = false,
+  ): Promise<void> {
+    if (!request.owner || !this.loopTracker?.lookupRef) return;
+    try {
+      // The local source owns this ref. Never trust detail.sessionKey or a
+      // client-selected destination; lookupRef only returns active loops.
+      const loop = this.loopTracker.lookupRef(request.owner);
+      if (!loop?.loopId || loop.agentDid !== this.config.agentDid) return;
+      const previous = this.executionRegistry.getBinding(request.proposalId);
+      if (replay && previous?.loopId !== loop.loopId) return;
+      const payload: ApprovalLoopBinding = {
+        loopId: loop.loopId,
+        principalDid: this.config.operatorDid,
+        agentDid: this.config.agentDid,
+        approvalId: request.proposalId,
+      };
+      this.executionRegistry.bind(payload);
+      if (!this.publishApprovalBinding) return;
+      const binding = await signMessage(payload, {
+        did: this.config.agentDid,
+        type: "agent",
+        privateKeyHex: this.config.agentPrivateKeyHex,
+      });
+      await this.publishApprovalBinding(binding);
+    } catch (err) {
+      // Telemetry failure must not deny a successfully published live card.
+      this.logger.warn(`failed to publish approval loop binding for ${request.proposalId}: ${String(err)}`);
     }
   }
 
@@ -963,6 +1023,7 @@ export class GatewayApprovalsBridge {
     const proposalId = request.proposalId;
     let outcome: FailClosedOutcome;
     try {
+      if (!this.executionRegistry.claim(proposalId)) return;
       // `applied: false` means the Gateway approval was already settled (e.g.
       // the operator approved it on another surface) — the deny did NOT take effect.
       const { applied } = await source.resolve(proposalId, "reject", request.sourceRevision);
@@ -1165,6 +1226,11 @@ export class GatewayApprovalsBridge {
     }
 
     try {
+      if (!this.executionRegistry.claim(proposalId)) {
+        this.logger.info(`approval ${proposalId} was claimed by another execution rail — no-op`);
+        this.forget(proposalId);
+        return "noop";
+      }
       const result = await source.resolve(proposalId, decision, tracked.sourceRevision);
       this.logger.info(`applied ${decision} for ${proposalId} (source=${tracked.sourceId}, applied=${result.applied})`);
       this.forget(proposalId);
@@ -1405,6 +1471,9 @@ export interface StartGatewayApprovalsBridgeDeps {
    * Observe-only: a failing block/unblock never affects the approval flow.
    */
   loopTracker?: ApprovalLoopTracker;
+  /** Shared runtime claims, also injected into session commands and legacy callbacks. */
+  executionRegistry?: ApprovalExecutionRegistry;
+  publishApprovalBinding?: (binding: SignedMessage<ApprovalLoopBinding>) => Promise<void>;
 }
 
 /** What `startGatewayApprovalsBridge` hands back to `index.ts`. */
@@ -1594,6 +1663,8 @@ export async function startGatewayApprovalsBridge(
     deps.directSend?.target ? (text) => sendDirectChannelMessage(deps.directSend, text) : undefined,
     {
       loopTracker: deps.loopTracker,
+      executionRegistry: deps.executionRegistry,
+      publishApprovalBinding: deps.publishApprovalBinding,
       loopBlockSweepIntervalMs: resolveLoopBlockSweepIntervalMs(config!.loopBlockSweepIntervalMs),
     },
   );
@@ -1628,10 +1699,12 @@ export async function startGatewayApprovalsBridge(
   // Serialized: two reconnects in quick succession share one sync run.
   let syncInFlight: Promise<void> | undefined;
   const onKernelConnected = (): Promise<void> => {
-    if (!kernelHttp) return Promise.resolve();
-    syncInFlight ??= bridge
-      .syncWithKernel({ http: kernelHttp, cursorStore, operatorDid })
-      .then(() => undefined)
+    syncInFlight ??= (async () => {
+      // WS sends before auth-ok may be dropped. Bindings do not depend on
+      // operator:approvals entitlement and must replay even without HTTP.
+      await bridge.republishApprovalBindings();
+      if (kernelHttp) await bridge.syncWithKernel({ http: kernelHttp, cursorStore, operatorDid });
+    })()
       .catch((err: unknown) => {
         console.error(`[imajin-approvals-bridge] connect-time sync failed: ${String(err)}`);
       })
