@@ -144,6 +144,14 @@
       "label": "Notification State Directory",
       "help": "Directory for the ack-dedup LRU and pending-wake persistence files (#26). Defaults to a directory colocated with keypairPath."
     },
+    "wsNotifications.reach.kernelPublicKeyHex": {
+      "label": "Reach Events: Trusted Kernel Public Key",
+      "help": "Public node Ed25519 signing key (64 hex characters), pinned for agent.reach.delivered verification (#68). Obtain through a trusted channel from the node's /auth/.well-known/kernel-signing-key current key. Not a secret. Replies instead verify the configured principal's registered DID key."
+    },
+    "wsNotifications.reach.telegramEscalation": {
+      "label": "Reach Events: Telegram Escalation",
+      "help": "Default false. Explicit true sends verified, bounded UNTRUSTED reach context to the existing wsNotifications.directSend Telegram target/CLI. No new secrets; non-Telegram destinations are not used."
+    },
     "wsNotifications.reportTo": {
       "label": "Wake Report Sessions",
       "help": "Session keys (e.g. agent:main:telegram:direct:<id>) the wake worker session discloses to (#47). After a wake turn completes in the wake session, its final assistant output \u2014 or 'no output' plus the Warp run state \u2014 is forwarded once per wake batch to each key, wrapped as an informational report from warp-events (not a wake). Default empty = no reports. Invalid keys are logged once and ignored.",
@@ -218,6 +226,23 @@
         "type": "object",
         "description": "Configure which WS notification scopes trigger agent session injection (#1672)",
         "properties": {
+          "reach": {
+            "type": "object",
+            "additionalProperties": false,
+            "description": "Dedicated signed reach adapter (#68). Uses targetSession and principal actAs (falling back to did). Separate from injectScopes and Warp wakes.",
+            "properties": {
+              "kernelPublicKeyHex": {
+                "type": "string",
+                "pattern": "^[0-9a-fA-F]{64}$",
+                "description": "Trusted public node Ed25519 signing key. Required for delivered events; missing/invalid pins fail closed. Replies require the principal's registered key, not this pin."
+              },
+              "telegramEscalation": {
+                "type": "boolean",
+                "default": false,
+                "description": "Explicit opt-in to Telegram escalation using the existing directSend target/CLI; false or omitted never sends reach channel pings, wake fallbacks, or reports."
+              }
+            }
+          },
           "injectScopes": {
             "type": "array",
             "items": { "type": "string" },

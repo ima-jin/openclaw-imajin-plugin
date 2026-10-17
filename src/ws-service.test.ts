@@ -327,6 +327,42 @@ describe("ImajinWsService.send", () => {
 });
 
 describe("ImajinWsService.onConnected (#53)", () => {
+  it("registers principal notifications only after auth-ok and repeats on reconnect (#68)", async () => {
+    vi.useFakeTimers();
+    const principal = "did:imajin:ryan";
+    const service = new ImajinWsService({
+      nodeUrl: NODE_URL, keypairPath: KEYPAIR_PATH, actAs: principal,
+    }, silentLogger());
+    await service.start();
+    const first = FakeSocket.instances[0];
+    first.triggerOpen();
+    expect(first.sent.map((raw) => JSON.parse(raw).type)).not.toContain("register_also");
+    first.triggerMessage(JSON.stringify({ type: "auth_required" }));
+    expect(first.closedWith).toBeNull(); // initial native token-auth prompt, not rejection
+    first.triggerMessage(JSON.stringify({ type: "connected" }));
+    expect(first.sent.map((raw) => JSON.parse(raw))).toContainEqual({ type: "register_also", did: principal });
+    first.close(1006, "network");
+    await vi.advanceTimersByTimeAsync(2_000);
+    await vi.waitFor(() => expect(FakeSocket.instances[1]).toBeDefined());
+    const second = FakeSocket.instances[1];
+    second.triggerOpen();
+    expect(second.sent.map((raw) => JSON.parse(raw).type)).not.toContain("register_also");
+    second.triggerMessage(JSON.stringify({ type: "connected" }));
+    expect(second.sent.map((raw) => JSON.parse(raw))).toContainEqual({ type: "register_also", did: principal });
+    service.stop();
+  });
+  it("treats an auth prompt after auth-ok as a real failure", async () => {
+    vi.useFakeTimers();
+    const service = new ImajinWsService({ nodeUrl: NODE_URL, keypairPath: KEYPAIR_PATH }, silentLogger());
+    await service.start();
+    const socket = FakeSocket.instances[0];
+    socket.triggerOpen();
+    socket.triggerMessage(JSON.stringify({ type: "connected" }));
+    socket.triggerMessage(JSON.stringify({ type: "auth_required" }));
+    expect(socket.closedWith?.code).toBe(4001);
+    service.stop();
+  });
+
   it("fires only on the kernel's `connected` frame, not on socket open or other frames", async () => {
     vi.useFakeTimers();
     const service = new ImajinWsService({ nodeUrl: NODE_URL, keypairPath: KEYPAIR_PATH }, silentLogger());

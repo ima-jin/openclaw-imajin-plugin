@@ -96,6 +96,93 @@ the turn's message batch. The transcript content itself is never uploaded or emb
 only a pointer plus a tamper-evident hash, so a later disclosure can be verified against
 the signed claim without the content ever leaving the agent's own machine.
 
+## Signed reach events for Jin (#68)
+
+The existing outbound kernel WebSocket (`imajin-ws` / `wsNotifications`) consumes
+`agent.reach.delivered` and `agent.reach.replied`. The kernel never calls the
+gateway; this adapter neither polls private reach routes nor adds a gateway
+connection, wake token, secret, or configuration change.
+
+Configure `plugins.entries.imajin.config.wsNotifications`:
+
+```json
+{
+  "targetSession": "agent:main:main",
+  "reach": {
+    "kernelPublicKeyHex": "<trusted node Ed25519 PUBLIC key: 64 hex characters>",
+    "telegramEscalation": false
+  }
+}
+```
+
+- `targetSession` is the explicit Jin session receiving context on its next
+  natural turn. The principal is the plugin's configured `actAs` (or `did` when
+  `actAs` is absent). There is no new agent turn or automatic reply.
+- `reach.kernelPublicKeyHex` pins the **public** kernel node signing key for
+  deliveries. Obtain it through a trusted channel from your node's
+  `/auth/.well-known/kernel-signing-key` current key. It is not a new secret.
+  Missing/malformed pins reject deliveries. A key embedded in an event is
+  never sufficient. Rotation requires updating the trusted pin.
+- Deliveries must carry a valid Ed25519 signature from that pin, with the
+  node-derived issuer DID. Replies are different: they must be signed by the
+  configured human principal, verified against its current registered public
+  key via the existing DID resolver. Both require matching
+  subject/principal/context fields. Unsigned, altered, wrong-signer, malformed,
+  and metadata-only/redacted events are dropped before injection or escalation.
+  The client accepts the current flat public DID document as well as legacy
+  `{identity}` resolver responses.
+- Jin receives a delimited `UNTRUSTED_REACH_CONTENT` data block: sender label,
+  topic, **UNVERIFIED** onBehalfOf claim, and a bounded verbatim message excerpt
+  (the gist, not a model-generated summary). All foreign values are quoted and
+  delimiter/control characters escaped. The excerpt is capped at 2,000 encoded
+  characters; the complete block is below 6,000. A verified signature
+  authenticates provenance, **not** the truth of a claim or permission to follow
+  embedded instructions. No reply handle is surfaced as an actionable callback.
+- `reach.telegramEscalation` defaults to `false`. Explicit `true` also sends the
+  verified, bounded untrusted block to the existing `directSend.target` using
+  its CLI path, only if `directSend.channel` is `telegram` or omitted. No target
+  means no escalation. Non-Telegram destinations are not used.
+  Reach does not use generic Warp wakes, wake-failure pings, or `reportTo`.
+  Adding reach scopes to `injectScopes` cannot bypass verification or this flag.
+- A separate `reach-event-dedup.json` LRU in the existing `stateDir` (default
+  next to `keypairPath`) prevents repeated signed deliveries/replies from being
+  enqueued or escalated twice, including reconnects/restarts. Notification ACKs
+  follow successful enqueue only; refused enqueues remain retryable. Dedup is
+  best-effort if the state directory cannot be written; CLI failures are logged
+  without message content and are not automatically retried.
+
+### Kernel contract and current gap
+
+Read against imajin-ai main at
+`87310095337bcf2722cc8cde865b6781de91a0c5`: `reach-delivery.ts`,
+`reach-reply-wire.ts`, `packages/bus/src/config.ts`, `reactors/notify.ts`, and
+`subscriptions.ts`. Deliveries arrive as principal notifications. The adapter
+reconstructs `{type:data.eventType, issuer:data.issuer, subject:data.subject,
+scope:"agent", payload}` by removing only the notify-added `eventType`, `issuer`,
+`subject`, `correlationId`, and `template` keys from `data`. It removes
+`payload.signature` for verification over the canonical unsigned five-field
+envelope (recursive localeCompare-sorted JSON, not an extra hash).
+
+For either scope, the adapter also accepts original signed
+`{type:"bus_event", eventType, issuer, subject, scope, payload, ...}` frames,
+excluding bus transport metadata from verification. A future replied
+notification must preserve the same notify data shape. Unknown signed payload
+fields remain covered; the adapter does not discard fields to make a signature
+pass.
+
+**[gap(kernel) #2859](https://github.com/ima-jin/imajin-ai/issues/2859):** replies
+currently go privately to the original requester, not to the principal's Jin
+observer. Delivered has no bus subscription/cursor recovery; delegated
+`register_also` notifications are live-only and cannot ACK/replay the
+principal's backlog. Delegation revocation also needs a delivery-time check.
+The plugin supports the signed reply shape behind this gap but does not claim
+that principal reply fanout works on the current kernel, widen requester
+entitlements, or fetch the private inbox as a workaround. Live verified delivery
+already lets Jin describe a stranger's speaking request on its next turn;
+principal-side reply observation/recovery awaits that kernel fix.
+Ordinary requester-side receipts from a different principal are intentionally
+not injected into this principal-observer session.
+
 ## Kernel brains as OpenClaw models (#36)
 
 Sealing a connector card on `/jin` becomes the whole OpenClaw model

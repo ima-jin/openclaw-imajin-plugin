@@ -432,7 +432,11 @@ export class ImajinClient {
 
   async getIdentity(did: string): Promise<ImajinIdentity | null> {
     const res = await this.get(`/registry/api/identity/${encodeURIComponent(did)}`);
-    return ((res as Record<string, unknown>).identity as ImajinIdentity) ?? null;
+    // The public kernel resolver returns a flat DID Document (#1443), not
+    // {identity}. Retain compatibility with older wrapped responses (#68).
+    const response = res as Record<string, unknown>;
+    if ("identity" in response) return (response.identity as ImajinIdentity) ?? null;
+    return response.did === did ? response as unknown as ImajinIdentity : null;
   }
 
   /**

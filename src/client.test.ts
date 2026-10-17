@@ -175,6 +175,32 @@ describe("ImajinClient media extensions", () => {
   });
 });
 
+describe("ImajinClient public DID resolution (#68)", () => {
+  const did = "did:imajin:ryan";
+  const client = new ImajinClient({ nodeUrl: BASE_URL });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  it("accepts the current kernel's flat public DID document", async () => {
+    const document = { id: did, did, publicKey: "ab".repeat(32), tier: "hard" };
+    global.fetch = mockFetch(document);
+    expect(await client.getIdentity(did)).toEqual(document);
+  });
+
+  it("retains older wrapped identity compatibility and explicit null", async () => {
+    const identity = { did, publicKey: "ab".repeat(32) };
+    global.fetch = mockFetch({ identity });
+    expect(await client.getIdentity(did)).toEqual(identity);
+    global.fetch = mockFetch({ identity: null });
+    expect(await client.getIdentity(did)).toBeNull();
+  });
+
+  it("rejects a flat document that does not match the requested DID", async () => {
+    global.fetch = mockFetch({ did: "did:imajin:other", publicKey: "ab".repeat(32) });
+    expect(await client.getIdentity(did)).toBeNull();
+  });
+});
+
 describe("validateDid", () => {
   it("accepts valid Imajin DIDs", () => {
     expect(validateDid("did:imajin:abc123")).toBe(true);

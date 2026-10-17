@@ -28,6 +28,7 @@ import { ImajinChat } from "./src/chat.js";
 import { ImajinClient } from "./src/client.js";
 import { ImajinWsService, type NotificationFrame } from "./src/ws-service.js";
 import { createNotificationInjector, type WsNotificationsConfig } from "./src/notification-injector.js";
+import { createReachEventHandler, isReachFrame } from "./src/reach-events.js";
 import {
   startGatewayApprovalsBridge,
   type ApprovalsBridgePluginConfig,
@@ -247,6 +248,15 @@ export default definePluginEntry({
         sendFrame: (frame) => wsService.send(frame),
         keypairPath: config.keypairPath,
       });
+      const reachEvents = createReachEventHandler(api, config.wsNotifications?.reach, {
+        principalDid: config.actAs ?? config.did,
+        targetSession: config.wsNotifications?.targetSession,
+        identityClient: client,
+        directSend: config.wsNotifications?.directSend,
+        stateDir: config.wsNotifications?.stateDir,
+        keypairPath: config.keypairPath,
+        sendFrame: (frame) => wsService.send(frame),
+      });
 
       // wsNotifications.reportTo (#47): the wake worker session discloses its
       // turn outcome. Only registered when a valid reportTo target exists, so
@@ -409,6 +419,12 @@ export default definePluginEntry({
       });
 
       wsService.onFrame((frame) => {
+        // Consume before generic logging/injection; even invalid reach events
+        // must never become trusted instructions or automatic Warp pings.
+        if (isReachFrame(frame)) {
+          void reachEvents.handle(frame);
+          return;
+        }
         if (frame.type === "notification") {
           const nf = frame as NotificationFrame;
           console.log(
@@ -466,6 +482,7 @@ export default definePluginEntry({
           console.log("[imajin-ws] service stop called");
           wsService.stop();
           disposeInjector();
+          reachEvents.dispose();
           sessionGateway?.dispose();
           void approvalsBridgeReady.then((started) => started?.dispose());
         },

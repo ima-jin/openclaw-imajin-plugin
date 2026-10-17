@@ -9,6 +9,12 @@
   agent session. Config-only; injector logic unchanged.
 
 ### Added
+- **Signed reach events for Jin (#68).** Verify kernel delivery signatures and
+  principal reply signatures on the existing WebSocket path; enqueue bounded,
+  escaped UNTRUSTED context with UNVERIFIED onBehalfOf claims. Optional
+  `wsNotifications.reach.telegramEscalation` is off by default and reuses the
+  existing Telegram destination. Principal reply socket delivery and delegated
+  recovery remain tracked in ima-jin/imajin-ai#2859.
 - **`imajin_usage` read-only tool + compact `imajin_warp list_runs` (#72).**
   `summary` reads the kernel usage service's `GET /usage/api/summary?window=`
   for a UTC range (`month` or `from`/`to`; default the current month): range
