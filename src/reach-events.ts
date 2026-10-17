@@ -82,7 +82,7 @@ function quoted(value: unknown, budget: number): string {
   let text = "";
   for (const char of value) {
     const encoded = /[<>&`\u007f-\u009f\u202a-\u202e\u2066-\u2069]/u.test(char)
-      ? `\\u${char.charCodeAt(0).toString(16).padStart(4, "0")}`
+      ? String.raw`\u${(char.codePointAt(0) ?? 0).toString(16).padStart(4, "0")}`
       : JSON.stringify(char).slice(1, -1);
     if (text.length + encoded.length > budget) return `"${text}…[truncated]"`;
     text += encoded;

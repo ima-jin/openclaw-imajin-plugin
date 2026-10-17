@@ -181,6 +181,15 @@ export class PendingWakeStore {
     await this.persist();
   }
 
+  /** Remove a group atomically in memory, with one ordered persistence write. */
+  async deleteMany(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
+    for (const key of keys) {
+      delete this.wakes[key];
+    }
+    await this.persist();
+  }
+
   private async persist(): Promise<void> {
     if (!this.filePath) {
       return;

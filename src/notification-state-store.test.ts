@@ -134,6 +134,20 @@ describe("PendingWakeStore", () => {
     expect(store.all()).toEqual([]);
   });
 
+  it("deleteMany removes reach markers in one persisted update, preserving unrelated wakes", async () => {
+    const filePath = join(tmpDir, "bulk-pending.json");
+    const store = new PendingWakeStore(filePath);
+    await store.load();
+    await store.set("reach-delivered", { scope: "agent.reach.delivered", sinceTs: 1, frames: [] });
+    await store.set("reach-replied", { scope: "agent.reach.replied", sinceTs: 2, frames: [] });
+    await store.set("warp", { scope: "warp.run.completed", sinceTs: 3, frames: [] });
+    await store.deleteMany(["reach-delivered", "reach-replied", "missing"]);
+    await store.deleteMany([]);
+    const restarted = new PendingWakeStore(filePath);
+    await restarted.load();
+    expect(restarted.all().map(([key]) => key)).toEqual(["warp"]);
+  });
+
   it("set() then all() returns the record, and persists it to disk", async () => {
     const filePath = join(tmpDir, "pending.json");
     const store = new PendingWakeStore(filePath);

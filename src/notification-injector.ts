@@ -805,13 +805,13 @@ export function createNotificationInjector(
   const stateReady: Promise<void> = Promise.all([dedupStore.load(), pendingWakeStore.load()])
     .then(async () => {
       const owedByScope = new Map<string, OwedEntry[]>();
+      // Legacy/misconfigured reach records must never re-enter the generic
+      // action-oriented wake or automatic channel fallback pipeline.
+      const reachKeys = pendingWakeStore.all()
+        .filter(([, owed]) => isReachScope(owed.scope))
+        .map(([key]) => key);
+      await pendingWakeStore.deleteMany(reachKeys);
       for (const [key, owed] of pendingWakeStore.all()) {
-        // Legacy/misconfigured reach records must never re-enter the generic
-        // action-oriented wake or automatic channel fallback pipeline.
-        if (isReachScope(owed.scope)) {
-          await pendingWakeStore.delete(key);
-          continue;
-        }
         const list = owedByScope.get(owed.scope) ?? [];
         list.push({ key, owed });
         owedByScope.set(owed.scope, list);
