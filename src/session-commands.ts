@@ -354,6 +354,11 @@ interface ExecutionResult {
   approvalKind?: SessionApprovalKind;
 }
 
+function address(result: ExecutionResult, target: LocalLoopTarget): void {
+  result.loopId = target.loopId;
+  result.parentLoopId = target.parentLoopId;
+}
+
 export interface SessionCommandExecutor {
   /** Never throws. Always attests exactly once per frame. */
   handleFrame(frame: { type: SessionCommandType; [k: string]: unknown }): Promise<SessionCommandOutcome>;
@@ -468,7 +473,7 @@ export function createSessionCommandExecutor(
     if (!optional(loopId) || !optional(sessionKey, 512)) invalid("loopId/sessionKey must be short strings");
     if (loopId !== undefined) {
       const target = loops.resolveLoop(loopId as string);
-      if (!target || target.agentDid !== config.agentDid) throw new Rejection("loop_not_found");
+      if (target?.agentDid !== config.agentDid) throw new Rejection("loop_not_found");
       if (sessionKey !== undefined && sessionKey !== target.sessionKey) throw new Rejection("loop_target_mismatch");
       return target;
     }
@@ -481,15 +486,9 @@ export function createSessionCommandExecutor(
       else loops.onSubagentSpawned({ childSessionKey: sessionKey });
       target = loops.lookupSession(sessionKey);
     }
-    if (!target || target.agentDid !== config.agentDid) throw new Rejection("loop_not_found");
+    if (target?.agentDid !== config.agentDid) throw new Rejection("loop_not_found");
     return target;
   }
-
-  function address(result: ExecutionResult, target: LocalLoopTarget): void {
-    result.loopId = target.loopId;
-    result.parentLoopId = target.parentLoopId;
-  }
-
   type CommandPayload = Record<string, unknown>;
 
   async function send(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {

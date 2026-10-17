@@ -411,6 +411,23 @@ describe("loop-addressed commands", () => {
     expect(h.gateway.resolveApproval).toHaveBeenCalledTimes(1);
   });
 
+  it("rejects converted payload/owner mismatches before consuming the approval claim", async () => {
+    const h = harness();
+    const target = start(h);
+    h.approvals.bind({ approvalId: "bound", agentDid: AGENT, principalDid: PRINCIPAL, loopId: target.loopId });
+    h.loops.onSessionStart({ sessionKey: "other" });
+    const other = h.loops.lookupSession("other")!;
+    expect(await h.handle(await signedFrame("session.spawn", {
+      approvalId: "bound", parentLoopId: other.loopId, task: "wrong parent",
+    }))).toMatchObject({ reason: "approval_binding_mismatch" });
+    expect(await h.handle(await signedFrame("session.send", {
+      approvalId: "bound", loopId: target.loopId, message: "",
+    }))).toMatchObject({ reason: "invalid_payload" });
+    expect(h.approvals.claim("bound")).toBe(true);
+    expect(h.gateway.send).not.toHaveBeenCalled();
+    expect(h.gateway.spawn).not.toHaveBeenCalled();
+  });
+
   it("retains the shared execution claim after ambiguous gateway errors", async () => {
     const h = harness();
     h.gateway.resolveApproval.mockRejectedValueOnce(new Error("response lost"));

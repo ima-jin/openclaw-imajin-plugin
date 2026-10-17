@@ -569,7 +569,7 @@ function describeFailClosedOutcome(
 
 interface TrackedProposal {
   sourceId: string;
-  owner?: ApprovalSourceRequest["owner"];
+  owner?: NonNullable<ApprovalSourceRequest["owner"]>;
   kind: string;
   summary: string;
   detail?: Record<string, unknown>;
@@ -942,9 +942,9 @@ export class GatewayApprovalsBridge {
 
   /** Authenticated reconnect replay: closed sockets may have dropped startup bindings. */
   async republishApprovalBindings(): Promise<void> {
-    for (const [proposalId, tracked] of this.published) {
-      await this.publishNativeApprovalBinding({ proposalId, owner: tracked.owner }, true);
-    }
+    await Promise.all(Array.from(this.published, ([proposalId, tracked]) =>
+      this.publishNativeApprovalBinding({ proposalId, owner: tracked.owner }, true),
+    ));
   }
 
   /** Publishes a signed public binding from the local owner's active loop only. */
@@ -959,7 +959,7 @@ export class GatewayApprovalsBridge {
       const loop = this.loopTracker.lookupRef(request.owner);
       if (!loop?.loopId || loop.agentDid !== this.config.agentDid) return;
       const previous = this.executionRegistry.getBinding(request.proposalId);
-      if (replay && (!previous || previous.loopId !== loop.loopId)) return;
+      if (replay && previous?.loopId !== loop.loopId) return;
       const payload: ApprovalLoopBinding = {
         loopId: loop.loopId,
         principalDid: this.config.operatorDid,

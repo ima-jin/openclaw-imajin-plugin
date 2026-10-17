@@ -329,10 +329,10 @@ export default definePluginEntry({
       let sessionGateway: LoopbackSessionGateway | undefined;
       if (config.sessionCommands?.enabled === true) {
         const settings = config.sessionCommands;
-        if (!config.did || !settings.kernelPublicKeyHex) {
+        if (!config.did || !settings.kernelPublicKeyHex || !loopLifecycle) {
           console.warn(
             "[imajin-plugin] sessionCommands.enabled needs an agent `did` and " +
-              "sessionCommands.kernelPublicKeyHex — session commands will not be accepted",
+              "sessionCommands.kernelPublicKeyHex with loop lifecycle tracking enabled — session commands will not be accepted",
           );
         } else {
           const keyResolver = createIdentityClientOperatorKeyResolver(client);
@@ -388,8 +388,9 @@ export default definePluginEntry({
         // #64: a pending approval blocks its owning loop on the loops rail.
         loopTracker: loopLifecycle?.tracker,
         executionRegistry: approvalExecutions,
-        publishApprovalBinding: async (attestation) => {
+        publishApprovalBinding: (attestation) => {
           wsService.send({ type: "loop.approval.bound", attestation });
+          return Promise.resolve();
         },
         // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
         // enabled via `approvals.sources` alongside system-agent/skill-
