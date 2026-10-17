@@ -18,6 +18,13 @@ import type { LoopRef } from "./loop-tracker.js";
 export interface ApprovalLoopTracker {
   block(ref: LoopRef, reason: string): void;
   unblock(ref: LoopRef): void;
+  /** Active, plugin-local owner lookup. Never creates a loop or exposes keys on the wire. */
+  lookupRef?(ref: LoopRef): {
+    loopId: string;
+    sessionKey?: string;
+    parentLoopId: string | null;
+    agentDid: string;
+  } | undefined;
 }
 
 export interface ApprovalLoopBlockerLogger {

@@ -220,7 +220,7 @@ describe("a gateway-exec card that cannot be published fails loud, not silent (#
   });
 
   it("does not hold the publish reservation on a slow operator notify", async () => {
-    const { bridge, client, emit, notify } = setup({
+    const { bridge, client, emit, notify, kernel } = setup({
       publish: rejectPublish,
       notify: () => new Promise<void>(() => {}), // never settles
     });
@@ -228,9 +228,11 @@ describe("a gateway-exec card that cannot be published fails loud, not silent (#
 
     await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
     // A second event for the same proposal must not be parked behind the hung notify:
-    // the reservation is released, so it is handled (and denied) for real.
+    // the reservation is released, so publishing is retried. The shared
+    // execution claim (#77) prevents a second deny, even on this failed path.
     emit(FAILING_RECORD);
-    await vi.waitFor(() => expect(client.resolve).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(2));
+    expect(client.resolve).toHaveBeenCalledTimes(1);
     expect(bridge.isPublished("approval-fail")).toBe(false);
   });
 
