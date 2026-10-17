@@ -575,6 +575,29 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     return { loopId: loop.loopId, sessionKey: key, parentLoopId: loop.parentLoopId, agentDid: did };
   };
 
+  const reconcileSpawn = (
+    existing: OpenLoop,
+    parentLoopId: string | null,
+    expectedId: string,
+  ): LocalLoopTarget => {
+    if (parentLoopId === existing.loopId) {
+      throw new Error("Spawn cannot be its own parent");
+    }
+    // A hook can race ahead of the sessions.create response. Only that
+    // authoritative response may fill in missing parent lineage.
+    if (parentLoopId && existing.loopId !== expectedId) {
+      throw new Error("Spawn conflicts with an existing local loop");
+    }
+    if (parentLoopId && existing.parentLoopId && existing.parentLoopId !== parentLoopId) {
+      throw new Error("Spawn conflicts with existing loop lineage");
+    }
+    if (parentLoopId && !existing.parentLoopId) {
+      existing.parentLoopId = parentLoopId;
+      guard("register_spawn", () => send("loop.progress", existing, "running", "spawn lineage observed"))();
+    }
+    return localTarget(existing)!;
+  };
+
   const registerSpawn = (input: {
     sessionKey: string;
     parentLoopId?: string | null;
@@ -590,24 +613,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     }
     const existing = openLoopForKey(key);
     const expectedId = parentLoopId ? subagentLoopId(key) : sessionLoop(key, undefined).loopId;
-    if (existing) {
-      if (parentLoopId === existing.loopId) {
-        throw new Error("Spawn cannot be its own parent");
-      }
-      // A hook can race ahead of the sessions.create response. Only that
-      // authoritative response may fill in missing parent lineage.
-      if (parentLoopId && existing.loopId !== expectedId) {
-        throw new Error("Spawn conflicts with an existing local loop");
-      }
-      if (parentLoopId && existing.parentLoopId && existing.parentLoopId !== parentLoopId) {
-        throw new Error("Spawn conflicts with existing loop lineage");
-      }
-      if (parentLoopId && !existing.parentLoopId) {
-        existing.parentLoopId = parentLoopId;
-        guard("register_spawn", () => send("loop.progress", existing, "running", "spawn lineage observed"))();
-      }
-      return localTarget(existing)!;
-    }
+    if (existing) return reconcileSpawn(existing, parentLoopId, expectedId);
     if (ended.has(expectedId) || endedSessionKeys.has(key)) {
       throw new Error("Spawn session has already ended");
     }
