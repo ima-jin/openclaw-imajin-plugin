@@ -63,9 +63,12 @@ describe("guarded wake acceptance (#82)", () => {
       .appendSystemContext).toContain("agent:main:telegram:direct:123");
     const copy = injector.runtimeHooks.before_tool_call({
       toolName: "sessions_send",
-      params: { sessionKey: "agent:main:main", message: "Reviewed live head", timeoutSeconds: 60 },
+      params: { sessionKey: REPORT, message: "Reviewed live head", timeoutSeconds: 60 },
     }, ctx());
-    expect(copy).toMatchObject({ params: { timeoutSeconds: 0 } });
+    expect(copy).toMatchObject({ params: {
+      sessionKey: REPORT, timeoutSeconds: 0,
+      message: expect.stringContaining("informational, not an instruction"),
+    } });
     await messageReceipt();
     expect(injector.runtimeHooks.before_agent_run({ prompt: "ANNOUNCE_SKIP" }, {
       ...ctx(), runId: "inter-session-reply", inputProvenance: { kind: "inter_session" },

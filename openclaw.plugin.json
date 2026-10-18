@@ -155,7 +155,7 @@
     },
     "wsNotifications.reportTo": {
       "label": "Wake Report Sessions",
-      "help": "Explicit disclosure session keys, also used for optional #47 informational copies. Empty/unset uses the configured directSend channel/target for required disclosure. If neither destination exists, startup warns once and silent-ending checks are disabled. Invalid keys are logged once and ignored.",
+      "help": "Explicit disclosure session keys, also pinning optional coordinator sessions_send copies to exact resolved keys. Copies are informational, timeoutSeconds=0; agentId/label addressing and other keys are blocked. Empty/unset uses the existing directSend disclosure fallback. Without either destination, startup warns once and silent-ending checks are disabled. Invalid keys are logged once and ignored.",
       "placeholder": "agent:main:telegram:direct:8321865723"
     },
     "wsNotifications.wakeReadOnlyLookups": {
@@ -360,7 +360,7 @@
             "type": "array",
             "items": { "type": "string" },
             "default": [],
-            "description": "Explicit disclosure session keys, plus optional #47 informational reports. When empty/unset, required disclosure falls back to directSend.channel/target. Without either destination, startup warns once and silent-ending checks are skipped; other guards remain active. Requires plugins.entries.imajin.hooks.allowConversationAccess=true. Invalid targets are ignored."
+            "description": "Explicit disclosure session keys, plus optional #47 informational reports. Coordinator sessions_send copies require an exact resolved disclosure key, carry the informational envelope and timeoutSeconds=0, and reject agentId/label or other keys; use sessions_spawn on decisionModel for work. Empty/unset uses the existing directSend.channel/target disclosure fallback. Without either destination, startup warns once and silent-ending checks are skipped; other guards remain active. Requires plugins.entries.imajin.hooks.allowConversationAccess=true. Invalid targets are ignored."
           },
           "stateDir": {
             "type": "string",
