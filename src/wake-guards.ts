@@ -348,9 +348,7 @@ export class WakeGuards {
     // Attempt-end usage is aggregate, not an additional assistant message.
     const assistant = record(event.lastAssistant);
     const identity = scalarIdentity(assistant?.id) ?? scalarIdentity(assistant?.timestamp);
-    const key = identity === undefined
-      ? signature({ assistant: event.lastAssistant, texts: event.assistantTexts, usage: event.usage })
-      : identity;
+    const key = identity ?? signature({ assistant: event.lastAssistant, texts: event.assistantTexts, usage: event.usage });
     if (key && (session.attempts.has(key) || session.attempts.size < MAX_SEEN)) {
       const tokens = usageTokens(event.usage);
       const previous = session.attempts.get(key) ?? 0;
