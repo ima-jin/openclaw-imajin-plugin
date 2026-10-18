@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentEndEvent } from "./turn-usage-attestation.js";
-import { compactWakeEndEvent, extractFinalAssistantOutput, type WakeBatch } from "./wake-report.js";
+import { compactWakeEndEvent, extractFinalAssistantOutput, extractWakeBatchId, matchWakeBatch, type WakeBatch } from "./wake-report.js";
 import { findFinalAssistantMessage } from "./turn-usage-attestation.js";
 
 export const DEFAULT_WAKE_SESSION = "agent:main:warp-events";
@@ -143,7 +143,8 @@ export class WakeSupervisor {
     const session = (event.sessionKey ?? ctx?.sessionKey)?.toLowerCase();
     if (!session) return;
     const candidates = [...this.pending.values()].filter((b) => b.sessionKey.toLowerCase() === session);
-    const batch = runId ? candidates.find((b) => b.hookRunId === runId) : candidates[0];
+    const batchId = extractWakeBatchId(event.messages);
+    const batch = matchWakeBatch(candidates, runId, batchId);
     if (!batch) {
       if (runId && candidates.some((b) => !b.hookRunId)) {
         this.earlyEnds.set(`${session}\n${runId}`, { event: compactWakeEndEvent(event), ctx });

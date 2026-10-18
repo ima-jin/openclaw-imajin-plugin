@@ -1078,8 +1078,9 @@ export function createNotificationInjector(
     // Evidence, not instructions (#22): one entry per run in the batch, no
     // imperative sentences — see `buildWakeTurnMessage`.
     await bridgeReady;
+    const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
     const continuity = await wakeContinuity(summarizeWakeRuns(frames).map((r) => r.runId));
-    const message = `${buildWakeTurnMessage(scope, frames)}\n\n${continuity}`;
+    const message = `Wake batch ID: ${idempotencyKey}\n\n${buildWakeTurnMessage(scope, frames)}\n\n${continuity}`;
 
     if (!hookToken) {
       // The single startup warning already fired in `hookTokenReady`'s
@@ -1089,13 +1090,12 @@ export function createNotificationInjector(
       return;
     }
 
-    const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
     const sessionKey = freshSessions
       ? deriveWakeSessionKey(wakeSessionKey, idempotencyKey, summarizeWakeRuns(frames).map((r) => r.runId), sessionPerWake)
       : await guardedReuseSession(frames);
     const gatewayPort = resolveGatewayPort(api);
     // Tracked BEFORE the POST so a fast turn can't finish unmatched (#47).
-    const batch = { batchId: idempotencyKey, scope, runs: summarizeWakeRuns(frames), sessionKey };
+    const batch = { batchId: idempotencyKey, scope, runs: summarizeWakeRuns(frames), sessionKey, uniqueSession: freshSessions };
     wakeReporter?.track(batch);
     supervisor.track(batch);
     const result = await postWakeHookWithRetries({

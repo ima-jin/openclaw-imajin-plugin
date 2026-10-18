@@ -56,6 +56,18 @@ export interface WakeBatch {
   runs: WakeRunSummary[];
   /** Actual fresh/rotated session; legacy callers use the reporter's fixed default. */
   sessionKey?: string;
+  /** Plugin-derived session dedicated to exactly this batch. */
+  uniqueSession?: boolean;
+}
+
+/** Gateway admission UUID and harness runner UUID are distinct on current hosts. */
+export function matchWakeBatch<T extends WakeBatch & { hookRunId?: string }>(
+  batches: T[], runId?: string, batchId?: string,
+): T | undefined {
+  if (batchId) return batches.find((batch) => batch.batchId === batchId);
+  if (batches.length === 1 && batches[0].uniqueSession) return batches[0];
+  if (runId) return batches.find((batch) => batch.hookRunId === runId);
+  return batches[0];
 }
 
 export interface ReportTarget {
@@ -135,6 +147,16 @@ function messageText(message: AgentMessage, maxChars: number): string {
     if (text.length >= maxChars) break;
   }
   return text.trim();
+}
+
+/** Current user evidence, never an earlier assistant's prose or a previous turn. */
+export function extractWakeBatchId(messages: AgentMessage[] | undefined): string | undefined {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    if (messages?.[i]?.role !== "user") continue;
+    const text = messageText(messages[i], 8_192);
+    return /Wake batch ID: (imajin-wake:[a-zA-Z0-9._:-]{1,200})/.exec(text)?.[1];
+  }
+  return undefined;
 }
 
 /**
@@ -279,7 +301,7 @@ export class WakeReporter {
       const sessionKey = event?.sessionKey ?? ctx?.sessionKey;
       if (!sessionKey) return;
       const runId = event?.runId ?? ctx?.runId;
-      const batch = this.claim(runId, sessionKey);
+      const batch = this.claim(runId, sessionKey, extractWakeBatchId(event?.messages));
       if (!batch) {
         if (event && runId && [...this.pending.values()].some((b) =>
           !b.hookRunId && sameSession(sessionKey, b.sessionKey ?? this.opts.wakeSessionKey))) {
@@ -302,11 +324,11 @@ export class WakeReporter {
    * it reported so a duplicate `agent_end` can neither re-report it nor
    * consume the next batch.
    */
-  private claim(runId: string | undefined, sessionKey: string): PendingBatch | undefined {
+  private claim(runId: string | undefined, sessionKey: string, batchId?: string): PendingBatch | undefined {
     if (runId && this.handledRuns.has(runId)) return undefined;
     const batches = [...this.pending.values()].filter((b) =>
       sameSession(sessionKey, b.sessionKey ?? this.opts.wakeSessionKey));
-    const batch = runId ? batches.find((b) => b.hookRunId === runId) : batches[0];
+    const batch = matchWakeBatch(batches, runId, batchId);
     if (!batch) return undefined;
     this.pending.delete(batch.batchId);
     remember(this.reportedBatches, batch.batchId);

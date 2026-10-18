@@ -1039,6 +1039,12 @@ appended. `{batchId}` expands to a 24-hex SHA-256 batch hash; `{runId}` expands
 to a hash of the batch's run IDs plus the batch hash, not a raw external ID.
 The same batch identity derives the same key on retry/replay.
 
+The hook admission UUID is not necessarily the harness runner UUID.
+Completion matches the plugin-owned fresh session or the `Wake batch ID`
+evidence marker in the current user turn; it does not assume those UUIDs
+are equal. Fixed-session batches use the marker to avoid guessing between
+queued wakes. Duplicate runner completions are ignored.
+
 Set `sessionPerWake: false` with a non-templated key to opt into legacy
 fixed-session reuse. Template tokens still select batch-specific sessions even
 when this flag is false. Before fixed-key injection/dispatch, the plugin reads

@@ -6,6 +6,7 @@ import { createNotificationInjector, type WsNotificationsConfig } from "./notifi
 import { sendDirectChannelMessage } from "./channel-notify.js";
 import { deriveWakeSessionKey, wakeEventTokens, WakeSupervisor } from "./wake-supervisor.js";
 import { buildWakeOutcome } from "./wake-outcome.js";
+import { extractWakeBatchId } from "./wake-report.js";
 import { PendingWakeStore } from "./notification-state-store.js";
 import type { NotificationFrame } from "./ws-service.js";
 import type { AgentEndEvent } from "./turn-usage-attestation.js";
@@ -59,8 +60,8 @@ describe("fresh wake bridge (#79)", () => {
 
   async function finish(injector: ReturnType<typeof create>, index: number, event: AgentEndEvent = {}) {
     await injector.onAgentEnd!({
-      success: true, runId: `hook-${index + 1}`,
-      messages: [{ role: "assistant", content: "Reviewed; PR awaiting review", usage: {
+      success: true, runId: `runner-${index + 1}`,
+      messages: [{ role: "user", content: posts[index].message }, { role: "assistant", content: "Reviewed; PR awaiting review", usage: {
         contextUsage: { state: "available", promptTokens: 2_000, totalTokens: 2_500 },
       } }], ...event,
     }, { sessionKey: posts[index].sessionKey });
@@ -93,6 +94,7 @@ describe("fresh wake bridge (#79)", () => {
     expect(posts[0].sessionKey).toBe(BASE);
     expect(api.runtime.system.enqueueSystemEvent).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ sessionKey: BASE }));
     await finish(injector, 0);
+    expect(await readFile(join(dir, "wake-bridge.json"), "utf8")).toContain("Reviewed; PR awaiting review");
   });
 
   it.each([195_000, undefined])("rotates unsafe reused metadata (%s) before any injection and alerts", async (tokens) => {
@@ -268,9 +270,40 @@ describe("fresh wake bridge (#79)", () => {
     await finish(injector, 0);
     expect(vi.mocked(console.log).mock.calls.some(([text]) => String(text).includes("wake ended"))).toBe(true);
   });
+
+  it("reports a fresh wake exactly once when admission and runner UUIDs differ", async () => {
+    const injector = create({ ...config, reportTo: ["agent:reporter:fixture"] });
+    await injector.inject(frame("different-ids"));
+    await posted(1);
+    await finish(injector, 0);
+    await finish(injector, 0);
+    expect(posts.filter((post) => post.name === "imajin-wake-report")).toHaveLength(1);
+    expect(posts[1].message).toContain("Reviewed; PR awaiting review");
+    expect(alerts()).toHaveLength(0);
+  });
 });
 
 describe("wake supervision pure contracts", () => {
+  it("correlates fixed queued batches by current evidence, not a previous transcript turn", async () => {
+    const complete = vi.fn(async () => {});
+    const supervisor = new WakeSupervisor({ complete, alert: async () => {}, sessionTokens: async () => 0 });
+    for (const id of ["one", "two"]) {
+      supervisor.track({ batchId: `imajin-wake:${id}`, sessionKey: BASE, scope: "scope", runs: [] });
+      supervisor.bindRun(`imajin-wake:${id}`, `admission-${id}`);
+    }
+    await supervisor.onAgentEnd({ runId: "runner-two", messages: [
+      { role: "user", content: "Wake batch ID: imajin-wake:one" },
+      { role: "assistant", content: "old turn" },
+      { role: "user", content: [{ type: "text", text: "Wake batch ID: imajin-wake:two\nEvidence" }] },
+      { role: "assistant", content: "second result" },
+    ] }, { sessionKey: BASE });
+    expect(complete).toHaveBeenCalledWith(expect.objectContaining({ batchId: "imajin-wake:two" }), expect.any(Object), undefined);
+    expect(extractWakeBatchId([
+      { role: "user", content: "Wake batch ID: imajin-wake:one" },
+      { role: "user", content: "Unrelated current turn" },
+    ])).toBeUndefined();
+    supervisor.dispose();
+  });
   it("buffers early completions until the exact gateway run ID is bound", async () => {
     const complete = vi.fn(async () => {});
     const supervisor = new WakeSupervisor({ complete, alert: async () => {}, sessionTokens: async () => 0 });
