@@ -205,7 +205,7 @@ describe("lookup failures and safe gh execution", () => {
     cliResult(null, JSON.stringify(state()));
     const result = await buildWakeLiveState([frame({ expectedPr: URL })]);
     expect(result.subjects[0].state).toBe("OPEN");
-    expect(execFile).toHaveBeenCalledWith("gh", [
+    expect(execFile).toHaveBeenCalledWith("/usr/bin/gh", [
       "pr", "view", URL, "--json", "state,isDraft,headRefOid,mergeable,reviewDecision,statusCheckRollup",
     ], {
       encoding: "utf8", shell: false, windowsHide: true,
@@ -225,6 +225,7 @@ describe("lookup failures and safe gh execution", () => {
   });
 
   it("validates direct lookup calls before spawning and clamps the subprocess timeout", async () => {
+    await expect(createGhPrLookup(1, "gh")(URL)).rejects.toThrow("absolute");
     await expect(createGhPrLookup()("https://evil.example/a/b/pull/1")).rejects.toThrow("Invalid");
     expect(execFile).not.toHaveBeenCalled();
     cliResult(null, JSON.stringify(state()));

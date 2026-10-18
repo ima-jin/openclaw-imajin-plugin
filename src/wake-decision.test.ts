@@ -33,7 +33,7 @@ describe("wake decision delegation", () => {
     expect(router.beforeModelResolve({}, parent)).toBeUndefined();
     expect(router.beforeToolCall({ toolName: "exec", params: {} }, child)).toBeUndefined();
     expect(router.beforePromptBuild({}, child)).not.toHaveProperty("toolsAllow");
-    expect(router.beforeToolCall({ toolName: "sessions_spawn", params: {} }, child)?.params?.model).toBe("provider/decision");
+    expect(router.beforeToolCall({ toolName: "sessions_spawn", params: { task: "dispatch" } }, child)?.params?.model).toBe("provider/decision");
   });
 
   it("waits for accepted children before claiming the wake complete", () => {

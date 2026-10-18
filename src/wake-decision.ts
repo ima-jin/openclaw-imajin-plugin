@@ -3,7 +3,7 @@ import { compactWakeEndEvent, extractWakeBatchId } from "./wake-report.js";
 import { randomUUID } from "node:crypto";
 
 export const DEFAULT_WAKE_DECISION_MODEL = "anthropic/claude-opus-5-5";
-const WORKER_TOOLS = ["message", "sessions_spawn", "session_status"];
+const WORKER_TOOLS = new Set(["message", "sessions_spawn", "session_status"]);
 const MAX_CHILDREN = 32;
 
 export interface WakeHookContext {
@@ -114,16 +114,19 @@ export class WakeDecisionRouter {
       return;
     }
     if (event.toolName === "sessions_spawn") {
+      if (typeof event.params.task !== "string" || !event.params.task.trim()) {
+        return { block: true, blockReason: "Decision delegation requires a nonempty task." };
+      }
       if (wake.delegations >= MAX_CHILDREN) return { block: true, blockReason: "Wake decision delegation capacity exceeded; report the blocker." };
       const ticket = randomUUID();
       this.tickets.set(ticket, wake.batchId);
       wake.delegations++;
       return { params: {
         ...event.params, runtime: "subagent", model: this.model,
-        task: `Wake decision ticket: ${ticket}\n${String(event.params.task ?? "")}`,
+        task: `Wake decision ticket: ${ticket}\n${event.params.task}`,
       } };
     }
-    if (ctx.sessionKey === wake.sessionKey && !WORKER_TOOLS.includes(event.toolName)) {
+    if (ctx.sessionKey === wake.sessionKey && !WORKER_TOOLS.has(event.toolName)) {
       return { block: true, blockReason: `Wake decision actions must run in a sessions_spawn subagent on ${this.model}.` };
     }
   }

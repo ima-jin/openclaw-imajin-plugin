@@ -1,4 +1,5 @@
 import { execFile } from "node:child_process";
+import { isAbsolute } from "node:path";
 import type { WakeBridgeRecord } from "./wake-bridge.js";
 import type { NotificationFrame } from "./ws-service.js";
 
@@ -42,6 +43,7 @@ export interface WakeLiveState {
 export interface WakeLiveStateOptions {
   lookup?: WakePrLookup;
   timeoutMs?: number;
+  githubCliPath?: string;
 }
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -52,8 +54,8 @@ function object(value: unknown): Record<string, unknown> | undefined {
 /** Only a literal HTTPS github.com PR URL; no credentials, query, fragments or escapes. */
 export function validatedWakePrUrl(value: unknown): string | undefined {
   if (typeof value !== "string" || value.length > 256) return undefined;
-  const match = /^https:\/\/github\.com\/([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?)\/([a-zA-Z0-9_.-]{1,100})\/pull\/([1-9][0-9]{0,9})\/?$/.exec(value);
-  if (!match || match[0] !== value || match[2] === "." || match[2] === "..") return undefined;
+  const match = /^https:\/\/github\.com\/([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,37}[a-zA-Z0-9])?)\/([a-zA-Z0-9_.-]{1,100})\/pull\/([1-9]\d{0,9})\/?$/.exec(value);
+  if (match?.[0] !== value || match[2] === "." || match[2] === "..") return undefined;
   return `https://github.com/${match[1]}/${match[2]}/pull/${match[3]}`;
 }
 
@@ -63,12 +65,13 @@ function timeoutBound(value: number | undefined): number {
 }
 
 /** No shell is involved. The public lookup also validates callers outside the batch builder. */
-export function createGhPrLookup(timeoutMs = WAKE_LIVE_TIMEOUT_MS): WakePrLookup {
+export function createGhPrLookup(timeoutMs = WAKE_LIVE_TIMEOUT_MS, cliPath = "/usr/bin/gh"): WakePrLookup {
   return async (url) => {
+    if (!isAbsolute(cliPath)) throw new Error("GitHub CLI path must be absolute");
     const valid = validatedWakePrUrl(url);
     if (!valid) throw new Error("Invalid GitHub PR URL");
     const stdout = await new Promise<string>((resolve, reject) => {
-      execFile("gh", ["pr", "view", valid, "--json", FIELDS], {
+      execFile(cliPath, ["pr", "view", valid, "--json", FIELDS], {
         encoding: "utf8",
         shell: false,
         windowsHide: true,
@@ -220,7 +223,7 @@ export async function buildWakeLiveState(
 ): Promise<WakeLiveState> {
   const discovered = discoveredSubjects(frames, records);
   const timeoutMs = timeoutBound(options.timeoutMs);
-  const lookup = options.lookup ?? createGhPrLookup(timeoutMs);
+  const lookup = options.lookup ?? createGhPrLookup(timeoutMs, options.githubCliPath);
   const subjects = await Promise.all(discovered.urls.map((url) => lookupSubject(url, lookup, timeoutMs)));
   const terminalSubjects = subjects.filter((subject) => TERMINAL_STATES.has(subject.state));
   return {

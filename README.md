@@ -66,6 +66,7 @@ In `openclaw.json`:
   - **`wsNotifications.maxWakeTokens`** — cumulative per-wake ceiling, default `80000`; includes decision subagents; stops and alerts when crossed, independently of context sizing
   - **`wsNotifications.model`** — optional coordinator model; omitted uses the host's configured wake-agent model
   - **`wsNotifications.decisionModel`** — decision subagent model, default `anthropic/claude-opus-5-5`; review/merge/enqueue/dispatch tools run only in pinned subagents, not the coordinator
+  - **`wsNotifications.githubCliPath`** — trusted absolute GitHub CLI path for live PR reads; default `/usr/bin/gh`; set the installed absolute path (e.g. `/opt/homebrew/bin/gh` on macOS), never a PATH-resolved command
   - **`wsNotifications.wakeTimeoutMs`** — completion watchdog; default `900000` (15 minutes), clamped to `1..3600000`ms, independent of `reportTo`
   - **`wsNotifications.bridgeStatePath`** — bounded continuity file; default `<stateDir>/wake-bridge.json` (32 KiB, 50 records, 6 KiB prompt contribution)
   - **`wsNotifications.horizonEnabled`** — defaults to `false`; no-op without an injected harness adapter pending #2881
@@ -1041,7 +1042,8 @@ admission failures alert on the first failed attempt while retries continue.
 
 Before dispatch, the plugin reads each subject PR with the authenticated `gh`
 CLI (`gh pr view`, bounded timeout/output). Install `gh` on the gateway host and
-grant its existing identity read access to subject repositories. The preamble
+grant its existing identity read access to subject repositories. Set
+`githubCliPath` if it is installed outside `/usr/bin/gh`. The preamble
 contains state, draft flag, head SHA, mergeability, review decision and CI rollup,
 alongside the existing horizon/bridge evidence. **MERGED/CLOSED wins over
 mergeable UNKNOWN/null**: terminal subjects receive a one-line directSend

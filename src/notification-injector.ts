@@ -19,7 +19,7 @@ import { buildWakeOutcome } from "./wake-outcome.js";
 import { createLoopbackSessionGateway } from "./session-command-gateway.js";
 import { DEFAULT_WAKE_DECISION_MODEL, WakeDecisionRouter, type WakeHookContext, type WakeToolEvent } from "./wake-decision.js";
 import { WakeGuards } from "./wake-guards.js";
-import { buildWakeLiveState } from "./wake-live-state.js";
+import { buildWakeLiveState, type WakeLiveState } from "./wake-live-state.js";
 import type { WakeDisclosureSender } from "./wake-report-tool.js";
 import {
   DEFAULT_WAKE_MAX_TOKENS,
@@ -70,6 +70,8 @@ export interface WsNotificationsConfig {
   model?: string;
   /** Model pinned on decision subagents; default anthropic/claude-opus-5-5. */
   decisionModel?: string;
+  /** Absolute authenticated GitHub CLI path; default /usr/bin/gh, never PATH lookup. */
+  githubCliPath?: string;
   /** Missing-completion watchdog; default 15 minutes, clamped to 1ms..60 minutes. */
   wakeTimeoutMs?: number;
   /** Bounded plugin-owned open-work file; default stateDir/wake-bridge.json. */
@@ -931,7 +933,7 @@ export function createNotificationInjector(
     if (!batchId) throw new Error("No active Warp wake owns this report");
     if (!reportTargets.length) throw new Error("No reportTo targets configured");
     if (guards.isStopped(batchId)) throw new Error("Wake already stopped; directSend guard alert owns disclosure");
-    for (const target of reportTargets) {
+    await Promise.all(reportTargets.map(async (target) => {
       if (guards.isStopped(batchId)) throw new Error("Wake stopped before report delivery");
       const match = /^agent:[^:]+:([^:]+):(?:direct|dm|group|channel):(.+)$/.exec(target.sessionKey);
       if (!match) throw new Error("reportTo target has no channel destination");
@@ -940,7 +942,7 @@ export function createNotificationInjector(
         `Warp wake ${disclosure.outcome} (${batchId}): ${disclosure.message}`,
       );
       guards.recordDisclosure(batchId, target.sessionKey);
-    }
+    }));
   };
 
   /**
@@ -1175,26 +1177,11 @@ export function createNotificationInjector(
     await bridgeReady;
     const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
     const continuity = await wakeContinuity(summarizeWakeRuns(frames).map((r) => r.runId));
-    const liveState = await buildWakeLiveState(frames, bridge.listOpen(), { lookup: deps.liveStateLookup });
+    const liveState = await buildWakeLiveState(frames, bridge.listOpen(), {
+      lookup: deps.liveStateLookup, githubCliPath: wsNotifications?.githubCliPath,
+    });
     const message = `Wake batch ID: ${idempotencyKey}\n\n${liveState.preamble}\n\n${buildWakeTurnMessage(scope, frames)}\n\n${continuity}`;
-    if (liveState.terminalSubjects.length) {
-      const disclosure = liveState.terminalSubjects.map((subject) =>
-        `${subject.url} is already ${subject.state}; wake skipped — no review or merge action taken.`).join("\n");
-      const disclosed = await discloseTerminalSubjects(disclosure);
-      if (!disclosed) {
-        await escalateWakeFailure(scope, frames, "terminal subject disclosure failed; wake retained for retry");
-        return;
-      }
-      if (liveState.allSubjectsTerminal) {
-        await bridge.recordOutcome({
-          runIds: summarizeWakeRuns(frames).map((run) => run.runId),
-          lastVerdict: disclosure,
-          status: "closed",
-        });
-        await pendingWakeStore.delete(pendingKey);
-        return;
-      }
-    }
+    if (await handleTerminalSubjects(liveState, scope, frames, pendingKey)) return;
 
     if (!hookToken) {
       // The single startup warning already fired in `hookTokenReady`'s
@@ -1281,6 +1268,26 @@ export function createNotificationInjector(
     // static-misconfiguration branches above) is worth retrying on the next
     // restart (#26) — cleared only once `postWakeHookWithRetries` reports 2xx.
     // The first real failed attempt already alerted, before the retry ladder.
+  }
+
+  /** A successful terminal disclosure consumes only an entirely terminal batch. */
+  async function handleTerminalSubjects(
+    liveState: WakeLiveState, scope: string, frames: NotificationFrame[], pendingKey: string,
+  ): Promise<boolean> {
+    if (!liveState.terminalSubjects.length) return false;
+    const disclosure = liveState.terminalSubjects.map((subject) =>
+      `${subject.url} is already ${subject.state}; wake skipped — no review or merge action taken.`).join("\n");
+    if (!await discloseTerminalSubjects(disclosure)) {
+      await escalateWakeFailure(scope, frames, "terminal subject disclosure failed; wake retained for retry");
+      return true;
+    }
+    if (!liveState.allSubjectsTerminal) return false;
+    await bridge.recordOutcome({
+      runIds: summarizeWakeRuns(frames).map((run) => run.runId),
+      lastVerdict: disclosure, status: "closed",
+    });
+    await pendingWakeStore.delete(pendingKey);
+    return true;
   }
 
   /** Authoritative horizon evidence when available, otherwise bounded local continuity. */

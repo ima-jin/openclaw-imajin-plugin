@@ -83,6 +83,10 @@ function record(value: unknown): Record<string, unknown> | undefined {
 function finite(value: unknown): number {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : 0;
 }
+function scalarIdentity(value: unknown): string | undefined {
+  if (typeof value === "string") return value;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+}
 
 function usageTokens(value: unknown): number {
   const usage = record(value);
@@ -106,7 +110,7 @@ function signature(value: unknown): string | undefined {
     if (ancestors.has(item)) throw new Error("cyclic signature");
     ancestors.add(item);
     hash.update(Array.isArray(item) ? "[" : "{");
-    for (const key of Object.keys(item).sort()) {
+    for (const key of Object.keys(item).sort((a, b) => a.localeCompare(b))) {
       hash.update(JSON.stringify(key));
       visit((item as Record<string, unknown>)[key], depth + 1);
     }
@@ -343,10 +347,10 @@ export class WakeGuards {
     const { pending, session } = match;
     // Attempt-end usage is aggregate, not an additional assistant message.
     const assistant = record(event.lastAssistant);
-    const identity = assistant?.id ?? assistant?.timestamp;
+    const identity = scalarIdentity(assistant?.id) ?? scalarIdentity(assistant?.timestamp);
     const key = identity === undefined
       ? signature({ assistant: event.lastAssistant, texts: event.assistantTexts, usage: event.usage })
-      : String(identity);
+      : identity;
     if (key && (session.attempts.has(key) || session.attempts.size < MAX_SEEN)) {
       const tokens = usageTokens(event.usage);
       const previous = session.attempts.get(key) ?? 0;
@@ -424,9 +428,9 @@ export class WakeGuards {
   private newMessage(pending: Pending, session: Correlation, message: Record<string, unknown>): boolean {
     if (pending.objects.has(message)) return false;
     pending.objects.add(message);
-    const id = message.id ?? message.timestamp;
+    const id = scalarIdentity(message.id) ?? scalarIdentity(message.timestamp);
     if (id === undefined) return true;
-    let key = `${session.sessionKey}:${String(id)}`;
+    let key = `${session.sessionKey}:${id}`;
     if (message.id === undefined) key += `:${signature(message)}`;
     if (pending.seenMessages.has(key)) return false;
     this.remember(pending.seenMessages, key);

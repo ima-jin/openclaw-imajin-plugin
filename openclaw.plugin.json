@@ -288,6 +288,12 @@
             "minLength": 1,
             "description": "Model pinned on sessions_spawn subagents for review/merge/enqueue/dispatch. Coordinator tools are restricted to delegation, reporting and session status."
           },
+          "githubCliPath": {
+            "type": "string",
+            "default": "/usr/bin/gh",
+            "pattern": "^/",
+            "description": "Absolute trusted GitHub CLI path for authenticated live PR reads. Defaults to /usr/bin/gh; set /opt/homebrew/bin/gh or another installed absolute path as appropriate. Never resolved through PATH."
+          },
           "wakeTimeoutMs": {
             "type": "number",
             "default": 900000,
