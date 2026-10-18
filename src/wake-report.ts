@@ -182,7 +182,7 @@ export function compactWakeEndEvent(event: AgentEndEvent): AgentEndEvent {
     error: typeof event.error === "string" ? event.error.slice(0, 200) : undefined,
     messages: last?.role === "assistant" ? [{
       role: "assistant",
-      content: extractFinalAssistantOutput(event.messages),
+      content: messageText(last, 8_193),
       stopReason: last.stopReason,
       usage: last.usage,
     }] : [],

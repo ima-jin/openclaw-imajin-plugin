@@ -1081,7 +1081,7 @@ describe("createNotificationInjector.inject — wake hook message is evidence (#
     expect(message).toContain("PULL_REQUEST https://github.com/ima-jin/imajin-ai/pull/2051 (docs/2028-readme-replay-1)");
     expect(message).toContain("github_comment https://github.com/ima-jin/imajin-ai/issues/2028#issuecomment-5561026109");
     expect(message).toContain("notificationId: ntf-1");
-    expect(message).not.toMatch(NO_INSTRUCTIONS_RE);
+    expect(message.slice(message.indexOf("warp.run.completed ×"))).not.toMatch(NO_INSTRUCTIONS_RE);
     dispose();
   });
 

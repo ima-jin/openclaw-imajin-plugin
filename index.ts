@@ -70,6 +70,7 @@ import {
 } from "./src/session-commands.js";
 import { createLoopbackSessionGateway, type LoopbackSessionGateway } from "./src/session-command-gateway.js";
 import { ApprovalExecutionRegistry } from "./src/approval-execution.js";
+import { createWakeReportTool } from "./src/wake-report-tool.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -245,10 +246,17 @@ export default definePluginEntry({
         inject: injector,
         dispose: disposeInjector,
         onAgentEnd: onWakeAgentEnd,
+        runtimeHooks: wakeRuntimeHooks,
+        reportWake,
       } = createNotificationInjector(api, config.wsNotifications, {
         sendFrame: (frame) => wsService.send(frame),
         keypairPath: config.keypairPath,
       });
+      for (const [hook, handler] of Object.entries(wakeRuntimeHooks)) {
+        api.on(hook, handler, { name: `imajin-wake:${hook}` });
+      }
+      api.registerTool((ctx: { sessionKey?: string; runId?: string }) => createWakeReportTool(ctx, reportWake),
+        { names: ["imajin_wake_report"] });
       const reachEvents = createReachEventHandler(api, config.wsNotifications?.reach, {
         principalDid: config.actAs ?? config.did,
         targetSession: config.wsNotifications?.targetSession,

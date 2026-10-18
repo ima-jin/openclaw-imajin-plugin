@@ -63,13 +63,17 @@ In `openclaw.json`:
   - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
   - **`wsNotifications.sessionPerWake`** — defaults to `true`; derives fresh batch sessions from `wakeSessionKey`/`targetSession` (default `agent:main:warp-events`); `false` opts into guarded fixed-key reuse without template tokens
   - **`wsNotifications.maxSessionTokens`** — reuse guard/final alert threshold; default and ceiling `50000`, with a `24000`-token pre-injection reserve; not a single-turn model cap
-  - **`wsNotifications.wakeTimeoutMs`** — completion watchdog; default `35000`, clamped to `1..40000`ms, independent of `reportTo`
+  - **`wsNotifications.maxWakeTokens`** — cumulative per-wake ceiling, default `80000`; includes decision subagents; stops and alerts when crossed, independently of context sizing
+  - **`wsNotifications.model`** — optional coordinator model; omitted uses the host's configured wake-agent model
+  - **`wsNotifications.decisionModel`** — decision subagent model, default `anthropic/claude-opus-5-5`; review/merge/enqueue/dispatch tools run only in pinned subagents, not the coordinator
+  - **`wsNotifications.githubCliPath`** — trusted absolute GitHub CLI path for live PR reads; default `/usr/bin/gh`; set the installed absolute path (e.g. `/opt/homebrew/bin/gh` on macOS), never a PATH-resolved command
+  - **`wsNotifications.wakeTimeoutMs`** — completion watchdog; default `900000` (15 minutes), clamped to `1..3600000`ms, independent of `reportTo`
   - **`wsNotifications.bridgeStatePath`** — bounded continuity file; default `<stateDir>/wake-bridge.json` (32 KiB, 50 records, 6 KiB prompt contribution)
   - **`wsNotifications.horizonEnabled`** — defaults to `false`; no-op without an injected harness adapter pending #2881
   - **`wsNotifications.wakeSettleMs`** — leading-edge settle window in ms (#25); default `10000` (10s); see "Coalescing" below
   - **`wsNotifications.wakeCoalesceMs`** — trailing coalesce window in ms (#25); default `30000` (30s, was `300000`/5min); see "Coalescing" below
   - **`wsNotifications.wakeOwedMaxAgeMs`** — age bound in ms (#30) for already-injected legacy/fixed pending markers; default `3600000` (1h); fresh `injected: false` markers do not silently age-expire
-  - **`wsNotifications.reportTo`** — session keys the wake worker discloses its outcome to (#47); default `[]` (no reports); see "Wake reports: the worker discloses" below
+  - **`wsNotifications.reportTo`** — session keys the wake worker discloses its outcome to; default `[]` cannot prove delivery and triggers silent-ending alerts (#82); see "Wake reports: the worker discloses" below
   - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
 - **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway proposals from one or more sources to the kernel and applies signed operator decisions from /jin (#24, generalized by #33); see "Gateway approvals bridge" below:
   - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
@@ -970,6 +974,10 @@ config and this plugin's config:
             "injectScopes": ["warp.run.completed", "warp.run.failed", "warp.run.timeout"],
             "wakeSessionKey": "agent:main:warp-events",
             "sessionPerWake": true,
+            "maxWakeTokens": 80000,
+            "decisionModel": "anthropic/claude-opus-5-5",
+            "reportTo": ["agent:main:telegram:direct:8321865723"],
+            "directSend": { "channel": "telegram", "target": "8321865723" },
             "hookToken": { "source": "store", "provider": "default", "id": "OPENCLAW_HOOKS_TOKEN" }
           }
         }
@@ -1029,7 +1037,61 @@ For plugin-dispatched wakes (not this manual smoke test), the independent
 completion watchdog alerts through `directSend` if no turn ends; other
 admission failures alert on the first failed attempt while retries continue.
 
-#### Fresh wake sessions (#79)
+
+#### Live state, bounded work and mandatory disclosure (#82)
+
+Before dispatch, the plugin reads each subject PR with the authenticated `gh`
+CLI (`gh pr view`, bounded timeout/output). Install `gh` on the gateway host and
+grant its existing identity read access to subject repositories. Set
+`githubCliPath` if it is installed outside `/usr/bin/gh`. The preamble
+contains state, draft flag, head SHA, mergeability, review decision and CI rollup,
+alongside the existing horizon/bridge evidence. **MERGED/CLOSED wins over
+mergeable UNKNOWN/null**: terminal subjects receive a one-line directSend
+disclosure and are not re-reviewed. Mixed batches retain open or unavailable
+subjects; lookup failures are explicitly unavailable, never assumed merged.
+
+The coordinator's tools are restricted to `sessions_spawn`, `message` and
+`session_status`. Review/merge/enqueue/dispatch work is delegated through
+`sessions_spawn` with `runtime: "subagent"` and the configured `decisionModel`;
+the plugin overrides attempted model substitutions. The host must allow that
+model and the spawn tool. Missing permission/model availability is a blocker,
+not permission to fall back to a cheap decision model. Accepted children are
+included in wake completion and guard accounting. One-use plugin tickets
+correlate children before their first model call, because the host can emit
+`subagent_spawned` after a child has already started. A resolved decision model
+that differs from the configured model is stopped and alerted, not accepted
+as a cheaper fallback.
+
+Three identical tool calls (same tool and recursively key-sorted args) with
+unchanged results stop the wake, including interleaved polls. The independent
+`maxWakeTokens` budget sums assistant input/output/cache usage across the wake
+and its children, rather than measuring final context occupancy. On crossing,
+the plugin blocks further tools, requests `chat.abort` for the wake and its
+children through the existing loopback gateway adapter, and alerts via
+`directSend` with session, subject, repeated call/last result or usage.
+Provider work already in flight cannot be unspent; host model limits remain
+useful additional bounds. Public per-message hooks provide live accounting;
+attempt-end usage is a fallback on harnesses without per-message usage.
+
+Configure **both `reportTo` and `directSend`**. A successful `message` send to
+every configured report target is the disclosure receipt. OpenClaw disables
+the native `message` tool in subagents, so decision children use the plugin's
+**`imajin_wake_report`** tool with `outcome: "completed"` or `"blocked"` and a
+concrete evidence/blocker message. It performs deterministic
+`openclaw message send` calls to the configured reportTo destinations and
+records receipts only after successful sends. Allow this plugin tool in
+decision-child tool policy. Final prose, spawn admission and the informational
+#47 report are not delivery evidence.
+An ending without receipts alerts **“wake ended without reporting”**, including
+the session, subject and last assistant line. `NO_REPLY` is silent too, unless
+the event is a known duplicate (replayed notifications are deduped before waking).
+Empty/missing report targets cannot prove disclosure and therefore alert.
+The existing watchdog still catches a wake or accepted child that never ends.
+Enable `plugins.entries.imajin.hooks.allowConversationAccess: true` for
+per-message and completion hooks. Gateway credentials need `operator.write`
+for scoped aborts; no kernel access to harness state is added.
+
+#### Fresh wake sessions, sizing and continuity (#79)
 
 `wsNotifications.sessionPerWake` defaults to `true`. The default base is
 `agent:main:warp-events` (`targetSession`, overridden by `wakeSessionKey`).

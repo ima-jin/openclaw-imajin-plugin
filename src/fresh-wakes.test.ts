@@ -137,6 +137,11 @@ describe("fresh wake bridge (#79)", () => {
   }
 
   async function finish(injector: ReturnType<typeof create>, index: number, event: AgentEndEvent = {}) {
+    await injector.runtimeHooks.after_tool_call({
+      toolName: "message", toolCallId: `report-${index}`,
+      params: { action: "send", channel: "telegram", target: "123", message: "Reviewed; PR awaiting review" },
+      result: { ok: true },
+    }, { sessionKey: posts[index].sessionKey, runId: `runner-${index + 1}` });
     await injector.onAgentEnd!({
       success: true, runId: `runner-${index + 1}`,
       messages: [{ role: "user", content: posts[index].message }, { role: "assistant", content: "Reviewed; PR awaiting review", usage: {
@@ -162,7 +167,7 @@ describe("fresh wake bridge (#79)", () => {
     const sizes = vi.mocked(console.log).mock.calls.filter(([text]) => String(text).includes("wake ended"));
     expect(sizes).toHaveLength(20);
     expect(sizes.every(([text]) => String(text).includes("sessionTokens=2500"))).toBe(true);
-    expect(alerts()).toHaveLength(0);
+    expect(alerts()).toHaveLength(20); // No reportTo means no delivery receipts, despite healthy context sizing.
   });
 
   it("keeps an explicit fixed key when sessionPerWake=false and the metadata is safe", async () => {
@@ -350,7 +355,7 @@ describe("fresh wake bridge (#79)", () => {
   });
 
   it("reports a fresh wake exactly once when admission and runner UUIDs differ", async () => {
-    const injector = create({ ...config, reportTo: ["agent:reporter:fixture"] });
+    const injector = create({ ...config, reportTo: ["agent:main:telegram:direct:123"] });
     await injector.inject(frame("different-ids"));
     await posted(1);
     await finish(injector, 0);
