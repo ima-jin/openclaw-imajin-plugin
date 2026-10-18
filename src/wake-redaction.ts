@@ -11,6 +11,7 @@ function quotedValueEnd(text: string, start: number, quote: string): number {
 }
 
 function assignmentValueEnd(text: string, start: number): number {
+  if (text.startsWith(REDACTED, start)) return start + REDACTED.length;
   const quote = text[start];
   if (quote === '"' || quote === "'") return quotedValueEnd(text, start, quote);
   let end = start;
@@ -31,11 +32,12 @@ function redactAssignments(text: string): string {
 
 /** Mask before clipping: a truncated credential must never escape as a prefix. */
 export function redactWakeText(text: string): string {
-  return redactAssignments(text)
+  const masked = text
     .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)/g, REDACTED)
     .replace(/\b(?:gh[pos]_|github_pat_)\w+/g, REDACTED)
     .replace(/\bsk-[\w-]+/g, REDACTED)
     .replace(/\bxox[abp]-[A-Za-z0-9-]+/g, REDACTED)
     .replace(/\bBearer[ \t]+[^\s"'<>;,}]+/gi, REDACTED)
     .replace(/\beyJ[\w-]*\.[\w-]+\.[\w-]+/g, REDACTED);
+  return redactAssignments(masked);
 }

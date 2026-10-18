@@ -42,4 +42,15 @@ describe("wake alert redaction", () => {
     expect(redactWakeText("ghp_" + "x".repeat(2_000))).toBe("[redacted]");
     expect(redactWakeText("normal output: successful")).toBe("normal output: successful");
   });
+
+  it("masks multiline private keys and Bearer values inside unquoted assignments", () => {
+    const pem = "-----BEGIN PRIVATE KEY-----\nfixturePrivateBody\n-----END PRIVATE KEY-----";
+    for (const text of [`PRIVATE_KEY=${pem}`, "AUTHORIZATION=Bearer fixtureBearerBody"]) {
+      const masked = redactWakeText(text);
+      expect(masked).not.toContain("fixture");
+      expect(masked).not.toContain("PRIVATE KEY-----");
+      expect(masked).toContain("[redacted]");
+      expect(redactWakeText(masked)).toBe(masked);
+    }
+  });
 });
