@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { AgentEndEvent } from "./turn-usage-attestation.js";
-import { extractFinalAssistantOutput, type WakeBatch } from "./wake-report.js";
+import { compactWakeEndEvent, extractFinalAssistantOutput, type WakeBatch } from "./wake-report.js";
 import { findFinalAssistantMessage } from "./turn-usage-attestation.js";
 
 export const DEFAULT_WAKE_SESSION = "agent:main:warp-events";
@@ -68,6 +68,7 @@ export interface WakeSupervisorOptions {
 export class WakeSupervisor {
   private readonly pending = new Map<string, PendingWake>();
   private readonly handledRuns = new Set<string>();
+  private readonly earlyEnds = new Map<string, { event: AgentEndEvent; ctx?: { sessionKey?: string; runId?: string } }>();
 
   constructor(private readonly options: WakeSupervisorOptions) {}
 
@@ -95,7 +96,16 @@ export class WakeSupervisor {
 
   bindRun(batchId: string, runId?: string): void {
     const batch = this.pending.get(batchId);
-    if (batch && runId) batch.hookRunId = runId;
+    if (!batch || !runId) return;
+    batch.hookRunId = runId;
+    const key = `${batch.sessionKey.toLowerCase()}\n${runId}`;
+    const early = this.earlyEnds.get(key);
+    if (early) {
+      this.earlyEnds.delete(key);
+      void this.onAgentEnd(early.event, early.ctx).catch(() => {
+        console.error("[imajin-ws] early wake outcome handling failed");
+      });
+    }
   }
 
   async alert(batchId: string, reason: string): Promise<void> {
@@ -117,9 +127,14 @@ export class WakeSupervisor {
     const session = (event.sessionKey ?? ctx?.sessionKey)?.toLowerCase();
     if (!session) return;
     const candidates = [...this.pending.values()].filter((b) => b.sessionKey.toLowerCase() === session);
-    const batch = (runId ? candidates.find((b) => b.hookRunId === runId) : candidates[0])
-      ?? candidates.find((b) => !b.hookRunId);
-    if (!batch) return;
+    const batch = runId ? candidates.find((b) => b.hookRunId === runId) : candidates[0];
+    if (!batch) {
+      if (runId && candidates.some((b) => !b.hookRunId)) {
+        this.earlyEnds.set(`${session}\n${runId}`, { event: compactWakeEndEvent(event), ctx });
+        if (this.earlyEnds.size > 100) this.earlyEnds.delete(this.earlyEnds.keys().next().value!);
+      }
+      return;
+    }
     // Claim synchronously before any I/O, so duplicate hooks cannot consume another batch.
     clearTimeout(batch.timer);
     this.pending.delete(batch.batchId);
@@ -143,6 +158,7 @@ export class WakeSupervisor {
   dispose(): void {
     for (const batch of this.pending.values()) clearTimeout(batch.timer);
     this.pending.clear();
+    this.earlyEnds.clear();
   }
 
   private expire(batch: PendingWake, reason: string): void {

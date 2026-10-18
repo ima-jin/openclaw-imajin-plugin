@@ -237,9 +237,54 @@ describe("fresh wake bridge (#79)", () => {
     await finish(injector, 0);
     expect(await readFile(join(dir, "wake-bridge.json"), "utf8")).toContain("Reviewed; PR awaiting review");
   });
+
+  it("a pending wake cannot block a later fresh batch", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+      posts.push(JSON.parse(init.body));
+      return { status: 503, text: async () => JSON.stringify({ runId: `queued-${posts.length}` }) };
+    }));
+    const injector = create();
+    await injector.inject(frame("stuck"));
+    await posted(1);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    await injector.inject(frame("next-independent"));
+    await posted(2);
+    expect(posts[1].sessionKey).not.toBe(posts[0].sessionKey);
+  });
+
+  it("an authoritative empty horizon does not inject stale bridge work", async () => {
+    const horizon = { readOpenItems: async () => [], writeStepEvents: async () => {} };
+    const injector = create({ ...config, horizonEnabled: true }, { horizon });
+    await injector.inject(frame("current"));
+    await posted(1);
+    expect(posts[0].message).not.toContain("Wake continuity");
+  });
+
+  it("uses the gateway-selected agent namespace for completion correlation", async () => {
+    const injector = create({ ...config, targetSession: "agent:other:warp-events", hookAgentId: "worker" });
+    await injector.inject(frame("agent-routing"));
+    await posted(1);
+    expect(posts[0].sessionKey).toMatch(/^agent:worker:/);
+    await finish(injector, 0);
+    expect(vi.mocked(console.log).mock.calls.some(([text]) => String(text).includes("wake ended"))).toBe(true);
+  });
 });
 
 describe("wake supervision pure contracts", () => {
+  it("buffers early completions until the exact gateway run ID is bound", async () => {
+    const complete = vi.fn(async () => {});
+    const supervisor = new WakeSupervisor({ complete, alert: async () => {}, sessionTokens: async () => 0 });
+    supervisor.track({ batchId: "a", sessionKey: BASE, scope: "scope", runs: [] });
+    supervisor.track({ batchId: "b", sessionKey: BASE, scope: "scope", runs: [] });
+    await supervisor.onAgentEnd({ runId: "second", messages: [{ role: "assistant", content: "result" }] }, { sessionKey: BASE });
+    expect(complete).not.toHaveBeenCalled();
+    supervisor.bindRun("a", "first");
+    expect(complete).not.toHaveBeenCalled();
+    supervisor.bindRun("b", "second");
+    await vi.waitFor(() => expect(complete).toHaveBeenCalledTimes(1));
+    expect(complete).toHaveBeenCalledWith(expect.objectContaining({ batchId: "b" }), expect.any(Object), undefined);
+    supervisor.dispose();
+  });
   it("derives stable template batches, separates repeated run IDs and supports fixed keys", () => {
     expect(deriveWakeSessionKey(BASE, "batch", ["run"], false)).toBe(BASE);
     for (const template of [`${BASE}:{batchId}`, `${BASE}:{runId}`]) {

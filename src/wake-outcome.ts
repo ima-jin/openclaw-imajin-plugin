@@ -5,7 +5,7 @@ import { wakeFailureReason } from "./wake-supervisor.js";
 
 function bounded(value: unknown, bytes: number): string | undefined {
   if (typeof value !== "string") return undefined;
-  return Buffer.from(value.slice(0, bytes)).subarray(0, bytes).toString("utf8").replace(/\uFFFD+$/, "").trim() || undefined;
+  return Buffer.from(value.slice(0, bytes)).subarray(0, bytes).toString("utf8").replace(/\uFFFD$/, "").trim() || undefined;
 }
 
 function structuredUpdates(output: string, runIds: readonly string[]): WakeBridgeRecord[] {

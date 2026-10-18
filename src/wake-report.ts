@@ -30,6 +30,7 @@
  */
 
 import type { AgentEndEvent, AgentMessage } from "./turn-usage-attestation.js";
+import { findFinalAssistantMessage } from "./turn-usage-attestation.js";
 
 /** `agent:<agentId>:<rest>` — the shape every OpenClaw session key has. */
 const SESSION_KEY_RE = /^agent:([^:\s]+):\S+$/;
@@ -156,6 +157,23 @@ export function extractFinalAssistantOutput(messages: AgentMessage[] | undefined
   return text && text !== NO_REPLY_SENTINEL ? text : undefined;
 }
 
+/** Early hook correlation must never retain the turn's transcript. */
+export function compactWakeEndEvent(event: AgentEndEvent): AgentEndEvent {
+  const last = findFinalAssistantMessage(event.messages);
+  return {
+    runId: event.runId,
+    sessionKey: event.sessionKey,
+    success: event.success,
+    error: typeof event.error === "string" ? event.error.slice(0, 200) : undefined,
+    messages: last?.role === "assistant" ? [{
+      role: "assistant",
+      content: extractFinalAssistantOutput(event.messages),
+      stopReason: last.stopReason,
+      usage: last.usage,
+    }] : [],
+  };
+}
+
 function describeTurn(event: AgentEndEvent | undefined): TurnSummary {
   const error = typeof event?.error === "string" && event.error ? event.error : undefined;
   const failed = event?.success === false || error !== undefined;
@@ -217,6 +235,7 @@ export class WakeReporter {
   private readonly reportedBatches = new Set<string>();
   private readonly handledRuns = new Set<string>();
   private readonly failedTargets = new Set<string>();
+  private readonly earlyEnds = new Map<string, { event: AgentEndEvent; sessionKey: string }>();
 
   constructor(private readonly opts: WakeReporterOptions) {}
 
@@ -242,7 +261,14 @@ export class WakeReporter {
   /** Records the Gateway's runId for a tracked batch so `agent_end` can match it exactly. */
   bindRun(batchId: string, hookRunId: string | undefined): void {
     const batch = this.pending.get(batchId);
-    if (batch && hookRunId) batch.hookRunId = hookRunId;
+    if (!batch || !hookRunId) return;
+    batch.hookRunId = hookRunId;
+    const key = `${(batch.sessionKey ?? this.opts.wakeSessionKey).toLowerCase()}\n${hookRunId}`;
+    const early = this.earlyEnds.get(key);
+    if (early) {
+      this.earlyEnds.delete(key);
+      void this.onAgentEnd(early.event, { sessionKey: early.sessionKey });
+    }
   }
 
   /** The wake POST failed outright — there will be no turn to report on. */
@@ -259,8 +285,16 @@ export class WakeReporter {
     try {
       const sessionKey = event?.sessionKey ?? ctx?.sessionKey;
       if (!sessionKey) return;
-      const batch = this.claim(event?.runId ?? ctx?.runId, sessionKey);
-      if (!batch) return;
+      const runId = event?.runId ?? ctx?.runId;
+      const batch = this.claim(runId, sessionKey);
+      if (!batch) {
+        if (event && runId && [...this.pending.values()].some((b) =>
+          !b.hookRunId && sameSession(sessionKey, b.sessionKey ?? this.opts.wakeSessionKey))) {
+          this.earlyEnds.set(`${sessionKey.toLowerCase()}\n${runId}`, { event: compactWakeEndEvent({ ...event, runId }), sessionKey });
+          if (this.earlyEnds.size > MAX_PENDING_BATCHES) this.earlyEnds.delete(this.earlyEnds.keys().next().value!);
+        }
+        return;
+      }
       const report = buildWakeReport(batch, describeTurn(event));
       await Promise.all(this.opts.targets.map((target) => this.send(target, batch.batchId, report)));
     } catch (err: unknown) {
@@ -279,8 +313,7 @@ export class WakeReporter {
     if (runId && this.handledRuns.has(runId)) return undefined;
     const batches = [...this.pending.values()].filter((b) =>
       sameSession(sessionKey, b.sessionKey ?? this.opts.wakeSessionKey));
-    const batch = (runId ? batches.find((b) => b.hookRunId === runId) : batches[0])
-      ?? batches.find((b) => !b.hookRunId);
+    const batch = runId ? batches.find((b) => b.hookRunId === runId) : batches[0];
     if (!batch) return undefined;
     this.pending.delete(batch.batchId);
     remember(this.reportedBatches, batch.batchId);

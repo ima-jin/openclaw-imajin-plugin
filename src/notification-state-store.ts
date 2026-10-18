@@ -41,14 +41,9 @@ export interface PendingWakeRecord {
   sinceTs: number;
   frames: NotificationFrame[];
   /**
-   * Whether every frame in this record already reached `enqueueSystemEvent`
-   * (false for fresh wakes whose evidence is persisted only in this file).
-   * successfully (#30) — true for every record this injector itself writes,
-   * since a frame only ever joins the coalesce buffer (and therefore this
-   * store) after its durable enqueue succeeded. Optional/absent on records
-   * written before this field existed; treated as `true` in that case (the
-   * same guarantee held then too — see `wakeOwedMaxAgeMs` in
-   * `notification-injector.ts`).
+   * True when frames reached the legacy host system-event inbox. False for
+   * fresh wakes persisted only here: they must not be silently age-expired.
+   * Optional on pre-#79 records, where all frames were host-enqueued.
    */
   injected?: boolean;
 }

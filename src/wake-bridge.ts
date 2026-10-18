@@ -63,7 +63,7 @@ function text(value: unknown, max: number): string | undefined {
   if (!raw) return undefined;
   const bytes = Buffer.from(raw);
   if (bytes.length <= max) return raw;
-  return bytes.subarray(0, max).toString("utf8").replace(/\uFFFD+$/, "");
+  return bytes.subarray(0, max).toString("utf8").replace(/\uFFFD$/, "");
 }
 
 function runId(value: unknown): string | undefined {
@@ -96,7 +96,7 @@ function capped(records: WakeBridgeRecord[]): WakeBridgeRecord[] {
     Buffer.byteLength(serialized(records)) > MAX_WAKE_BRIDGE_FILE_BYTES
   ) {
     const closed = records.findIndex((item) => item.status === "closed");
-    records.splice(closed < 0 ? 0 : closed, 1);
+    records.splice(Math.max(0, closed), 1);
   }
   return records;
 }
