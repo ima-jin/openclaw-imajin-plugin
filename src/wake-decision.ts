@@ -42,6 +42,7 @@ export class WakeDecisionRouter {
   private readonly roots = new Map<string, string>();
   private readonly runners = new Map<string, string>();
   private readonly tickets = new Map<string, string>();
+  private readonly retired = new Set<string>();
 
   constructor(
     readonly model: string,
@@ -78,7 +79,13 @@ export class WakeDecisionRouter {
 
   beforePromptBuild(_event: unknown, ctx: WakeHookContext) {
     const wake = this.find(ctx);
-    if (!wake) return;
+    if (!wake) {
+      if (this.retired.has(ctx.sessionKey ?? "")) return {
+        toolsAllow: ["message", "session_status"],
+        appendSystemContext: "This Warp wake already ended. Do not start new work from a late child announcement.",
+      };
+      return;
+    }
     const reporting = `Send a concrete outcome using message action=send to every reportTo target: ${JSON.stringify(this.reportTo)}. Final prose and NO_REPLY do not disclose an outcome. If blocked, disclose what did not finish.`;
     if (wake.sessionKey !== ctx.sessionKey) {
       return { appendSystemContext: "This is delegated Warp decision work. Review/merge/enqueue/dispatch here, using live state before acting. Call imajin_wake_report with outcome=completed or blocked and concrete evidence before ending; it sends a real channel message to every configured reportTo target. Subagents do not have the normal message tool." };
@@ -100,7 +107,12 @@ export class WakeDecisionRouter {
 
   beforeToolCall(event: WakeToolEvent, ctx: WakeHookContext) {
     const wake = this.find(ctx);
-    if (!wake) return;
+    if (!wake) {
+      if (this.retired.has(ctx.sessionKey ?? "") && !["message", "session_status"].includes(event.toolName)) {
+        return { block: true, blockReason: "Warp wake already ended; no further decision work is permitted." };
+      }
+      return;
+    }
     if (event.toolName === "sessions_spawn") {
       if (wake.delegations >= MAX_CHILDREN) return { block: true, blockReason: "Wake decision delegation capacity exceeded; report the blocker." };
       const ticket = randomUUID();
@@ -193,6 +205,10 @@ export class WakeDecisionRouter {
   }
 
   untrack(batchId: string): void {
+    for (const [sessionKey, id] of this.roots) {
+      if (id === batchId) this.retired.add(sessionKey);
+    }
+    while (this.retired.size > 500) this.retired.delete(this.retired.values().next().value!);
     for (const [ticket, value] of this.tickets) if (value === batchId) this.tickets.delete(ticket);
     for (const map of [this.roots, this.runners]) {
       for (const [key, value] of map) if (value === batchId) map.delete(key);
@@ -208,6 +224,7 @@ export class WakeDecisionRouter {
     this.roots.clear();
     this.runners.clear();
     this.tickets.clear();
+    this.retired.clear();
   }
 }
 

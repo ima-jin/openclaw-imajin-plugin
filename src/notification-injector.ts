@@ -917,7 +917,7 @@ export function createNotificationInjector(
     llm_output: (event: any, ctx: WakeHookContext = {}) => guards.onLlmOutput(event, ctx),
     llm_input: (event: { prompt?: string; runId?: string; provider?: string; model?: string }, ctx: WakeHookContext = {}) => {
       const batchId = extractWakeBatchId([{ role: "user", content: event.prompt }]);
-      if (batchId && event.runId && decisionRouter.root(ctx.sessionKey)) {
+      if (batchId && event.runId && ctx.sessionKey === decisionRouter.root(ctx.sessionKey)) {
         guards.bindRunner(batchId, event.runId);
         decisionRouter.bindRunner(batchId, event.runId);
       }
@@ -930,9 +930,9 @@ export function createNotificationInjector(
     const batchId = decisionRouter.batch(ctx);
     if (!batchId) throw new Error("No active Warp wake owns this report");
     if (!reportTargets.length) throw new Error("No reportTo targets configured");
-    const blocked = guards.beforeToolCall({ toolName: "imajin_wake_report", params: {}, batchId }, ctx);
-    if (blocked) throw new Error("Wake already stopped; directSend guard alert owns disclosure");
+    if (guards.isStopped(batchId)) throw new Error("Wake already stopped; directSend guard alert owns disclosure");
     for (const target of reportTargets) {
+      if (guards.isStopped(batchId)) throw new Error("Wake stopped before report delivery");
       const match = /^agent:[^:]+:([^:]+):(?:direct|dm|group|channel):(.+)$/.exec(target.sessionKey);
       if (!match) throw new Error("reportTo target has no channel destination");
       await sendDirectChannelMessage(

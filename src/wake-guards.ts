@@ -279,6 +279,11 @@ export class WakeGuards {
     if (!pending || pending.reason) return;
     if (this.targets.some((target) => target.key === targetSessionKey)) pending.sent.add(targetSessionKey);
   }
+  /** Plugin-owned effect checks do not receive the host runner identity. */
+  isStopped(batchId: string): boolean {
+    const pending = this.pending.get(batchId);
+    return !pending || Boolean(pending.reason);
+  }
 
   aliasSession(parentSessionKey: string, childSessionKey: string, runId?: string, batchId?: string): boolean {
     const matches = [...this.pending.values()].filter((pending) =>

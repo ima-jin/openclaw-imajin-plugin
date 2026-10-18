@@ -214,6 +214,10 @@ describe("guarded wake acceptance (#82)", () => {
     await start();
     expect(injector.runtimeHooks.before_tool_call({ toolName: "exec", params: { command: "gh pr merge" } }, ctx())).toMatchObject({ block: true });
     const child = await spawnChild();
+    injector.runtimeHooks.llm_input({
+      prompt: wakes()[0].message, runId: child.runId,
+      provider: "anthropic", model: "claude-opus-5-5",
+    }, child); // Delegated evidence must not overwrite the parent runner.
     await end("NO_REPLY"); // delegation is not completion
     expect(alerts()).toHaveLength(0);
     const tool = createWakeReportTool(child, injector.reportWake);
@@ -226,6 +230,7 @@ describe("guarded wake acceptance (#82)", () => {
     expect(alerts()).toHaveLength(0);
     const bridge = JSON.parse(await readFile(join(dir, "wake-bridge.json"), "utf8"));
     expect(bridge.records[0].lastVerdict).toBe("Reviewed and merged");
+    expect(injector.runtimeHooks.before_tool_call({ toolName: "exec", params: {} }, ctx())).toMatchObject({ block: true });
   });
 
   it("sums parent and child usage and aborts both on a crossing", async () => {
@@ -271,6 +276,16 @@ describe("guarded wake acceptance (#82)", () => {
       .execute("r", { outcome: "completed", message: "unrelated" })).rejects.toThrow("No active Warp wake");
     await expect(createWakeReportTool(ctx(), injector.reportWake)
       .execute("r", { outcome: "completed", message: "" })).rejects.toThrow("disclosure");
+  });
+
+  it("rechecks stopped state using factory context without runId before a report side effect", async () => {
+    config.maxWakeTokens = 1;
+    create();
+    await start();
+    const child = await spawnChild();
+    const tool = createWakeReportTool({ sessionKey: child.sessionKey }, injector.reportWake);
+    injector.runtimeHooks.before_message_write({ message: { role: "assistant", usage: { input: 2 } } }, child);
+    await expect(tool.execute("late-report", { outcome: "completed", message: "too late" })).rejects.toThrow("already stopped");
   });
 
   it("accounts live fixed-session usage by current batch/runner, not admission UUID", async () => {
