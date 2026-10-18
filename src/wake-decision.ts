@@ -3,12 +3,18 @@ import { compactWakeEndEvent, extractWakeBatchId } from "./wake-report.js";
 import { randomUUID } from "node:crypto";
 
 export const DEFAULT_WAKE_DECISION_MODEL = "anthropic/claude-opus-5-5";
-const WORKER_TOOLS = new Set(["message", "sessions_spawn", "session_status"]);
+const WORKER_TOOLS = new Set(["message", "sessions_spawn", "sessions_send", "session_status"]);
 const MAX_CHILDREN = 32;
+const POSTING_TOOLS = new Set(["message", "imajin_wake_report"]);
 
 export interface WakeHookContext {
   sessionKey?: string;
   runId?: string;
+}
+interface WakeToolPolicy {
+  block?: boolean;
+  blockReason?: string;
+  params?: Record<string, unknown>;
 }
 
 export interface WakeToolEvent {
@@ -28,6 +34,8 @@ interface DecisionWake {
   childEnd?: AgentEndEvent;
   failed: boolean;
   delegations: number;
+  disclosed: boolean;
+  copyRequested: boolean;
 }
 
 export interface SettledWake {
@@ -43,6 +51,7 @@ export class WakeDecisionRouter {
   private readonly runners = new Map<string, string>();
   private readonly tickets = new Map<string, string>();
   private readonly retired = new Set<string>();
+  private readonly ignoredRuns = new Set<string>();
 
   constructor(
     readonly model: string,
@@ -53,8 +62,45 @@ export class WakeDecisionRouter {
   track(sessionKey: string, batchId = sessionKey): void {
     if (this.wakes.has(batchId)) return;
     if (this.wakes.size >= 100) this.untrack(this.wakes.keys().next().value!);
-    this.wakes.set(batchId, { batchId, sessionKey, children: new Set(), failed: false, delegations: 0 });
+    this.wakes.set(batchId, {
+      batchId, sessionKey, children: new Set(), failed: false, delegations: 0, disclosed: false, copyRequested: false,
+    });
     if (!this.roots.has(sessionKey)) this.roots.set(sessionKey, batchId);
+  }
+
+  private delegateDecision(event: WakeToolEvent, wake: DecisionWake): WakeToolPolicy {
+    if (typeof event.params.task !== "string" || !event.params.task.trim()) {
+      return { block: true, blockReason: "Decision delegation requires a nonempty task." };
+    }
+    if (wake.delegations >= MAX_CHILDREN) return { block: true, blockReason: "Wake decision delegation capacity exceeded; report the blocker." };
+    const ticket = randomUUID();
+    this.tickets.set(ticket, wake.batchId);
+    wake.delegations++;
+    return { params: {
+      ...event.params, runtime: "subagent", model: this.model,
+      task: `Wake decision ticket: ${ticket}\n${event.params.task}`,
+    } };
+  }
+
+  private mainSessionCopy(event: WakeToolEvent, wake: DecisionWake) {
+    if (wake.copyRequested) return { block: true, blockReason: "Wake main-session copy already attempted; no reply-back." };
+    wake.copyRequested = true;
+    return { params: { ...event.params, timeoutSeconds: 0 } };
+  }
+
+  markDisclosed(batchId: string): void {
+    const wake = this.wakes.get(batchId);
+    if (wake) wake.disclosed = true;
+  }
+
+  beforeAgentRun(_event: unknown, ctx: WakeHookContext) {
+    const wake = this.find(ctx);
+    const closed = wake ? wake.disclosed : this.retired.has(ctx.sessionKey ?? "");
+    if (closed) {
+      if (ctx.runId) this.ignoredRuns.add(ctx.runId);
+      if (this.ignoredRuns.size > 500) this.ignoredRuns.delete(this.ignoredRuns.values().next().value!);
+      return { outcome: "block", reason: "Warp wake already disclosed or ended; inter-session replies require no response." };
+    }
   }
 
   root(sessionKey?: string): string | undefined {
@@ -81,18 +127,28 @@ export class WakeDecisionRouter {
     const wake = this.find(ctx);
     if (!wake) {
       if (this.retired.has(ctx.sessionKey ?? "")) return {
-        toolsAllow: ["message", "session_status"],
-        appendSystemContext: "This Warp wake already ended. Do not start new work from a late child announcement.",
+        toolsAllow: ["session_status"],
+        appendSystemContext: "This Warp wake already ended. Do not reply, post acknowledgments, or start work from inter-session replies or late child announcements.",
       };
       return;
     }
-    const reporting = `Send a concrete outcome using message action=send to every reportTo target: ${JSON.stringify(this.reportTo)}. Final prose and NO_REPLY do not disclose an outcome. If blocked, disclose what did not finish.`;
+    const reporting = this.reportTo.length
+      ? `Send a concrete outcome using message action=send to every disclosure target: ${JSON.stringify(this.reportTo)}. Final prose and NO_REPLY do not disclose an outcome. If blocked, disclose what did not finish.`
+      : "No disclosure destination is configured; silent-ending monitoring is disabled. Do not invent a recipient.";
     if (wake.sessionKey !== ctx.sessionKey) {
-      return { appendSystemContext: "This is delegated Warp decision work. Review/merge/enqueue/dispatch here, using live state before acting. Call imajin_wake_report with outcome=completed or blocked and concrete evidence before ending; it sends a real channel message to every configured reportTo target. Subagents do not have the normal message tool." };
+      const childReporting = this.reportTo.length
+        ? "Call imajin_wake_report with outcome=completed or blocked and concrete evidence before ending; it sends a real channel message to every configured disclosure target. Subagents do not have the normal message tool."
+        : reporting;
+      return { appendSystemContext: [
+        "This is delegated Warp decision work. Review/merge/enqueue/dispatch here, using live state before acting.",
+        childReporting,
+        "Do not poll CI or mergeable in a loop: use one bounded `gh pr checks <n> --watch` call, or report blocked with CI pending; the next wake picks it up.",
+        "An optional main-session copy uses sessions_send with timeoutSeconds 0, once only. After disclosure, do not acknowledge inter-session replies, including ANNOUNCE_SKIP.",
+      ].join("\n") };
     }
     return {
       toolsAllow: [...WORKER_TOOLS],
-      appendSystemContext: `Warp wake coordinator: delegate review, merge, enqueue and dispatch work with sessions_spawn, runtime=subagent, model=${this.model}. Pass the entire live-state preamble and relevant horizon/bridge evidence in the task. Do not perform decision work yourself. ${reporting}`,
+      appendSystemContext: `Warp wake coordinator: delegate review, merge, enqueue and dispatch work with sessions_spawn, runtime=subagent, model=${this.model}. Pass the entire live-state preamble and relevant horizon/bridge evidence in the task. Do not perform decision work yourself. ${reporting} An optional main-session copy uses sessions_send with timeoutSeconds 0, once only. After disclosure, do not acknowledge inter-session replies, including ANNOUNCE_SKIP.`,
     };
   }
 
@@ -105,26 +161,20 @@ export class WakeDecisionRouter {
     return { providerOverride: this.model.slice(0, slash), modelOverride: this.model.slice(slash + 1) };
   }
 
-  beforeToolCall(event: WakeToolEvent, ctx: WakeHookContext) {
+  beforeToolCall(event: WakeToolEvent, ctx: WakeHookContext): WakeToolPolicy | undefined {
     const wake = this.find(ctx);
     if (!wake) {
-      if (this.retired.has(ctx.sessionKey ?? "") && !["message", "session_status"].includes(event.toolName)) {
+      if (this.retired.has(ctx.sessionKey ?? "") && event.toolName !== "session_status") {
         return { block: true, blockReason: "Warp wake already ended; no further decision work is permitted." };
       }
       return;
     }
+    if (event.toolName === "sessions_send") return this.mainSessionCopy(event, wake);
+    if (wake.disclosed && POSTING_TOOLS.has(event.toolName)) {
+      return { block: true, blockReason: "Warp wake already disclosed; do not post or act on inter-session replies." };
+    }
     if (event.toolName === "sessions_spawn") {
-      if (typeof event.params.task !== "string" || !event.params.task.trim()) {
-        return { block: true, blockReason: "Decision delegation requires a nonempty task." };
-      }
-      if (wake.delegations >= MAX_CHILDREN) return { block: true, blockReason: "Wake decision delegation capacity exceeded; report the blocker." };
-      const ticket = randomUUID();
-      this.tickets.set(ticket, wake.batchId);
-      wake.delegations++;
-      return { params: {
-        ...event.params, runtime: "subagent", model: this.model,
-        task: `Wake decision ticket: ${ticket}\n${event.params.task}`,
-      } };
+      return this.delegateDecision(event, wake);
     }
     if (ctx.sessionKey === wake.sessionKey && !WORKER_TOOLS.has(event.toolName)) {
       return { block: true, blockReason: `Wake decision actions must run in a sessions_spawn subagent on ${this.model}.` };
@@ -182,6 +232,7 @@ export class WakeDecisionRouter {
 
   /** Parent endings wait for accepted children; neither NO_REPLY nor delegation is success. */
   end(event: AgentEndEvent, ctx: WakeHookContext): SettledWake | undefined {
+    if (this.ignoredRuns.has(event.runId ?? ctx.runId ?? "")) return;
     const session = event.sessionKey ?? ctx.sessionKey;
     const batchId = extractWakeBatchId(event.messages);
     const wake = batchId ? this.wakes.get(batchId) : this.find({ sessionKey: session, runId: event.runId ?? ctx.runId });
@@ -232,6 +283,7 @@ export class WakeDecisionRouter {
     this.runners.clear();
     this.tickets.clear();
     this.retired.clear();
+    this.ignoredRuns.clear();
   }
 }
 

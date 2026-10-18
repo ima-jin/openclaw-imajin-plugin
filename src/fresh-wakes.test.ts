@@ -105,6 +105,7 @@ describe("fresh wake bridge (#79)", () => {
   let config: WsNotificationsConfig;
   let api: any;
   const injectors: Array<ReturnType<typeof createNotificationInjector>> = [];
+  const configurations = new WeakMap<ReturnType<typeof createNotificationInjector>, WsNotificationsConfig>();
   const alerts = () => vi.mocked(sendDirectChannelMessage).mock.calls.filter(([, text]) => text.includes("automatic wake failed"));
   const posted = async (count: number) => vi.waitFor(() => expect(posts).toHaveLength(count), { interval: 5 });
 
@@ -132,16 +133,23 @@ describe("fresh wake bridge (#79)", () => {
 
   function create(settings = config, deps: Parameters<typeof createNotificationInjector>[2] = {}) {
     const injector = createNotificationInjector(api, settings, deps);
+    configurations.set(injector, settings);
     injectors.push(injector);
     return injector;
   }
 
   async function finish(injector: ReturnType<typeof create>, index: number, event: AgentEndEvent = {}) {
-    await injector.runtimeHooks.after_tool_call({
-      toolName: "message", toolCallId: `report-${index}`,
-      params: { action: "send", channel: "telegram", target: "123", message: "Reviewed; PR awaiting review" },
-      result: { ok: true },
-    }, { sessionKey: posts[index].sessionKey, runId: `runner-${index + 1}` });
+    if (!Object.keys(event).length) {
+      const settings = configurations.get(injector)!;
+      const key = settings.reportTo?.[0]?.split(":");
+      const channel = key?.[2] ?? settings.directSend?.channel ?? "telegram";
+      const target = key?.slice(4).join(":") ?? settings.directSend?.target;
+      await injector.runtimeHooks.after_tool_call({
+        toolName: "message", toolCallId: `report-${index}`,
+        params: { action: "send", channel, target, message: "Reviewed; PR awaiting review" },
+        result: { ok: true },
+      }, { sessionKey: posts[index].sessionKey, runId: `runner-${index + 1}` });
+    }
     await injector.onAgentEnd!({
       success: true, runId: `runner-${index + 1}`,
       messages: [{ role: "user", content: posts[index].message }, { role: "assistant", content: "Reviewed; PR awaiting review", usage: {
@@ -167,7 +175,7 @@ describe("fresh wake bridge (#79)", () => {
     const sizes = vi.mocked(console.log).mock.calls.filter(([text]) => String(text).includes("wake ended"));
     expect(sizes).toHaveLength(20);
     expect(sizes.every(([text]) => String(text).includes("sessionTokens=2500"))).toBe(true);
-    expect(alerts()).toHaveLength(20); // No reportTo means no delivery receipts, despite healthy context sizing.
+    expect(alerts()).toHaveLength(0); // Successful sends to directSend are valid fallback receipts.
   });
 
   it("keeps an explicit fixed key when sessionPerWake=false and the metadata is safe", async () => {

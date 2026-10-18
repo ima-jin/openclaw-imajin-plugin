@@ -155,7 +155,7 @@
     },
     "wsNotifications.reportTo": {
       "label": "Wake Report Sessions",
-      "help": "Session keys (e.g. agent:main:telegram:direct:<id>) the wake worker session discloses to (#47). After a wake turn completes in the wake session, its final assistant output \u2014 or 'no output' plus the Warp run state \u2014 is forwarded once per wake batch to each key, wrapped as an informational report from warp-events (not a wake). Default empty = no reports. Invalid keys are logged once and ignored.",
+      "help": "Explicit disclosure session keys, also used for optional #47 informational copies. Empty/unset uses the configured directSend channel/target for required disclosure. If neither destination exists, startup warns once and silent-ending checks are disabled. Invalid keys are logged once and ignored.",
       "placeholder": "agent:main:telegram:direct:8321865723"
     },
     "wsNotifications.wakeOwedMaxAgeMs": {
@@ -269,13 +269,13 @@
             "default": 50000,
             "minimum": 1,
             "maximum": 50000,
-            "description": "Reuse guard threshold and final-size alert limit, default/ceiling 50000 tokens. Reserves 24000 tokens before reuse; unknown size rotates. Not a hook-body model cap: configure per-model contextTokens/maxTokens in the host for single-turn limits."
+            "description": "Reuse guard threshold, default/ceiling 50000 tokens. Reserves 24000 tokens before reuse; unknown size rotates. maxWakeTokens separately caps each wake/child session's current context."
           },
           "maxWakeTokens": {
             "type": "integer",
             "default": 80000,
             "minimum": 1,
-            "description": "Cumulative per-wake token ceiling, including decision subagents. Crossings stop tool work, abort the wake and children, and alert through directSend. Independent of maxSessionTokens context sizing."
+            "description": "Per-session context ceiling, default 80000, independently for the wake and each decision child. Measures the latest call's input+cacheRead+cacheWrite+output, never cumulative billed usage or sums across sessions. Crossings stop tool work, abort the wake and children, and alert through directSend."
           },
           "model": {
             "type": "string",
@@ -351,7 +351,7 @@
             "type": "array",
             "items": { "type": "string" },
             "default": [],
-            "description": "Session keys the wake worker discloses to (#47). Forwards final output (or no-output status) once per batch as an informational report, not a wake. Default empty disables reports only; agent_end size/failure monitoring remains active and requires plugins.entries.imajin.hooks.allowConversationAccess=true. Invalid targets are ignored."
+            "description": "Explicit disclosure session keys, plus optional #47 informational reports. When empty/unset, required disclosure falls back to directSend.channel/target. Without either destination, startup warns once and silent-ending checks are skipped; other guards remain active. Requires plugins.entries.imajin.hooks.allowConversationAccess=true. Invalid targets are ignored."
           },
           "stateDir": {
             "type": "string",

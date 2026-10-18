@@ -38,12 +38,12 @@ export function wakeEventTokens(event: AgentEndEvent): number | undefined {
   return values.reduce<number>((sum, n) => sum + (typeof n === "number" && Number.isFinite(n) ? n : 0), 0);
 }
 
-export function wakeFailureReason(event: AgentEndEvent): string | undefined {
+export function wakeFailureReason(event: AgentEndEvent, checkEmptyReply = true): string | undefined {
   const last = findFinalAssistantMessage(event.messages);
   const stop = last?.stopReason ?? event.stopReason;
   if (stop === "length") return "stopReason=length (truncated reply)";
   if (stop === "error" || stop === "aborted" || event.success === false || event.error) return "wake turn failed";
-  if (!extractFinalAssistantOutput(event.messages, 1_024)) return "empty wake reply";
+  if (checkEmptyReply && !extractFinalAssistantOutput(event.messages, 1_024)) return "empty wake reply";
   return undefined;
 }
 
@@ -60,6 +60,8 @@ interface PendingWake extends SupervisedWake {
 export interface WakeSupervisorOptions {
   timeoutMs?: number;
   maxTokens?: number;
+  /** No configured disclosure route means silence cannot be monitored. Other failures still alert. */
+  checkEmptyReply?: boolean;
   alert: (batch: SupervisedWake, reason: string) => Promise<void>;
   complete: (batch: SupervisedWake, event: AgentEndEvent, tokens?: number) => Promise<void>;
   sessionTokens: (sessionKey: string) => Promise<number | undefined>;
@@ -125,7 +127,7 @@ export class WakeSupervisor {
   async onAgentEnd(event: AgentEndEvent, ctx?: { sessionKey?: string; runId?: string }): Promise<void> {
     const batch = this.claim(event, ctx);
     if (!batch) return;
-    const reason = wakeFailureReason(event);
+    const reason = wakeFailureReason(event, this.options.checkEmptyReply);
     if (reason && !batch.alerted) {
       batch.alerted = true;
       await this.options.alert(batch, reason);

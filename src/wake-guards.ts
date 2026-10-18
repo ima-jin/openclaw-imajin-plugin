@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { redactWakeText, SECRET_KEY } from "./wake-redaction.js";
 
 export const DEFAULT_WAKE_TOKEN_BUDGET = 80_000;
 const MAX_BATCHES = 100;
@@ -11,11 +12,11 @@ export interface GuardWakeBatch {
   sessionKey: string;
   subject: string;
   uniqueSession?: boolean;
-  knownDuplicate?: boolean;
 }
 
 export interface WakeGuardAlert extends GuardWakeBatch {
   tokens: number;
+  contextSessionKey?: string;
   lastAssistantLine?: string;
   lastTool?: { toolName: string; args: string; result: string };
 }
@@ -47,9 +48,7 @@ interface Correlation {
   runId?: string;
   admissionId?: string;
   unique: boolean;
-  live: number;
-  aggregate: number;
-  attempts: Map<string, number>;
+  contextTokens: number;
 }
 
 interface CallState {
@@ -88,12 +87,13 @@ function scalarIdentity(value: unknown): string | undefined {
   if (typeof value === "number" && Number.isFinite(value)) return String(value);
 }
 
-function usageTokens(value: unknown): number {
+/** Only a single assistant call's usage, never llm_output's attempt aggregate. */
+function usageTokens(value: unknown): number | undefined {
   const usage = record(value);
-  if (!usage) return 0;
-  const sum = ["input", "output", "cacheRead", "cacheWrite"]
-    .reduce((total, key) => total + finite(usage[key]), 0);
-  return sum || finite(usage.total) || finite(usage.totalTokens);
+  if (!usage) return;
+  const values = ["input", "output", "cacheRead", "cacheWrite"].map((key) => usage[key]);
+  if (!values.some((value) => typeof value === "number" && Number.isFinite(value) && value >= 0)) return;
+  return values.reduce<number>((total, value) => total + finite(value), 0);
 }
 
 /** Full sorted-key hashes, but never retain full arguments/results or cyclic input. */
@@ -125,7 +125,28 @@ function signature(value: unknown): string | undefined {
   }
 }
 
-/** Bounded operator-only evidence, never written to ordinary logs. */
+/** Stable visible outcome only; transport/per-call telemetry is not progress. */
+function resultSignature(event: WakeGuardToolEvent): string | undefined {
+  const result = record(event.result);
+  const details = record(result?.details);
+  const blocks = Array.isArray(result?.content) ? result.content : [];
+  const content = blocks.flatMap((block) => {
+    const text = record(block);
+    return text?.type === "text" && typeof text.text === "string" ? [text.text] : [];
+  });
+  if (typeof event.result === "string") content.push(event.result);
+  const error = event.error ?? result?.error;
+  if (!content.length && error === undefined && result?.isError === undefined
+    && details?.exitCode === undefined && details?.status === undefined) return;
+  return signature({ content, isError: result?.isError, error, exitCode: details?.exitCode, status: details?.status });
+}
+
+function runningProcess(event: WakeGuardToolEvent): boolean {
+  return event.toolName === "process" && (event.params.action === "poll" || event.params.action === "log")
+    && record(record(event.result)?.details)?.status === "running";
+}
+
+/** Redacted, bounded evidence, never written to ordinary logs. */
 function preview(value: unknown): string {
   let remaining = MAX_TEXT;
   const seen = new WeakSet<object>();
@@ -139,7 +160,7 @@ function preview(value: unknown): string {
   function visit(item: unknown, depth: number): void {
     if (remaining <= 0) return;
     if (!item || typeof item !== "object") {
-      append(String(item));
+      append(redactWakeText(String(item)));
       return;
     }
     if (seen.has(item) || depth > 8) {
@@ -152,7 +173,8 @@ function preview(value: unknown): string {
       if (remaining <= 0) break;
       if (!Object.hasOwn(item, key)) continue;
       append(`${key}:`);
-      visit((item as Record<string, unknown>)[key], depth + 1);
+      if (SECRET_KEY.test(key)) append("[redacted]");
+      else visit((item as Record<string, unknown>)[key], depth + 1);
       append(",");
     }
     append("}");
@@ -216,7 +238,7 @@ function assistantLine(message: Record<string, unknown>): string {
 }
 
 function lastLine(text: string): string {
-  const trimmed = text.trimEnd();
+  const trimmed = redactWakeText(text).trimEnd();
   return trimmed.slice(trimmed.lastIndexOf("\n") + 1).trim().slice(0, MAX_TEXT);
 }
 
@@ -244,11 +266,11 @@ export class WakeGuards {
   track(batch: GuardWakeBatch): boolean {
     if (this.pending.has(batch.batchId) || this.finished.has(batch.batchId)) return false;
     if (this.pending.size >= MAX_BATCHES) return false;
-    const safe = { ...batch, subject: batch.subject.slice(0, MAX_TEXT) };
+    const safe = { ...batch, subject: redactWakeText(batch.subject).slice(0, MAX_TEXT) };
     this.pending.set(batch.batchId, {
       batch: safe,
       sessions: new Map([[batch.sessionKey, {
-        sessionKey: batch.sessionKey, unique: batch.uniqueSession === true, live: 0, aggregate: 0, attempts: new Map(),
+        sessionKey: batch.sessionKey, unique: batch.uniqueSession === true, contextTokens: 0,
       }]]),
       calls: new Map(), seenCalls: new Set(), seenMessages: new Set(),
       objects: new WeakSet(), sent: new Set(), alert: { ...safe, tokens: 0 },
@@ -289,13 +311,18 @@ export class WakeGuards {
     return !pending || Boolean(pending.reason);
   }
 
+  hasReported(batchId: string): boolean {
+    const pending = this.pending.get(batchId);
+    return Boolean(pending && this.targets.length && this.reported(pending));
+  }
+
   aliasSession(parentSessionKey: string, childSessionKey: string, runId?: string, batchId?: string): boolean {
     const matches = [...this.pending.values()].filter((pending) =>
       pending.batch.sessionKey === parentSessionKey && (!batchId || pending.batch.batchId === batchId));
     if (matches.length !== 1 || matches[0].sessions.size >= MAX_CALLS) return false;
     const pending = matches[0];
     if (pending.sessions.has(childSessionKey) || pending.reason) return false;
-    pending.sessions.set(childSessionKey, { sessionKey: childSessionKey, runId, unique: true, live: 0, aggregate: 0, attempts: new Map() });
+    pending.sessions.set(childSessionKey, { sessionKey: childSessionKey, runId, unique: true, contextTokens: 0 });
     return true;
   }
 
@@ -314,13 +341,19 @@ export class WakeGuards {
     if (callId && pending.seenCalls.has(callId)) return;
     if (callId) this.remember(pending.seenCalls, callId);
     pending.alert.lastTool = {
-      toolName: event.toolName.slice(0, 128), args: preview(event.params), result: preview(event.result),
+      toolName: event.toolName.slice(0, 128), args: preview(event.params),
+      result: event.toolName === "imajin_vault" ? "[vault result omitted]" : preview(event.result),
     };
     this.disclosure(pending, event);
     const args = signature(event.params);
-    const result = signature({ result: event.result, error: event.error });
-    if (!args || !result) return;
+    if (!args) return;
     const key = `${event.toolName}:${args}`;
+    if (runningProcess(event)) {
+      pending.calls.delete(key);
+      return;
+    }
+    const result = resultSignature(event);
+    if (!result) return;
     const previous = pending.calls.get(key);
     const count = previous?.result === result ? previous.count + 1 : 1;
     pending.calls.delete(key);
@@ -336,8 +369,7 @@ export class WakeGuards {
     const { pending, session } = match;
     pending.alert.lastAssistantLine = assistantLine(message);
     if (!this.newMessage(pending, session, message)) return;
-    session.live += usageTokens(message.usage);
-    this.checkTokens(pending);
+    this.observeContext(pending, session, message.usage);
   }
 
   async onLlmOutput(event: WakeGuardContext & { usage?: unknown; lastAssistant?: unknown; assistantTexts?: string[] },
@@ -345,18 +377,10 @@ export class WakeGuards {
     const match = this.match(event, ctx);
     if (!match) return;
     const { pending, session } = match;
-    // Attempt-end usage is aggregate, not an additional assistant message.
+    // event.usage is billed usage over an entire attempt. Only lastAssistant is per-call.
     const assistant = record(event.lastAssistant);
-    const identity = scalarIdentity(assistant?.id) ?? scalarIdentity(assistant?.timestamp);
-    const key = identity ?? signature({ assistant: event.lastAssistant, texts: event.assistantTexts, usage: event.usage });
-    if (key && (session.attempts.has(key) || session.attempts.size < MAX_SEEN)) {
-      const tokens = usageTokens(event.usage);
-      const previous = session.attempts.get(key) ?? 0;
-      session.attempts.set(key, Math.max(previous, tokens));
-      session.aggregate += Math.max(0, tokens - previous);
-    }
     if (assistant) pending.alert.lastAssistantLine = assistantLine(assistant);
-    this.checkTokens(pending);
+    if (assistant && this.newMessage(pending, session, assistant)) this.observeContext(pending, session, assistant.usage);
     await pending.effects;
   }
 
@@ -374,7 +398,7 @@ export class WakeGuards {
       stopReason = message.stopReason;
       break;
     }
-    if (!pending.reason && !pending.batch.knownDuplicate && !this.reported(pending)) {
+    if (!pending.reason && !this.reported(pending)) {
       const suffix = stopReason === "length" ? "; stopReason=length (truncated reply)" : "";
       await this.trip(pending, `wake ended without reporting${suffix}`);
     }
@@ -446,13 +470,18 @@ export class WakeGuards {
   }
 
   private reported(pending: Pending): boolean {
-    return !this.targetOverflow && this.targets.length > 0 && this.targets.every((target) => pending.sent.has(target.key));
+    return !this.targetOverflow && this.targets.every((target) => pending.sent.has(target.key));
   }
 
-  private checkTokens(pending: Pending): void {
-    pending.alert.tokens = [...pending.sessions.values()]
-      .reduce((sum, session) => sum + Math.max(session.live, session.aggregate), 0);
-    if (pending.alert.tokens > this.maxTokens) void this.trip(pending, "wake token budget exceeded");
+  private observeContext(pending: Pending, session: Correlation, usage: unknown): void {
+    const tokens = usageTokens(usage);
+    if (tokens === undefined) return;
+    session.contextTokens = tokens;
+    pending.alert.tokens = Math.max(...[...pending.sessions.values()].map((item) => item.contextTokens));
+    if (tokens > this.maxTokens) {
+      pending.alert.contextSessionKey = session.sessionKey;
+      void this.trip(pending, "wake per-session context ceiling exceeded");
+    }
   }
 
   private trip(pending: Pending, reason: string): Promise<void> {
