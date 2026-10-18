@@ -57,7 +57,7 @@ export interface WsNotificationsConfig {
   sessionPerWake?: boolean;
   /** Context threshold for rotation; default and ceiling 50000 tokens. */
   maxSessionTokens?: number;
-  /** Completion watchdog; clamped to 1..40000ms, leaving directSend's 20s budget. */
+  /** Missing-completion watchdog; default 15 minutes, clamped to 1ms..60 minutes. */
   wakeTimeoutMs?: number;
   /** Bounded plugin-owned open-work file; default stateDir/wake-bridge.json. */
   bridgeStatePath?: string;

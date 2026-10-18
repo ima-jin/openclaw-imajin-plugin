@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNotificationInjector, type WsNotificationsConfig } from "./notification-injector.js";
 import { sendDirectChannelMessage } from "./channel-notify.js";
-import { deriveWakeSessionKey, wakeEventTokens, WakeSupervisor } from "./wake-supervisor.js";
+import { DEFAULT_WAKE_TIMEOUT_MS, MAX_WAKE_TIMEOUT_MS, deriveWakeSessionKey, wakeEventTokens, WakeSupervisor } from "./wake-supervisor.js";
 import { buildWakeOutcome } from "./wake-outcome.js";
 import { extractWakeBatchId } from "./wake-report.js";
 import { PendingWakeStore } from "./notification-state-store.js";
@@ -19,6 +19,84 @@ const frame = (id: string): NotificationFrame => ({
   type: "notification", id: `notification-${id}`, scope: "warp.run.completed",
   title: `Run ${id} SUCCEEDED`, body: null, createdAt: "",
   data: { runId: id, issue: "fixture/issue/79", expectedPr: "fixture/pr/80" },
+});
+
+describe("wake completion watchdog", () => {
+  const supervisors: WakeSupervisor[] = [];
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    for (const supervisor of supervisors.splice(0)) supervisor.dispose();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function track(timeoutMs?: number) {
+    const alert = vi.fn(async () => {});
+    const complete = vi.fn(async () => {});
+    const supervisor = new WakeSupervisor({ timeoutMs, alert, complete, sessionTokens: async () => 0 });
+    supervisors.push(supervisor);
+    supervisor.track({ batchId: "batch", sessionKey: BASE, scope: "scope", runs: [], uniqueSession: true });
+    return { supervisor, alert, complete };
+  }
+
+  it.each([
+    { timeoutMs: undefined, expectedMs: 900_000 },
+    { timeoutMs: Number.NaN, expectedMs: 900_000 },
+    { timeoutMs: Number.POSITIVE_INFINITY, expectedMs: 900_000 },
+    { timeoutMs: -1, expectedMs: 1 },
+    { timeoutMs: 0, expectedMs: 1 },
+    { timeoutMs: 50_000, expectedMs: 50_000 },
+    { timeoutMs: 3_600_000, expectedMs: 3_600_000 },
+    { timeoutMs: 3_600_001, expectedMs: 3_600_000 },
+  ])("uses $expectedMs ms for configured timeout $timeoutMs", async ({ timeoutMs, expectedMs }) => {
+    const { alert, complete } = track(timeoutMs);
+    await vi.advanceTimersByTimeAsync(expectedMs - 1);
+    expect(alert).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ batchId: "batch" }), "wake completion timeout");
+    expect(complete).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ wakeWatchdog: true }));
+  });
+
+  it("keeps runtime and config-schema defaults/bounds aligned at 15 and 60 minutes", async () => {
+    const manifest = JSON.parse(await readFile(new URL("../openclaw.plugin.json", import.meta.url), "utf8"));
+    expect(DEFAULT_WAKE_TIMEOUT_MS).toBe(900_000);
+    expect(MAX_WAKE_TIMEOUT_MS).toBe(3_600_000);
+    expect(manifest.configSchema.properties.wsNotifications.properties.wakeTimeoutMs).toMatchObject({
+      default: DEFAULT_WAKE_TIMEOUT_MS, minimum: 1, maximum: MAX_WAKE_TIMEOUT_MS,
+    });
+  });
+
+  it("does not alert or write a timeout verdict for a healthy turn finishing after 60 seconds", async () => {
+    const { supervisor, alert, complete } = track();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(alert).not.toHaveBeenCalled();
+    expect(complete).not.toHaveBeenCalled();
+    const event = { success: true, runId: "runner", messages: [{ role: "assistant", content: "Review complete; PR awaiting review" }] };
+    await supervisor.onAgentEnd(event, { sessionKey: BASE });
+    expect(alert).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledWith(expect.any(Object), event, undefined);
+    await vi.advanceTimersByTimeAsync(DEFAULT_WAKE_TIMEOUT_MS);
+    expect(alert).not.toHaveBeenCalled();
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { success: false, messages: [], reason: "wake turn failed" },
+    { success: true, messages: [{ role: "assistant", content: "" }], reason: "empty wake reply" },
+    { success: true, messages: [{ role: "assistant", content: "partial", stopReason: "length" }], reason: "stopReason=length (truncated reply)" },
+  ])("alerts an observed $reason immediately without waiting 15 minutes", async ({ reason, ...event }) => {
+    const { supervisor, alert } = track();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(alert).not.toHaveBeenCalled();
+    const observedAt = Date.now();
+    await supervisor.onAgentEnd(event, { sessionKey: BASE });
+    expect(alert).toHaveBeenCalledWith(expect.any(Object), reason);
+    expect(Date.now()).toBe(observedAt);
+  });
 });
 
 describe("fresh wake bridge (#79)", () => {
@@ -136,7 +214,7 @@ describe("fresh wake bridge (#79)", () => {
     expect(alerts()[0][1]).toContain("hook-failure");
   });
 
-  it("retains #31 queued-503 semantics, but a dead completion alerts within a minute", async () => {
+  it("retains #31 queued-503 semantics and alerts at the configured missing-completion deadline", async () => {
     const fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
       posts.push(JSON.parse(init.body));
       return { status: 503, text: async () => JSON.stringify({ runId: "queued-hook" }) };
@@ -360,6 +438,8 @@ describe("wake supervision pure contracts", () => {
     await supervisor.onAgentEnd({ runId: "real", messages: [] }, { sessionKey: "agent:main:other" });
     expect(complete).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(40_000);
+    expect(alert).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(alert).toHaveBeenCalledTimes(1);
     await supervisor.onAgentEnd({ runId: "real", messages: [{ role: "assistant", content: "late success" }] }, { sessionKey: `${BASE}:fresh` });
     expect(complete).toHaveBeenCalledTimes(2);

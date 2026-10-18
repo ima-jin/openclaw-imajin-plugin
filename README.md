@@ -1069,12 +1069,19 @@ cumulative tool-loop billing. Missing data is explicitly `unavailable`, never
 presented as a measured zero. Outer accounting can finish after `agent_end`.
 
 **Completion supervision is independent of reports.** `wakeTimeoutMs` defaults
-to 35,000ms and clamps to 1..40,000ms from wake dispatch. `directSend` has a
-20,000ms delivery timeout, leaving a watchdog-plus-delivery budget of at most
-one minute (excluding the earlier settle/coalesce window). Configure
-`directSend` for human-facing alerts on failure, `stopReason=length`, empty
-output or completion timeout. Admission-timeout/pending responses do not
-disable the watchdog; a late successful turn can still update continuity.
+to 900,000ms (15 minutes) and clamps to 1..3,600,000ms (60 minutes) from wake
+dispatch. This is a **missing-completion backstop**, not a one-minute limit
+on healthy work: run lookups, PR discovery and reviews can take minutes.
+Configure it for the expected duration of the wake's work.
+
+The **within-one-minute failure-alert budget starts when `agent_end` reports
+a failure**, an empty reply or `stopReason=length`. That path invokes the
+configured `directSend` immediately, without waiting for the completion
+watchdog; the delivery call has a 20,000ms timeout. Real hook-call failures
+also alert on the first failed attempt. If no completion arrives, the
+watchdog alerts only after `wakeTimeoutMs`, not within one minute of dispatch.
+Admission-timeout/pending responses do not disable this backstop; a late
+successful turn can still update continuity.
 
 **Bounded continuity, not transcript history.** `bridgeStatePath` defaults to
 `<stateDir>/wake-bridge.json`; without a resolved path it is in-memory only.

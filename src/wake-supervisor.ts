@@ -5,7 +5,8 @@ import { findFinalAssistantMessage } from "./turn-usage-attestation.js";
 
 export const DEFAULT_WAKE_SESSION = "agent:main:warp-events";
 export const DEFAULT_WAKE_MAX_TOKENS = 50_000;
-export const DEFAULT_WAKE_TIMEOUT_MS = 35_000;
+export const DEFAULT_WAKE_TIMEOUT_MS = 900_000;
+export const MAX_WAKE_TIMEOUT_MS = 3_600_000;
 
 /** Batch hashes keep external run IDs out of session keys and distinguish coalesced runs. */
 export function deriveWakeSessionKey(
@@ -82,10 +83,10 @@ export class WakeSupervisor {
         this.untrack(oldest.batchId);
       }
     }
-    // directSend has a 20s delivery timeout: <=40s leaves the one-minute alert budget.
+    // Missing-completion backstop, not the deadline for reporting an observed failure.
     const configured = this.options.timeoutMs;
     const timeout = typeof configured === "number" && Number.isFinite(configured)
-      ? Math.min(40_000, Math.max(1, configured)) : DEFAULT_WAKE_TIMEOUT_MS;
+      ? Math.min(MAX_WAKE_TIMEOUT_MS, Math.max(1, configured)) : DEFAULT_WAKE_TIMEOUT_MS;
     const timer = setTimeout(() => {
       const pending = this.pending.get(batch.batchId);
       if (pending) this.expire(pending, "wake completion timeout");

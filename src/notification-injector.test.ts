@@ -632,6 +632,8 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
     // Advancing well past the old retry window must not add further attempts.
     await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(wakeFailureCalls()).toHaveLength(0); // healthy work may take minutes
+    await vi.advanceTimersByTimeAsync(900_000); // missing-completion watchdog, not the admission/retry budget
     expect(wakeFailureCalls()).toHaveLength(1); // independent completion watchdog, not a hook retry
     dispose();
   });

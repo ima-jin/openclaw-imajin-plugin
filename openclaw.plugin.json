@@ -272,10 +272,10 @@
           },
           "wakeTimeoutMs": {
             "type": "number",
-            "default": 35000,
+            "default": 900000,
             "minimum": 1,
-            "maximum": 40000,
-            "description": "Completion watchdog from wake dispatch, clamped to 1..40000ms. Default 35000ms plus directSend's 20000ms delivery timeout leaves a one-minute alert budget. Requires directSend for human-facing alerts and plugins.entries.imajin.hooks.allowConversationAccess=true for agent_end monitoring."
+            "maximum": 3600000,
+            "description": "Missing-completion watchdog from wake dispatch, default 900000ms (15 minutes), clamped to 1..3600000ms (60 minutes). Independent of the one-minute failure-alert budget: agent_end failures alert immediately via directSend (20000ms delivery timeout), without waiting for this watchdog. Requires directSend for human-facing alerts and plugins.entries.imajin.hooks.allowConversationAccess=true for agent_end monitoring."
           },
           "bridgeStatePath": {
             "type": "string",
