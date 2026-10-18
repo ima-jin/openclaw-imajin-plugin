@@ -6,6 +6,7 @@ import { digest, record, type MappedItem, type StepFact, type StepRequest } from
 
 interface ItemCursor {
   immutable: string;
+  refs: string;
   update: Record<string, unknown>;
   facts: Record<string, string>;
 }
@@ -24,8 +25,33 @@ export interface PlannedFact extends StepFact {
   item: MappedItem;
 }
 function immutable(item: MappedItem): string {
-  const { intention: _intention, rank: _rank, ...fields } = item.declaration;
-  return canonicalize(fields);
+  return canonicalize({
+    stepKind: item.declaration.stepKind,
+    repository: item.declaration.repository ?? null,
+    exitConditions: item.declaration.exitConditions,
+  });
+}
+function changedUpdate(item: MappedItem, previous?: ItemCursor): Record<string, unknown> {
+  const update: Record<string, unknown> = {};
+  for (const [field, value] of Object.entries(item.update)) {
+    if (canonicalize(value) !== canonicalize(previous?.update[field] ?? null)) update[field] = value;
+  }
+  if (!previous) {
+    delete update.rank;
+    delete update.intention;
+  } else if (previous.refs !== canonicalize(item.refs)) {
+    update.intention = item.update.intention;
+  }
+  return update;
+}
+function changedFacts(item: MappedItem, previous: ItemCursor | undefined, events: PlannedFact[]) {
+  const facts = { ...previous?.facts };
+  for (const [name, fact] of Object.entries(item.facts)) {
+    const fingerprint = digest(fact);
+    if (facts[name] !== fingerprint) events.push({ ...fact, item });
+    facts[name] = fingerprint;
+  }
+  return facts;
 }
 export function planDiff(items: MappedItem[], cursor: Cursor) {
   const steps: Cursor["steps"] = structuredClone(cursor.steps);
@@ -34,24 +60,12 @@ export function planDiff(items: MappedItem[], cursor: Cursor) {
     const previous = cursor.steps[item.stepId];
     if (previous && previous.immutable !== immutable(item)) throw new Error("immutable declaration changed");
     if (!previous) events.push({ type: "step.queued", data: { step: item.declaration }, item });
-    const update: Record<string, unknown> = {};
-    for (const [field, value] of Object.entries(item.update)) {
-      if (canonicalize(value) !== canonicalize(previous?.update[field] ?? null)) update[field] = value;
-    }
-    // A new declaration already carries rank and intention.
-    if (!previous) {
-      delete update.rank;
-      delete update.intention;
-    }
+    const update = changedUpdate(item, previous);
     if (Object.keys(update).length) events.push({ type: "step.updated", data: { update }, item });
-    const facts = { ...previous?.facts };
-    for (const [name, fact] of Object.entries(item.facts)) {
-      const fingerprint = digest(fact);
-      if (facts[name] !== fingerprint) events.push({ ...fact, item });
-      facts[name] = fingerprint;
-    }
+    const facts = changedFacts(item, previous, events);
     steps[item.stepId] = {
       immutable: immutable(item),
+      refs: canonicalize(item.refs),
       update: { ...previous?.update, ...item.update },
       facts,
     };

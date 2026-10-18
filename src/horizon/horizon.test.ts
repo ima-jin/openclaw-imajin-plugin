@@ -103,10 +103,10 @@ describe("bridge mapping", () => {
   });
 
   it("supports ops/human attestations but never impersonates another DID", () => {
-    const mapped = mapItem(item({ refs: [], attestation: "Operator checklist complete" }), 0, context);
+    const mapped = mapItem(item({ refs: [], stepKind: "ops", attestation: "Operator checklist complete" }), 0, context);
     expect(mapped.declaration.exitConditions).toEqual([{ id: "attestation", kind: "attestation", attestorDid: DID }]);
     expect(mapped.facts.attestation?.type).toBe("step.attested");
-    expect(() => mapItem(item({ refs: [], attestation: "complete", attestorDid: PRINCIPAL }), 0, context)).toThrow();
+    expect(() => mapItem(item({ refs: [], stepKind: "human", attestation: "complete", attestorDid: PRINCIPAL }), 0, context)).toThrow();
   });
 
   it("normalizes qualified and GitHub refs and does not infer closure from a PR", () => {
@@ -135,6 +135,13 @@ describe("cursor diff", () => {
     const cursor = { ...empty(), steps: planDiff([first], empty()).steps };
     expect(planDiff([mapItem(item(), 0, context)], cursor).events).toEqual([]);
     expect(() => planDiff([mapItem(item({ stepKind: "human" }), 0, context)], cursor)).toThrow("immutable");
+  });
+  it("lets a fuzzy code intention gain issue and PR refs without changing its declaration", () => {
+    const first = mapItem(item({ refs: [] }), 0, context);
+    const cursor = { ...empty(), steps: planDiff([first], empty()).steps };
+    const next = planDiff([mapItem(item({ pr: 2909 }), 0, context)], cursor);
+    expect(next.events.map(event => event.type)).toEqual(["step.updated"]);
+    expect(next.events[0]?.item.refs.issue).toBe("ima-jin/imajin-ai#2866");
   });
 });
 
@@ -265,6 +272,42 @@ describe("signed durable sync", () => {
     expect(JSON.stringify(test.requests)).not.toContain('"zone"');
     expect(JSON.stringify(test.requests)).not.toContain('"claim"');
   });
+  it("serializes separate instances sharing a cursor and preserves edits during an in-flight send", async () => {
+    const test = await setup();
+    let release: () => void = () => {};
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    test.fetchImpl.mockImplementationOnce(async (_url, init) => {
+      test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
+      await gate;
+      return new Response("{}", { status: 201 });
+    });
+    const first = test.create();
+    const second = test.create();
+    const inFlight = first.sync();
+    await vi.waitFor(() => expect(test.requests).toHaveLength(1));
+    await test.write([item(), item({ id: "added-during-send" })]);
+    const change = first.sync();
+    const anotherInstance = second.sync();
+    release();
+    await Promise.all([inFlight, change, anotherInstance]);
+    expect(test.requests.filter(request => request.type === "step.queued")).toHaveLength(2);
+    expect(new Set(test.requests.map(request => request.payload.stepId)).size).toBe(2);
+  });
+  it("retains exact stale envelopes on kernel rejection instead of inventing a fresh timestamp", async () => {
+    const test = await setup();
+    test.fetchImpl.mockImplementation(async (_url, init) => {
+      test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
+      return new Response("stale", { status: 400 });
+    });
+    const first = test.create();
+    await first.sync();
+    await first.stop();
+    const restart = test.create({ now: () => Date.parse("2026-10-20T12:00:00Z") });
+    await restart.sync();
+    expect(test.requests).toHaveLength(2);
+    expect(test.requests[1]).toEqual(test.requests[0]);
+    expect(JSON.parse(await readFile(restart.cursorPath, "utf8")).pending.requests).toHaveLength(1);
+  });
 });
 
 describe("safe failures and service lifecycle", () => {
@@ -355,5 +398,46 @@ describe("safe failures and service lifecycle", () => {
     expect(() => parseHorizon("[]")).toThrow();
     expect(() => parseHorizon(JSON.stringify({ depthTarget: 0, items: [] }))).toThrow();
     expect(() => mapItem(item({ release: { issue: "#99", mergeCommit: "a".repeat(40), tag: "v1" } }), 0, context)).toThrow();
+  });
+  it("fails before network I/O if the private cursor cannot be written", async () => {
+    const test = await setup();
+    const blocked = join(test.directory, "not-a-directory");
+    await writeFile(blocked, "blocked");
+    await test.create({ config: { ...test.options.config, stateDir: blocked } }).sync();
+    expect(test.fetchImpl).not.toHaveBeenCalled();
+    expect(test.logger.warn).toHaveBeenCalledTimes(1);
+  });
+  it("uses periodic ticks as a recovery path and rate-limits missing-file warnings", async () => {
+    const test = await setup();
+    const missing = join(test.directory, "temporarily-missing.json");
+    const service = test.create({ config: { ...test.options.config, filePath: missing } });
+    vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+    service.start();
+    await service.sync();
+    expect(test.fetchImpl).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1000);
+    await service.sync();
+    expect(test.logger.warn).toHaveBeenCalledTimes(1);
+    await writeFile(missing, JSON.stringify({ depthTarget: 12, items: [item()] }));
+    await vi.advanceTimersByTimeAsync(1000);
+    await service.sync();
+    expect(test.requests).toHaveLength(1);
+    await service.stop();
+    vi.useRealTimers();
+  });
+  it("logs the base bridge's missing OUTCOME gap without claiming a derived zone", async () => {
+    const test = await setup();
+    await test.write([item({ zone: "past" })]);
+    await test.create().sync();
+    expect(test.requests.map(request => request.type)).toEqual(["step.queued", "step.finished", "step.observed"]);
+    expect(test.logger.warn.mock.calls[0]?.[0]).toContain("#2931");
+  });
+  it("rejects credential-shaped free text without publishing or logging the input", async () => {
+    const test = await setup();
+    const unsafe = `Bearer ${randomBytes(24).toString("base64url")}`;
+    await test.write([item({ title: unsafe })]);
+    await test.create().sync();
+    expect(test.fetchImpl).not.toHaveBeenCalled();
+    expect(JSON.stringify(test.logger.warn.mock.calls)).not.toContain(unsafe);
   });
 });

@@ -88,6 +88,30 @@
       "label": "Loop Lifecycle Events: Keeper Cron Jobs",
       "help": "Cron jobs (matched on job id, name or declarationKey) to publish as kind openclaw.keeper instead of openclaw.automation. Jobs named keeper, keeper:*, keeper-*, keeper_* or keeper/* are always keepers."
     },
+    "horizon.enabled": {
+      "label": "Harness Horizon: Enabled",
+      "help": "Opt-in signed step sync from a local horizon file. Requires an existing horizon.loopId, horizon.repository, did and keypairPath. Zones are derived by the kernel; no gateway or transcript reads. See docs/horizon-sync.md."
+    },
+    "horizon.loopId": {
+      "label": "Harness Horizon: Owning Loop",
+      "help": "Existing kernel loop id belonging to actAs (or did). The publisher does not create this loop."
+    },
+    "horizon.repository": {
+      "label": "Harness Horizon: Repository",
+      "help": "owner/repo used for code declarations and bare issue/PR refs (for example ima-jin/imajin-ai)."
+    },
+    "horizon.filePath": {
+      "label": "Harness Horizon: File",
+      "help": "Default ~/.openclaw/workspace/horizon/horizon.json; ~/ is expanded."
+    },
+    "horizon.stateDir": {
+      "label": "Harness Horizon: Durable State",
+      "help": "Private cursor/outbox directory, default horizon-sync beside the keypair. Preserve across restarts; one live plugin process per cursor."
+    },
+    "horizon.syncIntervalMs": {
+      "label": "Harness Horizon: Tick Interval (ms)",
+      "help": "Default 30000, minimum 1000. File changes also trigger synchronization."
+    },
     "sessionCommands.enabled": {
       "label": "Session Commands: Enabled",
       "help": "Accept signed, DID-addressed session commands (session.send/approve/deny/abort/spawn) over the kernel WebSocket, execute them against the local gateway, and attest every outcome as a signed loop.session.* event (#51). Off by default; requires did + keypairPath + sessionCommands.kernelPublicKeyHex. See docs/session-commands.md."

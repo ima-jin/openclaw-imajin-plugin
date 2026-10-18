@@ -59,10 +59,26 @@ export function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("expected object");
   return value as Record<string, unknown>;
 }
+const CREDENTIAL_PATTERNS = [
+  /-----BEGIN /,
+  /\b(?:Bearer|Basic)\s/i,
+  /\b(?:sk-|gh[pousr]_|github_pat_|glpat-|xox[baprs]-)\S+/i,
+  /\b(?:password|secret|token|apikey|api_key|api-key|privatekey|private_key|private-key)["']?\s*[:=]/i,
+  /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/,
+  /\bAIza[A-Za-z0-9_-]{20,}/,
+  /\b[rs]k_(?:live|test)_[A-Za-z0-9]+/,
+];
+function hasConnectionCredentials(word: string): boolean {
+  const start = word.indexOf("://");
+  if (start < 0) return false;
+  const end = word.indexOf("/", start + 3);
+  const at = word.indexOf("@", start + 3);
+  return at >= 0 && (end < 0 || at < end);
+}
 export function text(value: unknown): string {
   if (typeof value !== "string" || !value.trim() || value.length > 2000) throw new Error("invalid text");
   // Fail closed instead of leaking credential-shaped free text into signed facts or cursor.
-  if (/-----BEGIN |(?:Bearer|Basic)\s+\S+|\b(?:sk-|gh[pousr]_|github_pat_|glpat-|xox[baprs]-)\S+|\b(?:password|secret|token|api[_-]?key|private[_-]?key)\s*[=:]|\w+:\/\/[^/\s]+@/i.test(value)) {
+  if (CREDENTIAL_PATTERNS.some(pattern => pattern.test(value)) || value.split(/\s+/).some(hasConnectionCredentials)) {
     throw new Error("credential-shaped text");
   }
   return value;
@@ -78,15 +94,15 @@ function optionalTexts(item: Record<string, unknown>): void {
   for (const field of ["outcome", "briefRef", "provisionRef", "designRef", "attestation", "attestorDid"]) {
     if (item[field] !== undefined) text(item[field]);
   }
-  if (item.outcome !== undefined && !/^OUTCOME\b/u.test(String(item.outcome))) throw new Error("invalid outcome");
-  if (item.attestorDid !== undefined && !/^did:[^\s:]+:\S+$/.test(String(item.attestorDid))) throw new Error("invalid attestor");
+  if (item.outcome !== undefined && !/^OUTCOME\b/u.test(text(item.outcome))) throw new Error("invalid outcome");
+  if (item.attestorDid !== undefined && !/^did:[^\s:]+:\S+$/.test(text(item.attestorDid))) throw new Error("invalid attestor");
 }
 function validateEvidence(item: Record<string, unknown>): void {
   if (item.release !== undefined) {
     const release = record(item.release);
     text(release.issue);
     text(release.tag);
-    if (!/^[0-9a-f]{40}$/i.test(String(release.mergeCommit))) throw new Error("invalid commit");
+    if (!/^[0-9a-f]{40}$/i.test(text(release.mergeCommit))) throw new Error("invalid commit");
   }
   if (item.deployment !== undefined) {
     const deployment = record(item.deployment);
@@ -99,7 +115,7 @@ function validateItem(value: unknown): HorizonItem {
   text(item.id);
   text(item.title);
   timestamp(item.addedAt);
-  if (!["head", "near", "middle", "tail", "past"].includes(String(item.zone))) throw new Error("invalid zone");
+  if (!["head", "near", "middle", "tail", "past"].includes(text(item.zone))) throw new Error("invalid zone");
   texts(item.refs);
   if (item.waitingOn !== undefined) texts(item.waitingOn);
   if (item.movedAt !== undefined) timestamp(item.movedAt);
@@ -107,7 +123,7 @@ function validateItem(value: unknown): HorizonItem {
     if (item[field] !== undefined && typeof item[field] !== "boolean") throw new Error("invalid flag");
   }
   if (item.pr !== undefined && !(typeof item.pr === "number" && Number.isSafeInteger(item.pr) && item.pr > 0)) text(item.pr);
-  if (item.stepKind !== undefined && !["code", "human", "ops"].includes(String(item.stepKind))) throw new Error("invalid kind");
+  if (item.stepKind !== undefined && !["code", "human", "ops"].includes(text(item.stepKind))) throw new Error("invalid kind");
   optionalTexts(item);
   validateEvidence(item);
   return item as unknown as HorizonItem;
@@ -134,53 +150,72 @@ function prRef(value: string | number | undefined, repository: string): string |
   if (/^https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/[1-9]\d*$/.test(String(value))) return String(value);
   throw new Error("invalid PR ref");
 }
-/** Local zone is a hint only. Never publish zone/depth or fabricate a claim. */
-export function mapItem(item: HorizonItem, rank: number, context: MappingContext): MappedItem {
-  const stepId = deriveStepId(context.loopId, context.did, item.id);
-  const issue = item.refs.map(ref => issueRef(ref, context.repository)).find(Boolean);
-  const pr = prRef(item.pr, context.repository);
-  const repository = issue?.split("#")[0] ?? context.repository;
-  const stepKind = item.stepKind ?? (issue || pr ? "code" : "ops");
+function declaration(item: HorizonItem, rank: number, context: MappingContext, repository: string) {
+  // Kind is immutable. A fuzzy code intention can gain refs later without
+  // accidentally changing an initially ref-less ops declaration into code.
+  const stepKind = item.stepKind ?? "code";
   const conditions = stepKind === "code"
     ? ["issue_closed", "release_contains", "deployed"].map(kind => ({ id: kind, kind }))
     : [{ id: "attestation", kind: "attestation", attestorDid: item.attestorDid ?? context.did }];
-  const declaration = {
+  return {
     stepKind, intention: item.title, rank,
     ...(stepKind === "code" ? { repository } : {}),
     exitConditions: conditions,
   };
+}
+function sharpening(item: HorizonItem, rank: number, issue?: string): Record<string, unknown> {
   const update: Record<string, unknown> = { rank, intention: item.title };
   if (issue && item.outcome) update.issue = { ref: issue, outcome: item.outcome };
   for (const key of ["briefRef", "provisionRef", "designRef"] as const) {
     if (item[key]) update[key] = item[key];
   }
+  return update;
+}
+function completionFacts(item: HorizonItem, issue?: string): Record<string, StepFact> {
   const facts: Record<string, StepFact> = {};
   if (item.zone === "past" || item.closed) {
     facts.finished = { type: "step.finished", data: {} };
-    if (stepKind === "code" && issue) facts.closed = {
+    if ((item.stepKind ?? "code") === "code" && issue) facts.closed = {
       type: "step.observed",
       data: { observation: { conditionId: "issue_closed", evidence: { kind: "issue_closed", issue } } },
     };
   }
-  if (item.release) {
-    if (stepKind !== "code" || issueRef(item.release.issue, repository) !== issue) throw new Error("release issue mismatch");
-    facts.release = { type: "step.observed", data: { observation: {
+  return facts;
+}
+function releaseFact(item: HorizonItem, repository: string, issue?: string): StepFact {
+  const release = item.release!;
+  if ((item.stepKind ?? "code") !== "code" || !issue || issueRef(release.issue, repository) !== issue) throw new Error("release issue mismatch");
+  return { type: "step.observed", data: { observation: {
       conditionId: "release_contains", evidence: {
-        kind: "release_contains", repository, mergeCommit: item.release.mergeCommit, tag: item.release.tag, issue,
+        kind: "release_contains", repository, mergeCommit: release.mergeCommit, tag: release.tag, issue,
       },
-    } } };
-  }
-  if (item.deployment) {
-    if (stepKind !== "code") throw new Error("deployment on non-code step");
-    facts.deployment = { type: "step.observed", data: { observation: {
-      conditionId: "deployed", evidence: { kind: "deployed", repository, tag: item.deployment.tag, environment: "prod" },
-    } } };
-  }
-  if (item.attestation) {
-    if (stepKind === "code" || (item.attestorDid ?? context.did) !== context.did) throw new Error("cannot attest for another DID");
-    facts.attestation = { type: "step.attested", data: { attestation: {
-      conditionId: "attestation", did: context.did, statement: item.attestation,
-    } } };
-  }
-  return { stepId, declaration, update, facts, refs: { ...(issue ? { issue } : {}), ...(pr ? { pr } : {}) } };
+  } } };
+}
+function deploymentFact(item: HorizonItem, repository: string): StepFact {
+  if ((item.stepKind ?? "code") !== "code") throw new Error("deployment on non-code step");
+  return { type: "step.observed", data: { observation: {
+    conditionId: "deployed", evidence: { kind: "deployed", repository, tag: item.deployment!.tag, environment: "prod" },
+  } } };
+}
+function attestationFact(item: HorizonItem, did: string): StepFact {
+  if ((item.stepKind ?? "code") === "code" || (item.attestorDid ?? did) !== did) throw new Error("cannot attest for another DID");
+  return { type: "step.attested", data: { attestation: {
+    conditionId: "attestation", did, statement: item.attestation,
+  } } };
+}
+/** Local zone is a hint only. Never publish zone/depth or fabricate a claim. */
+export function mapItem(item: HorizonItem, rank: number, context: MappingContext): MappedItem {
+  const stepId = deriveStepId(context.loopId, context.did, item.id);
+  const issue = item.refs.map(ref => issueRef(ref, context.repository)).find(Boolean);
+  const repository = issue?.split("#")[0] ?? context.repository;
+  const pr = prRef(item.pr, repository);
+  const facts = completionFacts(item, issue);
+  if (item.release) facts.release = releaseFact(item, repository, issue);
+  if (item.deployment) facts.deployment = deploymentFact(item, repository);
+  if (item.attestation) facts.attestation = attestationFact(item, context.did);
+  return {
+    stepId, declaration: declaration(item, rank, context, repository),
+    update: sharpening(item, rank, issue), facts,
+    refs: { ...(issue ? { issue } : {}), ...(pr ? { pr } : {}) },
+  };
 }
