@@ -1010,6 +1010,14 @@ connection refused, or a ~10s timeout) falls back to the deterministic
 Telegram ping from `directSend` (#14) — the same backstop that fires when
 the hook is disabled entirely.
 
+#### Fresh wake sessions (#79)
+
+The wake lane is moving from a long-lived worker transcript to one session
+per coalesced batch. Open-work continuity belongs in a bounded plugin-owned
+bridge file until the registry horizon adapter is connected (#2881), not in
+the previous wake's transcript. The kernel never reads or calls a gateway
+session; both horizon reads and signed outcome writeback are harness-owned.
+
 #### Coalescing (#25)
 
 Warp wake turns coalesce in two phases, so a single completion doesn't wait
