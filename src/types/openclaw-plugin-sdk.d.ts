@@ -199,3 +199,30 @@ declare module "openclaw/plugin-sdk/gateway-runtime" {
 declare module "openclaw/plugin-sdk/core" {
   export function resolveGatewayPort(cfg: unknown, env?: NodeJS.ProcessEnv): number;
 }
+
+/**
+ * Verified openclaw@2026.10.4 session-store-runtime exports:
+ * dist/agent-harness-runtime-DZjstJNb.d.ts:6535-6542,8026-8031 and
+ * dist/reply-payload-DazZPys5.d.ts:3177-3216. Only read-side fields used here.
+ */
+declare module "openclaw/plugin-sdk/session-store-runtime" {
+  export interface SessionEntry {
+    sessionId: string;
+    totalTokens?: number;
+    totalTokensFresh?: boolean;
+    totalTokensVersion?: 1;
+    contextTokens?: number;
+  }
+  export function resolveStorePath(
+    store?: string,
+    options?: { agentId?: string; env?: NodeJS.ProcessEnv },
+  ): string;
+  export function getSessionEntry(params: {
+    sessionKey: string;
+    agentId?: string;
+    env?: NodeJS.ProcessEnv;
+    hydrateSkillPromptRefs?: boolean;
+    readConsistency?: "latest";
+    storePath?: string;
+  }): SessionEntry | undefined;
+}
