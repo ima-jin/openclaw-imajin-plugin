@@ -212,13 +212,17 @@ export class WakeDecisionRouter {
       if (id === batchId) this.retired.add(sessionKey);
     }
     while (this.retired.size > 500) this.retired.delete(this.retired.values().next().value!);
-    for (const [ticket, value] of this.tickets) if (value === batchId) this.tickets.delete(ticket);
-    for (const map of [this.roots, this.runners]) {
-      for (const [key, value] of map) if (value === batchId) map.delete(key);
-    }
+    this.removeBatchMappings(batchId);
     this.wakes.delete(batchId);
     for (const [id, wake] of this.wakes) {
       if (!this.roots.has(wake.sessionKey)) this.roots.set(wake.sessionKey, id);
+    }
+  }
+
+  private removeBatchMappings(batchId: string): void {
+    for (const [ticket, value] of this.tickets) if (value === batchId) this.tickets.delete(ticket);
+    for (const map of [this.roots, this.runners]) {
+      for (const [key, value] of map) if (value === batchId) map.delete(key);
     }
   }
 
