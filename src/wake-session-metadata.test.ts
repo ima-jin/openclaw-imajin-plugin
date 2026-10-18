@@ -119,7 +119,7 @@ describe("readWakeSessionMetadata", () => {
 
   it("wrapper uses the hook default and distinguishes absent from failed reads", async () => {
     sdk.getSessionEntry.mockReturnValue(undefined);
-    expect(await readWakeSessionTokens({}, "wake:test")).toBe(0);
+    expect(await readWakeSessionTokens({}, "wake:test")).toBeUndefined();
     expect(sdk.resolveStorePath).toHaveBeenCalledWith(undefined, { agentId: "main" });
     sdk.getSessionEntry.mockImplementation(() => { throw new Error("simulated failure"); });
     expect(await readWakeSessionTokens({}, "wake:test")).toBeUndefined();

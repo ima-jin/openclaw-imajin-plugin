@@ -259,17 +259,17 @@ export default definePluginEntry({
         sendFrame: (frame) => wsService.send(frame),
       });
 
-      // wsNotifications.reportTo (#47): the wake worker session discloses its
-      // turn outcome. Only registered when a valid reportTo target exists, so
-      // an install without it behaves exactly as before. Fire-and-forget:
-      // the hook never blocks or fails the wake turn.
+      // Supervise every wake (#79), independently of optional reportTo (#47).
+      // Completion observes local agent_end; the kernel never reads a transcript.
       if (onWakeAgentEnd) {
         api.on(
           "agent_end",
           (event: AgentEndEvent, ctx?: { sessionKey?: string }) => {
-            void onWakeAgentEnd(event, ctx);
+            void onWakeAgentEnd(event, ctx).catch(() => {
+              console.error("[imajin-ws] wake outcome handling failed");
+            });
           },
-          { name: "wake-report" },
+          { name: "wake-outcome" },
         );
       }
 

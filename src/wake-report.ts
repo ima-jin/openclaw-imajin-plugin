@@ -53,6 +53,8 @@ export interface WakeBatch {
   batchId: string;
   scope: string;
   runs: WakeRunSummary[];
+  /** Actual fresh/rotated session; legacy callers use the reporter's fixed default. */
+  sessionKey?: string;
 }
 
 export interface ReportTarget {
@@ -127,27 +129,30 @@ export function parseReportTo(raw: unknown, wakeSessionKey?: string): ReportTarg
   return [...targets.values()];
 }
 
-function messageText(message: AgentMessage): string {
+function messageText(message: AgentMessage, maxChars: number): string {
   const content = message.content;
-  if (typeof content === "string") return content.trim();
+  if (typeof content === "string") return content.slice(0, maxChars).trim();
   if (!Array.isArray(content)) return "";
-  return content
-    .map((block: unknown) => {
-      const b = block as { type?: unknown; text?: unknown } | null;
-      return b?.type === "text" && typeof b.text === "string" ? b.text : "";
-    })
-    .filter(Boolean)
-    .join("\n")
-    .trim();
+  let text = "";
+  for (const block of content.slice(0, 128)) {
+    const b = block as { type?: unknown; text?: unknown } | null;
+    if (b?.type !== "text" || typeof b.text !== "string") continue;
+    text += `${text ? "\n" : ""}${b.text.slice(0, maxChars - text.length)}`;
+    if (text.length >= maxChars) break;
+  }
+  return text.trim();
 }
 
 /**
  * The turn's final assistant output, or `undefined` when there is none (no
  * assistant message, an empty one, or the `NO_REPLY` sentinel).
  */
-export function extractFinalAssistantOutput(messages: AgentMessage[] | undefined): string | undefined {
-  const last = [...(messages ?? [])].reverse().find((m) => m?.role === "assistant");
-  const text = last ? messageText(last) : "";
+export function extractFinalAssistantOutput(messages: AgentMessage[] | undefined, maxChars = 8_193): string | undefined {
+  let last: AgentMessage | undefined;
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    if (messages?.[i]?.role === "assistant") { last = messages[i]; break; }
+  }
+  const text = last ? messageText(last, maxChars) : "";
   return text && text !== NO_REPLY_SENTINEL ? text : undefined;
 }
 
@@ -250,10 +255,11 @@ export class WakeReporter {
    * else (the report targets' own turns included) is ignored, so a report can
    * never loop back into another report. Never throws.
    */
-  async onAgentEnd(event: AgentEndEvent | undefined, ctx?: { sessionKey?: string }): Promise<void> {
+  async onAgentEnd(event: AgentEndEvent | undefined, ctx?: { sessionKey?: string; runId?: string }): Promise<void> {
     try {
-      if (!sameSession(event?.sessionKey ?? ctx?.sessionKey, this.opts.wakeSessionKey)) return;
-      const batch = this.claim(event?.runId);
+      const sessionKey = event?.sessionKey ?? ctx?.sessionKey;
+      if (!sessionKey) return;
+      const batch = this.claim(event?.runId ?? ctx?.runId, sessionKey);
       if (!batch) return;
       const report = buildWakeReport(batch, describeTurn(event));
       await Promise.all(this.opts.targets.map((target) => this.send(target, batch.batchId, report)));
@@ -269,10 +275,12 @@ export class WakeReporter {
    * it reported so a duplicate `agent_end` can neither re-report it nor
    * consume the next batch.
    */
-  private claim(runId: string | undefined): PendingBatch | undefined {
+  private claim(runId: string | undefined, sessionKey: string): PendingBatch | undefined {
     if (runId && this.handledRuns.has(runId)) return undefined;
-    const batches = [...this.pending.values()];
-    const batch = (runId ? batches.find((b) => b.hookRunId === runId) : undefined) ?? batches[0];
+    const batches = [...this.pending.values()].filter((b) =>
+      sameSession(sessionKey, b.sessionKey ?? this.opts.wakeSessionKey));
+    const batch = (runId ? batches.find((b) => b.hookRunId === runId) : batches[0])
+      ?? batches.find((b) => !b.hookRunId);
     if (!batch) return undefined;
     this.pending.delete(batch.batchId);
     remember(this.reportedBatches, batch.batchId);

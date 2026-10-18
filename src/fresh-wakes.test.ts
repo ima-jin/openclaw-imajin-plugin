@@ -1,0 +1,291 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createNotificationInjector, type WsNotificationsConfig } from "./notification-injector.js";
+import { sendDirectChannelMessage } from "./channel-notify.js";
+import { deriveWakeSessionKey, wakeEventTokens, WakeSupervisor } from "./wake-supervisor.js";
+import { buildWakeOutcome } from "./wake-outcome.js";
+import { PendingWakeStore } from "./notification-state-store.js";
+import type { NotificationFrame } from "./ws-service.js";
+import type { AgentEndEvent } from "./turn-usage-attestation.js";
+
+vi.mock("./channel-notify.js", () => ({ sendDirectChannelMessage: vi.fn(async () => {}) }));
+
+const BASE = "agent:main:warp-events";
+const directSend = { channel: "fixture-channel", target: "fixture-recipient", cliPath: "/fixture/cli" };
+const frame = (id: string): NotificationFrame => ({
+  type: "notification", id: `notification-${id}`, scope: "warp.run.completed",
+  title: `Run ${id} SUCCEEDED`, body: null, createdAt: "",
+  data: { runId: id, issue: "fixture/issue/79", expectedPr: "fixture/pr/80" },
+});
+
+describe("fresh wake bridge (#79)", () => {
+  let dir: string;
+  let posts: Array<{ sessionKey: string; message: string; name: string }>;
+  let config: WsNotificationsConfig;
+  let api: any;
+  const injectors: Array<ReturnType<typeof createNotificationInjector>> = [];
+  const alerts = () => vi.mocked(sendDirectChannelMessage).mock.calls.filter(([, text]) => text.includes("automatic wake failed"));
+  const posted = async (count: number) => vi.waitFor(() => expect(posts).toHaveLength(count), { interval: 5 });
+
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "fresh-wakes-"));
+    posts = [];
+    config = {
+      targetSession: BASE, injectScopes: ["warp.run.completed"], hookToken: "fixture-only",
+      wakeSettleMs: 2, wakeCoalesceMs: 2, stateDir: dir, directSend,
+    };
+    api = { runtime: { system: { enqueueSystemEvent: vi.fn(() => true) }, config: { current: () => ({}) } } };
+    vi.mocked(sendDirectChannelMessage).mockClear();
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+      posts.push(JSON.parse(init.body));
+      return { status: 200, json: async () => ({ runId: `hook-${posts.length}` }), text: async () => "" };
+    }));
+    for (const method of ["log", "warn", "error", "info"] as const) vi.spyOn(console, method).mockImplementation(() => {});
+  });
+  afterEach(async () => {
+    for (const injector of injectors.splice(0)) injector.dispose();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    await rm(dir, { recursive: true, force: true });
+  });
+
+  function create(settings = config, deps: Parameters<typeof createNotificationInjector>[2] = {}) {
+    const injector = createNotificationInjector(api, settings, deps);
+    injectors.push(injector);
+    return injector;
+  }
+
+  async function finish(injector: ReturnType<typeof create>, index: number, event: AgentEndEvent = {}) {
+    await injector.onAgentEnd!({
+      success: true, runId: `hook-${index + 1}`,
+      messages: [{ role: "assistant", content: "Reviewed; PR awaiting review", usage: {
+        contextUsage: { state: "available", promptTokens: 2_000, totalTokens: 2_500 },
+      } }], ...event,
+    }, { sessionKey: posts[index].sessionKey });
+  }
+
+  it("20 consecutive wakes use 20 fresh sessions, bounded context, and no fixed-session inbox", async () => {
+    const sendFrame = vi.fn();
+    const injector = create(config, { sendFrame });
+    for (let i = 0; i < 20; i++) {
+      await injector.inject(frame(`run-${i}`));
+      await posted(i + 1);
+      expect(Buffer.byteLength(posts[i].message)).toBeLessThan(24_000);
+      await finish(injector, i);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    expect(new Set(posts.map((p) => p.sessionKey)).size).toBe(20);
+    expect(posts.every((p) => p.sessionKey.startsWith(`${BASE}:`))).toBe(true);
+    expect(api.runtime.system.enqueueSystemEvent).not.toHaveBeenCalled();
+    expect(sendFrame).toHaveBeenCalledTimes(20);
+    const sizes = vi.mocked(console.log).mock.calls.filter(([text]) => String(text).includes("wake ended"));
+    expect(sizes).toHaveLength(20);
+    expect(sizes.every(([text]) => String(text).includes("sessionTokens=2500"))).toBe(true);
+    expect(alerts()).toHaveLength(0);
+  });
+
+  it("keeps an explicit fixed key when sessionPerWake=false and the metadata is safe", async () => {
+    const injector = create({ ...config, sessionPerWake: false }, { sessionTokens: async () => 1_000 });
+    await injector.inject(frame("fixed"));
+    await posted(1);
+    expect(posts[0].sessionKey).toBe(BASE);
+    expect(api.runtime.system.enqueueSystemEvent).toHaveBeenCalledWith(expect.any(String), expect.objectContaining({ sessionKey: BASE }));
+    await finish(injector, 0);
+  });
+
+  it.each([195_000, undefined])("rotates unsafe reused metadata (%s) before any injection and alerts", async (tokens) => {
+    const read = vi.fn(async (key: string) => key === BASE ? tokens : undefined);
+    const injector = create({ ...config, sessionPerWake: false }, { sessionTokens: read });
+    await injector.inject(frame("guarded"));
+    await posted(1);
+    expect(posts[0].sessionKey).toMatch(/:rotated-/);
+    expect(api.runtime.system.enqueueSystemEvent.mock.calls[0][1].sessionKey).toBe(posts[0].sessionKey);
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0][0]).toEqual(directSend);
+    expect(alerts()[0][1]).toContain("guarded");
+    await finish(injector, 0);
+  });
+
+  it.each([
+    { messages: [{ role: "assistant", content: "" }] },
+    { messages: [{ role: "assistant", content: "NO_REPLY" }] },
+    { messages: [{ role: "assistant", content: "partial", stopReason: "length" }] },
+    { success: false, error: "fixture error" },
+  ])("alerts empty/truncated/failed outcomes via configured directSend: %j", async (event: AgentEndEvent) => {
+    const injector = create();
+    await injector.inject(frame("failed-run"));
+    await posted(1);
+    await finish(injector, 0, event);
+    await finish(injector, 0, event);
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0][0]).toEqual(directSend);
+    expect(alerts()[0][1]).toContain("failed-run");
+    if (event.messages?.[0]?.stopReason === "length") expect(alerts()[0][1]).toContain("stopReason=length");
+  });
+
+  it("alerts hook failure on the first attempt, without waiting through the retry ladder", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => ({ status: 401, text: async () => "ignored private response" })));
+    const injector = create();
+    await injector.inject(frame("hook-failure"));
+    await vi.waitFor(() => expect(alerts()).toHaveLength(1), { interval: 5 });
+    expect(alerts()[0][1]).toContain("gateway returned 401");
+    expect(alerts()[0][1]).toContain("hook-failure");
+  });
+
+  it("retains #31 queued-503 semantics, but a dead completion alerts within a minute", async () => {
+    const fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
+      posts.push(JSON.parse(init.body));
+      return { status: 503, text: async () => JSON.stringify({ runId: "queued-hook" }) };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const injector = create({ ...config, wakeTimeoutMs: 30 });
+    await injector.inject(frame("queued-run"));
+    await posted(1);
+    expect(alerts()).toHaveLength(0);
+    await vi.waitFor(() => expect(alerts()).toHaveLength(1), { interval: 5 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(alerts()[0][1]).toContain("completion timeout");
+    expect(alerts()[0][1]).toContain("queued-run");
+  });
+
+  it("clears pending admission markers on a real completion, not on watchdog expiry", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+      posts.push(JSON.parse(init.body));
+      return { status: 503, text: async () => JSON.stringify({ runId: "hook-1" }) };
+    }));
+    const injector = create({ ...config, wakeTimeoutMs: 30 });
+    await injector.inject(frame("pending"));
+    await posted(1);
+    await vi.waitFor(() => expect(alerts()).toHaveLength(1), { interval: 5 });
+    expect(Object.keys(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes)).toHaveLength(1);
+    await finish(injector, 0);
+    expect(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes).toEqual({});
+  });
+
+  it("next fresh wake reads the previous verdict and open PR from disk, never prior messages", async () => {
+    const first = create();
+    await first.inject(frame("watched"));
+    await posted(1);
+    await finish(first, 0);
+    first.dispose();
+    const second = create();
+    await second.inject(frame("next"));
+    await posted(2);
+    expect(posts[1].sessionKey).not.toBe(posts[0].sessionKey);
+    expect(posts[1].message).toContain("Reviewed; PR awaiting review");
+    expect(posts[1].message).toContain("fixture/pr/80");
+    expect(posts[1].message).toContain("watched");
+  });
+
+  it("does not silently expire old fresh evidence on startup", async () => {
+    const store = new PendingWakeStore(join(dir, "pending-wakes.json"));
+    await store.set("warp.run.completed:1:leading", { scope: "warp.run.completed", sinceTs: 1, frames: [frame("old")], injected: false });
+    const injector = create();
+    await injector.ready;
+    await posted(1);
+    expect(posts[0].message).toContain("old");
+  });
+
+  it("does not acknowledge fresh evidence without a durable state directory", async () => {
+    const sendFrame = vi.fn();
+    const injector = create({ ...config, stateDir: undefined }, { sendFrame });
+    await injector.inject(frame("in-memory"));
+    await posted(1);
+    expect(sendFrame).not.toHaveBeenCalled();
+  });
+
+  it("does not acknowledge a failed pending-file write", async () => {
+    await writeFile(join(dir, "not-a-directory"), "");
+    const sendFrame = vi.fn();
+    const injector = create({ ...config, stateDir: join(dir, "not-a-directory") }, { sendFrame });
+    await injector.inject(frame("disk-failure"));
+    expect(sendFrame).not.toHaveBeenCalled();
+    expect(alerts().some(([, text]) => text.includes("persistence failed"))).toBe(true);
+  });
+
+  it("horizon is feature-flagged off by default, then reads open items and writes sanitized outcomes when enabled", async () => {
+    const horizon = {
+      readOpenItems: vi.fn(async () => [{ runId: "horizon-open", status: "open" as const, expectedPr: "fixture/pr/horizon" }]),
+      writeStepEvents: vi.fn(async () => {}),
+    };
+    const off = create(config, { horizon });
+    await off.inject(frame("off"));
+    await posted(1);
+    await finish(off, 0);
+    expect(horizon.readOpenItems).not.toHaveBeenCalled();
+    expect(horizon.writeStepEvents).not.toHaveBeenCalled();
+    off.dispose();
+    const on = create({ ...config, horizonEnabled: true }, { horizon });
+    await on.inject(frame("on"));
+    await posted(2);
+    expect(posts[1].message).toContain("horizon-open");
+    await finish(on, 1);
+    expect(horizon.writeStepEvents).toHaveBeenCalledWith(expect.objectContaining({ runIds: ["on"], lastVerdict: "Reviewed; PR awaiting review" }));
+  });
+
+  it("falls back to bridge when horizon read or signed-step write fails", async () => {
+    const horizon = {
+      readOpenItems: vi.fn(async () => { throw new Error("offline"); }),
+      writeStepEvents: vi.fn(async () => { throw new Error("offline"); }),
+    };
+    const injector = create({ ...config, horizonEnabled: true }, { horizon });
+    await injector.inject(frame("fallback"));
+    await posted(1);
+    expect(posts[0].message).toContain("fixture/pr/80");
+    await finish(injector, 0);
+    expect(await readFile(join(dir, "wake-bridge.json"), "utf8")).toContain("Reviewed; PR awaiting review");
+  });
+});
+
+describe("wake supervision pure contracts", () => {
+  it("derives stable template batches, separates repeated run IDs and supports fixed keys", () => {
+    expect(deriveWakeSessionKey(BASE, "batch", ["run"], false)).toBe(BASE);
+    for (const template of [`${BASE}:{batchId}`, `${BASE}:{runId}`]) {
+      const one = deriveWakeSessionKey(template, "one", ["run"]);
+      expect(one).toBe(deriveWakeSessionKey(template, "one", ["run"]));
+      expect(one).not.toBe(deriveWakeSessionKey(template, "two", ["run"]));
+      expect(one).not.toContain("{");
+    }
+  });
+
+  it("prefers the final context snapshot to cumulative billable usage", () => {
+    expect(wakeEventTokens({ messages: [{ role: "assistant", usage: {
+      totalTokens: 195_000, contextUsage: { state: "available", promptTokens: 100, totalTokens: 200 },
+    } }] })).toBe(200);
+    expect(wakeEventTokens({ messages: [] })).toBeUndefined();
+  });
+
+  it("sanitizes structured outcome updates and never infers closure from prose or failed output", () => {
+    const event = (content: string, stopReason = "stop") => ({ messages: [{ role: "assistant", content, stopReason }] });
+    expect(buildWakeOutcome(["r"], event("All closed")).updates).toEqual([]);
+    const output = JSON.stringify({ updates: [
+      { runId: "r", status: "closed", expectedPr: "fixture/pr", secretField: "discard" },
+      { runId: "unrelated", status: "closed" },
+    ] });
+    expect(buildWakeOutcome(["r"], event(output)).updates).toEqual([{
+      runId: "r", status: "closed", expectedPr: "fixture/pr", issue: undefined, lastVerdict: undefined,
+    }]);
+    expect(buildWakeOutcome(["r"], event(output, "length")).updates).toEqual([]);
+    expect(Buffer.byteLength(buildWakeOutcome(["r"], event("字".repeat(5_000))).lastVerdict!)).toBeLessThanOrEqual(768);
+  });
+
+  it("does not consume a different session/run and keeps observing late completions", async () => {
+    vi.useFakeTimers();
+    const complete = vi.fn(async () => {});
+    const alert = vi.fn(async () => {});
+    const supervisor = new WakeSupervisor({ timeoutMs: 50_000, alert, complete, sessionTokens: async () => 0 });
+    supervisor.track({ batchId: "batch", sessionKey: `${BASE}:fresh`, scope: "scope", runs: [] });
+    supervisor.bindRun("batch", "real");
+    await supervisor.onAgentEnd({ runId: "wrong", messages: [] }, { sessionKey: `${BASE}:fresh` });
+    await supervisor.onAgentEnd({ runId: "real", messages: [] }, { sessionKey: "agent:main:other" });
+    expect(complete).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(alert).toHaveBeenCalledTimes(1);
+    await supervisor.onAgentEnd({ runId: "real", messages: [{ role: "assistant", content: "late success" }] }, { sessionKey: `${BASE}:fresh` });
+    expect(complete).toHaveBeenCalledTimes(2);
+    supervisor.dispose();
+    vi.useRealTimers();
+  });
+});

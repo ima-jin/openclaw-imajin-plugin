@@ -13,6 +13,16 @@
  */
 
 import * as path from "node:path";
+import { WakeBridgeStore, type HorizonWakeAdapter } from "./wake-bridge.js";
+import { readWakeSessionTokens } from "./wake-session-metadata.js";
+import { buildWakeOutcome } from "./wake-outcome.js";
+import {
+  DEFAULT_WAKE_MAX_TOKENS,
+  DEFAULT_WAKE_SESSION,
+  deriveWakeSessionKey,
+  rotateWakeSessionKey,
+  WakeSupervisor,
+} from "./wake-supervisor.js";
 import type { NotificationFrame } from "./ws-service.js";
 import { isReachFrame, isReachScope, type ReachEventsConfig } from "./reach-events.js";
 import { sendDirectChannelMessage } from "./channel-notify.js";
@@ -43,6 +53,16 @@ export interface WsNotificationsConfig {
   injectScopes?: string[];
   /** Exact session key to inject into, e.g. `agent:main:telegram:direct:8321865723`. */
   targetSession?: string;
+  /** Fresh per-batch sessions by default. Explicit false preserves fixed-key routing. */
+  sessionPerWake?: boolean;
+  /** Context threshold for rotation; default and ceiling 50000 tokens. */
+  maxSessionTokens?: number;
+  /** Completion watchdog; clamped to 1..40000ms, leaving directSend's 20s budget. */
+  wakeTimeoutMs?: number;
+  /** Bounded plugin-owned open-work file; default stateDir/wake-bridge.json. */
+  bridgeStatePath?: string;
+  /** Future horizon read / signed-step adapter opt-in; false by default. */
+  horizonEnabled?: boolean;
   /**
    * Session key to run a real agent turn into when a Warp run completes/fails,
    * via the Gateway `POST /hooks/agent` wake (#18). Falls back to `targetSession`
@@ -124,6 +144,21 @@ export interface WsNotificationsConfig {
   };
 }
 
+/** External adapters/metadata cannot wedge the wake lane. */
+async function withWakeDeadline<T>(task: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      task,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("wake adapter timeout")), 2_000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // A queued notification is stale once the run it describes is old news; the
 // host drops the record instead of prepending it to some much later turn.
 const INJECTION_TTL_MS = 15 * 60_000;
@@ -177,6 +212,7 @@ export function buildNotificationText(nf: NotificationFrame): string {
       dataJson = "(unserializable)";
     }
   }
+
   const text = [
     `[Warp Notification: ${nf.scope}]`,
     "",
@@ -213,7 +249,7 @@ export function buildWakeFailureMessage(frames: NotificationFrame[], reason: str
   const title =
     frames.length === 1 ? (frames[0].title ?? frames[0].scope) : `${frames.length} Warp runs`;
   return truncate(
-    `⚠️ Warp run ${title} finished — automatic wake failed (${reason}); ask me to review`,
+    `⚠️ Warp run ${frames.map((f) => extractWakeRunData(f).runId ?? f.id).slice(0, 5).join(", ")}: ${reason} — automatic wake failed; ${title}`,
     900,
   );
 }
@@ -377,7 +413,17 @@ export function buildWakeTurnMessage(scope: string, frames: NotificationFrame[])
     return aFail - bFail;
   });
   const header = `${scope} × ${frames.length}`;
-  return [header, "", sorted.map(formatWakeRunEntry).join("\n\n")].join("\n");
+  const entries: string[] = [];
+  let bytes = Buffer.byteLength(header) + 2;
+  for (const frame of sorted.slice(0, 50)) {
+    const entry = formatWakeRunEntry(frame);
+    const bounded = Buffer.from(entry.slice(0, 4_000)).subarray(0, 4_000).toString("utf8");
+    if (bytes + Buffer.byteLength(bounded) + 64 > 16_000) break;
+    entries.push(bounded);
+    bytes += Buffer.byteLength(bounded) + 2;
+  }
+  if (entries.length < frames.length) entries.push("[Additional wake evidence omitted; retained in pending state/bridge]");
+  return [header, "", entries.join("\n\n")].join("\n");
 }
 
 /**
@@ -546,7 +592,7 @@ async function postWakeHook(params: {
           };
         }
       }
-      return { ok: false, reason: `gateway returned ${res.status}${text ? `: ${text.slice(0, 200)}` : ""}` };
+      return { ok: false, reason: `gateway returned ${res.status}` };
     }
     let runId: string | undefined;
     try {
@@ -565,16 +611,23 @@ async function postWakeHook(params: {
       // the wake was refused, just that it's still running/queued.
       return { ok: false, pending: true, reason: `timed out after ${HOOK_REQUEST_TIMEOUT_MS}ms` };
     }
-    const reason = String(err?.code ?? err?.message ?? err);
+    const reason = "gateway transport failure";
     return { ok: false, reason };
   } finally {
     clearTimeout(timeoutHandle);
   }
 }
 
-function sleep(ms: number): Promise<void> {
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener("abort", done, { once: true });
+    if (signal?.aborted) done();
   });
 }
 
@@ -586,6 +639,8 @@ function sleep(ms: number): Promise<void> {
  */
 export async function postWakeHookWithRetries(
   params: Parameters<typeof postWakeHook>[0],
+  onFailure?: (reason: string) => void,
+  signal?: AbortSignal,
 ): Promise<WakeHookResult> {
   let result = await postWakeHook(params);
   if (result.pending) {
@@ -601,16 +656,19 @@ export async function postWakeHookWithRetries(
     if (result.ok) {
       return result;
     }
+    onFailure?.(result.reason ?? "wake hook failed");
     attempt += 1;
     console.warn(
       `[imajin-ws] wake hook attempt ${attempt} failed (${result.reason}) — retrying in ${delayMs}ms`,
     );
-    await sleep(delayMs);
+    await sleep(delayMs, signal);
+    if (signal?.aborted) return result;
     result = await postWakeHook(params);
     if (result.pending) {
       return result;
     }
   }
+  if (!result.ok) onFailure?.(result.reason ?? "wake hook failed");
   return result;
 }
 
@@ -668,6 +726,10 @@ export interface NotificationInjectorDeps {
   sendFrame?: (frame: unknown) => void;
   /** Used only to derive the default `stateDir` (colocated with the keypair file) when `wsNotifications.stateDir` is not set. */
   keypairPath?: string;
+  /** Harness-side adapter owns loops_get horizon reads and signed step publishing. */
+  horizon?: HorizonWakeAdapter;
+  /** Test seam; production uses scoped session metadata from the public SDK. */
+  sessionTokens?: (sessionKey: string) => Promise<number | undefined>;
 }
 
 export function createNotificationInjector(
@@ -682,11 +744,18 @@ export function createNotificationInjector(
    * `agent_end` hook handler for `wsNotifications.reportTo` (#47); `undefined`
    * when no valid `reportTo` target is configured (nothing to register).
    */
-  onAgentEnd?: (event: AgentEndEvent, ctx?: { sessionKey?: string }) => Promise<void>;
+  onAgentEnd?: (event: AgentEndEvent, ctx?: { sessionKey?: string; runId?: string }) => Promise<void>;
 } {
   const injectScopes = new Set(wsNotifications?.injectScopes ?? []);
-  const targetSession = wsNotifications?.targetSession?.trim();
+  const targetSession = wsNotifications?.targetSession?.trim() || DEFAULT_WAKE_SESSION;
   const wakeSessionKey = wsNotifications?.wakeSessionKey?.trim() ?? targetSession;
+  const sessionPerWake = wsNotifications?.sessionPerWake !== false;
+  const freshSessions = sessionPerWake || /\{(?:batchId|runId)\}/.test(wakeSessionKey);
+  const maxSessionTokens = Math.max(1, Math.min(DEFAULT_WAKE_MAX_TOKENS, wsNotifications?.maxSessionTokens ?? DEFAULT_WAKE_MAX_TOKENS));
+  const readTokens = deps.sessionTokens ?? ((sessionKey: string) => readWakeSessionTokens(api, sessionKey));
+  const lifecycle = new AbortController();
+  let reusedSessionKey = wakeSessionKey;
+  let allocatedFreshReuseKey = false;
   const wakeCoalesceMs = wsNotifications?.wakeCoalesceMs ?? DEFAULT_WAKE_COALESCE_MS;
   const wakeSettleMs = wsNotifications?.wakeSettleMs ?? DEFAULT_WAKE_SETTLE_MS;
   const wakeOwedMaxAgeMs = wsNotifications?.wakeOwedMaxAgeMs ?? DEFAULT_WAKE_OWED_MAX_AGE_MS;
@@ -748,6 +817,39 @@ export function createNotificationInjector(
   const pendingWakeStore = new PendingWakeStore(
     stateDir ? path.join(stateDir, PENDING_WAKES_FILENAME) : undefined,
   );
+  const bridge = new WakeBridgeStore(
+    wsNotifications?.bridgeStatePath ?? (stateDir ? path.join(stateDir, "wake-bridge.json") : undefined),
+    (message) => console.warn(message),
+  );
+  const bridgeReady = bridge.load();
+  const horizon = wsNotifications?.horizonEnabled === true ? deps.horizon : undefined;
+  const supervisor = new WakeSupervisor({
+    timeoutMs: wsNotifications?.wakeTimeoutMs,
+    maxTokens: maxSessionTokens,
+    sessionTokens: readTokens,
+    alert: async (batch, reason) => {
+      const frames: NotificationFrame[] = batch.runs.map((r) => ({
+        type: "notification", id: r.runId, title: r.title, scope: batch.scope,
+        body: null, createdAt: "", data: { runId: r.runId },
+      }));
+      await sendChannelMessage(buildWakeFailureMessage(frames, reason)).catch(() => {
+        console.error("[imajin-ws] wake alert delivery failed; check directSend configuration");
+      });
+    },
+    complete: async (batch, event) => {
+      const outcome = buildWakeOutcome(batch.runs.map((r) => r.runId), event);
+      await bridge.recordOutcome(outcome);
+      if (event.wakeWatchdog !== true) {
+        await pendingWakeStore.delete(batch.batchId.replace(/^imajin-wake:/, ""));
+      }
+      if (horizon) {
+        await withWakeDeadline(horizon.writeStepEvents(outcome)).catch(() => {
+          console.warn("[imajin-ws] horizon step writeback failed; outcome retained in bridge");
+        });
+      }
+      wakeReporter?.untrack(batch.batchId);
+    },
+  });
 
   /**
    * Sends the kernel-facing `notification_ack` frame (#26). Never called
@@ -773,7 +875,7 @@ export function createNotificationInjector(
     windowStart: number,
     phase: "leading" | "trailing",
   ): Promise<void> {
-    const sessionKey = wakeSessionKey || "(unconfigured)";
+    const sessionKey = freshSessions ? `${scope}:${windowStart}:${phase}` : wakeSessionKey;
     const prior = wakeQueueBySession.get(sessionKey) ?? Promise.resolve();
     const task = prior.then(
       () => flushWakeTurn(scope, frames, windowStart, phase),
@@ -782,7 +884,12 @@ export function createNotificationInjector(
     // `flushWakeTurn` never throws (every branch handles its own errors), but
     // guard the queue chain anyway so one unexpected rejection can't wedge
     // every wake behind it forever.
-    wakeQueueBySession.set(sessionKey, task.catch(() => {}));
+    const guarded = task.catch(() => {
+      void escalateWakeFailure(scope, frames, "unexpected wake dispatch failure");
+    }).finally(() => {
+      if (wakeQueueBySession.get(sessionKey) === guarded) wakeQueueBySession.delete(sessionKey);
+    });
+    wakeQueueBySession.set(sessionKey, guarded);
     return task;
   }
 
@@ -802,7 +909,7 @@ export function createNotificationInjector(
     key: string;
     owed: PendingWakeRecord;
   }
-  const stateReady: Promise<void> = Promise.all([dedupStore.load(), pendingWakeStore.load()])
+  const stateReady: Promise<void> = Promise.all([dedupStore.load(), pendingWakeStore.load(), bridgeReady])
     .then(async () => {
       const owedByScope = new Map<string, OwedEntry[]>();
       // Legacy/misconfigured reach records must never re-enter the generic
@@ -822,7 +929,7 @@ export function createNotificationInjector(
         const live: OwedEntry[] = [];
         for (const entry of entries) {
           const age = now - entry.owed.sinceTs;
-          if (age > wakeOwedMaxAgeMs) {
+          if (age > wakeOwedMaxAgeMs && entry.owed.injected !== false) {
             // Every frame that ever reaches this store already passed
             // `enqueueSystemEvent` successfully (`inject()` below only pushes
             // into the coalesce buffer — and therefore this store — after
@@ -868,7 +975,7 @@ export function createNotificationInjector(
             scope,
             sinceTs: earliestSinceTs,
             frames: mergedFrames,
-            injected: true,
+            injected: live.every((entry) => entry.owed.injected !== false),
           });
           for (const entry of live) {
             if (entry.key !== mergedKey) {
@@ -877,6 +984,7 @@ export function createNotificationInjector(
           }
         }
 
+        await bridge.ingest(mergedFrames);
         console.log(
           live.length > 1
             ? `[imajin-ws] replaying owed wake for ${scope} from persisted state: merged ${live.length} window(s) into ${mergedFrames.length} notification(s)`
@@ -981,7 +1089,16 @@ export function createNotificationInjector(
 
     // Evidence, not instructions (#22): one entry per run in the batch, no
     // imperative sentences — see `buildWakeTurnMessage`.
-    const message = buildWakeTurnMessage(scope, frames);
+    await bridgeReady;
+    if (horizon) {
+      try {
+        const items = await withWakeDeadline(horizon.readOpenItems({ runIds: summarizeWakeRuns(frames).map((r) => r.runId) }));
+        await bridge.merge(items);
+      } catch {
+        console.warn("[imajin-ws] horizon read unavailable; using wake bridge");
+      }
+    }
+    const message = `${buildWakeTurnMessage(scope, frames)}\n\n${bridge.buildPrompt()}`;
 
     if (!hookToken) {
       // The single startup warning already fired in `hookTokenReady`'s
@@ -994,18 +1111,26 @@ export function createNotificationInjector(
     }
 
     const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
+    const sessionKey = freshSessions
+      ? deriveWakeSessionKey(wakeSessionKey, idempotencyKey, summarizeWakeRuns(frames).map((r) => r.runId), sessionPerWake)
+      : await guardedReuseSession(frames);
     const gatewayPort = resolveGatewayPort(api);
     // Tracked BEFORE the POST so a fast turn can't finish unmatched (#47).
-    wakeReporter?.track({ batchId: idempotencyKey, scope, runs: summarizeWakeRuns(frames) });
+    const batch = { batchId: idempotencyKey, scope, runs: summarizeWakeRuns(frames), sessionKey };
+    wakeReporter?.track(batch);
+    supervisor.track(batch);
     const result = await postWakeHookWithRetries({
       gatewayPort,
       hooksPath,
       hookToken,
       agentId: hookAgentId,
-      sessionKey: wakeSessionKey,
+      sessionKey,
       message,
       idempotencyKey,
-    });
+    }, (reason) => { void supervisor.alert(idempotencyKey, reason); }, lifecycle.signal);
+    supervisor.bindRun(idempotencyKey, result.runId);
+    allocatedFreshReuseKey = false;
+    if (!result.ok && !result.pending) supervisor.untrack(idempotencyKey);
 
     if (wakeReporter) {
       if (result.ok || result.pending) {
@@ -1044,7 +1169,7 @@ export function createNotificationInjector(
     // Marker intentionally retained: a transient hook failure (unlike the two
     // static-misconfiguration branches above) is worth retrying on the next
     // restart (#26) — cleared only once `postWakeHookWithRetries` reports 2xx.
-    await escalateWakeFailure(scope, frames, result.reason ?? "unknown wake hook failure");
+    // The first real failed attempt already alerted, before the retry ladder.
   }
 
   /**
@@ -1055,6 +1180,19 @@ export function createNotificationInjector(
    * in flight joins the trailing batch rather than being lost or re-joining
    * the batch that's already being sent.
    */
+  async function guardedReuseSession(frames: NotificationFrame[]): Promise<string> {
+    const observed = await withWakeDeadline(readTokens(reusedSessionKey)).catch(() => undefined);
+    const size = observed ?? (allocatedFreshReuseKey ? 0 : undefined);
+    // Reserve room for bounded evidence + bridge. Unknown metadata is not proof of safety.
+    if (size === undefined || size + 24_000 > maxSessionTokens) {
+      reusedSessionKey = rotateWakeSessionKey(wakeSessionKey);
+      allocatedFreshReuseKey = true;
+      await escalateWakeFailure("session-size", frames,
+        size === undefined ? "session size unavailable; rotated to fresh session" : `session size ${size} tokens; rotated before wake limit`);
+    }
+    return reusedSessionKey;
+  }
+
   function onLeadingFire(scope: string) {
     const state = coalesceByScope.get(scope);
     if (!state || state.phase !== "leading") {
@@ -1086,6 +1224,8 @@ export function createNotificationInjector(
   }
 
   function dispose() {
+    lifecycle.abort();
+    supervisor.dispose();
     for (const [scope, buf] of coalesceByScope) {
       clearTimeout(buf.timeout);
       coalesceByScope.delete(scope);
@@ -1104,17 +1244,21 @@ export function createNotificationInjector(
     // once, so re-ack without running enqueue/direct-send/coalesce again.
     if (dedupStore.has(nf.id)) {
       console.log(`[imajin-ws] ${nf.id} already injected for ${nf.scope} — re-acking without re-injecting`);
-      sendAck(nf.id);
+      if (!freshSessions || stateDir) sendAck(nf.id);
       return;
     }
 
+    await bridge.ingest([nf]);
     const text = buildNotificationText(nf);
     let queuedVia: "system-event" | undefined;
-
-    if (enqueueSystemEvent) {
+    // Fresh wakes persist evidence locally, never accumulating a fixed gateway inbox.
+    if (freshSessions) {
+      if (await bufferWake(nf)) queuedVia = "system-event";
+      else await escalateWakeFailure(nf.scope, [nf], "pending wake persistence failed; notification not acknowledged");
+    } else if (enqueueSystemEvent) {
       try {
         enqueueSystemEvent(text, {
-          sessionKey: targetSession,
+          sessionKey: await guardedReuseSession([nf]),
           contextKey: `imajin-ws:${nf.scope}`,
         });
         queuedVia = "system-event";
@@ -1128,7 +1272,7 @@ export function createNotificationInjector(
       // dropped/failed enqueue must leave the notification un-acked so the
       // kernel replays it on the next reconnect.
       await dedupStore.add(nf.id);
-      sendAck(nf.id);
+      if (!freshSessions || stateDir) sendAck(nf.id);
     } else {
       console.error(
         `[imajin-ws] system-event queue rejected ${nf.scope} for ${targetSession} — direct send still attempted`,
@@ -1143,7 +1287,7 @@ export function createNotificationInjector(
       try {
         await sendChannelMessage(buildDirectMessage(nf));
         console.log(
-          `[imajin-ws] direct-sent ${nf.scope} → ${ds.channel ?? "telegram"}:${ds.target}` +
+          `[imajin-ws] direct-sent ${nf.scope} via configured channel` +
             (queuedVia ? ` (context queued via ${queuedVia})` : ""),
         );
         // No early return here: the direct ping is the instant human-facing
@@ -1167,39 +1311,34 @@ export function createNotificationInjector(
     // machine. A frame joins whichever phase is currently open (leading or
     // trailing); a frame arriving while the scope is idle starts a brand-new
     // leading window.
-    const existing = coalesceByScope.get(nf.scope);
-    if (existing) {
-      existing.frames.push(nf);
-      const pendingKey = `${pendingWakeKey(nf.scope, existing.windowStart)}:${existing.phase}`;
-      await pendingWakeStore.set(pendingKey, {
-        scope: nf.scope,
-        sinceTs: existing.windowStart,
-        frames: existing.frames,
-        injected: true,
-      });
-      const firesInMs = existing.phase === "leading" ? wakeSettleMs : wakeCoalesceMs;
-      console.log(
-        `[imajin-ws] warp wake: ${existing.phase} batched ${nf.id} (n=${existing.frames.length}, fires in ~${firesInMs}ms)`,
-      );
-      return;
-    }
+    if (!freshSessions) await bufferWake(nf);
+  }
 
-    const windowStart = Date.now();
-    const timeout = setTimeout(() => onLeadingFire(nf.scope), wakeSettleMs);
-    coalesceByScope.set(nf.scope, { phase: "leading", timeout, frames: [nf], windowStart });
-    await pendingWakeStore.set(`${pendingWakeKey(nf.scope, windowStart)}:leading`, {
+  async function bufferWake(nf: NotificationFrame): Promise<boolean> {
+    let state = coalesceByScope.get(nf.scope);
+    if (!state) {
+      const windowStart = Date.now();
+      const timeout = setTimeout(() => onLeadingFire(nf.scope), wakeSettleMs);
+      state = { phase: "leading", timeout, frames: [], windowStart };
+      coalesceByScope.set(nf.scope, state);
+    }
+    if (!state.frames.some((f) => f.id === nf.id)) state.frames.push(nf);
+    const stored = await pendingWakeStore.set(`${pendingWakeKey(nf.scope, state.windowStart)}:${state.phase}`, {
       scope: nf.scope,
-      sinceTs: windowStart,
-      frames: [nf],
-      injected: true,
+      sinceTs: state.windowStart,
+      frames: state.frames,
+      injected: !freshSessions,
     });
-    console.log(`[imajin-ws] warp wake: leading batched ${nf.id} (n=1, fires in ${wakeSettleMs}ms)`);
+    console.log(`[imajin-ws] warp wake: ${state.phase} batched notification (n=${state.frames.length})`);
+    return stored;
   }
 
   return {
     inject,
     dispose,
     ready: stateReady,
-    onAgentEnd: wakeReporter ? (event, ctx) => wakeReporter.onAgentEnd(event, ctx) : undefined,
+    onAgentEnd: async (event, ctx) => {
+      await Promise.all([wakeReporter?.onAgentEnd(event, ctx), supervisor.onAgentEnd(event, ctx)]);
+    },
   };
 }

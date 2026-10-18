@@ -23,7 +23,8 @@
  * improvement, not a hard dependency for the injector's in-memory behavior.
  */
 
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, writeFile, rename } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import type { NotificationFrame } from "./ws-service.js";
 
@@ -41,6 +42,7 @@ export interface PendingWakeRecord {
   frames: NotificationFrame[];
   /**
    * Whether every frame in this record already reached `enqueueSystemEvent`
+   * (false for fresh wakes whose evidence is persisted only in this file).
    * successfully (#30) — true for every record this injector itself writes,
    * since a frame only ever joins the coalesce buffer (and therefore this
    * store) after its durable enqueue succeeded. Optional/absent on records
@@ -151,6 +153,7 @@ export class NotificationDedupStore {
 /** Persisted "wake owed" markers, keyed by `scope:windowStart` (#26). */
 export class PendingWakeStore {
   private wakes: Record<string, PendingWakeRecord> = {};
+  private writes: Promise<boolean> = Promise.resolve(true);
 
   constructor(private readonly filePath: string | undefined) {}
 
@@ -167,9 +170,9 @@ export class PendingWakeStore {
     return Object.entries(this.wakes);
   }
 
-  async set(key: string, record: PendingWakeRecord): Promise<void> {
+  async set(key: string, record: PendingWakeRecord): Promise<boolean> {
     this.wakes[key] = record;
-    await this.persist();
+    return this.persist();
   }
 
   /** Clears an owed marker — call only once its wake has been durably confirmed delivered. */
@@ -190,18 +193,25 @@ export class PendingWakeStore {
     await this.persist();
   }
 
-  private async persist(): Promise<void> {
+  private persist(): Promise<boolean> {
     if (!this.filePath) {
-      return;
+      return Promise.resolve(true);
     }
-    const shape: PendingWakeFileShape = { wakes: this.wakes };
-    try {
-      await writeJsonFile(this.filePath, shape);
-    } catch (err: unknown) {
-      console.error(
-        `[imajin-ws] failed to persist pending wake store: ${err instanceof Error ? err.message : err}`,
-      );
-    }
+    const filePath = this.filePath;
+    const serialized = JSON.stringify({ wakes: this.wakes } satisfies PendingWakeFileShape);
+    this.writes = this.writes.then(async () => {
+      try {
+        await mkdir(path.dirname(filePath), { recursive: true });
+        const temp = `${filePath}.${randomUUID()}.tmp`;
+        await writeFile(temp, serialized, { encoding: "utf-8", mode: 0o600 });
+        await rename(temp, filePath);
+        return true;
+      } catch {
+        console.error("[imajin-ws] failed to persist pending wake store");
+        return false;
+      }
+    });
+    return this.writes;
   }
 }
 

@@ -87,8 +87,7 @@ export async function readWakeSessionMetadata(
 }
 
 /**
- * Integration wrapper for freshly allocated wake keys. Missing metadata maps to
- * zero only under that caller-owned freshness assumption; SDK failures never do.
+ * Integration wrapper. Missing metadata is unknown, never proof of empty context.
  */
 export async function readWakeSessionTokens(
   api: any,
@@ -110,7 +109,7 @@ export async function readWakeSessionTokens(
         : "main"
     );
     const metadata = await readWakeSessionMetadata({ agentId, sessionKey, config });
-    return metadata.status === "known" ? metadata.tokens : metadata.status === "missing" ? 0 : undefined;
+    return metadata.status === "known" ? metadata.tokens : undefined;
   } catch {
     return undefined;
   }
