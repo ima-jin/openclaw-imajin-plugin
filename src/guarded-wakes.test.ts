@@ -32,6 +32,30 @@ describe("guarded wake acceptance (#82)", () => {
     createdAt: "", data: { runId: `run-${id}`, expectedPr: pr },
   });
 
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "guarded-wakes-"));
+    posts = [];
+    config = {
+      injectScopes: ["warp.run.completed"], targetSession: "agent:main:warp-events",
+      hookToken: "fixture-only", wakeSettleMs: 2, wakeCoalesceMs: 2, stateDir: dir,
+      reportTo: [REPORT], directSend: { channel: "telegram", target: "123", cliPath: "/fixture/openclaw" },
+    };
+    lookup = vi.fn(async () => OPEN);
+    abort = vi.fn(async () => {});
+    vi.mocked(sendDirectChannelMessage).mockReset().mockResolvedValue();
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+      posts.push(JSON.parse(init.body));
+      return { status: 200, json: async () => ({ runId: `admission-${posts.length}` }), text: async () => "" };
+    }));
+    for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation(() => {});
+  });
+  afterEach(async () => {
+    injector?.dispose();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("makes main-session copies fire-and-forget and blocks inter-session ping-pong after disclosure", async () => {
     create();
     await start();
@@ -70,30 +94,6 @@ describe("guarded wake acceptance (#82)", () => {
       { role: "assistant", content: "Completed and reported", usage: { input: 60_000 } },
     ] }, ctx());
     expect(alerts()).toHaveLength(0);
-  });
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "guarded-wakes-"));
-    posts = [];
-    config = {
-      injectScopes: ["warp.run.completed"], targetSession: "agent:main:warp-events",
-      hookToken: "fixture-only", wakeSettleMs: 2, wakeCoalesceMs: 2, stateDir: dir,
-      reportTo: [REPORT], directSend: { channel: "telegram", target: "123", cliPath: "/fixture/openclaw" },
-    };
-    lookup = vi.fn(async () => OPEN);
-    abort = vi.fn(async () => {});
-    vi.mocked(sendDirectChannelMessage).mockReset().mockResolvedValue();
-    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
-      posts.push(JSON.parse(init.body));
-      return { status: 200, json: async () => ({ runId: `admission-${posts.length}` }), text: async () => "" };
-    }));
-    for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation(() => {});
-  });
-  afterEach(async () => {
-    injector?.dispose();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-    await rm(dir, { recursive: true, force: true });
   });
 
   function create() {

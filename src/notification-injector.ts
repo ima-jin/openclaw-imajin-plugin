@@ -224,6 +224,11 @@ function wakeDisclosureTargets(targets: ReportTarget[], directSend: DirectSendCo
   return [{ agentId, sessionKey: `agent:${agentId}:${channel}:direct:${target}` }];
 }
 
+function wakeContextCeiling(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  return DEFAULT_WAKE_TOKEN_BUDGET;
+}
+
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated ${value.length - max} chars]`;
 }
@@ -790,9 +795,7 @@ export function createNotificationInjector(
   const configuredMax = wsNotifications?.maxSessionTokens;
   const maxSessionTokens = typeof configuredMax === "number" && Number.isFinite(configuredMax)
     ? Math.max(1, Math.min(DEFAULT_WAKE_MAX_TOKENS, configuredMax)) : DEFAULT_WAKE_MAX_TOKENS;
-  const configuredWakeMax = wsNotifications?.maxWakeTokens;
-  const maxWakeTokens = typeof configuredWakeMax === "number" && Number.isFinite(configuredWakeMax) && configuredWakeMax > 0
-    ? configuredWakeMax : DEFAULT_WAKE_TOKEN_BUDGET;
+  const maxWakeTokens = wakeContextCeiling(wsNotifications?.maxWakeTokens);
   const readTokens = deps.sessionTokens ?? ((sessionKey: string) => readWakeSessionTokens(api, sessionKey));
   const lifecycle = new AbortController();
   let reusedSessionKey = wakeSessionKey;
