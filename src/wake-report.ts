@@ -30,6 +30,7 @@
  */
 
 import type { AgentEndEvent, AgentMessage } from "./turn-usage-attestation.js";
+import { findFinalAssistantMessage } from "./turn-usage-attestation.js";
 
 /** `agent:<agentId>:<rest>` — the shape every OpenClaw session key has. */
 const SESSION_KEY_RE = /^agent:([^:\s]+):\S+$/;
@@ -53,6 +54,20 @@ export interface WakeBatch {
   batchId: string;
   scope: string;
   runs: WakeRunSummary[];
+  /** Actual fresh/rotated session; legacy callers use the reporter's fixed default. */
+  sessionKey?: string;
+  /** Plugin-derived session dedicated to exactly this batch. */
+  uniqueSession?: boolean;
+}
+
+/** Gateway admission UUID and harness runner UUID are distinct on current hosts. */
+export function matchWakeBatch<T extends WakeBatch & { hookRunId?: string }>(
+  batches: T[], runId?: string, batchId?: string,
+): T | undefined {
+  if (batchId) return batches.find((batch) => batch.batchId === batchId);
+  if (batches.length === 1 && batches[0].uniqueSession) return batches[0];
+  if (runId) return batches.find((batch) => batch.hookRunId === runId);
+  return batches[0];
 }
 
 export interface ReportTarget {
@@ -88,13 +103,6 @@ function sameSession(a: string | undefined, b: string): boolean {
   return a?.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
-function describeEntry(entry: unknown): string {
-  try {
-    return (JSON.stringify(entry) ?? String(entry)).slice(0, 80);
-  } catch {
-    return "(unserializable)";
-  }
-}
 
 /**
  * Validates `wsNotifications.reportTo`. Logs ONE warning per rejected entry
@@ -114,11 +122,11 @@ export function parseReportTo(raw: unknown, wakeSessionKey?: string): ReportTarg
     const agentId = SESSION_KEY_RE.exec(sessionKey)?.[1];
     if (!agentId) {
       console.warn(
-        `[imajin-ws] wsNotifications.reportTo: ignoring invalid session key ${describeEntry(entry)} (expected agent:<agentId>:<...>)`,
+        "[imajin-ws] wsNotifications.reportTo: ignoring invalid session key (expected agent:<agentId>:<...>)",
       );
     } else if (wakeSessionKey && sameSession(sessionKey, wakeSessionKey)) {
       console.warn(
-        `[imajin-ws] wsNotifications.reportTo: ignoring ${sessionKey} — it is the wake session itself and would re-trigger the worker`,
+        "[imajin-ws] wsNotifications.reportTo: ignoring the wake session itself (would re-trigger the worker)",
       );
     } else {
       targets.set(sessionKey.toLowerCase(), { sessionKey, agentId });
@@ -127,28 +135,58 @@ export function parseReportTo(raw: unknown, wakeSessionKey?: string): ReportTarg
   return [...targets.values()];
 }
 
-function messageText(message: AgentMessage): string {
+function messageText(message: AgentMessage, maxChars: number): string {
   const content = message.content;
-  if (typeof content === "string") return content.trim();
+  if (typeof content === "string") return content.slice(0, maxChars).trim();
   if (!Array.isArray(content)) return "";
-  return content
-    .map((block: unknown) => {
-      const b = block as { type?: unknown; text?: unknown } | null;
-      return b?.type === "text" && typeof b.text === "string" ? b.text : "";
-    })
-    .filter(Boolean)
-    .join("\n")
-    .trim();
+  let text = "";
+  for (const block of content.slice(0, 128)) {
+    const b = block as { type?: unknown; text?: unknown } | null;
+    if (b?.type !== "text" || typeof b.text !== "string") continue;
+    text += `${text ? "\n" : ""}${b.text.slice(0, maxChars - text.length)}`;
+    if (text.length >= maxChars) break;
+  }
+  return text.trim();
+}
+
+/** Current user evidence, never an earlier assistant's prose or a previous turn. */
+export function extractWakeBatchId(messages: AgentMessage[] | undefined): string | undefined {
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    if (messages?.[i]?.role !== "user") continue;
+    const text = messageText(messages[i], 8_192);
+    return /Wake batch ID: (imajin-wake:[a-zA-Z0-9._:-]{1,200})/.exec(text)?.[1];
+  }
+  return undefined;
 }
 
 /**
  * The turn's final assistant output, or `undefined` when there is none (no
  * assistant message, an empty one, or the `NO_REPLY` sentinel).
  */
-export function extractFinalAssistantOutput(messages: AgentMessage[] | undefined): string | undefined {
-  const last = [...(messages ?? [])].reverse().find((m) => m?.role === "assistant");
-  const text = last ? messageText(last) : "";
+export function extractFinalAssistantOutput(messages: AgentMessage[] | undefined, maxChars = 8_193): string | undefined {
+  let last: AgentMessage | undefined;
+  for (let i = (messages?.length ?? 0) - 1; i >= 0; i--) {
+    if (messages?.[i]?.role === "assistant") { last = messages[i]; break; }
+  }
+  const text = last ? messageText(last, maxChars) : "";
   return text && text !== NO_REPLY_SENTINEL ? text : undefined;
+}
+
+/** Early hook correlation must never retain the turn's transcript. */
+export function compactWakeEndEvent(event: AgentEndEvent): AgentEndEvent {
+  const last = findFinalAssistantMessage(event.messages);
+  return {
+    runId: event.runId,
+    sessionKey: event.sessionKey,
+    success: event.success,
+    error: typeof event.error === "string" ? event.error.slice(0, 200) : undefined,
+    messages: last?.role === "assistant" ? [{
+      role: "assistant",
+      content: messageText(last, 8_193),
+      stopReason: last.stopReason,
+      usage: last.usage,
+    }] : [],
+  };
 }
 
 function describeTurn(event: AgentEndEvent | undefined): TurnSummary {
@@ -212,6 +250,7 @@ export class WakeReporter {
   private readonly reportedBatches = new Set<string>();
   private readonly handledRuns = new Set<string>();
   private readonly failedTargets = new Set<string>();
+  private readonly earlyEnds = new Map<string, { event: AgentEndEvent; sessionKey: string }>();
 
   constructor(private readonly opts: WakeReporterOptions) {}
 
@@ -237,7 +276,14 @@ export class WakeReporter {
   /** Records the Gateway's runId for a tracked batch so `agent_end` can match it exactly. */
   bindRun(batchId: string, hookRunId: string | undefined): void {
     const batch = this.pending.get(batchId);
-    if (batch && hookRunId) batch.hookRunId = hookRunId;
+    if (!batch || !hookRunId) return;
+    batch.hookRunId = hookRunId;
+    const key = `${(batch.sessionKey ?? this.opts.wakeSessionKey).toLowerCase()}\n${hookRunId}`;
+    const early = this.earlyEnds.get(key);
+    if (early) {
+      this.earlyEnds.delete(key);
+      void this.onAgentEnd(early.event, { sessionKey: early.sessionKey });
+    }
   }
 
   /** The wake POST failed outright — there will be no turn to report on. */
@@ -250,15 +296,24 @@ export class WakeReporter {
    * else (the report targets' own turns included) is ignored, so a report can
    * never loop back into another report. Never throws.
    */
-  async onAgentEnd(event: AgentEndEvent | undefined, ctx?: { sessionKey?: string }): Promise<void> {
+  async onAgentEnd(event: AgentEndEvent | undefined, ctx?: { sessionKey?: string; runId?: string }): Promise<void> {
     try {
-      if (!sameSession(event?.sessionKey ?? ctx?.sessionKey, this.opts.wakeSessionKey)) return;
-      const batch = this.claim(event?.runId);
-      if (!batch) return;
+      const sessionKey = event?.sessionKey ?? ctx?.sessionKey;
+      if (!sessionKey) return;
+      const runId = event?.runId ?? ctx?.runId;
+      const batch = this.claim(runId, sessionKey, extractWakeBatchId(event?.messages));
+      if (!batch) {
+        if (event && runId && [...this.pending.values()].some((b) =>
+          !b.hookRunId && sameSession(sessionKey, b.sessionKey ?? this.opts.wakeSessionKey))) {
+          this.earlyEnds.set(`${sessionKey.toLowerCase()}\n${runId}`, { event: compactWakeEndEvent({ ...event, runId }), sessionKey });
+          if (this.earlyEnds.size > MAX_PENDING_BATCHES) this.earlyEnds.delete(this.earlyEnds.keys().next().value!);
+        }
+        return;
+      }
       const report = buildWakeReport(batch, describeTurn(event));
       await Promise.all(this.opts.targets.map((target) => this.send(target, batch.batchId, report)));
-    } catch (err: unknown) {
-      console.error("[imajin-ws] wake report failed:", err instanceof Error ? err.message : String(err));
+    } catch {
+      console.error("[imajin-ws] wake report failed");
     }
   }
 
@@ -269,10 +324,11 @@ export class WakeReporter {
    * it reported so a duplicate `agent_end` can neither re-report it nor
    * consume the next batch.
    */
-  private claim(runId: string | undefined): PendingBatch | undefined {
+  private claim(runId: string | undefined, sessionKey: string, batchId?: string): PendingBatch | undefined {
     if (runId && this.handledRuns.has(runId)) return undefined;
-    const batches = [...this.pending.values()];
-    const batch = (runId ? batches.find((b) => b.hookRunId === runId) : undefined) ?? batches[0];
+    const batches = [...this.pending.values()].filter((b) =>
+      sameSession(sessionKey, b.sessionKey ?? this.opts.wakeSessionKey));
+    const batch = matchWakeBatch(batches, runId, batchId);
     if (!batch) return undefined;
     this.pending.delete(batch.batchId);
     remember(this.reportedBatches, batch.batchId);
@@ -284,17 +340,17 @@ export class WakeReporter {
     let result: WakeReportDelivery;
     try {
       result = await this.opts.deliver(target, report, `imajin-wake-report:${batchId}:${target.sessionKey}`);
-    } catch (err: unknown) {
-      result = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    } catch {
+      result = { ok: false, reason: "report delivery failed" };
     }
     if (result.ok || result.pending) {
       console.log(
-        `[imajin-ws] wake report for ${batchId} → ${target.sessionKey}${result.pending ? " (queued)" : ""}`,
+        `[imajin-ws] wake report for ${batchId} sent to configured target${result.pending ? " (queued)" : ""}`,
       );
     } else if (!this.failedTargets.has(target.sessionKey)) {
       remember(this.failedTargets, target.sessionKey);
       console.error(
-        `[imajin-ws] wake report to ${target.sessionKey} FAILED (${result.reason ?? "unknown"}) — further failures for this session are not logged`,
+        "[imajin-ws] wake report to configured target FAILED — further failures for this target are not logged",
       );
     }
   }
