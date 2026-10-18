@@ -6,6 +6,7 @@ import type { NotificationFrame } from "./ws-service.js";
 
 // The wake path's CLI ping is irrelevant here; keep it from spawning anything.
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
+vi.mock("./wake-session-metadata.js", () => ({ readWakeSessionTokens: vi.fn(async () => 0) }));
 
 const WORKER = "agent:main:warp-events";
 const DM = "agent:main:telegram:direct:1";
@@ -15,6 +16,7 @@ const SETTLE_MS = 1_000;
 const CONFIG: WsNotificationsConfig = {
   injectScopes: ["warp.run.completed"],
   targetSession: WORKER,
+  sessionPerWake: false,
   wakeSettleMs: SETTLE_MS,
   wakeCoalesceMs: SETTLE_MS,
   hookToken: "test-hook-token-do-not-log",
@@ -176,15 +178,15 @@ describe("wsNotifications.reportTo (#47)", () => {
     dispose();
   });
 
-  it("forwards nothing — and registers no hook — when reportTo is empty or omitted", async () => {
+  it("forwards nothing but still monitors wake outcomes when reportTo is empty or omitted", async () => {
     const gw = mockGateway();
     const empty = await wake({ ...CONFIG, reportTo: [] });
-    expect(empty.onAgentEnd).toBeUndefined();
+    expect(empty.onAgentEnd).toBeTypeOf("function");
     empty.dispose();
 
     const { reportTo: _omit, ...omitted } = CONFIG;
     const none = createNotificationInjector(makeApi(), omitted);
-    expect(none.onAgentEnd).toBeUndefined();
+    expect(none.onAgentEnd).toBeTypeOf("function");
     none.dispose();
 
     expect(gw.reports()).toHaveLength(0);

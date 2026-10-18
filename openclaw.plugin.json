@@ -251,11 +251,40 @@
           },
           "targetSession": {
             "type": "string",
-            "description": "Session key to inject notifications into"
+            "default": "agent:main:warp-events",
+            "description": "Base session key for Warp wakes. Fresh per-batch sessions are derived by default; fixed-session injection requires sessionPerWake=false without template tokens."
           },
           "wakeSessionKey": {
             "type": "string",
-            "description": "Session key to wake with a real agent turn via the Gateway's POST /hooks/agent (#18). Defaults to targetSession."
+            "description": "Wake session base/template via POST /hooks/agent. Defaults to targetSession (agent:main:warp-events when both are omitted). {batchId} and {runId} expand to hashes, not raw IDs; otherwise sessionPerWake=true appends a deterministic batch hash. Permit the derived prefix in hooks.allowedSessionKeyPrefixes."
+          },
+          "sessionPerWake": {
+            "type": "boolean",
+            "default": true,
+            "description": "Use a fresh session per coalesced batch. False preserves fixed-key reuse only when wakeSessionKey has no {batchId}/{runId} tokens. Reused sessions rotate before injection when their size is unknown or the token reserve would exceed maxSessionTokens."
+          },
+          "maxSessionTokens": {
+            "type": "number",
+            "default": 50000,
+            "minimum": 1,
+            "maximum": 50000,
+            "description": "Reuse guard threshold and final-size alert limit, default/ceiling 50000 tokens. Reserves 24000 tokens before reuse; unknown size rotates. Not a hook-body model cap: configure per-model contextTokens/maxTokens in the host for single-turn limits."
+          },
+          "wakeTimeoutMs": {
+            "type": "number",
+            "default": 900000,
+            "minimum": 1,
+            "maximum": 3600000,
+            "description": "Missing-completion watchdog from wake dispatch, default 900000ms (15 minutes), clamped to 1..3600000ms (60 minutes). Independent of the one-minute failure-alert budget: agent_end failures alert immediately via directSend (20000ms delivery timeout), without waiting for this watchdog. Requires directSend for human-facing alerts and plugins.entries.imajin.hooks.allowConversationAccess=true for agent_end monitoring."
+          },
+          "bridgeStatePath": {
+            "type": "string",
+            "description": "Plugin-owned continuity JSON path; defaults to stateDir/wake-bridge.json. Bounded to 32 KiB and 50 records, with at most 6 KiB injected into the wake prompt. Stores allowlisted run/issue/PR/verdict/status evidence, never a transcript. Without a resolved path continuity is in-memory only."
+          },
+          "horizonEnabled": {
+            "type": "boolean",
+            "default": false,
+            "description": "Opt in to an injected HorizonWakeAdapter (readOpenItems/writeStepEvents). Off/no-op without an adapter; registry integration remains pending #2881. The harness-side adapter owns signing, not the kernel or this local continuity file."
           },
           "wakeSettleMs": {
             "type": "number",
@@ -267,7 +296,8 @@
           },
           "wakeOwedMaxAgeMs": {
             "type": "number",
-            "description": "Age bound, in ms, for a persisted 'wake owed' marker replayed at startup (#30). A marker older than this is dropped instead of firing a stale wake \u2014 its frames already reached the agent via the durable system-event queue \u2014 and logged as expired. Default 3600000 (1h)."
+            "default": 3600000,
+            "description": "Legacy already-injected pending-wake replay age bound in ms, default 3600000 (1h). Fixed-session records marked injected:true (or legacy records without the flag) may expire because their system events remain queued. Fresh-session injected:false records are not silently age-expired."
           },
           "hookToken": {
             "description": "Bearer token for the Gateway's POST /hooks/agent, matching that Gateway's hooks.token. Accepts a plain string or a SecretRef object (#20), resolved once via the plugin SDK. Falls back to the IMAJIN_WAKE_HOOK_TOKEN env var when omitted or unresolvable.",
@@ -297,7 +327,7 @@
             "type": "array",
             "items": { "type": "string" },
             "default": [],
-            "description": "Session keys (e.g. agent:main:telegram:direct:<id>) the wake worker session discloses to (#47). After a wake turn completes in the wake session, its final assistant output (or 'no output' plus the run state) is forwarded once per wake batch to each key as an informational report from warp-events \u2014 not a wake. Default empty = no reports. Entries are validated at runtime rather than by this schema: a malformed or unknown session key is logged once and ignored, never a startup failure."
+            "description": "Session keys the wake worker discloses to (#47). Forwards final output (or no-output status) once per batch as an informational report, not a wake. Default empty disables reports only; agent_end size/failure monitoring remains active and requires plugins.entries.imajin.hooks.allowConversationAccess=true. Invalid targets are ignored."
           },
           "stateDir": {
             "type": "string",
@@ -305,7 +335,7 @@
           },
           "directSend": {
             "type": "object",
-            "description": "Direct channel ping via the OpenClaw CLI \u2014 deterministic, no model turn. Also the #14 fallback destination when the wake hook is disabled or unreachable.",
+            "description": "Deterministic channel delivery through the OpenClaw CLI, no model turn, with a 20-second timeout. Configure a target for completion pings and wake failure/truncation/empty-output/watchdog alerts, independently of reportTo.",
             "properties": {
               "channel": { "type": "string", "description": "Channel id, default telegram." },
               "target": { "type": "string", "description": "Chat/recipient target." },

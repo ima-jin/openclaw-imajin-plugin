@@ -25,6 +25,7 @@ const TOTAL_RETRY_WINDOW_MS =
   (HOOK_RETRY_DELAYS_MS.length + 1) * HOOK_REQUEST_TIMEOUT_MS;
 
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
+vi.mock("./wake-session-metadata.js", () => ({ readWakeSessionTokens: vi.fn(async () => 0) }));
 const execFileMock = vi.mocked(execFile);
 
 // #20: `resolveHookToken`'s SecretRef branch dynamically `import()`s these two
@@ -195,6 +196,7 @@ const HOOK_TOKEN = "test-hook-token-do-not-log";
 const CONFIG: WsNotificationsConfig = {
   injectScopes: ["warp.run.completed"],
   targetSession: SESSION,
+  sessionPerWake: false,
   wakeSettleMs: COALESCE_MS,
   wakeCoalesceMs: COALESCE_MS,
   hookToken: HOOK_TOKEN,
@@ -251,7 +253,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     void calls; // referenced by the request-shape describe block below
     dispose();
   });
@@ -267,7 +269,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
     expect(fetchMock).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     dispose();
   });
 
@@ -286,7 +288,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1); // one wake hook call for all three
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // one wake hook call for all three
     const body = JSON.parse(calls[0][1].body);
     expect(String(body.message)).toContain("warp.run.completed × 3");
     dispose();
@@ -302,7 +304,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
     expect(execFileMock).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     dispose();
   });
 
@@ -340,7 +342,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
       });
 
       await vi.advanceTimersByTimeAsync(COALESCE_MS);
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
       dispose();
     },
   );
@@ -434,7 +436,7 @@ describe("createNotificationInjector — wake hook request shape", () => {
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const [url, init] = calls[0];
     expect(url).toBe("http://127.0.0.1:19001/hooks/agent");
     expect(init.headers).toMatchObject({
@@ -547,11 +549,11 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(wakeFailureCalls()).toHaveLength(0); // not yet — still retrying
+    expect(wakeFailureCalls()).toHaveLength(1); // first real failure alerts immediately (#79)
 
     await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1));
     expect(wakeFailureCalls()).toHaveLength(1);
     expect(String(wakeFailureCalls()[0][1])).toContain("automatic wake failed");
     dispose();
@@ -566,12 +568,12 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
     await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1));
     expect(wakeFailureCalls()).toHaveLength(1);
     dispose();
   });
 
-  it("a retry that returns 200 clears the failure path — no Telegram fallback (#26)", async () => {
+  it("a retry that returns 200 clears the owed marker after the initial alert (#79)", async () => {
     let call = 0;
     setImpl(async () => {
       call += 1;
@@ -583,8 +585,8 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS + HOOK_RETRY_DELAYS_MS[0] + HOOK_RETRY_DELAYS_MS[1]);
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(wakeFailureCalls()).toHaveLength(0);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
+    expect(wakeFailureCalls()).toHaveLength(1);
     dispose();
   });
 
@@ -599,9 +601,9 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
     await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1));
     expect(wakeFailureCalls()).toHaveLength(1);
-    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("ECONNREFUSED"));
+    expect(console.error).toHaveBeenCalledWith(expect.stringContaining("gateway transport failure"));
     dispose();
   });
 
@@ -624,13 +626,15 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
 
     // Exactly one attempt — the retry ladder is never walked for a pending
     // outcome (#31), unlike every other failure mode above.
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(wakeFailureCalls()).toHaveLength(0);
 
     // Advancing well past the old retry window must not add further attempts.
     await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(wakeFailureCalls()).toHaveLength(0);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+    expect(wakeFailureCalls()).toHaveLength(0); // healthy work may take minutes
+    await vi.advanceTimersByTimeAsync(900_000); // missing-completion watchdog, not the admission/retry budget
+    expect(wakeFailureCalls()).toHaveLength(1); // independent completion watchdog, not a hook retry
     dispose();
   });
 
@@ -679,7 +683,7 @@ describe("createNotificationInjector — idempotency key (#18)", () => {
     await inject(frame("3"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     dispose();
   });
 
@@ -689,12 +693,12 @@ describe("createNotificationInjector — idempotency key (#18)", () => {
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const firstKey = calls[0][1].headers["Idempotency-Key"];
 
     await inject(frame("2"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     const secondKey = calls[1][1].headers["Idempotency-Key"];
 
     expect(secondKey).not.toBe(firstKey);
@@ -811,7 +815,7 @@ describe("createNotificationInjector — wsNotifications.hookToken as a SecretRe
 
     expect(resolveSecretRefValuesMock).toHaveBeenCalledTimes(1);
     expect(resolveSecretRefValuesMock.mock.calls[0][0]).toEqual([SECRET_REF]);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const [, init] = calls[0];
     expect(init.headers.Authorization).toBe(`Bearer ${SECRET_REF_RESOLVED_TOKEN}`);
     dispose();
@@ -826,11 +830,11 @@ describe("createNotificationInjector — wsNotifications.hookToken as a SecretRe
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 
     await inject(frame("2"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
 
     // Two separate wake hook calls, but the SecretRef was only resolved once.
     expect(resolveSecretRefValuesMock).toHaveBeenCalledTimes(1);
@@ -849,7 +853,7 @@ describe("createNotificationInjector — wsNotifications.hookToken as a SecretRe
       await expect(inject(frame("1"))).resolves.toBeUndefined();
       await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
-      expect(fetchMock).toHaveBeenCalledTimes(1);
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
       const [, init] = calls[0];
       expect(init.headers.Authorization).toBe("Bearer env-fallback-after-secretref-failure");
       expect(allLoggedText()).toContain("SecretRef failed to resolve");
@@ -1240,7 +1244,7 @@ describe("createNotificationInjector — dedup by id across a kernel replay (#26
     expect(sendFrame).toHaveBeenCalledWith({ type: "notification_ack", id: "dup-1" });
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1); // not re-batched into a second wake
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // not re-batched into a second wake
     dispose();
   });
 });
@@ -1282,7 +1286,7 @@ describe("createNotificationInjector — persisted state across a simulated rest
     const second = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
     await second.ready;
 
-    expect(fetchMock).toHaveBeenCalledTimes(1); // replayed immediately on the "next start"
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // replayed immediately on the "next start"
     second.dispose();
   });
 
@@ -1295,7 +1299,7 @@ describe("createNotificationInjector — persisted state across a simulated rest
     await first.ready;
     await first.inject(frame("r1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS); // flush succeeds, marker cleared
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     first.dispose();
 
     fetchMock.mockClear();
@@ -1323,8 +1327,8 @@ describe("createNotificationInjector — persisted state across a simulated rest
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS + HOOK_RETRY_DELAYS_MS[0]);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(wakeFailureCalls()).toHaveLength(0);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    expect(wakeFailureCalls()).toHaveLength(1); // first failed attempt is loud even if retry succeeds
     dispose();
 
     fetchMock.mockClear();
@@ -1348,7 +1352,7 @@ describe("createNotificationInjector — persisted state across a simulated rest
     const totalRetryMs = HOOK_RETRY_DELAYS_MS.reduce((sum, d) => sum + d, 0);
     await vi.advanceTimersByTimeAsync(COALESCE_MS + totalRetryMs + 1_000);
 
-    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1));
     expect(wakeFailureCalls()).toHaveLength(1); // Telegram fallback fired
     dispose();
 
@@ -1357,7 +1361,7 @@ describe("createNotificationInjector — persisted state across a simulated rest
     const restarted = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
     await restarted.ready;
 
-    expect(fetchMock).toHaveBeenCalledTimes(1); // marker retained -> replayed on the next start
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // marker retained -> replayed on the next start
     restarted.dispose();
   });
 });
@@ -1412,12 +1416,12 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
     expect(fetchMock).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(SETTLE_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1); // leading wake
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // leading wake
     expect(calls[0][1].headers["Idempotency-Key"]).toMatch(/:leading$/);
 
     // Nothing else arrives — the trailing window must not produce a second wake.
     await vi.advanceTimersByTimeAsync(TRAILING_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     dispose();
   });
 
@@ -1428,7 +1432,7 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
     await inject(frame("2", "Warp run 2 SUCCEEDED")); // joins the leading batch (still within settle)
     await vi.advanceTimersByTimeAsync(SETTLE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const leadingMessage = String(JSON.parse(calls[0][1].body).message);
     expect(leadingMessage).toContain("× 2");
     expect(leadingMessage).toContain("Warp run 1 SUCCEEDED");
@@ -1439,7 +1443,7 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
     await inject(frame("4", "Warp run 4 SUCCEEDED"));
     await vi.advanceTimersByTimeAsync(TRAILING_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2); // exactly leading + one trailing wake
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2)); // exactly leading + one trailing wake
     expect(calls[1][1].headers["Idempotency-Key"]).toMatch(/:trailing$/);
     const trailingMessage = String(JSON.parse(calls[1][1].body).message);
     expect(trailingMessage).toContain("× 2");
@@ -1456,20 +1460,20 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(SETTLE_MS); // leading wake #1
     await vi.advanceTimersByTimeAsync(TRAILING_MS); // trailing window closes with nothing pending
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const firstKey = calls[0][1].headers["Idempotency-Key"];
 
     await inject(frame("2")); // scope is idle again — a brand-new leading window
     await vi.advanceTimersByTimeAsync(SETTLE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     const secondKey = calls[1][1].headers["Idempotency-Key"];
     expect(secondKey).toMatch(/:leading$/);
     expect(secondKey).not.toBe(firstKey); // fresh windowStart
 
     // And it too must not produce a stray trailing wake on its own.
     await vi.advanceTimersByTimeAsync(TRAILING_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
     dispose();
   });
 
@@ -1481,7 +1485,7 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
     await inject(f); // kernel replay of the same id, still inside the settle window
     await vi.advanceTimersByTimeAsync(SETTLE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const message = String(JSON.parse(calls[0][1].body).message);
     expect(message).toContain("× 1"); // the duplicate must not be counted twice
     dispose();
@@ -1492,14 +1496,14 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(SETTLE_MS); // leading wake fires, trailing window opens
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 
     const f2 = frame("2");
     await inject(f2);
     await inject(f2); // replay during the trailing window
     await vi.advanceTimersByTimeAsync(TRAILING_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(2); // leading + exactly one trailing wake
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2)); // leading + exactly one trailing wake
     const trailingMessage = String(JSON.parse(calls[1][1].body).message);
     expect(trailingMessage).toContain("× 1");
     dispose();
@@ -1518,13 +1522,13 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
     await vi.advanceTimersByTimeAsync(CUSTOM_SETTLE_MS - 100);
     expect(fetchMock).not.toHaveBeenCalled(); // settle hasn't elapsed yet
     await vi.advanceTimersByTimeAsync(100);
-    expect(fetchMock).toHaveBeenCalledTimes(1); // leading wake at exactly wakeSettleMs
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // leading wake at exactly wakeSettleMs
 
     await inject(frame("2"));
     await vi.advanceTimersByTimeAsync(CUSTOM_TRAILING_MS - 100);
-    expect(fetchMock).toHaveBeenCalledTimes(1); // trailing window hasn't elapsed yet
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // trailing window hasn't elapsed yet
     await vi.advanceTimersByTimeAsync(100);
-    expect(fetchMock).toHaveBeenCalledTimes(2); // trailing wake at exactly wakeCoalesceMs
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2)); // trailing wake at exactly wakeCoalesceMs
     dispose();
   });
 });
@@ -1578,14 +1582,14 @@ describe("createNotificationInjector — wake-pending classification (#31)", () 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(wakeFailureCalls()).toHaveLength(0);
     expect(console.info).toHaveBeenCalledWith(
       expect.stringContaining("wake pending for warp.run.completed: 1 notification(s), 1 frame(s) durable"),
     );
 
     await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
-    expect(fetchMock).toHaveBeenCalledTimes(1); // still just one attempt
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // still just one attempt
     dispose();
   });
 
@@ -1596,11 +1600,11 @@ describe("createNotificationInjector — wake-pending classification (#31)", () 
 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
-    expect(wakeFailureCalls()).toHaveLength(0); // still retrying
+    expect(wakeFailureCalls()).toHaveLength(1); // first real failure alerts immediately (#79)
 
     await vi.advanceTimersByTimeAsync(TOTAL_RETRY_WINDOW_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1));
     expect(wakeFailureCalls()).toHaveLength(1);
     dispose();
   });
@@ -1613,7 +1617,7 @@ describe("createNotificationInjector — wake-pending classification (#31)", () 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS + TOTAL_RETRY_WINDOW_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1));
     expect(wakeFailureCalls()).toHaveLength(1);
     dispose();
   });
@@ -1637,16 +1641,16 @@ describe("createNotificationInjector — wake-pending classification (#31)", () 
 
     await inject(frame("1")); // scope warp.run.completed
     await vi.advanceTimersByTimeAsync(COALESCE_MS); // its leading wake fires, fetch #1 in flight (unresolved)
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
 
     await inject(frameWithScope("2", "warp.run.failed")); // a second, independent completion
     await vi.advanceTimersByTimeAsync(COALESCE_MS); // its own leading wake elapses too
-    expect(fetchMock).toHaveBeenCalledTimes(1); // queued behind #1 — same session, in-flight cap 1
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // queued behind #1 — same session, in-flight cap 1
 
     resolveFirst(jsonResponse(200, { runId: "run-1" }));
     await vi.advanceTimersByTimeAsync(0); // let the queue advance to the next task
 
-    expect(fetchMock).toHaveBeenCalledTimes(2); // #2 now proceeds
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2)); // #2 now proceeds
     dispose();
   });
 });
@@ -1711,7 +1715,7 @@ describe("createNotificationInjector — owed-wake replay drains, doesn't fan ou
     // chain (fetch -> json() -> persisted delete) a tick to finish.
     await vi.advanceTimersByTimeAsync(0);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1); // one drained wake, not five
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // one drained wake, not five
     const body = JSON.parse(calls[0][1].body);
     expect(String(body.message)).toContain("warp.run.completed × 5");
     // Merged replay always fires as "leading", keyed by the earliest sinceTs.
@@ -1719,8 +1723,10 @@ describe("createNotificationInjector — owed-wake replay drains, doesn't fan ou
 
     // Consolidated to a single persisted marker (cleared on the 2xx above).
     const reloaded = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
-    await reloaded.load();
-    expect(reloaded.all()).toEqual([]);
+    await vi.waitFor(async () => {
+      await reloaded.load();
+      expect(reloaded.all()).toEqual([]);
+    });
     dispose();
   });
 
@@ -1766,15 +1772,17 @@ describe("createNotificationInjector — owed-wake replay drains, doesn't fan ou
     await vi.advanceTimersByTimeAsync(0);
 
     // Exactly one wake, deduped by frame id (5, not 10).
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     const body = JSON.parse(calls[0][1].body);
     expect(String(body.message)).toContain("warp.run.completed × 5");
     expect(calls[0][1].headers["Idempotency-Key"]).toBe(`imajin-wake:${mergedKey}`);
 
     // Fully consolidated and cleared by the 2xx above — nothing left owed.
     const reloaded = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
-    await reloaded.load();
-    expect(reloaded.all()).toEqual([]);
+    await vi.waitFor(async () => {
+      await reloaded.load();
+      expect(reloaded.all()).toEqual([]);
+    });
     dispose();
   });
 
@@ -1805,8 +1813,10 @@ describe("createNotificationInjector — owed-wake replay drains, doesn't fan ou
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining("injected only"));
 
     const reloaded = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
-    await reloaded.load();
-    expect(reloaded.all()).toEqual([]); // cleared — nothing left to replay on a further restart
+    await vi.waitFor(async () => {
+      await reloaded.load();
+      expect(reloaded.all()).toEqual([]);
+    }); // cleared — nothing left to replay on a further restart
     dispose();
   });
 
@@ -1842,7 +1852,7 @@ describe("createNotificationInjector — owed-wake replay drains, doesn't fan ou
     });
     await ready;
 
-    expect(fetchMock).toHaveBeenCalledTimes(1); // only the fresh scope woke
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // only the fresh scope woke
     const body = JSON.parse(calls[0][1].body);
     expect(String(body.message)).toContain("warp.run.failed");
     dispose();
@@ -1894,7 +1904,7 @@ describe("createNotificationInjector — wake-pending marker survives a restart 
     await inject(frame("1"));
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
     expect(wakeFailureCalls()).toHaveLength(0); // pending, not a failure
     dispose();
 
@@ -1903,7 +1913,7 @@ describe("createNotificationInjector — wake-pending marker survives a restart 
     const restarted = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
     await restarted.ready;
 
-    expect(fetchMock).toHaveBeenCalledTimes(1); // marker retained -> replayed on the next start
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1)); // marker retained -> replayed on the next start
     // Same as above: let the replay's 2xx flush finish persisting the delete
     // before tearing down and reading the file again.
     await vi.advanceTimersByTimeAsync(0);

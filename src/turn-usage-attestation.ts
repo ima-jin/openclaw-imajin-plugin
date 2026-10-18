@@ -59,6 +59,7 @@ export interface AgentTokenUsage {
   cacheRead?: number;
   cacheWrite?: number;
   totalTokens?: number;
+  contextUsage?: { state: "available"; promptTokens: number; totalTokens: number } | { state: "unavailable" };
 }
 
 export interface AgentTurnCost {
