@@ -1,6 +1,7 @@
 import type { AgentEndEvent } from "./turn-usage-attestation.js";
 import { compactWakeEndEvent, extractWakeBatchId } from "./wake-report.js";
 import { randomUUID } from "node:crypto";
+import { WAKE_LOOKUP_TOOLS, wakeReadOnlyLookup } from "./wake-read-only.js";
 
 export const DEFAULT_WAKE_DECISION_MODEL = "anthropic/claude-opus-5-5";
 const WORKER_TOOLS = new Set(["message", "sessions_spawn", "sessions_send", "session_status"]);
@@ -10,6 +11,16 @@ const POSTING_TOOLS = new Set(["message", "imajin_wake_report"]);
 export interface WakeHookContext {
   sessionKey?: string;
   runId?: string;
+}
+
+export interface WakeSubjectPolicy {
+  hasPr?: boolean;
+  failedRun?: boolean;
+}
+
+interface WakeDecisionOptions {
+  wakeReadOnlyLookups?: boolean;
+  githubCliPath?: string;
 }
 interface WakeToolPolicy {
   block?: boolean;
@@ -36,6 +47,7 @@ interface DecisionWake {
   delegations: number;
   disclosed: boolean;
   copyRequested: boolean;
+  lookupAllowed: boolean;
 }
 
 export interface SettledWake {
@@ -57,15 +69,26 @@ export class WakeDecisionRouter {
     readonly model: string,
     private readonly reportTo: readonly string[],
     private readonly childAdded: (parent: string, child: string, runId: string | undefined, batchId: string) => void,
+    private readonly options: WakeDecisionOptions = {},
   ) {}
 
-  track(sessionKey: string, batchId = sessionKey): void {
+  track(sessionKey: string, batchId = sessionKey, subject: WakeSubjectPolicy = {}): void {
     if (this.wakes.has(batchId)) return;
     if (this.wakes.size >= 100) this.untrack(this.wakes.keys().next().value!);
     this.wakes.set(batchId, {
       batchId, sessionKey, children: new Set(), failed: false, delegations: 0, disclosed: false, copyRequested: false,
+      lookupAllowed: this.options.wakeReadOnlyLookups === true && (subject.hasPr === false || subject.failedRun === true),
     });
     if (!this.roots.has(sessionKey)) this.roots.set(sessionKey, batchId);
+  }
+
+  private coordinatorTool(event: WakeToolEvent, wake: DecisionWake): WakeToolPolicy | undefined {
+    if (WORKER_TOOLS.has(event.toolName)) return;
+    if (wake.lookupAllowed) {
+      const params = wakeReadOnlyLookup(event, this.options.githubCliPath ?? "/usr/bin/gh");
+      if (params) return { params };
+    }
+    return { block: true, blockReason: `Wake review/approve/merge/enqueue/dispatch actions must run in a sessions_spawn subagent on ${this.model}. Only explicitly enabled, eligible read-only lookups may run here.` };
   }
 
   private delegateDecision(event: WakeToolEvent, wake: DecisionWake): WakeToolPolicy {
@@ -140,15 +163,15 @@ export class WakeDecisionRouter {
         ? "Call imajin_wake_report with outcome=completed or blocked and concrete evidence before ending; it sends a real channel message to every configured disclosure target. Subagents do not have the normal message tool."
         : reporting;
       return { appendSystemContext: [
-        "This is delegated Warp decision work. Review/merge/enqueue/dispatch here, using live state before acting.",
+        "This is delegated Warp decision work. Review/approve/merge/enqueue/dispatch here, using live state before acting.",
         childReporting,
         "Do not poll CI or mergeable in a loop: use one bounded `gh pr checks <n> --watch` call, or report blocked with CI pending; the next wake picks it up.",
         "An optional main-session copy uses sessions_send with timeoutSeconds 0, once only. After disclosure, do not acknowledge inter-session replies, including ANNOUNCE_SKIP.",
       ].join("\n") };
     }
     return {
-      toolsAllow: [...WORKER_TOOLS],
-      appendSystemContext: `Warp wake coordinator: delegate review, merge, enqueue and dispatch work with sessions_spawn, runtime=subagent, model=${this.model}. Pass the entire live-state preamble and relevant horizon/bridge evidence in the task. Do not perform decision work yourself. ${reporting} An optional main-session copy uses sessions_send with timeoutSeconds 0, once only. After disclosure, do not acknowledge inter-session replies, including ANNOUNCE_SKIP.`,
+      toolsAllow: [...WORKER_TOOLS, ...(wake.lookupAllowed ? WAKE_LOOKUP_TOOLS : [])],
+      appendSystemContext: `Warp wake coordinator (option c): delegate review, approve, merge, enqueue and dispatch work with sessions_spawn, runtime=subagent, model=${this.model}. Pass the entire live-state preamble and relevant horizon/bridge evidence in the task. Never approve or merge yourself, regardless of lookup settings. Read-only lookups allowed for this batch: ${wake.lookupAllowed}. ${reporting} An optional main-session copy uses sessions_send with timeoutSeconds 0, once only. After disclosure, do not acknowledge inter-session replies, including ANNOUNCE_SKIP.`,
     };
   }
 
@@ -176,9 +199,7 @@ export class WakeDecisionRouter {
     if (event.toolName === "sessions_spawn") {
       return this.delegateDecision(event, wake);
     }
-    if (ctx.sessionKey === wake.sessionKey && !WORKER_TOOLS.has(event.toolName)) {
-      return { block: true, blockReason: `Wake decision actions must run in a sessions_spawn subagent on ${this.model}.` };
-    }
+    if (ctx.sessionKey === wake.sessionKey) return this.coordinatorTool(event, wake);
   }
 
   onSubagentSpawned(

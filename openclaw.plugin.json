@@ -158,6 +158,10 @@
       "help": "Explicit disclosure session keys, also used for optional #47 informational copies. Empty/unset uses the configured directSend channel/target for required disclosure. If neither destination exists, startup warns once and silent-ending checks are disabled. Invalid keys are logged once and ignored.",
       "placeholder": "agent:main:telegram:direct:8321865723"
     },
+    "wsNotifications.wakeReadOnlyLookups": {
+      "label": "Allow Eligible Wake Read-Only Lookups",
+      "help": "Default false: option c, coordinate only. Explicit true allows only allowlisted read operations for no-known-PR or all-FAILED batches. Never allows the coordinator to review, approve, merge, enqueue or dispatch; use a decisionModel subagent."
+    },
     "wsNotifications.wakeOwedMaxAgeMs": {
       "label": "Owed Wake Max Age (ms)",
       "help": "Age bound for a persisted 'wake owed' marker replayed at startup (#30). A marker older than this is dropped \u2014 already durably injected \u2014 instead of firing a stale wake. Default 3600000 (1h)."
@@ -286,7 +290,12 @@
             "type": "string",
             "default": "anthropic/claude-opus-5-5",
             "minLength": 1,
-            "description": "Model pinned on sessions_spawn subagents for review/merge/enqueue/dispatch. Coordinator tools are restricted to delegation, reporting and session status."
+            "description": "Model pinned on sessions_spawn subagents for review/approve/merge/enqueue/dispatch. Coordinator decision writes are always blocked, regardless of wakeReadOnlyLookups."
+          },
+          "wakeReadOnlyLookups": {
+            "type": "boolean",
+            "default": false,
+            "description": "Option c: wake models coordinate only by default. Explicit true allows only allowlisted read-only lookups for batches with no known PR or all runs FAILED. Successful open-PR or unavailable-PR batches remain delegation-only. Never permits coordinator review/approve/merge/enqueue/dispatch actions; these require a decisionModel subagent."
           },
           "githubCliPath": {
             "type": "string",

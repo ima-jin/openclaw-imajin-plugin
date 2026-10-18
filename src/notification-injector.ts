@@ -71,6 +71,8 @@ export interface WsNotificationsConfig {
   model?: string;
   /** Model pinned on decision subagents; default anthropic/claude-opus-5-5. */
   decisionModel?: string;
+  /** Default false; opt-in allowlisted reads only for no-PR or all-FAILED batches. Never decision writes. */
+  wakeReadOnlyLookups?: boolean;
   /** Absolute authenticated GitHub CLI path; default /usr/bin/gh, never PATH lookup. */
   githubCliPath?: string;
   /** Missing-completion watchdog; default 15 minutes, clamped to 1ms..60 minutes. */
@@ -386,6 +388,11 @@ function deriveWakeState(nf: NotificationFrame, dataState: string | undefined): 
 
 function isFailureState(state: string): boolean {
   return FAILURE_STATE_RE.test(state);
+}
+
+function isFailedWakeFrame(frame: NotificationFrame): boolean {
+  const state = deriveWakeState(frame, extractWakeRunData(frame).state);
+  return state === "FAILED" || (state === "UNKNOWN" && frame.scope === "warp.run.failed");
 }
 
 /** Per-run `{ runId, state, title }` for a wake batch — what a #47 report names. */
@@ -927,6 +934,7 @@ export function createNotificationInjector(
     (parent, child, runId, batchId) => {
       if (!guards.aliasSession(parent, child, runId, batchId)) void guards.stop(batchId, "decision child could not be supervised");
     },
+    { wakeReadOnlyLookups: wsNotifications?.wakeReadOnlyLookups, githubCliPath: wsNotifications?.githubCliPath },
   );
   const runtimeHooks = {
     before_agent_run: (event: unknown, ctx: WakeHookContext = {}) => decisionRouter.beforeAgentRun(event, ctx),
@@ -1236,7 +1244,9 @@ export function createNotificationInjector(
       wakeReporter?.untrack(idempotencyKey);
       return;
     }
-    decisionRouter.track(sessionKey, idempotencyKey);
+    decisionRouter.track(sessionKey, idempotencyKey, {
+      hasPr: liveState.subjects.length > 0, failedRun: frames.every(isFailedWakeFrame),
+    });
     const result = await postWakeHookWithRetries({
       gatewayPort,
       hooksPath,

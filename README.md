@@ -66,6 +66,7 @@ In `openclaw.json`:
   - **`wsNotifications.maxWakeTokens`** — per-session context ceiling, default `80000`; applies independently to the wake and every decision child; never adds usage across turns or sessions
   - **`wsNotifications.model`** — optional coordinator model; omitted uses the host's configured wake-agent model
   - **`wsNotifications.decisionModel`** — decision subagent model, default `anthropic/claude-opus-5-5`; review/merge/enqueue/dispatch tools run only in pinned subagents, not the coordinator
+  - **`wsNotifications.wakeReadOnlyLookups`** — defaults to `false` (option c: coordinate only); explicit `true` enables allowlisted reads only when no PR is known or every run in the batch is FAILED. It never permits coordinator review, approve, merge, enqueue or dispatch.
   - **`wsNotifications.githubCliPath`** — trusted absolute GitHub CLI path for live PR reads; default `/usr/bin/gh`; set the installed absolute path (e.g. `/opt/homebrew/bin/gh` on macOS), never a PATH-resolved command
   - **`wsNotifications.wakeTimeoutMs`** — completion watchdog; default `900000` (15 minutes), clamped to `1..3600000`ms, independent of `reportTo`
   - **`wsNotifications.bridgeStatePath`** — bounded continuity file; default `<stateDir>/wake-bridge.json` (32 KiB, 50 records, 6 KiB prompt contribution)
@@ -976,6 +977,7 @@ config and this plugin's config:
             "sessionPerWake": true,
             "maxWakeTokens": 80000,
             "decisionModel": "anthropic/claude-opus-5-5",
+            "wakeReadOnlyLookups": false,
             "reportTo": ["agent:main:telegram:direct:8321865723"],
             "directSend": { "channel": "telegram", "target": "8321865723" },
             "hookToken": { "source": "store", "provider": "default", "id": "OPENCLAW_HOOKS_TOKEN" }
@@ -1051,7 +1053,7 @@ disclosure and are not re-reviewed. Mixed batches retain open or unavailable
 subjects; lookup failures are explicitly unavailable, never assumed merged.
 
 The coordinator's tools are restricted to `sessions_spawn`, `sessions_send`, `message` and
-`session_status`. Review/merge/enqueue/dispatch work is delegated through
+`session_status`. Review/approve/merge/enqueue/dispatch work is delegated through
 `sessions_spawn` with `runtime: "subagent"` and the configured `decisionModel`;
 the plugin overrides attempted model substitutions. The host must allow that
 model and the spawn tool. Missing permission/model availability is a blocker,
@@ -1061,6 +1063,28 @@ correlate children before their first model call, because the host can emit
 `subagent_spawned` after a child has already started. A resolved decision model
 that differs from the configured model is stopped and alerted, not accepted
 as a cheaper fallback.
+
+**Coordinator authority — option c (Ryan, 2026-10-18 11:08).** The wake
+model never approves or merges. `before_tool_call` denies direct review,
+approve, merge, enqueue and dispatch tools/actions, including shell commands
+and typed plugin actions; this is not only prompt guidance. An open-PR wake
+must use a `sessions_spawn` subagent pinned to `decisionModel` for that work.
+
+`wsNotifications.wakeReadOnlyLookups` defaults to **false**, so the default is
+delegation/reporting only for every wake. Explicit **true** allows a small
+read-only tool/action allowlist only for **no-known-PR** wakes or batches in
+which **every run is FAILED**. A mixed batch containing a successful open PR
+does not gain lookup permission because another run failed. A known PR whose
+live lookup failed is not treated as “no PR.” The switch never enables
+decision writes, even for FAILED runs.
+
+Eligible opted-in reads are local `read`, `imajin_status`, Warp
+`get_run`/`get_transcript`/`list_runs`, process `poll`/`log`, and narrowly
+validated `gh pr/run/issue` read commands. GitHub commands are rewritten to
+the trusted `githubCliPath` and accept only allowlisted verbs/flags and simple
+arguments: arbitrary executables, shell syntax, API mutations, jq/templates,
+and environment overrides are refused. Tool visibility and the runtime
+tool-call gate use the same eligibility; unknown tools fail closed.
 
 Three identical tool calls (same tool and recursively key-sorted args) with
 unchanged output stop the wake, including interleaved polls. Result comparison
