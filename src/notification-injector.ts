@@ -219,7 +219,10 @@ export const HOOK_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 45_000];
 function wakeDisclosureTargets(targets: ReportTarget[], directSend: DirectSendConfig | undefined, agentId: string): ReportTarget[] {
   if (targets.length) return targets;
   const target = directSend?.target?.trim();
-  if (!target) return [];
+  if (!target) {
+    console.warn("[imajin-ws] no reportTo or directSend disclosure destination; silent-ending check disabled");
+    return [];
+  }
   const channel = directSend?.channel?.trim() || "telegram";
   return [{ agentId, sessionKey: `agent:${agentId}:${channel}:direct:${target}` }];
 }
@@ -825,9 +828,6 @@ export function createNotificationInjector(
   // (invalid keys log once); no reporter at all when nothing valid is left.
   const reportTargets = parseReportTo(wsNotifications?.reportTo, wakeSessionKey);
   const disclosureTargets = wakeDisclosureTargets(reportTargets, wsNotifications?.directSend, hookAgentId);
-  if (!disclosureTargets.length) {
-    console.warn("[imajin-ws] no reportTo or directSend disclosure destination; silent-ending check disabled");
-  }
   const deliverWakeReport: WakeReportDeliver = async (target, message, idempotencyKey) => {
     await hookTokenReady;
     if (!hookToken) {
