@@ -155,8 +155,12 @@
     },
     "wsNotifications.reportTo": {
       "label": "Wake Report Sessions",
-      "help": "Session keys (e.g. agent:main:telegram:direct:<id>) the wake worker session discloses to (#47). After a wake turn completes in the wake session, its final assistant output \u2014 or 'no output' plus the Warp run state \u2014 is forwarded once per wake batch to each key, wrapped as an informational report from warp-events (not a wake). Default empty = no reports. Invalid keys are logged once and ignored.",
+      "help": "Explicit disclosure session keys, also pinning optional coordinator sessions_send copies to exact resolved keys. Copies are informational, timeoutSeconds=0; agentId/label addressing and other keys are blocked. Empty/unset uses the existing directSend disclosure fallback. Without either destination, startup warns once and silent-ending checks are disabled. Invalid keys are logged once and ignored.",
       "placeholder": "agent:main:telegram:direct:8321865723"
+    },
+    "wsNotifications.wakeReadOnlyLookups": {
+      "label": "Allow Eligible Wake Read-Only Lookups",
+      "help": "Default false: option c, coordinate only. Explicit true allows only allowlisted read operations for no-known-PR or all-FAILED batches. Never allows the coordinator to review, approve, merge, enqueue or dispatch; use a decisionModel subagent."
     },
     "wsNotifications.wakeOwedMaxAgeMs": {
       "label": "Owed Wake Max Age (ms)",
@@ -269,13 +273,13 @@
             "default": 50000,
             "minimum": 1,
             "maximum": 50000,
-            "description": "Reuse guard threshold and final-size alert limit, default/ceiling 50000 tokens. Reserves 24000 tokens before reuse; unknown size rotates. Not a hook-body model cap: configure per-model contextTokens/maxTokens in the host for single-turn limits."
+            "description": "Reuse guard threshold, default/ceiling 50000 tokens. Reserves 24000 tokens before reuse; unknown size rotates. maxWakeTokens separately caps each wake/child session's current context."
           },
           "maxWakeTokens": {
             "type": "integer",
             "default": 80000,
             "minimum": 1,
-            "description": "Cumulative per-wake token ceiling, including decision subagents. Crossings stop tool work, abort the wake and children, and alert through directSend. Independent of maxSessionTokens context sizing."
+            "description": "Per-session context ceiling, default 80000, independently for the wake and each decision child. Measures the latest call's input+cacheRead+cacheWrite+output, never cumulative billed usage or sums across sessions. Crossings stop tool work, abort the wake and children, and alert through directSend."
           },
           "model": {
             "type": "string",
@@ -286,7 +290,12 @@
             "type": "string",
             "default": "anthropic/claude-opus-5-5",
             "minLength": 1,
-            "description": "Model pinned on sessions_spawn subagents for review/merge/enqueue/dispatch. Coordinator tools are restricted to delegation, reporting and session status."
+            "description": "Model pinned on sessions_spawn subagents for review/approve/merge/enqueue/dispatch. Coordinator decision writes are always blocked, regardless of wakeReadOnlyLookups."
+          },
+          "wakeReadOnlyLookups": {
+            "type": "boolean",
+            "default": false,
+            "description": "Option c: wake models coordinate only by default. Explicit true allows only allowlisted read-only lookups for batches with no known PR or all runs FAILED. Successful open-PR or unavailable-PR batches remain delegation-only. Never permits coordinator review/approve/merge/enqueue/dispatch actions; these require a decisionModel subagent."
           },
           "githubCliPath": {
             "type": "string",
@@ -351,7 +360,7 @@
             "type": "array",
             "items": { "type": "string" },
             "default": [],
-            "description": "Session keys the wake worker discloses to (#47). Forwards final output (or no-output status) once per batch as an informational report, not a wake. Default empty disables reports only; agent_end size/failure monitoring remains active and requires plugins.entries.imajin.hooks.allowConversationAccess=true. Invalid targets are ignored."
+            "description": "Explicit disclosure session keys, plus optional #47 informational reports. Coordinator sessions_send copies require an exact resolved disclosure key, carry the informational envelope and timeoutSeconds=0, and reject agentId/label or other keys; use sessions_spawn on decisionModel for work. Empty/unset uses the existing directSend.channel/target disclosure fallback. Without either destination, startup warns once and silent-ending checks are skipped; other guards remain active. Requires plugins.entries.imajin.hooks.allowConversationAccess=true. Invalid targets are ignored."
           },
           "stateDir": {
             "type": "string",

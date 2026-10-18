@@ -5,16 +5,18 @@ const SESSION = "agent:main:wake:batch";
 const CTX = { sessionKey: SESSION, runId: "runner" };
 const TARGET = { sessionKey: "agent:main:telegram:direct:123" };
 
-function setup(options: Partial<WakeGuardOptions> = {}, uniqueSession = true, knownDuplicate = false) {
+function setup(options: Partial<WakeGuardOptions> = {}, uniqueSession = true) {
   const alert = vi.fn(async (_batch: WakeGuardAlert, _reason: string) => {});
   const abort = vi.fn(async () => {});
   const guards = new WakeGuards({ alert, abort, reportTo: [TARGET], ...options });
-  guards.track({ batchId: "batch", sessionKey: SESSION, subject: "Review issue #82", uniqueSession, knownDuplicate });
+  guards.track({ batchId: "batch", sessionKey: SESSION, subject: "Review issue #82", uniqueSession });
   return { guards, alert, abort };
 }
 
 function tool(params: Record<string, unknown> = { query: "state" }, result: unknown = { state: "pending" }): WakeGuardToolEvent {
-  return { toolName: "poll", params, result };
+  return { toolName: "poll", params, result: {
+    content: [{ type: "text", text: typeof result === "string" ? result : JSON.stringify(result) }],
+  } };
 }
 
 function message(tokens: number, id?: string) {
@@ -31,7 +33,7 @@ describe("wake repetition guards", () => {
   it("stops immediately after the third completed identical result with normalized keys", async () => {
     const { guards, alert, abort } = setup();
     await guards.afterToolCall(tool({ a: 1, b: { y: 2, z: 3 } }, { a: 1, b: 2 }), CTX);
-    await guards.afterToolCall(tool({ b: { z: 3, y: 2 }, a: 1 }, { b: 2, a: 1 }), CTX);
+    await guards.afterToolCall(tool({ b: { z: 3, y: 2 }, a: 1 }, { a: 1, b: 2 }), CTX);
     expect(alert).not.toHaveBeenCalled();
     expect(guards.beforeToolCall(tool(), CTX)).toBeUndefined();
     await guards.afterToolCall(tool({ a: 1, b: { y: 2, z: 3 } }, { a: 1, b: 2 }), CTX);
@@ -79,7 +81,7 @@ describe("wake repetition guards", () => {
     guards.bindRunner("batch", "runner");
     guards.onBeforeMessageWrite({ message: message(10) }, { sessionKey: SESSION });
     await guards.onLlmOutput({}, CTX);
-    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ batchId: "batch", tokens: 10 }), "wake token budget exceeded");
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ batchId: "batch", tokens: 10 }), "wake per-session context ceiling exceeded");
     expect(alert).toHaveBeenCalledTimes(1);
   });
 
@@ -114,13 +116,13 @@ describe("wake repetition guards", () => {
     const cyclic: Record<string, unknown> = {};
     cyclic.self = cyclic;
     for (let index = 0; index < 3; index++) {
-      await guards.afterToolCall(tool({}, cyclic), CTX);
+      await guards.afterToolCall(tool(cyclic, "unchanged"), CTX);
     }
     expect(alert).not.toHaveBeenCalled();
   });
 });
 
-describe("per-wake usage budget", () => {
+describe("per-session context ceiling", () => {
   it("uses 80,000 tokens independently of a larger context window", async () => {
     const { guards, alert } = setup();
     expect(DEFAULT_WAKE_TOKEN_BUDGET).toBe(80_000);
@@ -130,16 +132,18 @@ describe("per-wake usage budget", () => {
     } }, { sessionKey: SESSION });
     expect(guards.beforeToolCall(tool(), CTX)).toMatchObject({ block: true });
     await guards.onLlmOutput({ usage: { input: 80_000 } }, CTX);
-    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ tokens: 80_001 }), "wake token budget exceeded");
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ tokens: 80_001 }), "wake per-session context ceiling exceeded");
   });
 
-  it("sums every assistant message live and does not consume user or tool usage", async () => {
+  it("replaces the current assistant context and does not consume user or tool usage", async () => {
     const { guards, alert } = setup({ maxTokens: 99 });
     guards.onBeforeMessageWrite({ message: { role: "user", usage: { input: 1_000 } } }, CTX);
     guards.onBeforeMessageWrite({ message: { role: "toolResult", usage: { input: 1_000 } } }, CTX);
     guards.onBeforeMessageWrite({ message: message(40, "one") }, CTX);
     expect(alert).not.toHaveBeenCalled();
     guards.onBeforeMessageWrite({ message: message(60, "two") }, CTX);
+    expect(guards.beforeToolCall(tool(), CTX)).toBeUndefined();
+    guards.onBeforeMessageWrite({ message: message(100, "three") }, CTX);
     expect(guards.beforeToolCall(tool(), CTX)).toMatchObject({ block: true });
     await guards.onLlmOutput({}, CTX);
     expect(alert).toHaveBeenCalledTimes(1);
@@ -158,24 +162,26 @@ describe("per-wake usage budget", () => {
     expect(alert).not.toHaveBeenCalled();
   });
 
-  it("aggregate fallback never double-adds live messages or duplicate llm_output", async () => {
+  it("uses only the last assistant call when observing attempt-end usage", async () => {
     const { guards, alert } = setup({ maxTokens: 99 });
     guards.onBeforeMessageWrite({ message: message(40, "one") }, CTX);
-    await guards.onLlmOutput({ usage: { input: 70 }, lastAssistant: { id: "attempt" } }, CTX);
-    await guards.onLlmOutput({ usage: { input: 70 }, lastAssistant: { id: "attempt" } }, CTX);
+    await guards.onLlmOutput({ usage: { input: 700_000 }, lastAssistant: message(70, "attempt") }, CTX);
+    await guards.onLlmOutput({ usage: { input: 700_000 }, lastAssistant: message(70, "attempt") }, CTX);
     guards.onBeforeMessageWrite({ message: message(40, "two") }, CTX);
     expect(alert).not.toHaveBeenCalled();
-    await guards.onLlmOutput({ usage: { input: 100 }, lastAssistant: { id: "attempt" } }, CTX);
-    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ tokens: 100 }), "wake token budget exceeded");
+    await guards.onLlmOutput({ usage: { input: 700_000 }, lastAssistant: message(100, "oversized") }, CTX);
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ tokens: 100 }), "wake per-session context ceiling exceeded");
   });
 
-  it("allows exactly the budget and accumulates distinct retry attempts without live messages", async () => {
+  it("allows exactly the ceiling and does not accumulate retry attempts", async () => {
     const { guards, alert } = setup({ maxTokens: 100 });
-    await guards.onLlmOutput({ usage: { input: 60 }, lastAssistant: { id: "attempt-one" } }, CTX);
-    await guards.onLlmOutput({ usage: { input: 40 }, lastAssistant: { id: "attempt-two" } }, CTX);
+    await guards.onLlmOutput({ lastAssistant: message(60, "attempt-one") }, CTX);
+    await guards.onLlmOutput({ lastAssistant: message(40, "attempt-two") }, CTX);
     expect(alert).not.toHaveBeenCalled();
-    await guards.onLlmOutput({ usage: { input: 1 }, lastAssistant: { id: "attempt-three" } }, CTX);
-    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ tokens: 101 }), "wake token budget exceeded");
+    await guards.onLlmOutput({ lastAssistant: message(100, "attempt-three") }, CTX);
+    expect(alert).not.toHaveBeenCalled();
+    await guards.onLlmOutput({ lastAssistant: message(101, "attempt-four") }, CTX);
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ tokens: 101 }), "wake per-session context ceiling exceeded");
   });
 
   it("hashes large string results fully instead of bypassing repetition", async () => {
@@ -216,9 +222,11 @@ describe("per-wake usage budget", () => {
     expect(alert).toHaveBeenCalledWith(expect.any(Object), "wake ended without reporting");
   });
 
-  it("uses aggregate-only usage when no live messages are available", async () => {
+  it("does not treat aggregate-only usage as a context measurement", async () => {
     const { guards, alert } = setup({ maxTokens: 9 });
     await guards.onLlmOutput({ usage: { input: 3, output: 2, cacheRead: 3, cacheWrite: 2 } }, CTX);
+    expect(alert).not.toHaveBeenCalled();
+    await guards.onLlmOutput({ lastAssistant: message(10) }, CTX);
     expect(alert).toHaveBeenCalledTimes(1);
   });
 
@@ -308,19 +316,25 @@ describe("verified channel disclosure and silent endings", () => {
     expect(alert).toHaveBeenCalledTimes(1);
   });
 
-  it("suppresses silent alerts only for explicitly known duplicates", async () => {
-    const { guards, alert } = setup({}, true, true);
+  it("does not exempt a fresh NO_REPLY turn as a known duplicate", async () => {
+    const { guards, alert } = setup();
     await guards.end({ messages: [{ role: "assistant", content: "NO_REPLY" }] }, CTX);
-    expect(alert).not.toHaveBeenCalled();
+    expect(alert).toHaveBeenCalledTimes(1);
   });
 
-  it("known duplicates do not suppress real loop guards", async () => {
-    const { guards, alert } = setup({}, true, true);
+  it("keeps repetition guards active for every admitted wake", async () => {
+    const { guards, alert } = setup();
     for (let index = 0; index < 3; index++) await guards.afterToolCall(tool(), CTX);
     expect(alert).toHaveBeenCalledTimes(1);
   });
 
-  it.each([{ reportTo: [] }, { reportTo: [{ sessionKey: "agent:reporter:fixture" }] }])("fails loud without routable reportTo %j", async ({ reportTo }) => {
+  it("skips silent-ending checks without any required destinations", async () => {
+    const { guards, alert } = setup({ reportTo: [] });
+    await guards.end({ messages: [] }, CTX);
+    expect(alert).not.toHaveBeenCalled();
+  });
+
+  it.each([{ reportTo: [{ sessionKey: "agent:reporter:fixture" }] }])("fails loud for an explicitly unroutable reportTo %j", async ({ reportTo }) => {
     const { guards, alert } = setup({ reportTo });
     await send(guards);
     await guards.end({ messages: [] }, CTX);
@@ -343,7 +357,7 @@ describe("exact correlation, child ownership and bounded lifecycle", () => {
   it("unique session captures actual runner independently of gateway admission UUID", async () => {
     const { guards, alert, abort } = setup({ maxTokens: 9 });
     guards.bindRun("batch", "admission");
-    await guards.onLlmOutput({ usage: { input: 10 } }, CTX);
+    await guards.onLlmOutput({ lastAssistant: message(10) }, CTX);
     expect(alert).toHaveBeenCalledTimes(1);
     expect(abort).toHaveBeenCalledWith(SESSION, "runner");
     expect(guards.beforeToolCall(tool(), { ...CTX, runId: "unrelated" })).toBeUndefined();
@@ -352,37 +366,40 @@ describe("exact correlation, child ownership and bounded lifecycle", () => {
   it("fixed sessions need a proven runner and ignore uncorrelated live writes", async () => {
     const { guards, alert } = setup({ maxTokens: 9 }, false);
     guards.onBeforeMessageWrite({ message: message(10) }, CTX);
-    await guards.onLlmOutput({ usage: { input: 10 } }, CTX);
+    await guards.onLlmOutput({ lastAssistant: message(10) }, CTX);
     expect(alert).not.toHaveBeenCalled();
     guards.bindRun("batch", "admission");
-    await guards.onLlmOutput({ usage: { input: 10 } }, CTX);
+    await guards.onLlmOutput({ lastAssistant: message(10) }, CTX);
     expect(alert).not.toHaveBeenCalled();
     guards.bindRunner("batch", "runner");
-    await guards.onLlmOutput({ usage: { input: 10 } }, CTX);
+    await guards.onLlmOutput({ lastAssistant: message(10) }, CTX);
     expect(alert).toHaveBeenCalledTimes(1);
   });
 
   it("ignores missing/unknown sessions, missing runs and conflicting event/context", async () => {
     const { guards, alert } = setup({ maxTokens: 0.5 });
-    await guards.onLlmOutput({ usage: { input: 10 } }, { runId: "runner" });
-    await guards.onLlmOutput({ usage: { input: 10 } }, { sessionKey: "nonwake", runId: "runner" });
-    await guards.onLlmOutput({ usage: { input: 10 } }, { sessionKey: SESSION });
+    await guards.onLlmOutput({ lastAssistant: message(10) }, { runId: "runner" });
+    await guards.onLlmOutput({ lastAssistant: message(10) }, { sessionKey: "nonwake", runId: "runner" });
+    await guards.onLlmOutput({ lastAssistant: message(10) }, { sessionKey: SESSION });
     await guards.onLlmOutput({ sessionKey: "other", usage: { input: 10 } }, CTX);
     await guards.onLlmOutput({ runId: "other", usage: { input: 10 } }, CTX);
     await guards.end({ messages: [] }, { sessionKey: "nonwake", runId: "runner" });
     expect(alert).not.toHaveBeenCalled();
   });
 
-  it("shares root and child budgets, blocks both and aborts all owned runs", async () => {
+  it("checks root and child independently, but aborts both when either is oversized", async () => {
     const { guards, alert, abort } = setup({ maxTokens: 99 });
     guards.bindRunner("batch", "runner");
     const child = { sessionKey: "agent:main:subagent:child", runId: "child-runner" };
     expect(guards.aliasSession(SESSION, child.sessionKey, child.runId)).toBe(true);
     guards.onBeforeMessageWrite({ message: message(40, "same-id") }, CTX);
     guards.onBeforeMessageWrite({ message: message(60, "same-id") }, child);
+    await guards.onLlmOutput({}, child);
+    expect(alert).not.toHaveBeenCalled();
+    guards.onBeforeMessageWrite({ message: message(100, "oversized") }, child);
     expect(guards.beforeToolCall(tool(), child)).toMatchObject({ block: true });
     await guards.onLlmOutput({}, child);
-    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ tokens: 100 }), "wake token budget exceeded");
+    expect(alert).toHaveBeenCalledWith(expect.objectContaining({ tokens: 100 }), "wake per-session context ceiling exceeded");
     expect(abort).toHaveBeenCalledWith(SESSION, "runner");
     expect(abort).toHaveBeenCalledWith(child.sessionKey, "child-runner");
     expect(guards.beforeToolCall(tool(), CTX)).toMatchObject({ block: true });
@@ -402,7 +419,7 @@ describe("exact correlation, child ownership and bounded lifecycle", () => {
     const abort = vi.fn(async () => { throw new Error("private abort error"); });
     const { guards } = setup({ alert, abort, maxTokens: 0.5 });
     guards.onBeforeMessageWrite({ message: message(1) }, CTX);
-    await expect(guards.end({ messages: [] }, CTX)).resolves.toBe("wake token budget exceeded");
+    await expect(guards.end({ messages: [] }, CTX)).resolves.toBe("wake per-session context ceiling exceeded");
     expect(alert).toHaveBeenCalledTimes(1);
     expect(abort).toHaveBeenCalledTimes(1);
   });

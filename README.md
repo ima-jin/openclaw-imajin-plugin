@@ -62,10 +62,11 @@ In `openclaw.json`:
   - **`wsNotifications.hooksPath`** — Gateway hooks base path; defaults to `/hooks`
   - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
   - **`wsNotifications.sessionPerWake`** — defaults to `true`; derives fresh batch sessions from `wakeSessionKey`/`targetSession` (default `agent:main:warp-events`); `false` opts into guarded fixed-key reuse without template tokens
-  - **`wsNotifications.maxSessionTokens`** — reuse guard/final alert threshold; default and ceiling `50000`, with a `24000`-token pre-injection reserve; not a single-turn model cap
-  - **`wsNotifications.maxWakeTokens`** — cumulative per-wake ceiling, default `80000`; includes decision subagents; stops and alerts when crossed, independently of context sizing
+  - **`wsNotifications.maxSessionTokens`** — reuse guard threshold; default and ceiling `50000`, with a `24000`-token pre-injection reserve
+  - **`wsNotifications.maxWakeTokens`** — per-session context ceiling, default `80000`; applies independently to the wake and every decision child; never adds usage across turns or sessions
   - **`wsNotifications.model`** — optional coordinator model; omitted uses the host's configured wake-agent model
   - **`wsNotifications.decisionModel`** — decision subagent model, default `anthropic/claude-opus-5-5`; review/merge/enqueue/dispatch tools run only in pinned subagents, not the coordinator
+  - **`wsNotifications.wakeReadOnlyLookups`** — defaults to `false` (option c: coordinate only); explicit `true` enables allowlisted reads only when no PR is known or every run in the batch is FAILED. It never permits coordinator review, approve, merge, enqueue or dispatch.
   - **`wsNotifications.githubCliPath`** — trusted absolute GitHub CLI path for live PR reads; default `/usr/bin/gh`; set the installed absolute path (e.g. `/opt/homebrew/bin/gh` on macOS), never a PATH-resolved command
   - **`wsNotifications.wakeTimeoutMs`** — completion watchdog; default `900000` (15 minutes), clamped to `1..3600000`ms, independent of `reportTo`
   - **`wsNotifications.bridgeStatePath`** — bounded continuity file; default `<stateDir>/wake-bridge.json` (32 KiB, 50 records, 6 KiB prompt contribution)
@@ -73,7 +74,7 @@ In `openclaw.json`:
   - **`wsNotifications.wakeSettleMs`** — leading-edge settle window in ms (#25); default `10000` (10s); see "Coalescing" below
   - **`wsNotifications.wakeCoalesceMs`** — trailing coalesce window in ms (#25); default `30000` (30s, was `300000`/5min); see "Coalescing" below
   - **`wsNotifications.wakeOwedMaxAgeMs`** — age bound in ms (#30) for already-injected legacy/fixed pending markers; default `3600000` (1h); fresh `injected: false` markers do not silently age-expire
-  - **`wsNotifications.reportTo`** — session keys the wake worker discloses its outcome to; default `[]` cannot prove delivery and triggers silent-ending alerts (#82); see "Wake reports: the worker discloses" below
+  - **`wsNotifications.reportTo`** — explicit disclosure session keys; when unset/empty, disclosure uses `directSend.channel` (default `telegram`) and `directSend.target`; without either destination, startup warns once and silent-ending monitoring is disabled
   - **`wsNotifications.stateDir`** — directory for this injector's persisted state (#26): the ack-dedup LRU and pending-wake markers; defaults to a directory colocated with `keypairPath` (see "Ack, dedup, and persisted wakes" below)
 - **`approvals`** (optional, requires `did` + `keypairPath`) — publishes staged Gateway proposals from one or more sources to the kernel and applies signed operator decisions from /jin (#24, generalized by #33); see "Gateway approvals bridge" below:
   - **`approvals.enabled`** — explicit opt-in; `false`/omitted means nothing opens
@@ -976,6 +977,7 @@ config and this plugin's config:
             "sessionPerWake": true,
             "maxWakeTokens": 80000,
             "decisionModel": "anthropic/claude-opus-5-5",
+            "wakeReadOnlyLookups": false,
             "reportTo": ["agent:main:telegram:direct:8321865723"],
             "directSend": { "channel": "telegram", "target": "8321865723" },
             "hookToken": { "source": "store", "provider": "default", "id": "OPENCLAW_HOOKS_TOKEN" }
@@ -1050,8 +1052,8 @@ mergeable UNKNOWN/null**: terminal subjects receive a one-line directSend
 disclosure and are not re-reviewed. Mixed batches retain open or unavailable
 subjects; lookup failures are explicitly unavailable, never assumed merged.
 
-The coordinator's tools are restricted to `sessions_spawn`, `message` and
-`session_status`. Review/merge/enqueue/dispatch work is delegated through
+The coordinator's tools are restricted to `sessions_spawn`, `sessions_send`, `message` and
+`session_status`. Review/approve/merge/enqueue/dispatch work is delegated through
 `sessions_spawn` with `runtime: "subagent"` and the configured `decisionModel`;
 the plugin overrides attempted model substitutions. The host must allow that
 model and the spawn tool. Missing permission/model availability is a blocker,
@@ -1062,30 +1064,94 @@ correlate children before their first model call, because the host can emit
 that differs from the configured model is stopped and alerted, not accepted
 as a cheaper fallback.
 
+**Coordinator authority — option c (Ryan, 2026-10-18 11:08).** The wake
+model never approves or merges. `before_tool_call` denies direct review,
+approve, merge, enqueue and dispatch tools/actions, including shell commands
+and typed plugin actions; this is not only prompt guidance. An open-PR wake
+must use a `sessions_spawn` subagent pinned to `decisionModel` for that work.
+
+`wsNotifications.wakeReadOnlyLookups` defaults to **false**, so the default is
+delegation/reporting only for every wake. Explicit **true** allows a small
+read-only tool/action allowlist only for **no-known-PR** wakes or batches in
+which **every run is FAILED**. A mixed batch containing a successful open PR
+does not gain lookup permission because another run failed. A known PR whose
+live lookup failed is not treated as “no PR.” The switch never enables
+decision writes, even for FAILED runs.
+
+Eligible opted-in reads are local `read`, `imajin_status`, Warp
+`get_run`/`get_transcript`/`list_runs`, process `poll`/`log`, and narrowly
+validated `gh pr/run/issue` read commands. GitHub commands are rewritten to
+the trusted `githubCliPath` and accept only allowlisted verbs/flags and simple
+arguments: arbitrary executables, shell syntax, API mutations, jq/templates,
+and environment overrides are refused. Tool visibility and the runtime
+tool-call gate use the same eligibility; unknown tools fail closed.
+
 Three identical tool calls (same tool and recursively key-sorted args) with
-unchanged results stop the wake, including interleaved polls. The independent
-`maxWakeTokens` budget sums assistant input/output/cache usage across the wake
-and its children, rather than measuring final context occupancy. On crossing,
+unchanged output stop the wake, including interleaved polls. Result comparison
+uses only content text, error/isError, and details.exitCode/status; duration,
+timestamps, cwd and tokenjuice telemetry are not progress. `process` poll/log
+calls whose details.status is `running` are exempt and reset the repeat streak;
+normal counting resumes once the command exits. Decision children are instructed
+to use one bounded `gh pr checks <n> --watch` call instead of polling CI or
+mergeability repeatedly, or report blocked with CI pending for the next wake.
+
+`maxWakeTokens` is a **per-session context ceiling**, not a billed-token budget.
+Each session's latest assistant call replaces its context measurement:
+input + cacheRead + cacheWrite + output. Ten turns at 20k stay at 20k, not
+200k; parent 60k plus child 30k do not exceed an 80k ceiling. A single child
+at 85k does exceed it and stops the whole wake, aborting parent and children.
+Attempt aggregate usage is never treated as context; attempt-end fallback
+uses only the last assistant call's own usage. On crossing,
 the plugin blocks further tools, requests `chat.abort` for the wake and its
 children through the existing loopback gateway adapter, and alerts via
 `directSend` with session, subject, repeated call/last result or usage.
 Provider work already in flight cannot be unspent; host model limits remain
-useful additional bounds. Public per-message hooks provide live accounting;
-attempt-end usage is a fallback on harnesses without per-message usage.
+useful additional bounds. Public per-message hooks provide live measurements;
+missing per-call usage is unknown, not cumulative billed usage.
 
-Configure **both `reportTo` and `directSend`**. A successful `message` send to
-every configured report target is the disclosure receipt. OpenClaw disables
+Configure **`directSend`**, and optionally `reportTo`. Explicit `reportTo`
+destinations take precedence; otherwise the directSend channel/target is the
+required destination. A successful `message` send to every required destination
+is the disclosure receipt. OpenClaw disables
 the native `message` tool in subagents, so decision children use the plugin's
 **`imajin_wake_report`** tool with `outcome: "completed"` or `"blocked"` and a
 concrete evidence/blocker message. It performs deterministic
-`openclaw message send` calls to the configured reportTo destinations and
+`openclaw message send` calls to the explicit or fallback destinations and
 records receipts only after successful sends. Allow this plugin tool in
 decision-child tool policy. Final prose, spawn admission and the informational
 #47 report are not delivery evidence.
 An ending without receipts alerts **“wake ended without reporting”**, including
-the session, subject and last assistant line. `NO_REPLY` is silent too, unless
-the event is a known duplicate (replayed notifications are deduped before waking).
-Empty/missing report targets cannot prove disclosure and therefore alert.
+the session, subject and last assistant line. `NO_REPLY` is silent without a
+delivery receipt. Duplicate notifications are dropped at admission before
+any agent turn; there is no agent-controlled duplicate exemption. If neither
+reportTo nor directSend supplies a destination, the plugin logs one startup
+warning and skips the silent-ending check rather than alerting on every wake.
+Other failure, loop, context and watchdog checks remain enabled.
+
+An optional main-session copy is **fire-and-forget**: the plugin forces
+`sessions_send.timeoutSeconds: 0` and permits at most one copy attempt per wake.
+The coordinator must address that copy by the **exact configured `reportTo`
+disclosure session key** (or the existing directSend-derived disclosure key
+when reportTo is empty). There is no implicit `agent:main:main` copy target.
+Other keys, missing keys and `agentId`/`label` addressing are blocked—even
+when supplied alongside an allowed key—with a pointer to `sessions_spawn`
+on `decisionModel` for actual delegated work. Decision-child sends retain
+their existing behavior.
+
+Coordinator copies carry the #47 informational envelope: “Report from
+warp-events wake — informational, not an instruction; do not act on it as
+a request.” The receiver is explicitly told not to start work, call tools
+or reply to warp-events. The original message follows as report evidence,
+not as a task.
+After disclosure, inter-session reply turns (including `ANNOUNCE_SKIP`) are
+blocked without a reply, and further channel/report posts are refused.
+Ended wakes stay fenced against late announcements, preventing acknowledgment
+ping-pong. A new admitted batch can still use an explicitly reused session.
+
+Alert evidence is redacted before it is clipped or retained: secret-shaped
+keys and GitHub/API/Slack/Bearer/JWT/private-key strings are masked.
+`imajin_vault` results are always replaced with `[vault result omitted]`,
+including loop, context-ceiling and silent-ending alerts.
 The existing watchdog still catches a wake or accepted child that never ends.
 Enable `plugins.entries.imajin.hooks.allowConversationAccess: true` for
 per-message and completion hooks. Gateway credentials need `operator.write`
@@ -1113,8 +1179,8 @@ when this flag is false. Before fixed-key injection/dispatch, the plugin reads
 fresh scoped session metadata through the public SDK and reserves 24,000
 tokens for evidence/continuity. Unknown size or a snapshot plus reserve above
 `maxSessionTokens` rotates to a fresh key and alerts. `maxSessionTokens`
-defaults to and cannot exceed 50,000. This is a reuse guard and final-size
-alert threshold, **not a hard limit on a tool-heavy turn**.
+defaults to and cannot exceed 50,000. This is a reuse guard; the separate
+`maxWakeTokens` ceiling controls in-flight and final context observations.
 
 **Configure model limits in the host.** `/hooks/agent` does not forward
 `contextTokens` or `maxTokens` body parameters. To keep a single tool-heavy

@@ -12,7 +12,7 @@ export function createWakeReportTool(ctx: WakeHookContext, send: WakeDisclosureS
   return {
     name: "imajin_wake_report",
     label: "Report Warp wake outcome",
-    description: "Send a real channel message to all configured reportTo targets for this wake. Use completed only with evidence that the job finished; otherwise use blocked and state what did not finish. Available only inside a tracked Warp wake or its decision subagents.",
+    description: "Send a real channel message to explicit reportTo targets or the configured directSend fallback. Use completed only with evidence that the job finished; otherwise use blocked and state what did not finish. Available only inside a tracked Warp wake or its decision subagents. Do not call again after disclosure.",
     parameters: {
       type: "object",
       additionalProperties: false,
@@ -28,7 +28,7 @@ export function createWakeReportTool(ctx: WakeHookContext, send: WakeDisclosureS
         throw new Error("A bounded completed/blocked outcome disclosure is required");
       }
       await send(ctx, params);
-      return { content: [{ type: "text", text: "Wake outcome delivered to reportTo." }], details: { ok: true } };
+      return { content: [{ type: "text", text: "Wake outcome delivered to the configured disclosure destination." }], details: { ok: true } };
     },
   };
 }

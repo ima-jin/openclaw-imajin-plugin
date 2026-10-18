@@ -14,7 +14,7 @@ function setup(model = DEFAULT_WAKE_DECISION_MODEL) {
 describe("wake decision delegation", () => {
   it("narrows only coordinator tools and preserves unrelated session policy", () => {
     const { router } = setup();
-    expect(router.beforePromptBuild({}, parent)).toMatchObject({ toolsAllow: ["message", "sessions_spawn", "session_status"] });
+    expect(router.beforePromptBuild({}, parent)).toMatchObject({ toolsAllow: ["message", "sessions_spawn", "sessions_send", "session_status"] });
     expect(router.beforePromptBuild({}, parent)?.appendSystemContext).toContain("anthropic/claude-opus-5-5");
     expect(router.beforePromptBuild({}, {})).toBeUndefined();
     expect(router.beforeToolCall({ toolName: "exec", params: { command: "gh pr merge" } }, parent)?.block).toBe(true);

@@ -18,7 +18,7 @@ import { readWakeSessionTokens } from "./wake-session-metadata.js";
 import { buildWakeOutcome } from "./wake-outcome.js";
 import { createLoopbackSessionGateway } from "./session-command-gateway.js";
 import { DEFAULT_WAKE_DECISION_MODEL, WakeDecisionRouter, type WakeHookContext, type WakeToolEvent } from "./wake-decision.js";
-import { WakeGuards } from "./wake-guards.js";
+import { DEFAULT_WAKE_TOKEN_BUDGET, WakeGuards } from "./wake-guards.js";
 import { buildWakeLiveState, type WakeLiveState } from "./wake-live-state.js";
 import type { WakeDisclosureSender } from "./wake-report-tool.js";
 import {
@@ -30,7 +30,7 @@ import {
 } from "./wake-supervisor.js";
 import type { NotificationFrame } from "./ws-service.js";
 import { isReachFrame, isReachScope, type ReachEventsConfig } from "./reach-events.js";
-import { sendDirectChannelMessage } from "./channel-notify.js";
+import { sendDirectChannelMessage, type DirectSendConfig } from "./channel-notify.js";
 import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
 import { findFinalAssistantMessage, type AgentEndEvent } from "./turn-usage-attestation.js";
 import {
@@ -41,6 +41,7 @@ import {
   WakeReporter,
   type WakeReportDeliver,
   type WakeRunSummary,
+  type ReportTarget,
 } from "./wake-report.js";
 import {
   DEDUP_STATE_FILENAME,
@@ -64,12 +65,14 @@ export interface WsNotificationsConfig {
   sessionPerWake?: boolean;
   /** Context threshold for rotation; default and ceiling 50000 tokens. */
   maxSessionTokens?: number;
-  /** Cumulative per-wake usage (including delegated work); default 80000. */
+  /** Per-session current context ceiling for the wake and each child; default 80000. */
   maxWakeTokens?: number;
   /** Coordinator model; omitted keeps the host's configured wake-agent model. */
   model?: string;
   /** Model pinned on decision subagents; default anthropic/claude-opus-5-5. */
   decisionModel?: string;
+  /** Default false; opt-in allowlisted reads only for no-PR or all-FAILED batches. Never decision writes. */
+  wakeReadOnlyLookups?: boolean;
   /** Absolute authenticated GitHub CLI path; default /usr/bin/gh, never PATH lookup. */
   githubCliPath?: string;
   /** Missing-completion watchdog; default 15 minutes, clamped to 1ms..60 minutes. */
@@ -144,7 +147,8 @@ export interface WsNotificationsConfig {
    * discloses to (#47). After a wake turn completes in the wake session, its
    * final assistant output — or "no output" plus the run state — is forwarded
    * once per wake batch to each of these sessions, wrapped as a report from
-   * warp-events (informational, not a wake). Default empty = no reports.
+   * warp-events (informational, not a wake). Empty disables those #47 copies;
+   * required disclosure instead falls back to directSend.channel/target.
    * Invalid entries are logged once and ignored.
    */
   reportTo?: string[];
@@ -213,6 +217,22 @@ export const HOOK_TOKEN_ENV = "IMAJIN_WAKE_HOOK_TOKEN";
 // gateway hiccup (5xx, timeout, connection refused) gets these 3 retries
 // before falling back to the Telegram ping. Exported for unit tests.
 export const HOOK_RETRY_DELAYS_MS: readonly number[] = [5_000, 15_000, 45_000];
+/** Fallback is a receipt destination only, not another #47 model/report turn. */
+function wakeDisclosureTargets(targets: ReportTarget[], directSend: DirectSendConfig | undefined, agentId: string): ReportTarget[] {
+  if (targets.length) return targets;
+  const target = directSend?.target?.trim();
+  if (!target) {
+    console.warn("[imajin-ws] no reportTo or directSend disclosure destination; silent-ending check disabled");
+    return [];
+  }
+  const channel = directSend?.channel?.trim() || "telegram";
+  return [{ agentId, sessionKey: `agent:${agentId}:${channel}:direct:${target}` }];
+}
+
+function wakeContextCeiling(value: unknown): number {
+  if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
+  return DEFAULT_WAKE_TOKEN_BUDGET;
+}
 
 function truncate(value: string, max: number): string {
   return value.length <= max ? value : `${value.slice(0, max)}\n…[truncated ${value.length - max} chars]`;
@@ -368,6 +388,11 @@ function deriveWakeState(nf: NotificationFrame, dataState: string | undefined): 
 
 function isFailureState(state: string): boolean {
   return FAILURE_STATE_RE.test(state);
+}
+
+function isFailedWakeFrame(frame: NotificationFrame): boolean {
+  const state = deriveWakeState(frame, extractWakeRunData(frame).state);
+  return state === "FAILED" || (state === "UNKNOWN" && frame.scope === "warp.run.failed");
 }
 
 /** Per-run `{ runId, state, title }` for a wake batch — what a #47 report names. */
@@ -780,6 +805,7 @@ export function createNotificationInjector(
   const configuredMax = wsNotifications?.maxSessionTokens;
   const maxSessionTokens = typeof configuredMax === "number" && Number.isFinite(configuredMax)
     ? Math.max(1, Math.min(DEFAULT_WAKE_MAX_TOKENS, configuredMax)) : DEFAULT_WAKE_MAX_TOKENS;
+  const maxWakeTokens = wakeContextCeiling(wsNotifications?.maxWakeTokens);
   const readTokens = deps.sessionTokens ?? ((sessionKey: string) => readWakeSessionTokens(api, sessionKey));
   const lifecycle = new AbortController();
   let reusedSessionKey = wakeSessionKey;
@@ -808,6 +834,7 @@ export function createNotificationInjector(
   // #47: the wake worker discloses to `reportTo` sessions. Validated once here
   // (invalid keys log once); no reporter at all when nothing valid is left.
   const reportTargets = parseReportTo(wsNotifications?.reportTo, wakeSessionKey);
+  const disclosureTargets = wakeDisclosureTargets(reportTargets, wsNotifications?.directSend, hookAgentId);
   const deliverWakeReport: WakeReportDeliver = async (target, message, idempotencyKey) => {
     await hookTokenReady;
     if (!hookToken) {
@@ -853,7 +880,8 @@ export function createNotificationInjector(
   const horizon = wsNotifications?.horizonEnabled === true ? deps.horizon : undefined;
   const supervisor = new WakeSupervisor({
     timeoutMs: wsNotifications?.wakeTimeoutMs,
-    maxTokens: maxSessionTokens,
+    maxTokens: maxWakeTokens,
+    checkEmptyReply: disclosureTargets.length > 0,
     sessionTokens: readTokens,
     alert: async (batch, reason) => {
       const frames: NotificationFrame[] = batch.runs.map((r) => ({
@@ -885,11 +913,12 @@ export function createNotificationInjector(
     clientDisplayName: "Imajin wake guards",
   });
   const guards = new WakeGuards({
-    maxTokens: wsNotifications?.maxWakeTokens,
-    reportTo: reportTargets,
+    maxTokens: maxWakeTokens,
+    reportTo: disclosureTargets,
     alert: async (batch, reason) => {
       const evidence = [
         reason, `subject: ${batch.subject.slice(0, 500)}`, `tokens: ${batch.tokens}`,
+        batch.contextSessionKey ? `context session: ${batch.contextSessionKey}` : "",
         batch.lastTool ? `call: ${batch.lastTool.toolName} ${batch.lastTool.args.slice(0, 600)}\nlast result: ${batch.lastTool.result.slice(0, 600)}` : "",
         `last assistant: ${batch.lastAssistantLine?.slice(0, 500) ?? "(none)"}`,
       ].filter(Boolean).join("\n");
@@ -901,12 +930,14 @@ export function createNotificationInjector(
   });
   const decisionRouter = new WakeDecisionRouter(
     wsNotifications?.decisionModel?.trim() || DEFAULT_WAKE_DECISION_MODEL,
-    reportTargets.map((target) => target.sessionKey),
+    disclosureTargets.map((target) => target.sessionKey),
     (parent, child, runId, batchId) => {
       if (!guards.aliasSession(parent, child, runId, batchId)) void guards.stop(batchId, "decision child could not be supervised");
     },
+    { wakeReadOnlyLookups: wsNotifications?.wakeReadOnlyLookups, githubCliPath: wsNotifications?.githubCliPath },
   );
   const runtimeHooks = {
+    before_agent_run: (event: unknown, ctx: WakeHookContext = {}) => decisionRouter.beforeAgentRun(event, ctx),
     before_prompt_build: (event: unknown, ctx: WakeHookContext = {}) => decisionRouter.beforePromptBuild(event, ctx),
     before_model_resolve: (event: { prompt?: string }, ctx: WakeHookContext = {}) => decisionRouter.beforeModelResolve(event, ctx),
     before_tool_call: (event: WakeToolEvent, ctx: WakeHookContext = {}) =>
@@ -914,6 +945,8 @@ export function createNotificationInjector(
     after_tool_call: async (event: WakeToolEvent, ctx: WakeHookContext = {}) => {
       decisionRouter.afterToolCall(event, ctx);
       await guards.afterToolCall(event, ctx);
+      const batchId = decisionRouter.batch(ctx);
+      if (batchId && guards.hasReported(batchId)) decisionRouter.markDisclosed(batchId);
     },
     before_message_write: (event: any, ctx: WakeHookContext = {}) => guards.onBeforeMessageWrite(event, ctx),
     llm_output: (event: any, ctx: WakeHookContext = {}) => guards.onLlmOutput(event, ctx),
@@ -931,9 +964,10 @@ export function createNotificationInjector(
   const reportWake: WakeDisclosureSender = async (ctx, disclosure) => {
     const batchId = decisionRouter.batch(ctx);
     if (!batchId) throw new Error("No active Warp wake owns this report");
-    if (!reportTargets.length) throw new Error("No reportTo targets configured");
+    if (!disclosureTargets.length) throw new Error("No disclosure destination configured");
     if (guards.isStopped(batchId)) throw new Error("Wake already stopped; directSend guard alert owns disclosure");
-    await Promise.all(reportTargets.map(async (target) => {
+    if (guards.hasReported(batchId)) throw new Error("Wake already disclosed; no further posts");
+    await Promise.all(disclosureTargets.map(async (target) => {
       if (guards.isStopped(batchId)) throw new Error("Wake stopped before report delivery");
       const match = /^agent:[^:]+:([^:]+):(?:direct|dm|group|channel):(.+)$/.exec(target.sessionKey);
       if (!match) throw new Error("reportTo target has no channel destination");
@@ -943,6 +977,7 @@ export function createNotificationInjector(
       );
       guards.recordDisclosure(batchId, target.sessionKey);
     }));
+    decisionRouter.markDisclosed(batchId);
   };
 
   /**
@@ -1209,7 +1244,9 @@ export function createNotificationInjector(
       wakeReporter?.untrack(idempotencyKey);
       return;
     }
-    decisionRouter.track(sessionKey, idempotencyKey);
+    decisionRouter.track(sessionKey, idempotencyKey, {
+      hasPr: liveState.subjects.length > 0, failedRun: frames.every(isFailedWakeFrame),
+    });
     const result = await postWakeHookWithRetries({
       gatewayPort,
       hooksPath,
@@ -1474,7 +1511,7 @@ export function createNotificationInjector(
       if (!settled) return;
       const rootCtx = { sessionKey: settled.sessionKey, runId: settled.event.runId, batchId: settled.batchId };
       const guardReason = await guards.end(settled.event, rootCtx);
-      if (!guardReason && !extractFinalAssistantOutput(settled.event.messages)) {
+      if (disclosureTargets.length && !guardReason && !extractFinalAssistantOutput(settled.event.messages)) {
         const last = findFinalAssistantMessage(settled.event.messages);
         settled.event.messages = [
           { role: "user", content: `Wake batch ID: ${settled.batchId}` },

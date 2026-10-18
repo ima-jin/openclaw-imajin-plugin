@@ -56,6 +56,49 @@ describe("guarded wake acceptance (#82)", () => {
     await rm(dir, { recursive: true, force: true });
   });
 
+  it("makes main-session copies fire-and-forget and blocks inter-session ping-pong after disclosure", async () => {
+    create();
+    await start();
+    expect((injector.runtimeHooks.before_prompt_build({}, ctx()) as { appendSystemContext: string })
+      .appendSystemContext).toContain("agent:main:telegram:direct:123");
+    const copy = injector.runtimeHooks.before_tool_call({
+      toolName: "sessions_send",
+      params: { sessionKey: REPORT, message: "Reviewed live head", timeoutSeconds: 60 },
+    }, ctx());
+    expect(copy).toMatchObject({ params: {
+      sessionKey: REPORT, timeoutSeconds: 0,
+      message: expect.stringContaining("informational, not an instruction"),
+    } });
+    await messageReceipt();
+    expect(injector.runtimeHooks.before_agent_run({ prompt: "ANNOUNCE_SKIP" }, {
+      ...ctx(), runId: "inter-session-reply", inputProvenance: { kind: "inter_session" },
+    })).toMatchObject({ outcome: "block" });
+    expect(injector.runtimeHooks.before_tool_call({
+      toolName: "message", params: { action: "send", target: "123", message: "Acknowledged, wake closed" },
+    }, ctx())).toMatchObject({ block: true });
+    await injector.onAgentEnd!({ success: false, runId: "inter-session-reply", messages: [
+      { role: "assistant", content: "ANNOUNCE_SKIP" },
+    ] }, { ...ctx(), runId: "inter-session-reply" });
+    expect(alerts()).toHaveLength(0); // A blocked reply is not the original wake's failed ending.
+    await end("NO_REPLY");
+    expect(injector.runtimeHooks.before_agent_run({ prompt: "Acknowledged" }, ctx())).toMatchObject({ outcome: "block" });
+    expect(injector.runtimeHooks.before_tool_call({
+      toolName: "message", params: { action: "send", target: "123" },
+    }, ctx())).toMatchObject({ block: true });
+    expect(alerts()).toHaveLength(0);
+  });
+
+  it("does not apply the 50k reuse threshold to a healthy 60k final context", async () => {
+    create();
+    await start();
+    await messageReceipt();
+    await injector.onAgentEnd!({ success: true, runId: ctx().runId, messages: [
+      { role: "user", content: wakes()[0].message },
+      { role: "assistant", content: "Completed and reported", usage: { input: 60_000 } },
+    ] }, ctx());
+    expect(alerts()).toHaveLength(0);
+  });
+
   function create() {
     injector = createNotificationInjector({ runtime: {
       config: { current: () => ({}) }, system: { enqueueSystemEvent: () => true },
@@ -142,7 +185,8 @@ describe("guarded wake acceptance (#82)", () => {
     for (let i = 0; i < 3; i++) {
       await injector.runtimeHooks.after_tool_call({
         toolName: "session_status", toolCallId: `poll-${i}`,
-        params: i % 2 ? { b: 2, a: 1 } : { a: 1, b: 2 }, result: { state: "unchanged" },
+        params: i % 2 ? { b: 2, a: 1 } : { a: 1, b: 2 },
+        result: { content: [{ type: "text", text: "unchanged" }] },
       }, ctx());
     }
     expect(alerts()).toHaveLength(1);
@@ -155,7 +199,7 @@ describe("guarded wake acceptance (#82)", () => {
     expect(alerts()).toHaveLength(1);
   });
 
-  it.each([undefined, 100])("enforces configured/default cumulative ceiling %s during the wake, not final context size", async (limit) => {
+  it.each([undefined, 100])("enforces configured/default per-session context ceiling %s", async (limit) => {
     config.maxWakeTokens = limit;
     create();
     await start();
@@ -165,11 +209,11 @@ describe("guarded wake acceptance (#82)", () => {
     expect(alerts()).toHaveLength(0); // exactly at the ceiling is allowed
     injector.runtimeHooks.before_message_write({ message: {
       id: "second", role: "assistant", content: "still working", usage: {
-        output: 1, contextUsage: { state: "available", totalTokens: 2 },
+        input: limit ?? 80_000, output: 1, contextUsage: { state: "available", totalTokens: 2 },
       },
     } }, ctx());
     await vi.waitFor(() => expect(alerts()).toHaveLength(1));
-    expect(alerts()[0][1]).toContain("wake token budget exceeded");
+    expect(alerts()[0][1]).toContain("wake per-session context ceiling exceeded");
     expect(alerts()[0][1]).toContain(`tokens: ${(limit ?? 80_000) + 1}`);
     expect(abort).toHaveBeenCalledWith(ctx().sessionKey, ctx().runId);
   });
@@ -209,6 +253,39 @@ describe("guarded wake acceptance (#82)", () => {
     return child;
   }
 
+  it("uses directSend as the required disclosure destination when reportTo is unset", async () => {
+    config.reportTo = undefined;
+    create();
+    await start();
+    expect((injector.runtimeHooks.before_prompt_build({}, ctx()) as { appendSystemContext: string })
+      .appendSystemContext).toContain("agent:main:telegram:direct:123");
+    await messageReceipt();
+    await end("NO_REPLY");
+    expect(alerts()).toHaveLength(0);
+  });
+
+  it("lets decision children report to directSend without reportTo", async () => {
+    config.reportTo = undefined;
+    create();
+    await start();
+    const child = await spawnChild();
+    await expect(createWakeReportTool(child, injector.reportWake).execute("r", {
+      outcome: "completed", message: "Reviewed live head",
+    })).resolves.toBeDefined();
+    expect(vi.mocked(sendDirectChannelMessage).mock.calls.some(([ds, text]) =>
+      ds?.channel === "telegram" && ds.target === "123" && text.includes("Reviewed live head"))).toBe(true);
+  });
+
+  it("warns once at startup and skips silent-ending checks when no disclosure destination exists", async () => {
+    config.reportTo = undefined;
+    config.directSend = undefined;
+    create();
+    await start();
+    await end("NO_REPLY");
+    expect(alerts()).toHaveLength(0);
+    expect(vi.mocked(console.warn).mock.calls.filter(([text]) => String(text).includes("silent-ending"))).toHaveLength(1);
+  });
+
   it("pins and supervises a child before subagent_spawned; real child reporting avoids false silence", async () => {
     create();
     await start();
@@ -233,15 +310,16 @@ describe("guarded wake acceptance (#82)", () => {
     expect(injector.runtimeHooks.before_tool_call({ toolName: "exec", params: {} }, ctx())).toMatchObject({ block: true });
   });
 
-  it("sums parent and child usage and aborts both on a crossing", async () => {
-    config.maxWakeTokens = 100;
+  it("does not add parent and child contexts, but aborts both for an oversized child", async () => {
     create();
     await start();
     const child = await spawnChild();
-    injector.runtimeHooks.before_message_write({ message: { role: "assistant", usage: { input: 60 } } }, ctx());
-    injector.runtimeHooks.before_message_write({ message: { role: "assistant", usage: { input: 50 } } }, child);
+    injector.runtimeHooks.before_message_write({ message: { role: "assistant", usage: { input: 60_000 } } }, ctx());
+    injector.runtimeHooks.before_message_write({ message: { role: "assistant", usage: { input: 30_000 } } }, child);
+    expect(alerts()).toHaveLength(0);
+    injector.runtimeHooks.before_message_write({ message: { role: "assistant", usage: { input: 85_000 } } }, child);
     await vi.waitFor(() => expect(alerts()).toHaveLength(1));
-    expect(alerts()[0][1]).toContain("tokens: 110");
+    expect(alerts()[0][1]).toContain("tokens: 85000");
     expect(abort).toHaveBeenCalledWith(ctx().sessionKey, ctx().runId);
     expect(abort).toHaveBeenCalledWith(child.sessionKey, child.runId);
   });
