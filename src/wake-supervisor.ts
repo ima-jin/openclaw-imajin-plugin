@@ -122,6 +122,22 @@ export class WakeSupervisor {
   }
 
   async onAgentEnd(event: AgentEndEvent, ctx?: { sessionKey?: string; runId?: string }): Promise<void> {
+    const batch = this.claim(event, ctx);
+    if (!batch) return;
+    const reason = wakeFailureReason(event);
+    if (reason && !batch.alerted) {
+      batch.alerted = true;
+      await this.options.alert(batch, reason);
+    }
+    const tokens = wakeEventTokens(event);
+    console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=${tokens ?? "unavailable"} source=final-assistant limit=${this.options.maxTokens ?? DEFAULT_WAKE_MAX_TOKENS}`);
+    if (tokens !== undefined && tokens > (this.options.maxTokens ?? DEFAULT_WAKE_MAX_TOKENS) && !batch.alerted) {
+      await this.options.alert(batch, `session size ${tokens} tokens exceeds wake limit`);
+    }
+    await this.options.complete(batch, event, tokens);
+  }
+
+  private claim(event: AgentEndEvent, ctx?: { sessionKey?: string; runId?: string }): PendingWake | undefined {
     const runId = event.runId ?? ctx?.runId;
     if (runId && this.handledRuns.has(runId)) return;
     const session = (event.sessionKey ?? ctx?.sessionKey)?.toLowerCase();
@@ -142,17 +158,7 @@ export class WakeSupervisor {
       this.handledRuns.add(runId);
       if (this.handledRuns.size > 500) this.handledRuns.delete(this.handledRuns.values().next().value!);
     }
-    const reason = wakeFailureReason(event);
-    if (reason && !batch.alerted) {
-      batch.alerted = true;
-      await this.options.alert(batch, reason);
-    }
-    const tokens = wakeEventTokens(event);
-    console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=${tokens ?? "unavailable"} source=final-assistant limit=${this.options.maxTokens ?? DEFAULT_WAKE_MAX_TOKENS}`);
-    if (tokens !== undefined && tokens > (this.options.maxTokens ?? DEFAULT_WAKE_MAX_TOKENS) && !batch.alerted) {
-      await this.options.alert(batch, `session size ${tokens} tokens exceeds wake limit`);
-    }
-    await this.options.complete(batch, event, tokens);
+    return batch;
   }
 
   dispose(): void {

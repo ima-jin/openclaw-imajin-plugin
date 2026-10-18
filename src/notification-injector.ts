@@ -1120,8 +1120,9 @@ export function createNotificationInjector(
     }
 
     if (result.ok) {
+      const admittedRun = result.runId ? " runId=" + result.runId : "";
       console.log(
-        `[imajin-ws] wake admitted${result.runId ? ` runId=${result.runId}` : ""} for ${scope} ` +
+        `[imajin-ws] wake admitted${admittedRun} for ${scope} ` +
           `(${phase}, ${frames.length} notification(s) coalesced)`,
       );
       await pendingWakeStore.delete(pendingKey);
@@ -1244,7 +1245,7 @@ export function createNotificationInjector(
     }
 
     await bridge.ingest([nf]);
-    const text = buildNotificationText(nf);
+    const text = freshSessions ? "" : buildNotificationText(nf);
     let queuedVia: "system-event" | undefined;
     // Fresh wakes persist evidence locally, never accumulating a fixed gateway inbox.
     if (freshSessions) {
