@@ -487,11 +487,11 @@ async function resolveHookToken(
           "[imajin-ws] wsNotifications.hookToken is an object but not a recognized SecretRef — falling back",
         );
       }
-    } catch (err: any) {
+    } catch {
       // Never resolves to a throw: an unresolvable ref degrades to the next
       // tier (env, then none) rather than crashing the WS service (#20).
       console.warn(
-        `[imajin-ws] wsNotifications.hookToken SecretRef failed to resolve: ${err?.message ?? err} — falling back`,
+        "[imajin-ws] wsNotifications.hookToken SecretRef failed to resolve — falling back",
       );
     }
   } else if (typeof raw === "string" && raw.trim()) {
@@ -681,8 +681,8 @@ export async function postWakeHookWithRetries(
  * API it touches therefore has to be told which session to act on.
  *
  * Flow:
- * 1. Durable context injection (`enqueueNextTurnInjection` or fallback
- *    `enqueueSystemEvent`) so the event survives restarts — unchanged by #18.
+ * 1. Persist fresh-batch evidence locally before ack; fixed-mode compatibility
+ *    retains guarded `enqueueSystemEvent` injection.
  * 2. Coalesce (#25): leading-edge + trailing. The first qualifying frame in an
  *    idle window fires its own wake after a short settle (`wakeSettleMs`);
  *    anything joining before that settle elapses batches into the same
@@ -697,17 +697,17 @@ export async function postWakeHookWithRetries(
  *    `unschedulePluginSessionTurnsByTag` is gated the same bundled-only way
  *    as `scheduleSessionTurn` and cannot be used by a third-party plugin
  *    either way.
- * 3. Run a real agent turn in the owner's session via the local Gateway's
+ * 3. Run a real agent turn in a fresh batch session (or explicit fixed key) via
+ *    the local Gateway's
  *    `POST /hooks/agent` (`postWakeHook` above) instead of the bundled-only
  *    `api.session.workflow.scheduleSessionTurn` seam (#13, #17): that seam
  *    returns `undefined` for any plugin with `origin !== "bundled"`
  *    (openclaw core, `src/plugins/host-hook-scheduled-turns.ts`), so it never
  *    worked for this plugin. `/hooks/agent` is first-class, documented, and
  *    upgrade-safe (docs/automation/webhook.md).
- * 4. Outcome handling: HTTP 200 → log the admitted runId (never the token) and
- *    stop. Anything else (non-200, ECONNREFUSED, timeout) → the Telegram
- *    fallback from #14 (`buildWakeFailureMessage` + `sendChannelMessage`),
- *    which remains the backstop when the hook is disabled or unreachable.
+ * 4. HTTP admission is not completion: supervise agent_end and a bounded
+ *    watchdog, update bridge outcomes, and alert via configured directSend.
+ *    Pending admission never retries; real hook failures alert before retry.
  *
  * Evidence (2026-09-05, see docs/warp-wake-chain.md for the historical trace):
  * - `runHeartbeatOnce` wakes the heartbeat lane, which is isolated+lightContext
@@ -777,8 +777,8 @@ export function createNotificationInjector(
         console.log(`[imajin-ws] wake hook token resolved from ${result.source}`);
       }
     })
-    .catch((err: any) => {
-      console.error("[imajin-ws] unexpected error resolving wsNotifications.hookToken:", err?.message ?? err);
+    .catch(() => {
+      console.error("[imajin-ws] unexpected error resolving wsNotifications.hookToken");
     });
   const hooksPath = (wsNotifications?.hooksPath?.trim() || DEFAULT_HOOKS_PATH).replace(/\/+$/, "") || DEFAULT_HOOKS_PATH;
 
@@ -1152,14 +1152,7 @@ export function createNotificationInjector(
     // The first real failed attempt already alerted, before the retry ladder.
   }
 
-  /**
-   * Fires when a scope's leading settle (`wakeSettleMs`) elapses (#25).
-   * Flushes whatever batched during the settle as the leading wake, then
-   * immediately opens the trailing phase for `wakeCoalesceMs` so any frame
-   * that arrives while the (possibly slow, retried) leading flush is still
-   * in flight joins the trailing batch rather than being lost or re-joining
-   * the batch that's already being sent.
-   */
+  /** Authoritative horizon evidence when available, otherwise bounded local continuity. */
   async function wakeContinuity(runIds: string[]): Promise<string> {
     if (!horizon) return bridge.buildPrompt();
     try {
@@ -1258,8 +1251,8 @@ export function createNotificationInjector(
           contextKey: `imajin-ws:${nf.scope}`,
         });
         queuedVia = "system-event";
-      } catch (err: any) {
-        console.error(`[imajin-ws] enqueueSystemEvent failed for ${nf.scope}:`, err?.message ?? err);
+      } catch {
+        console.error(`[imajin-ws] enqueueSystemEvent failed for ${nf.scope}`);
       }
     }
 

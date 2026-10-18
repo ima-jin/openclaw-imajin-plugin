@@ -91,13 +91,6 @@ function sameSession(a: string | undefined, b: string): boolean {
   return a?.trim().toLowerCase() === b.trim().toLowerCase();
 }
 
-function describeEntry(entry: unknown): string {
-  try {
-    return (JSON.stringify(entry) ?? String(entry)).slice(0, 80);
-  } catch {
-    return "(unserializable)";
-  }
-}
 
 /**
  * Validates `wsNotifications.reportTo`. Logs ONE warning per rejected entry
@@ -117,11 +110,11 @@ export function parseReportTo(raw: unknown, wakeSessionKey?: string): ReportTarg
     const agentId = SESSION_KEY_RE.exec(sessionKey)?.[1];
     if (!agentId) {
       console.warn(
-        `[imajin-ws] wsNotifications.reportTo: ignoring invalid session key ${describeEntry(entry)} (expected agent:<agentId>:<...>)`,
+        "[imajin-ws] wsNotifications.reportTo: ignoring invalid session key (expected agent:<agentId>:<...>)",
       );
     } else if (wakeSessionKey && sameSession(sessionKey, wakeSessionKey)) {
       console.warn(
-        `[imajin-ws] wsNotifications.reportTo: ignoring ${sessionKey} — it is the wake session itself and would re-trigger the worker`,
+        "[imajin-ws] wsNotifications.reportTo: ignoring the wake session itself (would re-trigger the worker)",
       );
     } else {
       targets.set(sessionKey.toLowerCase(), { sessionKey, agentId });
@@ -297,8 +290,8 @@ export class WakeReporter {
       }
       const report = buildWakeReport(batch, describeTurn(event));
       await Promise.all(this.opts.targets.map((target) => this.send(target, batch.batchId, report)));
-    } catch (err: unknown) {
-      console.error("[imajin-ws] wake report failed:", err instanceof Error ? err.message : String(err));
+    } catch {
+      console.error("[imajin-ws] wake report failed");
     }
   }
 
@@ -325,17 +318,17 @@ export class WakeReporter {
     let result: WakeReportDelivery;
     try {
       result = await this.opts.deliver(target, report, `imajin-wake-report:${batchId}:${target.sessionKey}`);
-    } catch (err: unknown) {
-      result = { ok: false, reason: err instanceof Error ? err.message : String(err) };
+    } catch {
+      result = { ok: false, reason: "report delivery failed" };
     }
     if (result.ok || result.pending) {
       console.log(
-        `[imajin-ws] wake report for ${batchId} → ${target.sessionKey}${result.pending ? " (queued)" : ""}`,
+        `[imajin-ws] wake report for ${batchId} sent to configured target${result.pending ? " (queued)" : ""}`,
       );
     } else if (!this.failedTargets.has(target.sessionKey)) {
       remember(this.failedTargets, target.sessionKey);
       console.error(
-        `[imajin-ws] wake report to ${target.sessionKey} FAILED (${result.reason ?? "unknown"}) — further failures for this session are not logged`,
+        "[imajin-ws] wake report to configured target FAILED — further failures for this target are not logged",
       );
     }
   }
