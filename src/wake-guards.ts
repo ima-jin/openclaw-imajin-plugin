@@ -358,15 +358,18 @@ export class WakeGuards {
     if (!match) return;
     const { pending } = match;
     const messages = event.messages ?? [];
+    let stopReason: unknown;
     for (let index = messages.length - 1; index >= 0; index--) {
       const raw = messages[index];
       const message = record(raw);
       if (message?.role !== "assistant") continue;
       pending.alert.lastAssistantLine = assistantLine(message);
+      stopReason = message.stopReason;
       break;
     }
     if (!pending.reason && !pending.batch.knownDuplicate && !this.reported(pending)) {
-      await this.trip(pending, "wake ended without reporting");
+      const suffix = stopReason === "length" ? "; stopReason=length (truncated reply)" : "";
+      await this.trip(pending, `wake ended without reporting${suffix}`);
     }
     await pending.effects;
     this.untrack(pending.batch.batchId);

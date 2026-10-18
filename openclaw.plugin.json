@@ -17,7 +17,8 @@
       "imajin_usage",
       "imajin_chat",
       "imajin_status",
-      "imajin_vault"
+      "imajin_vault",
+      "imajin_wake_report"
     ]
   },
   "uiHints": {
@@ -270,6 +271,23 @@
             "maximum": 50000,
             "description": "Reuse guard threshold and final-size alert limit, default/ceiling 50000 tokens. Reserves 24000 tokens before reuse; unknown size rotates. Not a hook-body model cap: configure per-model contextTokens/maxTokens in the host for single-turn limits."
           },
+          "maxWakeTokens": {
+            "type": "integer",
+            "default": 80000,
+            "minimum": 1,
+            "description": "Cumulative per-wake token ceiling, including decision subagents. Crossings stop tool work, abort the wake and children, and alert through directSend. Independent of maxSessionTokens context sizing."
+          },
+          "model": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Optional wake coordinator model. Omitted preserves the host wake-agent model."
+          },
+          "decisionModel": {
+            "type": "string",
+            "default": "anthropic/claude-opus-5-5",
+            "minLength": 1,
+            "description": "Model pinned on sessions_spawn subagents for review/merge/enqueue/dispatch. Coordinator tools are restricted to delegation, reporting and session status."
+          },
           "wakeTimeoutMs": {
             "type": "number",
             "default": 900000,
@@ -335,7 +353,7 @@
           },
           "directSend": {
             "type": "object",
-            "description": "Deterministic channel delivery through the OpenClaw CLI, no model turn, with a 20-second timeout. Configure a target for completion pings and wake failure/truncation/empty-output/watchdog alerts, independently of reportTo.",
+            "description": "Deterministic channel delivery through the OpenClaw CLI, no model turn, with a 20-second timeout. Configure a target for completion pings, terminal-subject disclosures and wake loop/token/silent-ending/failure/watchdog alerts. The CLI path also serves imajin_wake_report sends to reportTo destinations.",
             "properties": {
               "channel": { "type": "string", "description": "Channel id, default telegram." },
               "target": { "type": "string", "description": "Chat/recipient target." },

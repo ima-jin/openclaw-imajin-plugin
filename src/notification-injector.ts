@@ -16,6 +16,11 @@ import * as path from "node:path";
 import { WakeBridgeStore, type HorizonWakeAdapter } from "./wake-bridge.js";
 import { readWakeSessionTokens } from "./wake-session-metadata.js";
 import { buildWakeOutcome } from "./wake-outcome.js";
+import { createLoopbackSessionGateway } from "./session-command-gateway.js";
+import { DEFAULT_WAKE_DECISION_MODEL, WakeDecisionRouter, type WakeHookContext, type WakeToolEvent } from "./wake-decision.js";
+import { WakeGuards } from "./wake-guards.js";
+import { buildWakeLiveState } from "./wake-live-state.js";
+import type { WakeDisclosureSender } from "./wake-report-tool.js";
 import {
   DEFAULT_WAKE_MAX_TOKENS,
   DEFAULT_WAKE_SESSION,
@@ -27,9 +32,11 @@ import type { NotificationFrame } from "./ws-service.js";
 import { isReachFrame, isReachScope, type ReachEventsConfig } from "./reach-events.js";
 import { sendDirectChannelMessage } from "./channel-notify.js";
 import type { SecretInput } from "openclaw/plugin-sdk/secret-input-runtime";
-import type { AgentEndEvent } from "./turn-usage-attestation.js";
+import { findFinalAssistantMessage, type AgentEndEvent } from "./turn-usage-attestation.js";
 import {
   parseReportTo,
+  extractWakeBatchId,
+  extractFinalAssistantOutput,
   WAKE_REPORT_HOOK_NAME,
   WakeReporter,
   type WakeReportDeliver,
@@ -57,6 +64,12 @@ export interface WsNotificationsConfig {
   sessionPerWake?: boolean;
   /** Context threshold for rotation; default and ceiling 50000 tokens. */
   maxSessionTokens?: number;
+  /** Cumulative per-wake usage (including delegated work); default 80000. */
+  maxWakeTokens?: number;
+  /** Coordinator model; omitted keeps the host's configured wake-agent model. */
+  model?: string;
+  /** Model pinned on decision subagents; default anthropic/claude-opus-5-5. */
+  decisionModel?: string;
   /** Missing-completion watchdog; default 15 minutes, clamped to 1ms..60 minutes. */
   wakeTimeoutMs?: number;
   /** Bounded plugin-owned open-work file; default stateDir/wake-bridge.json. */
@@ -245,12 +258,12 @@ export function buildDirectMessage(nf: NotificationFrame): string {
  * reaches the human — a deterministic, no-model-in-the-loop channel message,
  * same delivery mechanism as `buildDirectMessage`'s instant ping.
  */
-export function buildWakeFailureMessage(frames: NotificationFrame[], reason: string): string {
+export function buildWakeFailureMessage(frames: NotificationFrame[], reason: string, maxChars = 900): string {
   const title =
     frames.length === 1 ? (frames[0].title ?? frames[0].scope) : `${frames.length} Warp runs`;
   return truncate(
     `⚠️ Warp run ${frames.map((f) => extractWakeRunData(f).runId ?? f.id).slice(0, 5).join(", ")}: ${reason} — automatic wake failed; ${title}`,
-    900,
+    maxChars,
   );
 }
 
@@ -544,6 +557,7 @@ async function postWakeHook(params: {
   idempotencyKey: string;
   /** Hook run label; defaults to the wake's `imajin-wake`. */
   name?: string;
+  model?: string;
 }): Promise<WakeHookResult> {
   const url = `http://127.0.0.1:${params.gatewayPort}${params.hooksPath}/agent`;
   const controller = new AbortController();
@@ -564,6 +578,7 @@ async function postWakeHook(params: {
         sessionKey: params.sessionKey,
         deliver: true,
         name: params.name ?? "imajin-wake",
+        ...(params.model ? { model: params.model } : {}),
       }),
       signal: controller.signal,
     });
@@ -731,6 +746,10 @@ export interface NotificationInjectorDeps {
   horizon?: HorizonWakeAdapter;
   /** Test seam; production uses scoped session metadata from the public SDK. */
   sessionTokens?: (sessionKey: string) => Promise<number | undefined>;
+  /** Test seam for bounded GitHub PR reads; production uses authenticated gh. */
+  liveStateLookup?: (url: string) => Promise<unknown>;
+  /** Test seam; production uses the existing authenticated loopback adapter. */
+  abortWake?: (sessionKey: string, runId?: string) => Promise<void>;
 }
 
 export function createNotificationInjector(
@@ -745,6 +764,8 @@ export function createNotificationInjector(
    * Always installed for wake supervision; also forwards optional reportTo reports.
    */
   onAgentEnd?: (event: AgentEndEvent, ctx?: { sessionKey?: string; runId?: string }) => Promise<void>;
+  runtimeHooks: Record<string, (event: any, ctx?: any) => unknown>;
+  reportWake: WakeDisclosureSender;
 } {
   const injectScopes = new Set(wsNotifications?.injectScopes ?? []);
   const targetSession = wsNotifications?.targetSession?.trim() || DEFAULT_WAKE_SESSION;
@@ -837,7 +858,8 @@ export function createNotificationInjector(
         type: "notification", id: r.runId, title: r.title, scope: batch.scope,
         body: null, createdAt: "", data: { runId: r.runId },
       }));
-      await sendChannelMessage(buildWakeFailureMessage(frames, reason)).catch(() => {
+      await sendChannelMessage(buildWakeFailureMessage(frames,
+        `session: ${batch.sessionKey}\n${reason}`, 3_600)).catch(() => {
         console.error("[imajin-ws] wake alert delivery failed; check directSend configuration");
       });
     },
@@ -856,6 +878,70 @@ export function createNotificationInjector(
       wakeReporter?.untrack(batch.batchId);
     },
   });
+  const abortGateway = createLoopbackSessionGateway({
+    getConfig: () => api?.runtime?.config?.current?.() ?? api?.config ?? {},
+    clientDisplayName: "Imajin wake guards",
+  });
+  const guards = new WakeGuards({
+    maxTokens: wsNotifications?.maxWakeTokens,
+    reportTo: reportTargets,
+    alert: async (batch, reason) => {
+      const evidence = [
+        reason, `subject: ${batch.subject.slice(0, 500)}`, `tokens: ${batch.tokens}`,
+        batch.lastTool ? `call: ${batch.lastTool.toolName} ${batch.lastTool.args.slice(0, 600)}\nlast result: ${batch.lastTool.result.slice(0, 600)}` : "",
+        `last assistant: ${batch.lastAssistantLine?.slice(0, 500) ?? "(none)"}`,
+      ].filter(Boolean).join("\n");
+      await supervisor.alert(batch.batchId, evidence);
+    },
+    abort: deps.abortWake ?? (async (sessionKey, runId) => {
+      await withWakeDeadline(abortGateway.gateway.abort({ sessionKey, runId }));
+    }),
+  });
+  const decisionRouter = new WakeDecisionRouter(
+    wsNotifications?.decisionModel?.trim() || DEFAULT_WAKE_DECISION_MODEL,
+    reportTargets.map((target) => target.sessionKey),
+    (parent, child, runId, batchId) => {
+      if (!guards.aliasSession(parent, child, runId, batchId)) void guards.stop(batchId, "decision child could not be supervised");
+    },
+  );
+  const runtimeHooks = {
+    before_prompt_build: (event: unknown, ctx: WakeHookContext = {}) => decisionRouter.beforePromptBuild(event, ctx),
+    before_model_resolve: (event: { prompt?: string }, ctx: WakeHookContext = {}) => decisionRouter.beforeModelResolve(event, ctx),
+    before_tool_call: (event: WakeToolEvent, ctx: WakeHookContext = {}) =>
+      guards.beforeToolCall(event, ctx) ?? decisionRouter.beforeToolCall(event, ctx),
+    after_tool_call: async (event: WakeToolEvent, ctx: WakeHookContext = {}) => {
+      decisionRouter.afterToolCall(event, ctx);
+      await guards.afterToolCall(event, ctx);
+    },
+    before_message_write: (event: any, ctx: WakeHookContext = {}) => guards.onBeforeMessageWrite(event, ctx),
+    llm_output: (event: any, ctx: WakeHookContext = {}) => guards.onLlmOutput(event, ctx),
+    llm_input: (event: { prompt?: string; runId?: string; provider?: string; model?: string }, ctx: WakeHookContext = {}) => {
+      const batchId = extractWakeBatchId([{ role: "user", content: event.prompt }]);
+      if (batchId && event.runId && decisionRouter.root(ctx.sessionKey)) {
+        guards.bindRunner(batchId, event.runId);
+        decisionRouter.bindRunner(batchId, event.runId);
+      }
+      const wrongModel = decisionRouter.wrongDecisionModel(event, ctx);
+      if (wrongModel) void guards.stop(wrongModel, "decision subagent model differs from configured decisionModel");
+    },
+    subagent_spawned: (event: any, ctx: any = {}) => decisionRouter.onSubagentSpawned(event, ctx),
+  };
+  const reportWake: WakeDisclosureSender = async (ctx, disclosure) => {
+    const batchId = decisionRouter.batch(ctx);
+    if (!batchId) throw new Error("No active Warp wake owns this report");
+    if (!reportTargets.length) throw new Error("No reportTo targets configured");
+    const blocked = guards.beforeToolCall({ toolName: "imajin_wake_report", params: {}, batchId }, ctx);
+    if (blocked) throw new Error("Wake already stopped; directSend guard alert owns disclosure");
+    for (const target of reportTargets) {
+      const match = /^agent:[^:]+:([^:]+):(?:direct|dm|group|channel):(.+)$/.exec(target.sessionKey);
+      if (!match) throw new Error("reportTo target has no channel destination");
+      await sendDirectChannelMessage(
+        { ...wsNotifications?.directSend, channel: match[1], target: match[2] },
+        `Warp wake ${disclosure.outcome} (${batchId}): ${disclosure.message}`,
+      );
+      guards.recordDisclosure(batchId, target.sessionKey);
+    }
+  };
 
   /**
    * Sends the kernel-facing `notification_ack` frame (#26). Never called
@@ -1019,6 +1105,15 @@ export function createNotificationInjector(
   async function sendChannelMessage(text: string): Promise<void> {
     await sendDirectChannelMessage(ds, text);
   }
+  async function discloseTerminalSubjects(message: string): Promise<boolean> {
+    try {
+      await sendChannelMessage(message);
+      return true;
+    } catch {
+      console.error("[imajin-ws] terminal wake disclosure delivery failed");
+      return false;
+    }
+  }
 
 
   // In-memory coalesce state, keyed by scope (#25: leading-edge + trailing —
@@ -1080,7 +1175,26 @@ export function createNotificationInjector(
     await bridgeReady;
     const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
     const continuity = await wakeContinuity(summarizeWakeRuns(frames).map((r) => r.runId));
-    const message = `Wake batch ID: ${idempotencyKey}\n\n${buildWakeTurnMessage(scope, frames)}\n\n${continuity}`;
+    const liveState = await buildWakeLiveState(frames, bridge.listOpen(), { lookup: deps.liveStateLookup });
+    const message = `Wake batch ID: ${idempotencyKey}\n\n${liveState.preamble}\n\n${buildWakeTurnMessage(scope, frames)}\n\n${continuity}`;
+    if (liveState.terminalSubjects.length) {
+      const disclosure = liveState.terminalSubjects.map((subject) =>
+        `${subject.url} is already ${subject.state}; wake skipped — no review or merge action taken.`).join("\n");
+      const disclosed = await discloseTerminalSubjects(disclosure);
+      if (!disclosed) {
+        await escalateWakeFailure(scope, frames, "terminal subject disclosure failed; wake retained for retry");
+        return;
+      }
+      if (liveState.allSubjectsTerminal) {
+        await bridge.recordOutcome({
+          runIds: summarizeWakeRuns(frames).map((run) => run.runId),
+          lastVerdict: disclosure,
+          status: "closed",
+        });
+        await pendingWakeStore.delete(pendingKey);
+        return;
+      }
+    }
 
     if (!hookToken) {
       // The single startup warning already fired in `hookTokenReady`'s
@@ -1098,6 +1212,17 @@ export function createNotificationInjector(
     const batch = { batchId: idempotencyKey, scope, runs: summarizeWakeRuns(frames), sessionKey, uniqueSession: freshSessions };
     wakeReporter?.track(batch);
     supervisor.track(batch);
+    const guarded = guards.track({
+      ...batch,
+      subject: liveState.subjects.map((subject) => subject.url).join(", ") || batch.runs.map((run) => run.title).join("; "),
+    });
+    if (!guarded) {
+      await supervisor.alert(idempotencyKey, "wake guard capacity exceeded; wake not admitted");
+      supervisor.untrack(idempotencyKey);
+      wakeReporter?.untrack(idempotencyKey);
+      return;
+    }
+    decisionRouter.track(sessionKey, idempotencyKey);
     const result = await postWakeHookWithRetries({
       gatewayPort,
       hooksPath,
@@ -1106,10 +1231,16 @@ export function createNotificationInjector(
       sessionKey,
       message,
       idempotencyKey,
+      model: wsNotifications?.model?.trim(),
     }, (reason) => { void supervisor.alert(idempotencyKey, reason); }, lifecycle.signal);
     supervisor.bindRun(idempotencyKey, result.runId);
+    guards.bindRun(idempotencyKey, result.runId);
     allocatedFreshReuseKey = false;
-    if (!result.ok && !result.pending) supervisor.untrack(idempotencyKey);
+    if (!result.ok && !result.pending) {
+      supervisor.untrack(idempotencyKey);
+      guards.untrack(idempotencyKey);
+      decisionRouter.untrack(idempotencyKey);
+    }
 
     if (wakeReporter) {
       if (result.ok || result.pending) {
@@ -1215,6 +1346,9 @@ export function createNotificationInjector(
   function dispose() {
     lifecycle.abort();
     supervisor.dispose();
+    guards.dispose();
+    decisionRouter.dispose();
+    abortGateway.dispose();
     for (const [scope, buf] of coalesceByScope) {
       clearTimeout(buf.timeout);
       coalesceByScope.delete(scope);
@@ -1326,8 +1460,26 @@ export function createNotificationInjector(
     inject,
     dispose,
     ready: stateReady,
-    onAgentEnd: async (event, ctx) => {
-      await Promise.all([wakeReporter?.onAgentEnd(event, ctx), supervisor.onAgentEnd(event, ctx)]);
+    runtimeHooks,
+    reportWake,
+    onAgentEnd: async (event, ctx = {}) => {
+      const settled = decisionRouter.end(event, ctx);
+      if (!settled) return;
+      const rootCtx = { sessionKey: settled.sessionKey, runId: settled.event.runId, batchId: settled.batchId };
+      const guardReason = await guards.end(settled.event, rootCtx);
+      if (!guardReason && !extractFinalAssistantOutput(settled.event.messages)) {
+        const last = findFinalAssistantMessage(settled.event.messages);
+        settled.event.messages = [
+          { role: "user", content: `Wake batch ID: ${settled.batchId}` },
+          { ...last, role: "assistant", content: "Outcome disclosed to reportTo via channel message." },
+        ];
+      }
+      await Promise.all([
+        wakeReporter?.onAgentEnd(settled.event, rootCtx),
+        supervisor.onAgentEnd(settled.event, rootCtx),
+      ]);
+      guards.untrack(settled.batchId);
+      decisionRouter.untrack(settled.batchId);
     },
   };
 }
