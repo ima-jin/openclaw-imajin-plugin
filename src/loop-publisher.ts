@@ -86,9 +86,9 @@ export interface LoopEnvelope {
   at: string;
 }
 
-export interface LoopIngestRequest {
-  type: LoopLifecycleType;
-  payload: LoopEnvelope;
+export interface LoopIngestRequest<T extends string = LoopLifecycleType, P extends LoopEnvelope = LoopEnvelope> {
+  type: T;
+  payload: P;
   publisherDid: string;
   signature: { keyId: string; alg: "ed25519"; sig: string };
 }
@@ -210,12 +210,12 @@ async function loadSigningKey(keypairPath: string): Promise<SigningKey> {
 }
 
 /** Builds the signed ingest request for one envelope. */
-export async function signLoopEvent(
-  type: LoopLifecycleType,
-  payload: LoopEnvelope,
+export async function signLoopEvent<T extends string, P extends LoopEnvelope>(
+  type: T,
+  payload: P,
   publisherDid: string,
   key: SigningKey,
-): Promise<LoopIngestRequest> {
+): Promise<LoopIngestRequest<T, P>> {
   const ed = await loadEd25519();
   const bytes = new TextEncoder().encode(canonicalize({ type, payload }));
   const sig = bytesToHex(await ed.signAsync(bytes, hexToBytes(key.privateKeyHex)));
@@ -253,17 +253,45 @@ export interface LoopSender {
   idle(): Promise<void>;
 }
 
+/**
+ * Shared exact-envelope path for durable publishers. Callers persist the signed
+ * request before delivery and acknowledge only successful HTTP responses.
+ */
+export function createLoopTransport(options: LoopSenderOptions) {
+  let key: Promise<SigningKey> | undefined;
+  const getKey = (): Promise<SigningKey> => {
+    key ??= loadSigningKey(options.keypairPath).catch((err: unknown) => {
+      key = undefined;
+      throw err;
+    });
+    return key;
+  };
+  return {
+    async sign<T extends string, P extends LoopEnvelope>(type: T, payload: P) {
+      return signLoopEvent(type, payload, options.did, await getKey());
+    },
+    post(request: LoopIngestRequest<string>): Promise<Response> {
+      return (options.fetchImpl ?? fetch)(
+        `${options.nodeUrl.replace(/\/$/, "")}${LOOPS_INGEST_PATH}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(request),
+          signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+        },
+      );
+    },
+  };
+}
+
 export function createLoopSender(options: LoopSenderOptions): LoopSender {
   const log: LoopSenderLogger = options.logger ?? {
     info: (m) => console.log(m),
     warn: (m) => console.warn(m),
   };
-  const doFetch = options.fetchImpl ?? fetch;
+  const transport = createLoopTransport(options);
   const now = options.now ?? Date.now;
   const principal = options.principal ?? options.did;
-  const url = `${options.nodeUrl.replace(/\/$/, "")}${LOOPS_INGEST_PATH}`;
-
-  let key: Promise<SigningKey> | undefined;
   let chain: Promise<void> = Promise.resolve();
   let pending = 0;
   let lastFailureLogAt = 0;
@@ -275,13 +303,6 @@ export function createLoopSender(options: LoopSenderOptions): LoopSender {
     log.warn(`[imajin-loops] publish dropped: ${reason}`);
   };
 
-  const getKey = (): Promise<SigningKey> => {
-    key ??= loadSigningKey(options.keypairPath).catch((err: unknown) => {
-      key = undefined; // let a later transition retry once the keypair is readable
-      throw err;
-    });
-    return key;
-  };
 
   const send = async (transition: LoopTransition, at: string): Promise<void> => {
     try {
@@ -295,13 +316,8 @@ export function createLoopSender(options: LoopSenderOptions): LoopSender {
         summary: sanitizeSummary(transition.summary),
         at,
       };
-      const request = await signLoopEvent(transition.type, payload, options.did, await getKey());
-      const res = await doFetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(request),
-        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
-      });
+      const request = await transport.sign(transition.type, payload);
+      const res = await transport.post(request);
       if (!res.ok) {
         logFailure(`${transition.type} rejected by kernel (HTTP ${res.status})`);
       }

@@ -190,6 +190,32 @@
         "type": "string",
         "description": "Local passthrough /mcp endpoint for the kernel's MCP tools (#50). Defaults to the inferProxyBaseUrl root + /mcp. Used only by imajin_status (probe + registration check); the plugin never sends credentials to it."
       },
+      "horizon": {
+        "type": "object",
+        "description": "Opt-in one-way local horizon sync to an existing loop through signed step events. Zones remain kernel-derived. See docs/horizon-sync.md.",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "loopId": { "type": "string", "minLength": 1 },
+          "repository": { "type": "string", "pattern": "^[\\w.-]+/[\\w.-]+$" },
+          "filePath": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Default ~/.openclaw/workspace/horizon/horizon.json. Supports ~/."
+          },
+          "stateDir": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Private cursor/outbox directory; default horizon-sync beside keypairPath. Preserve across restarts."
+          },
+          "syncIntervalMs": {
+            "type": "integer",
+            "minimum": 1000,
+            "maximum": 2147483647,
+            "default": 30000
+          }
+        }
+      },
       "modelDiscovery": {
         "type": "object",
         "description": "Model discovery for the imajin OpenClaw model provider (#55): GET <nodeUrl><modelsPath> with the agent's DID session at plugin start and every refreshIntervalMs.",
