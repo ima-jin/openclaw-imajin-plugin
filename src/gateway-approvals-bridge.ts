@@ -680,9 +680,8 @@ export class GatewayApprovalsBridge {
   ) {
     this.published = options.publicationLedger?.published ?? new Map();
     this.reservations = options.publicationLedger?.reservations ?? new Map();
-    this.rejectedPublishes = options.publicationLedger
-      ? (options.publicationLedger.rejectedPublishes ??= new Map())
-      : new Map();
+    if (options.publicationLedger) options.publicationLedger.rejectedPublishes ??= new Map();
+    this.rejectedPublishes = options.publicationLedger?.rejectedPublishes ?? new Map();
     this.publishRetryDelaysMs = options.publishRetryDelaysMs ?? DEFAULT_PUBLISH_RETRY_DELAYS_MS;
     this.executionRegistry = options.executionRegistry ?? new ApprovalExecutionRegistry();
     this.loopTracker = options.loopTracker;
@@ -967,14 +966,7 @@ export class GatewayApprovalsBridge {
     }
     if (this.disposed) return;
     const rejectionKey = `${sourceId}:${proposalId}`;
-    const rejected = this.rejectedPublishes.get(rejectionKey);
-    if (rejected?.contentHash === payload.contentHash && Date.now() <= rejected.retryAtMs) {
-      this.sources.get(sourceId)?.onPublishFailed?.(proposalId, { retryAtMs: rejected.retryAtMs });
-      return;
-    }
-    if (rejected && rejected.contentHash !== payload.contentHash) {
-      this.rejectedPublishes.delete(rejectionKey);
-    }
+    if (this.holdRejectedPublish(sourceId, proposalId, payload.contentHash)) return;
     this.published.set(proposalId, {
       sourceId,
       owner: request.owner,
@@ -1015,6 +1007,17 @@ export class GatewayApprovalsBridge {
       await this.failClosedIfBlocking(sourceId, request, `the kernel refused or could not receive the card (${String(err)})`);
     }
   }
+  private holdRejectedPublish(sourceId: string, proposalId: string, contentHash: string): boolean {
+    const key = `${sourceId}:${proposalId}`;
+    const rejected = this.rejectedPublishes.get(key);
+    if (rejected?.contentHash === contentHash && Date.now() <= rejected.retryAtMs) {
+      this.sources.get(sourceId)?.onPublishFailed?.(proposalId, { retryAtMs: rejected.retryAtMs });
+      return true;
+    }
+    if (rejected && rejected.contentHash !== contentHash) this.rejectedPublishes.delete(key);
+    return false;
+  }
+
   private recordPublishFailure(sourceId: string, proposalId: string, contentHash: string, err: unknown): void {
     let failure: { retryAtMs: number } | undefined;
     let logFailure = true;
