@@ -78,6 +78,7 @@ import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { RegistrationLifecycle } from "./registration-lifecycle.js";
 import { canonicalize, signMessage, type SignedMessage } from "./approval-bridge.js";
+import { assertJsonStable } from "./approval-json.js";
 import { ApprovalExecutionRegistry, type ApprovalLoopBinding } from "./approval-execution.js";
 export type { ApprovalLoopBinding } from "./approval-execution.js";
 import {
@@ -233,7 +234,8 @@ export function buildDigestFields(params: {
   detail?: Record<string, unknown>;
   sourceRevision: string;
 }): ApprovalDigestFields {
-  return {
+  if (params.detail !== undefined) assertJsonStable(params.detail);
+  const fields = {
     proposalId: params.proposalId,
     source: params.source,
     kind: params.kind,
@@ -241,6 +243,8 @@ export function buildDigestFields(params: {
     keysTouched: [] as string[],
     detail: { ...(params.detail ?? {}), sourceRevision: params.sourceRevision },
   };
+  assertJsonStable(fields);
+  return fields;
 }
 
 /**
@@ -321,6 +325,7 @@ export async function signCanonicalPayload(
   payload: object,
   privateKeyHex: string,
 ): Promise<string> {
+  assertJsonStable(payload);
   const ed = await loadEd25519();
   const bytes = new TextEncoder().encode(canonicalize(payload));
   const signature = await ed.signAsync(bytes, hexToBytes(privateKeyHex));
@@ -332,6 +337,7 @@ export async function signCanonicalPayload(
  * digest. See the module doc for the exact field list this covers.
  */
 export async function computeContentHash(fields: object): Promise<string> {
+  assertJsonStable(fields);
   const { sha256 } = await import("@noble/hashes/sha2.js");
   const bytes = new TextEncoder().encode(canonicalize(fields));
   return `sha256:${bytesToHex(sha256(bytes))}`;
@@ -579,9 +585,16 @@ interface TrackedProposal {
   /** The composite digest signed and published to the kernel for this proposal (#2084). */
   contentHash: string;
 }
+interface RejectedPublication {
+  contentHash: string;
+  retryAtMs: number;
+  delayMs: number;
+}
+
 interface PublicationLedger {
   published: Map<string, TrackedProposal>;
   reservations: Map<string, Promise<void>>;
+  rejectedPublishes?: Map<string, RejectedPublication>;
 }
 
 const publicationLedgerKey = Symbol.for("imajin.plugin.approval-publications");
@@ -601,6 +614,7 @@ function processPublicationLedger(key: string): PublicationLedger {
 
 export class GatewayApprovalsBridge {
   private readonly published: Map<string, TrackedProposal>;
+  private readonly rejectedPublishes: Map<string, RejectedPublication>;
   /**
    * Synchronous publish-slot reservation (#48, fixing the #33 TOCTOU): keyed
    * by proposalId, set the INSTANT `handleSourceRequested` decides to
@@ -666,6 +680,9 @@ export class GatewayApprovalsBridge {
   ) {
     this.published = options.publicationLedger?.published ?? new Map();
     this.reservations = options.publicationLedger?.reservations ?? new Map();
+    this.rejectedPublishes = options.publicationLedger
+      ? (options.publicationLedger.rejectedPublishes ??= new Map())
+      : new Map();
     this.publishRetryDelaysMs = options.publishRetryDelaysMs ?? DEFAULT_PUBLISH_RETRY_DELAYS_MS;
     this.executionRegistry = options.executionRegistry ?? new ApprovalExecutionRegistry();
     this.loopTracker = options.loopTracker;
@@ -949,6 +966,15 @@ export class GatewayApprovalsBridge {
       return;
     }
     if (this.disposed) return;
+    const rejectionKey = `${sourceId}:${proposalId}`;
+    const rejected = this.rejectedPublishes.get(rejectionKey);
+    if (rejected?.contentHash === payload.contentHash && Date.now() <= rejected.retryAtMs) {
+      this.sources.get(sourceId)?.onPublishFailed?.(proposalId, { retryAtMs: rejected.retryAtMs });
+      return;
+    }
+    if (rejected && rejected.contentHash !== payload.contentHash) {
+      this.rejectedPublishes.delete(rejectionKey);
+    }
     this.published.set(proposalId, {
       sourceId,
       owner: request.owner,
@@ -960,6 +986,7 @@ export class GatewayApprovalsBridge {
     });
     try {
       await this.publishWithRetry(sourceId, proposalId, payload);
+      this.rejectedPublishes.delete(rejectionKey);
       if (this.disposed) return;
       this.logger.info(
         `published operator.approval.requested for ${proposalId} (source=${sourceId}, kind=${payload.kind})`,
@@ -983,10 +1010,26 @@ export class GatewayApprovalsBridge {
       // phantom publication when a retired instance cancels a failed POST.
       this.forget(proposalId);
       if (this.disposed) return;
-      this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
-      this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
+      this.recordPublishFailure(sourceId, proposalId, payload.contentHash, err);
       await this.failClosedIfBlocking(sourceId, request, `the kernel refused or could not receive the card (${String(err)})`);
     }
+  }
+  private recordPublishFailure(sourceId: string, proposalId: string, contentHash: string, err: unknown): void {
+    let failure: { retryAtMs: number } | undefined;
+    let logFailure = true;
+    if (err instanceof KernelNotifyError && err.status >= 400 && err.status < 500 && !isRetryablePublishError(err)) {
+      const key = `${sourceId}:${proposalId}`;
+      const previous = this.rejectedPublishes.get(key);
+      const sameRevision = previous?.contentHash === contentHash;
+      const delayMs = sameRevision ? Math.min(previous.delayMs * 2, 30 * 60_000) : 15_000;
+      failure = { retryAtMs: Date.now() + delayMs };
+      this.rejectedPublishes.set(key, { contentHash, delayMs, ...failure });
+      logFailure = !sameRevision;
+    }
+    if (logFailure) {
+      this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
+    }
+    this.sources.get(sourceId)?.onPublishFailed?.(proposalId, failure);
   }
 
   /** Authenticated reconnect replay: closed sockets may have dropped startup bindings. */

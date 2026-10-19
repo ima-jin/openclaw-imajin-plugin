@@ -1,8 +1,11 @@
 import { describe, it, expect, vi } from "vitest";
+import { createHash } from "node:crypto";
+import { canonicalize } from "./approval-bridge.js";
 import * as ed from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha2.js";
 import {
   GatewayApprovalsBridge,
+  buildApprovalRequestedPayload,
   resolveEnabledApprovalSourceIds,
   type KernelBusEventFrame,
   type KernelNotifyClient,
@@ -131,6 +134,21 @@ describe.each([
   ["skill-workshop", makeSkillWorkshopFixture],
   ["gateway-exec", makeGatewayExecFixture],
 ])("ApprovalSource contract: %s", (name, makeFixture) => {
+  it("hashes exactly the JSON wire payload the kernel receives (#94)", async () => {
+    const { source } = makeFixture();
+    const [request] = await source.list();
+    const payload = await buildApprovalRequestedPayload(source.id, request, {
+      did: AGENT_DID, privateKeyHex: await generatePrivateKeyHex(),
+    });
+    const wire = JSON.parse(JSON.stringify(payload));
+    const fields = {
+      proposalId: wire.proposalId, source: wire.source, kind: wire.kind,
+      summary: wire.summary, keysTouched: wire.keysTouched, detail: wire.detail,
+    };
+    const kernelHash = `sha256:${createHash("sha256").update(canonicalize(fields)).digest("hex")}`;
+    expect(payload.contentHash).toBe(kernelHash);
+    expect(wire.detail.sourceRevision).toBe(request.sourceRevision);
+  });
   it("implements list/subscribe/getCurrent/resolve and reports a consistent proposalId+contentHash", async () => {
     const { source } = makeFixture();
     expect(typeof source.list).toBe("function");
