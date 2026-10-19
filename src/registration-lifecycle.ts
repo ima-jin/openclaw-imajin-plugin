@@ -1,7 +1,8 @@
 /**
  * Registry reloads may re-import the entry module. Keep ownership on the
  * process, not in a module-local variable, and retire resources before the
- * replacement registration can start any work.
+ * replacement service can start any work. Call beginRegistration only from
+ * a full-mode service start, never while constructing a registry.
  */
 const registrationKey = Symbol.for("imajin.plugin.registration");
 type Dispose = () => void;

@@ -779,6 +779,12 @@ export interface NotificationInjectorDeps {
   abortWake?: (sessionKey: string, runId?: string) => Promise<void>;
 }
 
+export const WAKE_RUNTIME_HOOKS = [
+  "before_agent_run", "before_prompt_build", "before_model_resolve",
+  "before_tool_call", "after_tool_call", "before_message_write",
+  "llm_output", "llm_input", "subagent_spawned",
+] as const;
+
 export function createNotificationInjector(
   api: any,
   wsNotifications: WsNotificationsConfig | undefined,
@@ -936,7 +942,7 @@ export function createNotificationInjector(
     },
     { wakeReadOnlyLookups: wsNotifications?.wakeReadOnlyLookups, githubCliPath: wsNotifications?.githubCliPath },
   );
-  const runtimeHooks = {
+  const runtimeHooks: Record<(typeof WAKE_RUNTIME_HOOKS)[number], (event: any, ctx?: any) => unknown> = {
     before_agent_run: (event: unknown, ctx: WakeHookContext = {}) => decisionRouter.beforeAgentRun(event, ctx),
     before_prompt_build: (event: unknown, ctx: WakeHookContext = {}) => decisionRouter.beforePromptBuild(event, ctx),
     before_model_resolve: (event: { prompt?: string }, ctx: WakeHookContext = {}) => decisionRouter.beforeModelResolve(event, ctx),

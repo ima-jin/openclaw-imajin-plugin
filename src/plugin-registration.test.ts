@@ -14,7 +14,7 @@ const mocks = vi.hoisted(() => ({
   }>,
   discovery: [] as Array<{ stop: ReturnType<typeof vi.fn> }>,
   sessionGateways: [] as Array<{ dispose: ReturnType<typeof vi.fn> }>,
-  loopHook: vi.fn(), wakeHook: vi.fn(), usageHook: vi.fn(),
+  loopHook: vi.fn(), wakeHook: vi.fn(), usageHook: vi.fn(), wsStart: vi.fn(), inject: vi.fn(),
 }));
 
 vi.mock("openclaw/plugin-sdk/plugin-entry", () => ({
@@ -49,7 +49,7 @@ vi.mock("./imajin-provider.js", () => ({
 vi.mock("./ws-service.js", () => ({
   ImajinWsService: class {
     readonly socket = {
-      start: vi.fn(async () => {}), stop: vi.fn(),
+      start: vi.fn(() => mocks.wsStart()), stop: vi.fn(),
       frame: undefined as ((frame: any) => void) | undefined,
       connected: undefined as (() => Promise<void>) | undefined,
     };
@@ -62,13 +62,14 @@ vi.mock("./ws-service.js", () => ({
   },
 }));
 vi.mock("./notification-injector.js", () => ({
+  WAKE_RUNTIME_HOOKS: ["before_agent_run"],
   createNotificationInjector: () => {
     const timer = setInterval(() => {}, 120_000);
     const dispose = vi.fn(() => clearInterval(timer));
     mocks.helpers.push({ dispose });
     return {
-      inject: vi.fn(async () => {}), dispose,
-      runtimeHooks: { before_agent_start: mocks.wakeHook },
+      inject: mocks.inject, dispose,
+      runtimeHooks: { before_agent_run: mocks.wakeHook },
       onAgentEnd: vi.fn(async () => {}), reportWake: vi.fn(),
     };
   },
@@ -94,8 +95,9 @@ vi.mock("./session-commands.js", () => ({
   createSessionCommandAttester: () => vi.fn(), isSessionCommandFrame: () => false,
 }));
 vi.mock("./loop-hooks.js", () => ({
-  registerLoopLifecycle: (api: { on: (name: string, handler: () => void) => void }) => {
-    api.on("session_start", mocks.loopHook);
+  LOOP_LIFECYCLE_HOOKS: ["session_start"],
+  registerLoopLifecycle: (api: { on: (name: string, handler: () => void, opts: { name: string }) => void }) => {
+    api.on("session_start", mocks.loopHook, { name: "imajin-loops:session_start" });
     return { tracker: { block: vi.fn(), unblock: vi.fn() } };
   },
 }));
@@ -152,11 +154,11 @@ describe("process-wide plugin registration (#86)", () => {
   let workshops: ReturnType<typeof workshopConnection>[];
   let publish: ReturnType<typeof vi.fn>;
 
-  function register(overrides: Record<string, unknown> = {}) {
+  function register(overrides: Record<string, unknown> = {}, registrationMode?: string) {
     const services: Service[] = [];
     const hooks = new Map<string, Array<(...args: any[]) => unknown>>();
     plugin.register({
-      pluginConfig: { ...config, ...overrides }, registerTool: vi.fn(),
+      registrationMode, pluginConfig: { ...config, ...overrides }, registerTool: vi.fn(),
       registerService: (service: Service) => services.push(service),
       on: (name: string, handler: (...args: any[]) => unknown) =>
         hooks.set(name, [...hooks.get(name) ?? [], handler]),
@@ -166,6 +168,12 @@ describe("process-wide plugin registration (#86)", () => {
       ws: services.find((service) => service.id === "imajin-ws")!,
       discovery: services.find((service) => service.id === "imajin-model-discovery")!,
     };
+  }
+
+  async function start(overrides: Record<string, unknown> = {}) {
+    const registration = register(overrides, "full");
+    await (registration.ws ?? registration.discovery).start();
+    return registration;
   }
 
   async function ready() {
@@ -201,6 +209,8 @@ describe("process-wide plugin registration (#86)", () => {
       workshops.push(live);
       return live;
     });
+    mocks.wsStart.mockResolvedValue(undefined);
+    mocks.inject.mockResolvedValue(undefined);
     mocks.preflight.mockResolvedValue({
       status: 200,
       text: JSON.stringify({ events: [], nextCursor: "0", entitledEventTypes: ["operator.approval.decided"] }),
@@ -217,10 +227,118 @@ describe("process-wide plugin registration (#86)", () => {
     vi.restoreAllMocks();
   });
 
+  it("full/start stays live through three non-full register passes without any further starts", async () => {
+    const active = await start();
+    await ready();
+    const socket = mocks.sockets[0];
+    for (const mode of ["tool-discovery", "discovery", "cli-metadata"]) {
+      const metadata = register({}, mode);
+      metadata.emit("session_start");
+      metadata.emit("before_agent_run");
+      metadata.ws.stop(); // Even an unstarted registry's stop cannot touch the owner.
+    }
+    expect(systems).toHaveLength(1);
+    expect(workshops).toHaveLength(1);
+    expect(mocks.sockets).toHaveLength(1);
+    expect(mocks.helpers).toHaveLength(2);
+    expect(mocks.discovery).toHaveLength(1);
+    expect(mocks.sessionGateways).toHaveLength(1);
+    expect(socket.stop).not.toHaveBeenCalled();
+    expect(systems[0].stop).not.toHaveBeenCalled();
+    expect(workshops[0].stop).not.toHaveBeenCalled();
+    expect(mocks.loopHook).not.toHaveBeenCalled();
+    expect(mocks.wakeHook).not.toHaveBeenCalled();
+    for (const hook of ["session_start", "before_agent_run", "agent_end"]) active.emit(hook);
+    for (const hook of [mocks.loopHook, mocks.wakeHook, mocks.usageHook]) expect(hook).toHaveBeenCalledOnce();
+    workshops[0].client.list.mockClear();
+    await vi.advanceTimersByTimeAsync(30_000); // Beyond the observed ~20s failure.
+    expect(workshops[0].client.list).toHaveBeenCalledTimes(2);
+    expect(vi.getTimerCount()).toBe(4);
+    for (let index = 0; index < 4; index++) systems[0].emit(record);
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
+    const data = JSON.parse(publish.mock.calls[0][1].body).data;
+    socket.frame?.({ type: "notification", id: "n1", scope: "test", title: "Test", createdAt: "" });
+    expect(mocks.inject).toHaveBeenCalledOnce();
+    socket.frame?.({
+      type: "bus_event", eventType: "operator.approval.decided",
+      issuer: "did:imajin:operator", subject: "did:imajin:test", scope: "operator",
+      payload: {
+        proposalId: record.id, decidedBy: "did:imajin:operator",
+        decision: "approve", contentHash: data.contentHash,
+      },
+    });
+    await vi.waitFor(() => expect(systems[0].client.resolve).toHaveBeenCalledOnce());
+    await socket.connected?.();
+    expect(socket.stop).not.toHaveBeenCalled();
+    expect(publish).toHaveBeenCalledOnce();
+  });
+
+  it("building another full registry without starting it leaves the active owner untouched", async () => {
+    const active = await start();
+    await ready();
+    const replacement = register({}, "full");
+    replacement.ws.stop();
+    expect(mocks.sockets).toHaveLength(1);
+    expect(mocks.sockets[0].stop).not.toHaveBeenCalled();
+    active.emit("session_start");
+    replacement.emit("session_start");
+    expect(mocks.loopHook).toHaveBeenCalledOnce();
+    await replacement.ws.start();
+    await ready();
+    expect(mocks.sockets).toHaveLength(2);
+    expect(mocks.sockets[0].stop).toHaveBeenCalledOnce();
+    expect(systems[0].stop).toHaveBeenCalledOnce();
+    expect(mocks.sockets[1].stop).not.toHaveBeenCalled();
+  });
+
+  it.each(["full", undefined])("registration mode %s performs no runtime IO before start", async (mode) => {
+    const registration = register({}, mode);
+    registration.emit("session_start");
+    registration.emit("before_agent_run");
+    expect(systems).toHaveLength(0);
+    expect(mocks.sockets).toHaveLength(0);
+    expect(mocks.helpers).toHaveLength(0);
+    expect(mocks.discovery).toHaveLength(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await registration.ws.start();
+    await ready();
+    expect(systems).toHaveLength(1);
+    expect(mocks.sockets).toHaveLength(1);
+  });
+
+  it.each(["tool-discovery", "discovery", "cli-metadata", "setup-only"])(
+    "%s services stay inert even if start is called", async (mode) => {
+      await start();
+      await ready();
+      const metadata = register({}, mode);
+      await metadata.ws.start();
+      await metadata.discovery.start();
+      metadata.ws.stop();
+      metadata.discovery.stop();
+      expect(systems).toHaveLength(1);
+      expect(mocks.sockets).toHaveLength(1);
+      expect(mocks.sockets[0].stop).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(4);
+    },
+  );
+
+  it("both service IDs and concurrent starts share one runtime and one discovery poller", async () => {
+    const registration = register({}, "full");
+    await Promise.all([
+      registration.ws.start(), registration.ws.start(),
+      registration.discovery.start(), registration.discovery.start(),
+    ]);
+    await ready();
+    expect(systems).toHaveLength(1);
+    expect(mocks.sockets[0].start).toHaveBeenCalledOnce();
+    expect(mocks.discovery).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(4);
+  });
+
   it("N=3 leaves one client per source, one poller and one publish/notification", async () => {
     const registrations = [];
     for (let index = 0; index < 3; index++) {
-      const registration = register();
+      const registration = register({}, "full");
       registrations.push(registration);
       await registration.discovery.start();
       await registration.ws.start();
@@ -248,10 +366,11 @@ describe("process-wide plugin registration (#86)", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("rapid registrations cancel superseded startup before opening sources", async () => {
-    register();
-    register();
-    register();
+  it("rapid full service starts cancel superseded setup before opening sources", async () => {
+    const first = register({}, "full");
+    const second = register({}, "full");
+    const third = register({}, "full");
+    await Promise.all([first.ws.start(), second.ws.start(), third.ws.start()]);
     await ready();
     expect(mocks.system).toHaveBeenCalledOnce();
     expect(mocks.workshop).toHaveBeenCalledOnce();
@@ -262,9 +381,9 @@ describe("process-wide plugin registration (#86)", () => {
     const first = systemConnection();
     first.start.mockImplementation(() => pending.promise);
     mocks.system.mockResolvedValueOnce(first);
-    register();
+    await start();
     await vi.waitFor(() => expect(first.start).toHaveBeenCalledOnce());
-    register();
+    await start();
     expect(first.stop).toHaveBeenCalledOnce();
     pending.resolve();
     await ready();
@@ -275,9 +394,9 @@ describe("process-wide plugin registration (#86)", () => {
   it("closes a client factory result that arrives after replacement without starting it", async () => {
     const pending = deferred<ReturnType<typeof systemConnection>>();
     mocks.system.mockReturnValueOnce(pending.promise);
-    register();
+    await start();
     await vi.waitFor(() => expect(mocks.system).toHaveBeenCalledOnce());
-    register();
+    await start();
     const late = systemConnection();
     pending.resolve(late);
     await ready();
@@ -292,14 +411,14 @@ describe("process-wide plugin registration (#86)", () => {
     const pending = deferred<void>();
     const live = { ...systemConnection(), start: vi.fn(() => pending.promise) };
     factory.mockResolvedValueOnce(live);
-    register({
+    await start({
       approvals: {
         enabled: true, operatorDid: "did:imajin:operator",
         notifyWebhookSecret: "test-fixture", sources: [sourceId],
       },
     });
     await vi.waitFor(() => expect(live.start).toHaveBeenCalledOnce());
-    register({ nodeUrl: undefined });
+    await start({ nodeUrl: undefined });
     expect(live.stop).toHaveBeenCalledOnce();
     pending.resolve();
     await vi.advanceTimersByTimeAsync(1);
@@ -311,11 +430,11 @@ describe("process-wide plugin registration (#86)", () => {
   it("cancels subscriptions and pollers immediately while startup preflight is pending", async () => {
     const pending = deferred<unknown>();
     mocks.preflight.mockReturnValueOnce(pending.promise);
-    register();
+    await start();
     await vi.waitFor(() => expect(mocks.preflight).toHaveBeenCalledOnce());
-    expect(vi.getTimerCount()).toBe(3);
-    register({ nodeUrl: undefined });
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(4);
+    await start({ nodeUrl: undefined });
+    expect(vi.getTimerCount()).toBe(1);
     pending.resolve({
       status: 200, text: JSON.stringify({ events: [], nextCursor: "0", entitledEventTypes: [] }),
     });
@@ -328,10 +447,10 @@ describe("process-wide plugin registration (#86)", () => {
     const failed = systemConnection();
     failed.start.mockRejectedValueOnce(new Error("cannot connect"));
     mocks.system.mockResolvedValueOnce(failed);
-    register();
+    await start();
     await ready();
     expect(failed.stop).toHaveBeenCalledOnce();
-    register();
+    await start();
     await ready();
     expect(systems).toHaveLength(1);
     expect(systems[0].start).toHaveBeenCalledOnce();
@@ -339,60 +458,59 @@ describe("process-wide plugin registration (#86)", () => {
   });
 
   it("stale service/hook callbacks cannot revive old work or stop the new owner", async () => {
-    const old = register();
+    const old = await start();
     await ready();
-    const current = register();
+    const current = await start();
     await ready();
     await old.ws.start();
     old.discovery.start();
     old.ws.stop();
-    for (const hook of ["session_start", "before_agent_start", "agent_end"]) old.emit(hook);
-    expect(mocks.sockets[0].start).not.toHaveBeenCalled();
+    for (const hook of ["session_start", "before_agent_run", "agent_end"]) old.emit(hook);
+    expect(mocks.sockets[0].start).toHaveBeenCalledOnce();
     for (const hook of [mocks.loopHook, mocks.wakeHook, mocks.usageHook]) expect(hook).not.toHaveBeenCalled();
-    for (const hook of ["session_start", "before_agent_start", "agent_end"]) current.emit(hook);
+    for (const hook of ["session_start", "before_agent_run", "agent_end"]) current.emit(hook);
     for (const hook of [mocks.loopHook, mocks.wakeHook, mocks.usageHook]) expect(hook).toHaveBeenCalledOnce();
     expect(systems[1].stop).not.toHaveBeenCalled();
     expect(mocks.sockets[1].stop).not.toHaveBeenCalled();
   });
 
-  it("unconfigured registrations still retire previous resources", async () => {
-    register();
+  it("starting an unconfigured full service retires previous resources", async () => {
+    await start();
     await ready();
-    register({ nodeUrl: undefined });
+    await start({ nodeUrl: undefined });
     expect(systems[0].stop).toHaveBeenCalledOnce();
     expect(workshops[0].stop).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(1);
   });
 
   it("stop closes late WS startup and ignores late frames/reconnects", async () => {
-    const registration = register();
-    await ready();
     const pending = deferred<void>();
+    mocks.wsStart.mockReturnValueOnce(pending.promise);
+    const registration = register();
+    const starting = registration.ws.start();
+    await vi.waitFor(() => expect(mocks.sockets[0]?.start).toHaveBeenCalledOnce());
     const socket = mocks.sockets[0];
-    socket.start.mockImplementation(() => pending.promise);
-    const start = registration.ws.start();
     registration.ws.stop();
     pending.resolve();
-    await start;
+    await starting;
     socket.frame?.({ type: "notification", scope: "connector.models.changed" });
     await socket.connected?.();
     expect(socket.stop).toHaveBeenCalledTimes(2);
-    expect(systems[0].stop).toHaveBeenCalledOnce();
     expect(publish).not.toHaveBeenCalled();
   });
 
   it("replacement reconciliation does not re-notify an already published proposal", async () => {
-    register();
+    await start();
     await ready();
     systems[0].emit(record);
     await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
     const replacement = systemConnection();
     replacement.stage(record);
     mocks.system.mockResolvedValueOnce(replacement);
-    register();
+    await start();
     await ready();
     expect(publish).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(5); // Helpers + poller + restored expiry and sweep.
+    expect(vi.getTimerCount()).toBe(6); // Helpers + discovery + poller + restored expiry and sweep.
     replacement.emit(record);
     await vi.advanceTimersByTimeAsync(1);
     expect(publish).toHaveBeenCalledOnce();
