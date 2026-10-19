@@ -3,6 +3,7 @@ import * as ed from "@noble/ed25519";
 import { sha512 } from "@noble/hashes/sha2.js";
 import {
   GatewayApprovalsBridge,
+  KernelNotifyError,
   type KernelBusEventFrame,
   type KernelNotifyClient,
 } from "./gateway-approvals-bridge.js";
@@ -206,6 +207,63 @@ describe("Skill Workshop source through the bridge (#33)", () => {
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(2));
     await vi.waitFor(() => expect(bridge.isPublished("flaky-1")).toBe(true));
     bridge.dispose();
+  });
+
+  it.each(["approve", "reject"] as const)("binds %s to inspect's top-level revision when list omits it", async (decision) => {
+    const gateway = {
+      ...makeGateway({ ops: [proposal("inspected", { revisionHash: undefined })] }),
+      inspect: vi.fn().mockResolvedValue({ revisionHash: "actual-reviewed-revision" }),
+    };
+    const kernel = makeKernel();
+    const { bridge } = await makeBridge(gateway, kernel);
+    try {
+      await bridge.reconcile();
+      expect(gateway.inspect).toHaveBeenCalledWith("inspected", "ops");
+      expect(kernel.publishApprovalRequested.mock.calls[0][0].detail.sourceRevision).toBe("actual-reviewed-revision");
+      const outcome = await bridge.handleKernelDecision(decidedFrame("inspected", decision, publishedHash(kernel, "inspected")));
+      expect(outcome).toBe("applied");
+      const resolve = decision === "approve" ? gateway.apply : gateway.reject;
+      expect(resolve).toHaveBeenCalledWith("inspected", "actual-reviewed-revision", "ops");
+    } finally {
+      bridge.dispose();
+    }
+  });
+
+  it("does not publish a list-only proposal without a recoverable revision, and warns once", async () => {
+    const gateway = makeGateway({ main: [proposal("unversioned", { revisionHash: undefined })] });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const kernel = makeKernel();
+    const { bridge } = await makeBridge(gateway, kernel);
+    try {
+      await bridge.reconcile();
+      await bridge.reconcile();
+      expect(kernel.publishApprovalRequested).not.toHaveBeenCalled();
+      expect(warn).toHaveBeenCalledTimes(1);
+    } finally {
+      warn.mockRestore();
+      bridge.dispose();
+    }
+  });
+
+  it("does not re-publish a deterministic 400 on the next poll, but a changed revision publishes", async () => {
+    vi.useFakeTimers();
+    const byAgent = { main: [proposal("rejected")] };
+    const gateway = makeGateway(byAgent);
+    const kernel = makeKernel();
+    kernel.publishApprovalRequested.mockRejectedValueOnce(new KernelNotifyError(400, "invalid digest"));
+    const { bridge, logger } = await makeBridge(gateway, kernel);
+    try {
+      await bridge.reconcile();
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      byAgent.main[0] = proposal("rejected", { revisionHash: "changed-revision" });
+      await vi.advanceTimersByTimeAsync(15_000);
+      await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(2));
+      expect(kernel.publishApprovalRequested.mock.calls[1][0].detail.sourceRevision).toBe("changed-revision");
+    } finally {
+      bridge.dispose();
+    }
   });
 
   it("one agent's workshop failing is logged loudly and does not hide the other agents' proposals", async () => {

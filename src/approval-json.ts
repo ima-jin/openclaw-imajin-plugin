@@ -8,27 +8,37 @@ export function assertJsonStable(value: unknown, ancestors = new Set<object>()):
   if (typeof value !== "object" || value === null) {
     throw new TypeError("approval digest must contain only JSON-stable values");
   }
+  assertJsonContainer(value, ancestors);
+  ancestors.add(value);
+  try {
+    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
+      if (Array.isArray(value) && key === "length") continue;
+      assertJsonProperty(descriptor, ancestors);
+    }
+  } finally {
+    ancestors.delete(value);
+  }
+}
+
+function assertJsonContainer(value: object, ancestors: Set<object>): void {
   const array = Array.isArray(value);
   const prototype = Object.getPrototypeOf(value);
-  if ((!array && prototype !== Object.prototype && prototype !== null) || ancestors.has(value)) {
+  const plain = array ? prototype === Array.prototype : prototype === Object.prototype || prototype === null;
+  if (!plain || ancestors.has(value)) {
     throw new TypeError("approval digest must contain plain, acyclic JSON data");
   }
   if (Object.getOwnPropertySymbols(value).length > 0) {
     throw new TypeError("approval digest cannot contain symbol keys");
   }
-  if (array && Object.keys(value).length !== value.length) {
+  const keys = Object.keys(value);
+  if (array && (keys.length !== value.length || keys.some((key, index) => key !== String(index)))) {
     throw new TypeError("approval digest cannot contain sparse or extended arrays");
   }
-  ancestors.add(value);
-  try {
-    for (const [key, descriptor] of Object.entries(Object.getOwnPropertyDescriptors(value))) {
-      if (array && key === "length") continue;
-      if (!descriptor.enumerable || !("value" in descriptor)) {
-        throw new TypeError("approval digest cannot contain hidden properties or accessors");
-      }
-      assertJsonStable(descriptor.value, ancestors);
-    }
-  } finally {
-    ancestors.delete(value);
+}
+
+function assertJsonProperty(descriptor: PropertyDescriptor, ancestors: Set<object>): void {
+  if (!descriptor.enumerable || !("value" in descriptor)) {
+    throw new TypeError("approval digest cannot contain hidden properties or accessors");
   }
+  assertJsonStable(descriptor.value, ancestors);
 }

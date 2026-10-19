@@ -1009,8 +1009,9 @@ export class GatewayApprovalsBridge {
       // The caller releases the reservation in finally. Do not keep a
       // phantom publication when a retired instance cancels a failed POST.
       this.forget(proposalId);
-      if (this.disposed) return;
+      if (this.disposed && isRetryablePublishError(err)) return;
       this.recordPublishFailure(sourceId, proposalId, payload.contentHash, err);
+      if (this.disposed) return;
       await this.failClosedIfBlocking(sourceId, request, `the kernel refused or could not receive the card (${String(err)})`);
     }
   }
@@ -1029,7 +1030,7 @@ export class GatewayApprovalsBridge {
     if (logFailure) {
       this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
     }
-    this.sources.get(sourceId)?.onPublishFailed?.(proposalId, failure);
+    if (!this.disposed) this.sources.get(sourceId)?.onPublishFailed?.(proposalId, failure);
   }
 
   /** Authenticated reconnect replay: closed sockets may have dropped startup bindings. */

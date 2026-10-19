@@ -418,7 +418,7 @@ describe("GatewayApprovalsBridge disposal boundaries (#86)", () => {
       expect(tracker.block).not.toHaveBeenCalled();
 
       if (outcome === "success") publishing.resolve(undefined);
-      else publishing.reject(new KernelNotifyError(400, "rejected"));
+      else publishing.reject(new KernelNotifyError(503, "unavailable"));
       await Promise.all([initialReconciliation, replacementReconciliation]);
 
       expect(publicationLedger.reservations.size).toBe(0);

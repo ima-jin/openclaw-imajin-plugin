@@ -8,6 +8,8 @@ describe("approval JSON stability guard (#94)", () => {
     new Date(), new Map(), new Set(), /test/, new Number(1),
     { nested: { value: undefined } }, [undefined], Array(1),
     Object.assign([1], { extra: 2 }),
+    Object.assign(Array(1), { extra: 2 }),
+    new (class extends Array {})(),
     { [Symbol("key")]: "value" },
     Object.defineProperty({}, "hidden", { value: 1 }),
     Object.defineProperty({}, "getter", { enumerable: true, get: () => 1 }),
