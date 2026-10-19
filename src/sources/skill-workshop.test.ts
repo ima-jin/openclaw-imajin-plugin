@@ -193,7 +193,7 @@ describe("createSkillWorkshopSource", () => {
         const source = createSkillWorkshopSource(client);
         expect((await source.list()).map((request) => request.proposalId)).toEqual(["valid"]);
         expect((await source.list()).map((request) => request.proposalId)).toEqual(["valid"]);
-        await expect(source.getCurrent("proposal-1")).resolves.toMatchObject({ pending: false, sourceRevision: null });
+        await expect(source.getCurrent("proposal-1")).rejects.toThrow("pending but its revisionHash could not be verified");
         expect(console.warn).toHaveBeenCalledTimes(1);
         expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("no verified revisionHash"));
       },
@@ -222,6 +222,23 @@ describe("createSkillWorkshopSource", () => {
       expect((await source.list()).map((request) => request.proposalId)).toEqual(["valid"]);
       expect((await source.list()).map((request) => request.sourceRevision)).toEqual(["inspected-rev-1", "rev-1"]);
       expect(fns.inspect).toHaveBeenCalledTimes(2);
+      expect(console.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it.each([undefined, "ops"])("defers current checks on inspect failure and recovers for agent %j", async (agentId) => {
+      const { client, fns } = makeClient();
+      if (agentId) client.listAgentIds = vi.fn().mockResolvedValue([agentId]);
+      fns.list.mockResolvedValue({ proposals: [makeProposal({ revisionHash: undefined })] });
+      const source = createSkillWorkshopSource(client);
+      const [request] = await source.list();
+      fns.inspect.mockRejectedValueOnce(new Error("temporary inspect outage"));
+      await expect(source.getCurrent(request.proposalId)).rejects.toThrow(
+        "pending but its revisionHash could not be verified",
+      );
+      await expect(source.getCurrent(request.proposalId)).resolves.toMatchObject({
+        pending: true, sourceRevision: request.sourceRevision,
+      });
+      expect(fns.apply).not.toHaveBeenCalled();
       expect(console.warn).toHaveBeenCalledTimes(1);
     });
 

@@ -261,10 +261,13 @@ export function createSkillWorkshopSource(
   }
 
   /** Every list/current/poll uses the same fail-closed revision hydration. */
-  async function pendingFor(agentId?: string): Promise<RevisionedProposal[]> {
+  async function pendingFor(agentId?: string, requireRevisionFor?: string): Promise<RevisionedProposal[]> {
     try {
       const list = await currentPending(client, agentId);
       const hydrated = await Promise.all(list.map((proposal) => hydrate(proposal, agentId)));
+      if (list.some((proposal, index) => proposal.id === requireRevisionFor && hydrated[index] === null)) {
+        throw new Error(`skill-workshop proposal ${requireRevisionFor} is pending but its revisionHash could not be verified`);
+      }
       return hydrated.filter((proposal): proposal is RevisionedProposal => proposal !== null);
     } catch (err) {
       if (isMissingScopeError(err)) warnMissingScopeOnce(err);
@@ -298,10 +301,10 @@ export function createSkillWorkshopSource(
    * logged loudly and does not hide the others; only when every agent fails
    * does this throw (so the bridge logs the list failure).
    */
-  async function pending(): Promise<RevisionedProposal[]> {
+  async function pending(requireRevisionFor?: string): Promise<RevisionedProposal[]> {
     const agentIds = await resolveAgentIds();
-    if (agentIds.length === 0) return pendingFor();
-    const settled = await Promise.allSettled(agentIds.map((agentId) => pendingFor(agentId)));
+    if (agentIds.length === 0) return pendingFor(undefined, requireRevisionFor);
+    const settled = await Promise.allSettled(agentIds.map((agentId) => pendingFor(agentId, requireRevisionFor)));
     const seen = new Set<string>();
     const merged: RevisionedProposal[] = [];
     let firstError: unknown;
@@ -324,7 +327,7 @@ export function createSkillWorkshopSource(
         merged.push(proposal);
       }
     });
-    if (failures === agentIds.length) throw firstError;
+    if (failures === agentIds.length || (requireRevisionFor && failures > 0)) throw firstError;
     return merged;
   }
 
@@ -403,7 +406,7 @@ export function createSkillWorkshopSource(
       // Ask only the owning agent when known: a failure listing some OTHER
       // agent must never make this proposal look resolved.
       const owner = agentByProposal.get(proposalId);
-      const list = owner ? await pendingFor(owner) : await pending();
+      const list = owner ? await pendingFor(owner, proposalId) : await pending(proposalId);
       const match = list.find((proposal) => proposal.id === proposalId);
       if (!match) return { pending: false, sourceRevision: null };
       // #2084: return the CURRENT `detail` too (built the same way `list()`
