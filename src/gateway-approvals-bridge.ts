@@ -1750,6 +1750,16 @@ async function prepareBridgeCredentials(
   return { keypair, gatewayToken: gatewayTokenResult.value, notifySecret: notifySecretResult.value };
 }
 
+async function loadApprovalsCursor(deps: StartGatewayApprovalsBridgeDeps): Promise<ApprovalsCursorStore> {
+  const stateDir = resolveStateDir(deps.stateDir, deps.keypairPath);
+  const cursorStore = new ApprovalsCursorStore(
+    stateDir ? path.join(stateDir, APPROVALS_CURSOR_FILENAME) : undefined,
+    { nodeUrl: deps.nodeUrl, agentDid: deps.did! },
+  );
+  await cursorStore.load();
+  return cursorStore;
+}
+
 async function startOwnedGatewayApprovalsBridge(
   api: BridgeApi,
   config: ApprovalsBridgePluginConfig | undefined,
@@ -1813,12 +1823,7 @@ async function startOwnedGatewayApprovalsBridge(
 
   const operatorDid = config!.operatorDid!;
   const kernelHttp = deps.kernelHttp;
-  const stateDir = resolveStateDir(deps.stateDir, deps.keypairPath);
-  const cursorStore = new ApprovalsCursorStore(
-    stateDir ? path.join(stateDir, APPROVALS_CURSOR_FILENAME) : undefined,
-    { nodeUrl: deps.nodeUrl, agentDid: deps.did! },
-  );
-  await cursorStore.load();
+  const cursorStore = await loadApprovalsCursor(deps);
   if (!resources.active) return undefined;
 
   if (kernelHttp) {
