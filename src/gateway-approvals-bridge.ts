@@ -925,64 +925,67 @@ export class GatewayApprovalsBridge {
     this.reservations.set(proposalId, reservation);
     this.ownedReservations.add(reservation);
     try {
-      let payload: KernelApprovalRequestedPayload;
-      try {
-        payload = await buildApprovalRequestedPayload(sourceId, request, {
-          did: this.config.agentDid,
-          privateKeyHex: this.config.agentPrivateKeyHex,
-        });
-      } catch (err) {
-        if (this.disposed) return;
-        this.logger.error(`failed to sign operator.approval.requested for ${proposalId}: ${String(err)}`);
-        this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
-        await this.failClosedIfBlocking(sourceId, request, `could not sign the card (${String(err)})`);
-        return;
-      }
-      if (this.disposed) return;
-      this.published.set(proposalId, {
-        sourceId,
-        owner: request.owner,
-        kind: request.kind,
-        summary: request.summary,
-        detail: request.detail,
-        sourceRevision: request.sourceRevision,
-        contentHash: payload.contentHash,
-      });
-      try {
-        await this.publishWithRetry(sourceId, proposalId, payload);
-        if (this.disposed) return;
-        this.logger.info(
-          `published operator.approval.requested for ${proposalId} (source=${sourceId}, kind=${payload.kind})`,
-        );
-        // The owning session / cron run now waits on an operator (#64). The
-        // reason names the kind only — never the command text.
-        this.loopBlocker?.block(
-          proposalId,
-          request.owner,
-          `awaiting operator approval (${payload.kind})`,
-          request.expiresAtMs,
-        );
-        this.ensureSweepTimer();
-        await this.publishNativeApprovalBinding(request);
-        if (this.isDegraded()) {
-          // Fire-and-forget: a slow notify CLI must never hold the publish reservation.
-          void this.warnDegradedPublish(proposalId, payload.kind);
-        }
-      } catch (err) {
-        // Clear BOTH the tracked proposal and (via the outer `finally`) the
-        // reservation, so the next real event for this proposalId is treated
-        // as brand new and gets a genuine retry instead of being deduped
-        // against a publish that never actually happened.
-        this.forget(proposalId);
-        if (this.disposed) return;
-        this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
-        this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
-        await this.failClosedIfBlocking(sourceId, request, `the kernel refused or could not receive the card (${String(err)})`);
-      }
+      await this.publishSourceRequest(sourceId, request);
     } finally {
       this.reservations.delete(proposalId);
       this.ownedReservations.delete(reservation);
       settleReservation();
+    }
+  }
+
+  private async publishSourceRequest(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
+    const proposalId = request.proposalId;
+    let payload: KernelApprovalRequestedPayload;
+    try {
+      payload = await buildApprovalRequestedPayload(sourceId, request, {
+        did: this.config.agentDid,
+        privateKeyHex: this.config.agentPrivateKeyHex,
+      });
+    } catch (err) {
+      if (this.disposed) return;
+      this.logger.error(`failed to sign operator.approval.requested for ${proposalId}: ${String(err)}`);
+      this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
+      await this.failClosedIfBlocking(sourceId, request, `could not sign the card (${String(err)})`);
+      return;
+    }
+    if (this.disposed) return;
+    this.published.set(proposalId, {
+      sourceId,
+      owner: request.owner,
+      kind: request.kind,
+      summary: request.summary,
+      detail: request.detail,
+      sourceRevision: request.sourceRevision,
+      contentHash: payload.contentHash,
+    });
+    try {
+      await this.publishWithRetry(sourceId, proposalId, payload);
+      if (this.disposed) return;
+      this.logger.info(
+        `published operator.approval.requested for ${proposalId} (source=${sourceId}, kind=${payload.kind})`,
+      );
+      // The owning session / cron run now waits on an operator (#64). The
+      // reason names the kind only — never the command text.
+      this.loopBlocker?.block(
+        proposalId,
+        request.owner,
+        `awaiting operator approval (${payload.kind})`,
+        request.expiresAtMs,
+      );
+      this.ensureSweepTimer();
+      await this.publishNativeApprovalBinding(request);
+      if (!this.disposed && this.isDegraded()) {
+        // Fire-and-forget: a slow notify CLI must never hold the publish reservation.
+        void this.warnDegradedPublish(proposalId, payload.kind);
+      }
+    } catch (err) {
+      // The caller releases the reservation in finally. Do not keep a
+      // phantom publication when a retired instance cancels a failed POST.
+      this.forget(proposalId);
+      if (this.disposed) return;
+      this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
+      this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
+      await this.failClosedIfBlocking(sourceId, request, `the kernel refused or could not receive the card (${String(err)})`);
     }
   }
 
@@ -1557,6 +1560,122 @@ export interface StartedGatewayApprovalsBridge {
   isDegraded: () => boolean;
   dispose: () => void;
 }
+type BridgeApi = { runtime?: { config?: { current?: () => Record<string, unknown> } } };
+interface LiveSourceOptions {
+  api: BridgeApi;
+  config: ApprovalsBridgePluginConfig;
+  deps: StartGatewayApprovalsBridgeDeps;
+  resources: RegistrationLifecycle;
+  gatewayToken?: string;
+  notifySecret: string;
+  onExecReconnected: () => void;
+}
+
+/** Own a connection before awaiting start(), including partial startups. */
+async function ownConnection<T extends { start: () => Promise<void>; stop: () => void }>(
+  resources: RegistrationLifecycle,
+  pending: Promise<T>,
+): Promise<T> {
+  const live = await pending;
+  if (!resources.active) {
+    live.stop();
+    throw new Error("approvals bridge retired");
+  }
+  resources.add(live.stop);
+  try {
+    await live.start();
+  } catch (err) {
+    live.stop();
+    throw err;
+  }
+  if (!resources.active) {
+    live.stop();
+    throw new Error("approvals bridge retired");
+  }
+  return live;
+}
+
+async function startWorkshopSource(options: LiveSourceOptions): Promise<ApprovalSource> {
+  const { scopes: operatorScopes, defaulted } = resolveSkillWorkshopOperatorScopes(
+    options.config.skillWorkshop?.operatorScopes,
+  );
+  assertKnownOperatorGatewayScopes(operatorScopes, "approvals.skillWorkshop.operatorScopes");
+  if (defaulted) {
+    console.log(
+      `[imajin-approvals-bridge] approvals.skillWorkshop.operatorScopes not set — defaulting to ${JSON.stringify(operatorScopes)} (set ["operator.approvals"] to opt out)`,
+    );
+  }
+  const live = await ownConnection(options.resources, createLiveSkillWorkshopConnection(options.api, {
+    gatewayTokenOverride: options.gatewayToken,
+    clientDisplayName: "Imajin Gateway approvals bridge (skill-workshop)",
+    operatorScopes,
+  }));
+  return createSkillWorkshopSource(live.client);
+}
+
+async function startCatalogSource(options: LiveSourceOptions): Promise<ApprovalSource | undefined> {
+  const catalog = options.deps.imajinCatalog;
+  if (!catalog) {
+    console.warn(
+      '[imajin-approvals-bridge] approvals.sources includes "imajin-catalog" but no catalog accessor was wired (imajin provider not registered) — source not started',
+    );
+    return undefined;
+  }
+  const live = await ownConnection(options.resources, createLiveImajinCatalogConnection(options.api, {
+    gatewayTokenOverride: options.gatewayToken,
+    clientDisplayName: "Imajin Gateway approvals bridge (imajin-catalog)",
+  }));
+  return createImajinCatalogSource({
+    listDiscoveredModels: catalog.listDiscoveredModels,
+    isModelAllowed: catalog.isModelAllowed,
+    gateway: live.client,
+  });
+}
+
+async function startExecSource(options: LiveSourceOptions): Promise<ApprovalSource> {
+  const live = await ownConnection(options.resources, createLiveGatewayExecConnection(options.api, {
+    gatewayTokenOverride: options.gatewayToken,
+    clientDisplayName: "Imajin Gateway approvals bridge (gateway-exec)",
+    // Broadcasts missed while disconnected are not replayed; re-list them.
+    onReconnected: options.onExecReconnected,
+  }));
+  const outcomeClient = createHttpKernelExecOutcomeClient({
+    nodeUrl: options.deps.nodeUrl,
+    webhookSecret: options.notifySecret,
+  });
+  options.resources.add(wireGatewayExecOutcomeReporting(live.client, outcomeClient));
+  return createGatewayExecSource(live.client, { agentDid: options.deps.did! });
+}
+
+async function startApprovalSources(options: LiveSourceOptions): Promise<Map<string, ApprovalSource>> {
+  const factories: Record<string, () => Promise<ApprovalSource | undefined>> = {
+    "system-agent": async () => {
+      const live = await ownConnection(options.resources, createLiveGatewayApprovalsClient(options.api, {
+        gatewayTokenOverride: options.gatewayToken,
+        clientDisplayName: "Imajin Gateway approvals bridge (system-agent)",
+      }));
+      return createSystemAgentSource(live.client);
+    },
+    "skill-workshop": () => startWorkshopSource(options),
+    "imajin-catalog": () => startCatalogSource(options),
+    "gateway-exec": () => startExecSource(options),
+  };
+  const enabledSourceIds = resolveEnabledApprovalSourceIds(options.config.sources);
+  logExecApprovalPreflight(enabledSourceIds, options.api.runtime?.config?.current?.(), console);
+  const sources = new Map<string, ApprovalSource>();
+  for (const sourceId of enabledSourceIds) {
+    if (!options.resources.active) break;
+    try {
+      const source = await factories[sourceId]();
+      if (source) sources.set(sourceId, source);
+    } catch (err) {
+      if (!options.resources.active) break;
+      const consequence = sourceId === "gateway-exec" ? " — ask-gated exec will NOT reach /jin" : "";
+      console.error(`[imajin-approvals-bridge] failed to start ${sourceId} source${consequence}: ${String(err)}`);
+    }
+  }
+  return sources;
+}
 
 /**
  * Orchestrates the whole bridge for `index.ts`: resolves secrets, opens one
@@ -1591,12 +1710,12 @@ export async function startGatewayApprovalsBridge(
   }
 }
 
-async function startOwnedGatewayApprovalsBridge(
-  api: { runtime?: { config?: { current?: () => Record<string, unknown> } } },
+async function prepareBridgeCredentials(
+  api: BridgeApi,
   config: ApprovalsBridgePluginConfig | undefined,
   deps: StartGatewayApprovalsBridgeDeps,
   resources: RegistrationLifecycle,
-): Promise<StartedGatewayApprovalsBridge | undefined> {
+): Promise<{ keypair: Keypair; gatewayToken?: string; notifySecret: string } | undefined> {
   if (!isApprovalsBridgeConfigured(config, deps.did)) {
     if (config?.enabled) {
       console.warn(
@@ -1628,135 +1747,36 @@ async function startOwnedGatewayApprovalsBridge(
   }
 
   if (!resources.active) return undefined;
+  return { keypair, gatewayToken: gatewayTokenResult.value, notifySecret: notifySecretResult.value };
+}
+
+async function startOwnedGatewayApprovalsBridge(
+  api: BridgeApi,
+  config: ApprovalsBridgePluginConfig | undefined,
+  deps: StartGatewayApprovalsBridgeDeps,
+  resources: RegistrationLifecycle,
+): Promise<StartedGatewayApprovalsBridge | undefined> {
+  const credentials = await prepareBridgeCredentials(api, config, deps, resources);
+  if (!credentials) return undefined;
+  const { keypair, gatewayToken, notifySecret } = credentials;
   const kernel = createHttpKernelNotifyClient({
     nodeUrl: deps.nodeUrl,
-    webhookSecret: notifySecretResult.value,
+    webhookSecret: notifySecret,
     operatorDid: config!.operatorDid!,
   });
 
-  const enabledSourceIds = resolveEnabledApprovalSourceIds(config!.sources);
-  // #52: an ask-gated exec that never reaches /jin must not fail silently.
-  logExecApprovalPreflight(enabledSourceIds, api.runtime?.config?.current?.(), console);
-  const sources = new Map<string, ApprovalSource>();
-  // Own each connection before awaiting start(), including partial startups.
-  const startConnection = async <T extends { start: () => Promise<void>; stop: () => void }>(
-    pending: Promise<T>,
-  ): Promise<T | undefined> => {
-    const live = await pending;
-    if (!resources.active) {
-      live.stop();
-      return undefined;
-    }
-    resources.add(live.stop);
-    try {
-      await live.start();
-    } catch (err) {
-      live.stop();
-      throw err;
-    }
-    if (!resources.active) {
-      live.stop();
-      return undefined;
-    }
-    return live;
-  };
   // Late-bound: the Gateway connection opens before the bridge exists.
   let bridgeRef: GatewayApprovalsBridge | undefined;
-
-  if (enabledSourceIds.has("system-agent")) {
-    try {
-      const live = await startConnection(createLiveGatewayApprovalsClient(api, {
-        gatewayTokenOverride: gatewayTokenResult.value,
-        clientDisplayName: "Imajin Gateway approvals bridge (system-agent)",
-      }));
-      if (!live) return undefined;
-      sources.set("system-agent", createSystemAgentSource(live.client));
-    } catch (err) {
-      console.error(`[imajin-approvals-bridge] failed to start system-agent source: ${String(err)}`);
-    }
-  }
-
-  if (!resources.active) return undefined;
-  if (enabledSourceIds.has("skill-workshop")) {
-    try {
-      const { scopes: operatorScopes, defaulted } = resolveSkillWorkshopOperatorScopes(
-        config!.skillWorkshop?.operatorScopes,
-      );
-      assertKnownOperatorGatewayScopes(operatorScopes, "approvals.skillWorkshop.operatorScopes");
-      if (defaulted) {
-        console.log(
-          `[imajin-approvals-bridge] approvals.skillWorkshop.operatorScopes not set — defaulting to ${JSON.stringify(operatorScopes)} (set ["operator.approvals"] to opt out)`,
-        );
-      }
-      const live = await startConnection(createLiveSkillWorkshopConnection(api, {
-        gatewayTokenOverride: gatewayTokenResult.value,
-        clientDisplayName: "Imajin Gateway approvals bridge (skill-workshop)",
-        operatorScopes,
-      }));
-      if (!live) return undefined;
-      sources.set("skill-workshop", createSkillWorkshopSource(live.client));
-    } catch (err) {
-      console.error(`[imajin-approvals-bridge] failed to start skill-workshop source: ${String(err)}`);
-    }
-  }
-
-  if (!resources.active) return undefined;
-  if (enabledSourceIds.has("imajin-catalog")) {
-    if (deps.imajinCatalog) {
-      try {
-        const live = await startConnection(createLiveImajinCatalogConnection(api, {
-          gatewayTokenOverride: gatewayTokenResult.value,
-          clientDisplayName: "Imajin Gateway approvals bridge (imajin-catalog)",
-        }));
-        if (!live) return undefined;
-        sources.set(
-          "imajin-catalog",
-          createImajinCatalogSource({
-            listDiscoveredModels: deps.imajinCatalog.listDiscoveredModels,
-            isModelAllowed: deps.imajinCatalog.isModelAllowed,
-            gateway: live.client,
-          }),
-        );
-      } catch (err) {
-        console.error(`[imajin-approvals-bridge] failed to start imajin-catalog source: ${String(err)}`);
-      }
-    } else {
-      console.warn(
-        '[imajin-approvals-bridge] approvals.sources includes "imajin-catalog" but no catalog accessor was wired (imajin provider not registered) — source not started',
-      );
-    }
-  }
-
-  if (!resources.active) return undefined;
-  if (enabledSourceIds.has("gateway-exec")) {
-    try {
-      const live = await startConnection(createLiveGatewayExecConnection(api, {
-        gatewayTokenOverride: gatewayTokenResult.value,
-        clientDisplayName: "Imajin Gateway approvals bridge (gateway-exec)",
-        // #52: broadcasts raised while the loopback socket was down are never
-        // replayed — re-list pending exec approvals (dedup keeps it to one card).
-        onReconnected: () => {
-          void bridgeRef?.reconcile().catch((err: unknown) => {
-            console.error(`[imajin-approvals-bridge] gateway-exec reconnect reconcile failed: ${String(err)}`);
-          });
-        },
-      }));
-      if (!live) return undefined;
-      sources.set("gateway-exec", createGatewayExecSource(live.client, { agentDid: deps.did! }));
-      // Outcome reporting (#38) is a side channel alongside the source
-      // itself, not part of the generic ApprovalSource contract — see
-      // gateway-exec.ts's module doc.
-      const outcomeClient = createHttpKernelExecOutcomeClient({
-        nodeUrl: deps.nodeUrl,
-        webhookSecret: notifySecretResult.value,
+  const sources = await startApprovalSources({
+    api, config: config!, deps, resources,
+    gatewayToken,
+    notifySecret,
+    onExecReconnected: () => {
+      void bridgeRef?.reconcile().catch((err: unknown) => {
+        console.error(`[imajin-approvals-bridge] gateway-exec reconnect reconcile failed: ${String(err)}`);
       });
-      resources.add(wireGatewayExecOutcomeReporting(live.client, outcomeClient));
-    } catch (err) {
-      console.error(
-        `[imajin-approvals-bridge] failed to start gateway-exec source — ask-gated exec will NOT reach /jin: ${String(err)}`,
-      );
-    }
-  }
+    },
+  });
 
   if (!resources.active) return undefined;
   if (sources.size === 0) {

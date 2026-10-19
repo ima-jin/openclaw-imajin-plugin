@@ -6,7 +6,7 @@ import type { SystemAgentApprovalRequestRecord } from "./sources/system-agent.js
 import { beginRegistration } from "./registration-lifecycle.js";
 
 const mocks = vi.hoisted(() => ({
-  system: vi.fn(), workshop: vi.fn(), preflight: vi.fn(),
+  system: vi.fn(), workshop: vi.fn(), catalog: vi.fn(), exec: vi.fn(), preflight: vi.fn(),
   helpers: [] as Array<{ dispose: ReturnType<typeof vi.fn> }>,
   sockets: [] as Array<{
     start: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>;
@@ -26,8 +26,15 @@ vi.mock("./sources/system-agent.js", async (original) => ({
 vi.mock("./sources/skill-workshop.js", async (original) => ({
   ...await original<object>(), createLiveSkillWorkshopConnection: mocks.workshop,
 }));
+vi.mock("./sources/imajin-catalog.js", async (original) => ({
+  ...await original<object>(), createLiveImajinCatalogConnection: mocks.catalog,
+}));
+vi.mock("./sources/gateway-exec.js", async (original) => ({
+  ...await original<object>(), createLiveGatewayExecConnection: mocks.exec,
+}));
 vi.mock("./client.js", () => ({ ImajinClient: class { requestRaw = mocks.preflight; } }));
 vi.mock("./imajin-provider.js", () => ({
+  IMAJIN_PROVIDER_ID: "imajin",
   isImajinCatalogInvalidationScope: () => false,
   registerImajinProvider: () => ({
     baseUrl: "http://localhost:8000", cache: { peek: () => undefined },
@@ -276,6 +283,29 @@ describe("process-wide plugin registration (#86)", () => {
     await ready();
     expect(late.start).not.toHaveBeenCalled();
     expect(late.stop).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ["system-agent", mocks.system], ["skill-workshop", mocks.workshop],
+    ["imajin-catalog", mocks.catalog], ["gateway-exec", mocks.exec],
+  ] as const)("retires a pending %s source before it can install subscriptions", async (sourceId, factory) => {
+    const pending = deferred<void>();
+    const live = { ...systemConnection(), start: vi.fn(() => pending.promise) };
+    factory.mockResolvedValueOnce(live);
+    register({
+      approvals: {
+        enabled: true, operatorDid: "did:imajin:operator",
+        notifyWebhookSecret: "test-fixture", sources: [sourceId],
+      },
+    });
+    await vi.waitFor(() => expect(live.start).toHaveBeenCalledOnce());
+    register({ nodeUrl: undefined });
+    expect(live.stop).toHaveBeenCalledOnce();
+    pending.resolve();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(live.stop).toHaveBeenCalledTimes(2);
+    expect(live.client.onRequested).not.toHaveBeenCalled();
+    expect(publish).not.toHaveBeenCalled();
   });
 
   it("cancels subscriptions and pollers immediately while startup preflight is pending", async () => {
