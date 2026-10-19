@@ -48,7 +48,7 @@ export interface SystemAgentApprovalRequestRecord {
 
 export type GatewayApprovalStatus = "pending" | "allowed" | "denied" | "expired" | "cancelled";
 
-/** The relevant projection of `approval.get`'s `ApprovalSnapshot` (gateway-protocol). */
+/** Current-state projection synthesized from the runtime-visible pending list. */
 export interface GatewayApprovalSnapshot {
   status: GatewayApprovalStatus;
   presentation?: { proposalHash?: string; [key: string]: unknown };
@@ -56,9 +56,9 @@ export interface GatewayApprovalSnapshot {
 
 /** Abstracts the plugin's own loopback Gateway operator connection (#24). */
 export interface GatewayApprovalsClient {
-  /** `openclaw.approval.list` — startup reconcile for proposals staged while the plugin was down. */
+  /** `openclaw.approval.list` — startup reconcile and current pending state. */
   list(): Promise<SystemAgentApprovalRequestRecord[]>;
-  /** `approval.get` — the CURRENT staged proposal, used for the hash-mismatch check. */
+  /** CURRENT pending proposal, including its live hash; null only after a successful list omits it. */
   get(id: string): Promise<GatewayApprovalSnapshot | null>;
   /** `approval.resolve` with `kind: "system-agent"`. */
   resolve(id: string, decision: SystemAgentApprovalDecisionKind): Promise<{ applied: boolean }>;
@@ -142,7 +142,7 @@ export function createSystemAgentSource(client: GatewayApprovalsClient): Approva
 
     // `_expectedSourceRevision` is intentionally unused: system-agent's own
     // anti-tamper check already happened at the bridge level via `getCurrent`
-    // (`approval.get`'s live `proposalHash`, #24's original check, now folded
+    // (the pending record's live `proposalHash`, #24's original check, now folded
     // into the bridge's composite `contentHash` digest per #2084) before
     // `resolve` is ever called, and the Gateway's own `approval.resolve` has
     // no revision-binding parameter to forward it to.
@@ -222,8 +222,16 @@ export async function createLiveGatewayApprovalsClient(
       );
     },
     async get(id: string) {
-      const result = await gatewayClient.request<{ approval: GatewayApprovalSnapshot }>("approval.get", { id });
-      return result?.approval ?? null;
+      // `approval.get` hides records from approval-runtime clients without a
+      // device id (#88), even though `approval.resolve` permits them. Read the
+      // same runtime-visible pending list used for reconcile instead. Let RPC
+      // failures propagate: an unreadable list is NOT proof a proposal is gone.
+      const record = (await client.list()).find((entry) => entry.id === id);
+      if (!record) return null;
+      return {
+        status: "pending",
+        presentation: { proposalHash: record.request.proposalHash },
+      };
     },
     async resolve(id: string, decision: SystemAgentApprovalDecisionKind) {
       const result = await gatewayClient.request<{ applied: boolean }>("approval.resolve", {
