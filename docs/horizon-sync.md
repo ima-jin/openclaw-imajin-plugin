@@ -143,15 +143,29 @@ The write-ahead outbox stores exact signed envelopes in a mode-0600 file,
 fsyncs and atomically replaces it, then sends in declaration-before-fact order.
 Every successful response is acknowledged durably before the next send.
 An uncertain response or restart retries the identical payload, timestamp and
-signature; the kernel deduplicates exact signed requests. Changed source
+signature; the kernel deduplicates exact signed requests. Explicit "already
+applied" receipts also acknowledge the saved request: a JSON `code` equal to
+`already_applied`, a JSON `error` equal to `already applied`, or the exact
+plain-text body `already applied`. Generic duplicate/conflict messages are not
+treated as acknowledgements. Receipt reads are bounded to 4096 bytes; response
+bodies are never logged or persisted. Changed source
 facts wait behind the saved batch, then diff against its completed target.
 
-Kernel ingest currently rejects exact retries older than its signed-message
-clock window before deduplication (also tracked in #2931). Such an outbox
-remains pending and logged, not restamped: restamping could duplicate accepted
-history. Operator reconciliation is required until the kernel exposes a
-safe stale-replay/receipt path. This is not a promise of unbounded offline
-delivery through the current kernel contract.
+Other permanent HTTP 4xx rejections (excluding 408 and 429) are stored in
+`<cursorPath>.dead-letter.json` before advancing to the next request. This
+mode-0600 file retains the exact signed request, HTTP status and rejection time,
+keyed by the request hash so a crash cannot duplicate its entry. A warning names
+the rejected `stepId`, never the server body. A failed dead-letter write keeps
+the request pending rather than losing it. HTTP 408/429, 5xx and network errors
+still retain the exact head request for retry.
+
+This includes stale-timestamp 4xx rejections outside the kernel's signed-message
+clock window (tracked in #2931). They are dead-lettered, not restamped or
+allowed to strand later steps. A dead letter is **not** proof of acceptance:
+operators must reconcile rejected facts; they are not retried automatically.
+The cursor consumes that observation while preserving its rejected signed
+request for inspection. This is not a promise of unbounded offline delivery
+through the current kernel contract.
 
 ## Verification and wake seam
 

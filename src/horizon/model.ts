@@ -61,7 +61,7 @@ export function record(value: unknown): Record<string, unknown> {
 }
 const CREDENTIAL_PATTERNS = [
   /-----BEGIN /,
-  /\b(?:Bearer|Basic)\s/i,
+  /\b(?:Bearer|Basic)\s+[A-Za-z0-9._~+\/=-]{16,}/,
   /\b(?:sk-|gh[pousr]_|github_pat_|glpat-|xox[baprs]-)\S+/i,
   /\b(?:password|secret|token|apikey|api_key|api-key|privatekey|private_key|private-key)["']?\s*[:=]/i,
   /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/,

@@ -1,11 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { mkdtemp, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canonicalize } from "../approval-bridge.js";
 import { loadCursor, planDiff, saveCursor, type Cursor } from "./cursor.js";
-import { deriveStepId, mapItem, parseHorizon, type HorizonItem, type StepRequest } from "./model.js";
+import { deriveStepId, mapItem, parseHorizon, text, type HorizonItem, type StepRequest } from "./model.js";
 import { createHorizonSync, registerHorizonSync, type HorizonSyncOptions } from "./sync.js";
 
 const DID = "did:imajin:jin";
@@ -55,6 +55,46 @@ async function setup(overrides: Partial<HorizonSyncOptions> = {}) {
 }
 
 describe("bridge mapping", () => {
+  it.each([
+    "Add self-serve reach bearer for static-header clients",
+    "Basic setup",
+    "Use basic authentication and a bearer credential",
+  ])("accepts ordinary authentication prose: %s", title => {
+    const parsed = parseHorizon(JSON.stringify({ depthTarget: 12, items: [item({ title })] }));
+    expect(mapItem(parsed.items[0]!, 0, context).declaration.intention).toBe(title);
+  });
+
+  it("still rejects credential-bearing auth headers and the other secret shapes", () => {
+    const value = randomBytes(24).toString("base64url"); // 32 ephemeral token characters
+    const credentials = [
+      `Bearer ${value}`,
+      `Authorization: Basic ${Buffer.from(randomBytes(24)).toString("base64")}`,
+      `ghp_${value}`,
+      `token=${value}`,
+      `https://operator:${value}@example.test/path`,
+      `-----BEGIN PRIVATE KEY-----\n${value}`,
+    ];
+    for (const title of credentials) {
+      expect(() => parseHorizon(JSON.stringify({ depthTarget: 12, items: [item({ title })] }))).toThrow("credential-shaped text");
+    }
+    expect(() => text(`Bearer ${value}`)).toThrow("credential-shaped text");
+  });
+
+  it("parses and publishes the full bridge-shaped fixture while ignoring its extra metadata", async () => {
+    const raw = await readFile(new URL("./fixtures/bridge.json", import.meta.url), "utf8");
+    const parsed = parseHorizon(raw);
+    const mapped = parsed.items.map((entry, rank) => mapItem(entry, rank, context));
+    expect(parsed.items).toHaveLength(20);
+    expect(mapped[1]?.declaration.intention).toBe("Add self-serve reach bearer for static-header clients");
+    expect(mapped.map(entry => entry.declaration.rank)).toEqual(Array.from({ length: 20 }, (_, rank) => rank));
+    const test = await setup();
+    await writeFile(test.filePath, raw);
+    await test.create().sync();
+    expect(test.requests.filter(request => request.type === "step.queued")).toHaveLength(20);
+    for (const field of ["doneAt", "exit", "note", "owner", "prManual"]) {
+      expect(JSON.stringify(test.requests)).not.toContain(`"${field}":`);
+    }
+  });
   it("declares rank and three immutable code exits without authoring a zone or claim", () => {
     const mapped = mapItem(item({ zone: "head", pr: 2909, prDraft: true }), 3, context);
     expect(mapped.declaration).toEqual({
@@ -212,7 +252,7 @@ describe("signed durable sync", () => {
       return new Response("{}", { status: 201 });
     }).mockImplementationOnce(async (_url, init) => {
       test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
-      return new Response("not authorized", { status: 403 });
+      return new Response("temporarily unavailable", { status: 503 });
     });
     const first = test.create();
     await first.sync();
@@ -293,7 +333,7 @@ describe("signed durable sync", () => {
     expect(test.requests.filter(request => request.type === "step.queued")).toHaveLength(2);
     expect(new Set(test.requests.map(request => request.payload.stepId)).size).toBe(2);
   });
-  it("retains exact stale envelopes on kernel rejection instead of inventing a fresh timestamp", async () => {
+  it("dead-letters stale 400 envelopes instead of restamping or wedging the queue", async () => {
     const test = await setup();
     test.fetchImpl.mockImplementation(async (_url, init) => {
       test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
@@ -304,9 +344,115 @@ describe("signed durable sync", () => {
     await first.stop();
     const restart = test.create({ now: () => Date.parse("2026-10-20T12:00:00Z") });
     await restart.sync();
-    expect(test.requests).toHaveLength(2);
+    expect(test.requests).toHaveLength(1);
+    const letters = JSON.parse(await readFile(restart.deadLetterPath, "utf8"));
+    expect(Object.values(letters.entries)).toEqual([{
+      request: test.requests[0], httpStatus: 400, rejectedAt: "2026-10-18T12:00:00.000Z",
+    }]);
+    expect(JSON.parse(await readFile(restart.cursorPath, "utf8"))).not.toHaveProperty("pending");
+    expect(test.logger.warn.mock.calls[0]?.[0]).toContain(test.requests[0]!.payload.stepId);
+  });
+});
+
+describe("durable rejected deliveries", () => {
+  it("acks an already-applied replay after a lost response and continues the saved batch", async () => {
+    const test = await setup();
+    await test.write([item(), item({ id: "next-step" })]);
+    test.fetchImpl.mockImplementationOnce(async (_url, init) => {
+      test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
+      throw new TypeError("accepted but response lost");
+    }).mockImplementationOnce(async (_url, init) => {
+      test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
+      return new Response(JSON.stringify({ code: "already_applied" }), { status: 409 });
+    });
+    const first = test.create();
+    await first.sync();
+    await first.stop();
+    const restart = test.create();
+    await restart.sync();
+    expect(test.requests).toHaveLength(3);
     expect(test.requests[1]).toEqual(test.requests[0]);
-    expect(JSON.parse(await readFile(restart.cursorPath, "utf8")).pending.requests).toHaveLength(1);
+    expect(test.requests[2]!.payload.stepId).not.toBe(test.requests[0]!.payload.stepId);
+    expect(JSON.parse(await readFile(restart.cursorPath, "utf8"))).not.toHaveProperty("pending");
+    await expect(stat(restart.deadLetterPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await test.create().sync();
+    expect(test.requests).toHaveLength(3);
+    expect(test.logger.warn).toHaveBeenCalledTimes(1); // the original lost response only
+  });
+  it.each([400, 401, 403, 404, 409, 422])("dead-letters permanent HTTP %s and publishes the next step", async status => {
+    const test = await setup();
+    const serverBody = `private server diagnostic ${randomBytes(24).toString("base64url")}`;
+    await test.write([item(), item({ id: "unblocked-step" })]);
+    test.fetchImpl.mockImplementationOnce(async (_url, init) => {
+      test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
+      return new Response(serverBody, { status });
+    });
+    const service = test.create();
+    await service.sync();
+    expect(test.requests).toHaveLength(2);
+    const raw = await readFile(service.deadLetterPath, "utf8");
+    const entries = Object.values(JSON.parse(raw).entries);
+    expect(entries).toEqual([{
+      request: test.requests[0], httpStatus: status, rejectedAt: "2026-10-18T12:00:00.000Z",
+    }]);
+    expect((await stat(service.deadLetterPath)).mode & 0o777).toBe(0o600);
+    expect(raw).not.toContain(serverBody);
+    expect(raw).not.toContain(test.privateKey.toString("hex"));
+    expect(JSON.stringify(test.logger.warn.mock.calls)).not.toContain(serverBody);
+    expect(test.logger.warn.mock.calls[0]?.[0]).toContain(test.requests[0]!.payload.stepId);
+    expect(JSON.parse(await readFile(service.cursorPath, "utf8"))).not.toHaveProperty("pending");
+    await service.stop();
+    await test.create().sync();
+    expect(test.requests).toHaveLength(2);
+  });
+  it.each([408, 429, 500, 503])("retains an exact HTTP %s retry at the head rather than dead-lettering it", async status => {
+    const test = await setup();
+    await test.write([item(), item({ id: "waits-for-retry" })]);
+    test.fetchImpl.mockImplementationOnce(async (_url, init) => {
+      test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
+      return new Response("unavailable", { status });
+    });
+    const first = test.create();
+    await first.sync();
+    expect(test.requests).toHaveLength(1);
+    expect(JSON.parse(await readFile(first.cursorPath, "utf8")).pending.requests).toHaveLength(2);
+    await expect(stat(first.deadLetterPath)).rejects.toMatchObject({ code: "ENOENT" });
+    await first.stop();
+    await test.create().sync();
+    expect(test.requests).toHaveLength(3);
+    expect(test.requests[1]).toEqual(test.requests[0]);
+  });
+  it("does not advance if dead-letter persistence fails, then deduplicates crash-window rejections", async () => {
+    const test = await setup();
+    await test.write([item(), item({ id: "after-rejection" })]);
+    const service = test.create();
+    await mkdir(service.deadLetterPath, { recursive: true }); // block atomic replacement
+    test.fetchImpl.mockImplementationOnce(async (_url, init) => {
+      test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
+      return new Response("rejected", { status: 422 });
+    });
+    await service.sync();
+    expect(test.requests).toHaveLength(1);
+    expect(JSON.parse(await readFile(service.cursorPath, "utf8")).pending.requests).toHaveLength(2);
+    await rename(service.deadLetterPath, `${service.deadLetterPath}.blocked`);
+    test.fetchImpl.mockImplementationOnce(async (_url, init) => {
+      test.requests.push(JSON.parse(String(init?.body)) as StepRequest);
+      return new Response("rejected", { status: 422 });
+    });
+    await service.sync();
+    expect(test.requests).toHaveLength(3);
+    expect(test.requests[1]).toEqual(test.requests[0]);
+    const saved = await readFile(service.deadLetterPath, "utf8");
+    const cursor = JSON.parse(await readFile(service.cursorPath, "utf8")) as Cursor;
+    // Simulate a crash after saving the dead letter but before removing the outbox head.
+    await saveCursor(service.cursorPath, {
+      ...cursor, pending: { requests: [test.requests[0]!], steps: cursor.steps, at: cursor.lastAt },
+    });
+    test.fetchImpl.mockResolvedValueOnce(new Response("rejected", { status: 422 }));
+    await service.sync();
+    expect(await readFile(service.deadLetterPath, "utf8")).toBe(saved);
+    expect(Object.keys(JSON.parse(saved).entries)).toHaveLength(1);
+    expect(JSON.parse(await readFile(service.cursorPath, "utf8"))).not.toHaveProperty("pending");
   });
 });
 

@@ -104,10 +104,14 @@ export async function loadCursor(path: string, scope: string): Promise<Cursor> {
 }
 /** fsync + same-directory rename: no partially written cursor, even after a crash. */
 export async function saveCursor(path: string, cursor: Cursor): Promise<void> {
+  return saveJson(path, cursor);
+}
+/** Shared private atomic storage for cursors and rejected signed requests. */
+export async function saveJson(path: string, value: unknown): Promise<void> {
   const temp = `${path}.${randomUUID()}.tmp`;
   const file = await open(temp, "wx", 0o600);
   try {
-    await file.writeFile(JSON.stringify(cursor));
+    await file.writeFile(JSON.stringify(value));
     await file.sync();
   } finally {
     await file.close();

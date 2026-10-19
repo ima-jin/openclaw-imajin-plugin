@@ -5,6 +5,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { createLoopTransport, type LoopSenderOptions } from "../loop-publisher.js";
 import { loadCursor, planDiff, saveCursor, type Cursor } from "./cursor.js";
 import { digest, mapItem, parseHorizon, text, type StepEnvelope, type StepRequest } from "./model.js";
+import { deliveryResult, rejectedStepWarning, saveDeadLetter } from "./outbox.js";
 
 export interface HorizonConfig {
   enabled?: boolean;
@@ -48,6 +49,7 @@ export function createHorizonSync(options: HorizonSyncOptions) {
   const stateDir = expandPath(options.config.stateDir ?? join(dirname(expandPath(options.keypairPath)), "horizon-sync"));
   const scope = digest([options.nodeUrl.replace(/\/$/, ""), loopId, options.did, principal]);
   const cursorPath = join(stateDir, `${scope}.json`);
+  const deadLetterPath = `${cursorPath}.dead-letter.json`;
   if (filePath === cursorPath) throw new Error("horizon must not be its own cursor");
   const transport = createLoopTransport({ ...options, keypairPath: expandPath(options.keypairPath) });
   const log = options.logger ?? { info: console.log, warn: console.warn };
@@ -76,9 +78,12 @@ export function createHorizonSync(options: HorizonSyncOptions) {
         throw new Error("outbox identity mismatch");
       }
       const response = await transport.post(request);
-      // Never log server bodies or free-text input; either could contain secrets.
-      await response.body?.cancel();
-      if (!response.ok) throw new Error("kernel rejected event");
+      const result = await deliveryResult(response);
+      if (result === "retry") throw new Error("kernel delivery is transient");
+      if (result === "dead-letter") {
+        await saveDeadLetter(deadLetterPath, request, response.status, now());
+        log.warn(rejectedStepWarning(request, response.status));
+      }
       cursor = { ...cursor, pending: { ...pending, requests: pending.requests.slice(1) } };
       await saveCursor(cursorPath, cursor);
       // Each acknowledgement depends on the preceding POST and durable write.
@@ -138,6 +143,7 @@ export function createHorizonSync(options: HorizonSyncOptions) {
   return {
     sync,
     cursorPath,
+    deadLetterPath,
     start(): void {
       if (timer) return;
       stopped = false;
