@@ -34,6 +34,7 @@ class GatewayClientRequestError extends Error {
 function makeClient(): { client: SkillWorkshopGatewayClient; fns: Record<string, ReturnType<typeof vi.fn>> } {
   const fns = {
     list: vi.fn().mockResolvedValue({ proposals: [] }),
+    inspect: vi.fn().mockResolvedValue({ revisionHash: "inspected-rev-1" }),
     apply: vi.fn().mockResolvedValue({ applied: true }),
     reject: vi.fn().mockResolvedValue(undefined),
   };
@@ -86,6 +87,157 @@ describe("createSkillWorkshopSource", () => {
     expect(request.detail?.skillName).toBe("trip-planning");
   });
 
+  describe("revision hydration", () => {
+    beforeEach(() => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    it("uses inspect's top-level revision consistently for list, current and apply", async () => {
+      const { client, fns } = makeClient();
+      fns.list.mockResolvedValue({
+        proposals: [makeProposal({ revisionHash: undefined, updatedAt: "2026-10-19T00:00:00Z" })],
+      });
+      fns.inspect.mockResolvedValue({ revisionHash: "actual-revision", proposal: { revisionHash: "wrong" } });
+      const source = createSkillWorkshopSource(client);
+      const [request] = await source.list();
+      expect(request.sourceRevision).toBe("actual-revision");
+      expect(fns.inspect).toHaveBeenCalledWith("proposal-1");
+      await expect(source.getCurrent(request.proposalId)).resolves.toEqual({
+        pending: true, sourceRevision: request.sourceRevision, detail: request.detail,
+      });
+      await source.resolve(request.proposalId, "approve", request.sourceRevision);
+      expect(fns.apply).toHaveBeenCalledWith("proposal-1", "actual-revision");
+      expect(fns.inspect).toHaveBeenCalledTimes(1);
+    });
+
+    it("retains valid list revisions without requiring inspect", async () => {
+      const { client, fns } = makeClient();
+      const inspect = fns.inspect;
+      delete client.inspect;
+      fns.list.mockResolvedValue({ proposals: [makeProposal()] });
+      const source = createSkillWorkshopSource(client);
+      expect((await source.list())[0].sourceRevision).toBe("rev-1");
+      expect(inspect).not.toHaveBeenCalled();
+    });
+
+    it("invalidates cached revisions when updatedAt changes, including getCurrent", async () => {
+      const { client, fns } = makeClient();
+      const proposal = makeProposal({ revisionHash: undefined, updatedAt: "first" });
+      fns.list.mockImplementation(async () => ({ proposals: [proposal] }));
+      const source = createSkillWorkshopSource(client);
+      expect((await source.list())[0].sourceRevision).toBe("inspected-rev-1");
+      await source.list();
+      expect(fns.inspect).toHaveBeenCalledTimes(1);
+      proposal.updatedAt = "second";
+      fns.inspect.mockResolvedValue({ revisionHash: "inspected-rev-2" });
+      await expect(source.getCurrent(proposal.id)).resolves.toMatchObject({ sourceRevision: "inspected-rev-2" });
+      expect(fns.inspect).toHaveBeenCalledTimes(2);
+    });
+
+    it("does not cache proposals lacking updatedAt or reuse their old timestamp cache", async () => {
+      const { client, fns } = makeClient();
+      const proposal = makeProposal({ revisionHash: undefined, updatedAt: "first" });
+      fns.list.mockImplementation(async () => ({ proposals: [proposal] }));
+      const source = createSkillWorkshopSource(client);
+      await source.list();
+      proposal.updatedAt = undefined;
+      fns.inspect.mockResolvedValue({ revisionHash: "fresh-revision" });
+      expect((await source.list())[0].sourceRevision).toBe("fresh-revision");
+      await source.getCurrent(proposal.id);
+      expect(fns.inspect).toHaveBeenCalledTimes(3);
+      proposal.updatedAt = "first";
+      await source.list();
+      expect(fns.inspect).toHaveBeenCalledTimes(4);
+    });
+
+    it("keys the cache by proposal id and agent and binds scoped apply/reject", async () => {
+      const { client, fns } = makeClient();
+      client.listAgentIds = vi.fn().mockResolvedValue(["main", "ops"]);
+      fns.list.mockImplementation(async (agentId) => ({
+        proposals: [
+          makeProposal({ id: "shared", revisionHash: undefined, updatedAt: "same" }),
+          makeProposal({ id: `${agentId}-only`, revisionHash: undefined, updatedAt: "same" }),
+        ],
+      }));
+      fns.inspect.mockImplementation(async (id, agentId) => ({ revisionHash: `${agentId}-${id}-rev` }));
+      const source = createSkillWorkshopSource(client);
+      const requests = await source.list();
+      expect(requests.map((request) => request.sourceRevision)).toEqual([
+        "main-shared-rev", "main-main-only-rev", "ops-ops-only-rev",
+      ]);
+      expect(fns.inspect).toHaveBeenCalledWith("shared", "main");
+      expect(fns.inspect).toHaveBeenCalledWith("shared", "ops");
+      await source.list();
+      expect(fns.inspect).toHaveBeenCalledTimes(4);
+      fns.list.mockClear();
+      await expect(source.getCurrent("ops-only")).resolves.toMatchObject({ sourceRevision: "ops-ops-only-rev" });
+      expect(fns.list).toHaveBeenCalledTimes(1);
+      expect(fns.list).toHaveBeenCalledWith("ops");
+      await source.resolve("ops-only", "approve", "ops-ops-only-rev");
+      await source.resolve("ops-only", "reject", "ops-ops-only-rev");
+      expect(fns.apply).toHaveBeenCalledWith("ops-only", "ops-ops-only-rev", "ops");
+      expect(fns.reject).toHaveBeenCalledWith("ops-only", "ops-ops-only-rev", "ops");
+    });
+
+    it.each([undefined, null, "", "  ", 42, {}, ["rev"]])(
+      "withholds invalid inspect revision %j, logs once, and keeps valid proposals visible",
+      async (revisionHash) => {
+        const { client, fns } = makeClient();
+        fns.list.mockResolvedValue({
+          proposals: [makeProposal({ revisionHash: undefined }), makeProposal({ id: "valid" })],
+        });
+        fns.inspect.mockResolvedValue({ revisionHash });
+        const source = createSkillWorkshopSource(client);
+        expect((await source.list()).map((request) => request.proposalId)).toEqual(["valid"]);
+        expect((await source.list()).map((request) => request.proposalId)).toEqual(["valid"]);
+        await expect(source.getCurrent("proposal-1")).resolves.toMatchObject({ pending: false, sourceRevision: null });
+        expect(console.warn).toHaveBeenCalledTimes(1);
+        expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("no verified revisionHash"));
+      },
+    );
+
+    it("fails closed without inspect support rather than inventing a revision", async () => {
+      const { client, fns } = makeClient();
+      delete client.inspect;
+      fns.list.mockResolvedValue({ proposals: [makeProposal({ revisionHash: undefined })] });
+      const source = createSkillWorkshopSource(client);
+      await expect(source.list()).resolves.toEqual([]);
+      await source.list();
+      expect(console.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it("does not cache inspect errors and recovers without hiding another valid proposal", async () => {
+      const { client, fns } = makeClient();
+      fns.list.mockResolvedValue({
+        proposals: [
+          makeProposal({ revisionHash: undefined, updatedAt: "same" }),
+          makeProposal({ id: "valid" }),
+        ],
+      });
+      fns.inspect.mockRejectedValueOnce(new Error("inspect unavailable"));
+      const source = createSkillWorkshopSource(client);
+      expect((await source.list()).map((request) => request.proposalId)).toEqual(["valid"]);
+      expect((await source.list()).map((request) => request.sourceRevision)).toEqual(["inspected-rev-1", "rev-1"]);
+      expect(fns.inspect).toHaveBeenCalledTimes(2);
+      expect(console.warn).toHaveBeenCalledTimes(1);
+    });
+
+    it.each(["", " ", undefined, null])("rejects expected revision %j before either decision RPC", async (revision) => {
+      const { client, fns } = makeClient();
+      const source = createSkillWorkshopSource(client);
+      for (const decision of ["approve", "reject"] as const) {
+        await expect(source.resolve("proposal-1", decision, revision as string)).rejects.toThrow(
+          "requires a non-empty expectedSourceRevision",
+        );
+      }
+      expect(fns.apply).not.toHaveBeenCalled();
+      expect(fns.reject).not.toHaveBeenCalled();
+    });
+  });
+
   describe("subscribe()", () => {
     beforeEach(() => {
       vi.useFakeTimers();
@@ -112,6 +264,108 @@ describe("createSkillWorkshopSource", () => {
 
       unsubscribe();
     });
+  });
+
+  describe("content-aware publish retries", () => {
+    beforeEach(() => { vi.useFakeTimers(); });
+    afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); });
+
+    it("hydrates polls and recovers from inspect failure without emitting an unrevisioned request", async () => {
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const { client, fns } = makeClient();
+      fns.list.mockResolvedValue({
+        proposals: [makeProposal({ revisionHash: undefined, updatedAt: "first" })],
+      });
+      fns.inspect.mockRejectedValueOnce(new Error("offline")).mockResolvedValue({ revisionHash: "hydrated" });
+      const source = createSkillWorkshopSource(client, { pollIntervalMs: 1000 });
+      const onRequested = vi.fn();
+      const unsubscribe = source.subscribe(onRequested);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).toHaveBeenCalledTimes(1);
+      expect(onRequested).toHaveBeenCalledWith(expect.objectContaining({ sourceRevision: "hydrated" }));
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).toHaveBeenCalledTimes(1);
+      expect(fns.inspect).toHaveBeenCalledTimes(2);
+      expect(warn).toHaveBeenCalledTimes(1);
+      unsubscribe();
+    });
+
+    it("emits changed revisions and content for known proposals, but not unchanged requests", async () => {
+      const { client, fns } = makeClient();
+      const proposal = makeProposal();
+      fns.list.mockImplementation(async () => ({ proposals: [proposal] }));
+      const source = createSkillWorkshopSource(client, { pollIntervalMs: 1000 });
+      await source.list();
+      const onRequested = vi.fn();
+      const unsubscribe = source.subscribe(onRequested);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).not.toHaveBeenCalled();
+      proposal.revisionHash = "rev-2";
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).toHaveBeenCalledTimes(1);
+      proposal.description = "changed content with the same revision";
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).toHaveBeenCalledTimes(2);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).toHaveBeenCalledTimes(2);
+      unsubscribe();
+    });
+
+    it("retries transient publish failures on the next poll", async () => {
+      const { client, fns } = makeClient();
+      fns.list.mockResolvedValue({ proposals: [makeProposal()] });
+      const source = createSkillWorkshopSource(client, { pollIntervalMs: 1000 });
+      await source.list();
+      source.onPublishFailed!("proposal-1");
+      const onRequested = vi.fn();
+      const unsubscribe = source.subscribe(onRequested);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).toHaveBeenCalledTimes(1);
+      unsubscribe();
+    });
+
+    it("suppresses unchanged failures through retryAtMs, preserving backoff across list()", async () => {
+      const { client, fns } = makeClient();
+      fns.list.mockResolvedValue({ proposals: [makeProposal()] });
+      const source = createSkillWorkshopSource(client, { pollIntervalMs: 1000 });
+      await source.list();
+      const failed = source.onPublishFailed as (id: string, failure: { retryAtMs: number }) => void;
+      failed("proposal-1", { retryAtMs: Date.now() + 2000 });
+      const onRequested = vi.fn();
+      const unsubscribe = source.subscribe(onRequested);
+      await vi.advanceTimersByTimeAsync(1000);
+      await source.list();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(onRequested).toHaveBeenCalledTimes(1);
+      unsubscribe();
+    });
+
+    it.each(["revisionHash", "description"] as const)(
+      "allows changed %s immediately despite a deterministic failure's retry deadline",
+      async (field) => {
+        const { client, fns } = makeClient();
+        const proposal = makeProposal();
+        fns.list.mockImplementation(async () => ({ proposals: [proposal] }));
+        const source = createSkillWorkshopSource(client, { pollIntervalMs: 1000 });
+        await source.list();
+        const failed = source.onPublishFailed as (id: string, failure: { retryAtMs: number }) => void;
+        failed("proposal-1", { retryAtMs: Date.now() + 30_000 });
+        const onRequested = vi.fn();
+        const unsubscribe = source.subscribe(onRequested);
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(onRequested).not.toHaveBeenCalled();
+        proposal[field] = "changed";
+        await vi.advanceTimersByTimeAsync(1000);
+        expect(onRequested).toHaveBeenCalledTimes(1);
+        unsubscribe();
+      },
+    );
   });
 
   it("getCurrent() reports pending: false for an unknown/resolved proposal", async () => {
