@@ -159,9 +159,11 @@ export interface ApprovalSource {
    * (signing or POST). A source that remembers what it already reported
    * (e.g. Skill Workshop's poll) forgets it here so its next poll re-emits
    * the proposal and the bridge retries — otherwise a transient kernel
-   * outage would leave a pending item unpublished until restart.
+   * outage would leave a pending item unpublished until restart. A deterministic
+   * kernel rejection supplies a retry deadline: suppress the unchanged request
+   * through that deadline, but allow a changed revision/content immediately.
    */
-  onPublishFailed?(proposalId: string): void;
+  onPublishFailed?(proposalId: string, failure?: { retryAtMs: number }): void;
 
   /** Button labels for the /jin card. Omit for the default (Approve/Deny). */
   readonly decisionLabels?: { approve: string; reject: string };

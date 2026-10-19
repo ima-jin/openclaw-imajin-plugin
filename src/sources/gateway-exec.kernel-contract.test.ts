@@ -227,10 +227,10 @@ describe("a gateway-exec card that cannot be published fails loud, not silent (#
     emit(FAILING_RECORD);
 
     await vi.waitFor(() => expect(notify).toHaveBeenCalledTimes(1));
-    // A second event for the same proposal must not be parked behind the hung notify:
-    // the reservation is released, so publishing is retried. The shared
+    // A changed card must not be parked behind the hung notify (#94 holds
+    // unchanged deterministic rejections). The reservation is released. The shared
     // execution claim (#77) prevents a second deny, even on this failed path.
-    emit(FAILING_RECORD);
+    emit({ ...FAILING_RECORD, request: { ...FAILING_RECORD.request, cwd: "/var/tmp" } });
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(2));
     expect(client.resolve).toHaveBeenCalledTimes(1);
     expect(bridge.isPublished("approval-fail")).toBe(false);
