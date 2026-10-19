@@ -76,6 +76,7 @@
  */
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
+import { RegistrationLifecycle } from "./registration-lifecycle.js";
 import { canonicalize, signMessage, type SignedMessage } from "./approval-bridge.js";
 import { ApprovalExecutionRegistry, type ApprovalLoopBinding } from "./approval-execution.js";
 export type { ApprovalLoopBinding } from "./approval-execution.js";
@@ -578,8 +579,28 @@ interface TrackedProposal {
   /** The composite digest signed and published to the kernel for this proposal (#2084). */
   contentHash: string;
 }
+interface PublicationLedger {
+  published: Map<string, TrackedProposal>;
+  reservations: Map<string, Promise<void>>;
+}
+
+const publicationLedgerKey = Symbol.for("imajin.plugin.approval-publications");
+
+function processPublicationLedger(key: string): PublicationLedger {
+  const state = globalThis as typeof globalThis & {
+    [publicationLedgerKey]?: Map<string, PublicationLedger>;
+  };
+  const ledgers = state[publicationLedgerKey] ??= new Map();
+  let ledger = ledgers.get(key);
+  if (!ledger) {
+    ledger = { published: new Map(), reservations: new Map() };
+    ledgers.set(key, ledger);
+  }
+  return ledger;
+}
+
 export class GatewayApprovalsBridge {
-  private readonly published = new Map<string, TrackedProposal>();
+  private readonly published: Map<string, TrackedProposal>;
   /**
    * Synchronous publish-slot reservation (#48, fixing the #33 TOCTOU): keyed
    * by proposalId, set the INSTANT `handleSourceRequested` decides to
@@ -593,7 +614,8 @@ export class GatewayApprovalsBridge {
    * that caller settles, so a genuine retry (next real event) after a
    * publish failure sees no leftover reservation and can publish for real.
    */
-  private readonly reservations = new Map<string, Promise<void>>();
+  private readonly reservations: Map<string, Promise<void>>;
+  private readonly ownedReservations = new Set<Promise<void>>();
   /**
    * In-flight `handleKernelDecision` runs keyed by proposalId (#53): a live
    * WS push and a catch-up replay of the same decision share one run.
@@ -619,6 +641,7 @@ export class GatewayApprovalsBridge {
   private sweepTimer?: ReturnType<typeof setInterval>;
   private sweeping = false;
   private disposed = false;
+  private readonly shutdown = new AbortController();
 
   constructor(
     private readonly config: GatewayApprovalsBridgeConfig,
@@ -637,8 +660,12 @@ export class GatewayApprovalsBridge {
       publishApprovalBinding?: (binding: SignedMessage<ApprovalLoopBinding>) => Promise<void>;
       /** Stale-loop-block sweep interval in ms (#66); `0` disables. Used as given — clamp config with `resolveLoopBlockSweepIntervalMs`. */
       loopBlockSweepIntervalMs?: number;
+      /** Live registrations share dedup state across replacement/re-import. */
+      publicationLedger?: PublicationLedger;
     } = {},
   ) {
+    this.published = options.publicationLedger?.published ?? new Map();
+    this.reservations = options.publicationLedger?.reservations ?? new Map();
     this.publishRetryDelaysMs = options.publishRetryDelaysMs ?? DEFAULT_PUBLISH_RETRY_DELAYS_MS;
     this.executionRegistry = options.executionRegistry ?? new ApprovalExecutionRegistry();
     this.loopTracker = options.loopTracker;
@@ -751,7 +778,9 @@ export class GatewayApprovalsBridge {
 
   /** Stops observing every source. Does not evict already-tracked proposals. */
   dispose(): void {
+    if (this.disposed) return;
     this.disposed = true;
+    this.shutdown.abort();
     this.stopSweepTimer();
     for (const unsubscribe of this.unsubscribes) unsubscribe();
     this.loopBlocker?.dispose();
@@ -833,6 +862,7 @@ export class GatewayApprovalsBridge {
    */
   async reconcile(): Promise<void> {
     for (const source of this.sources.values()) {
+      if (this.disposed) return;
       await this.reconcileSource(source);
     }
   }
@@ -846,12 +876,12 @@ export class GatewayApprovalsBridge {
       return;
     }
     for (const request of requests) {
-      if (this.published.has(request.proposalId)) continue;
       await this.handleSourceRequested(source.id, request);
     }
   }
 
   private async handleSourceRequested(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
+    if (this.disposed) return;
     const proposalId = request.proposalId;
     // Native exec ids are also session.approve/session.deny claim keys. Do not
     // permit aliases to split one approval across two execution registries.
@@ -859,7 +889,17 @@ export class GatewayApprovalsBridge {
       this.logger.error(`refused gateway-exec proposal ${proposalId}: native approvalId must equal proposalId`);
       return;
     }
+    const predecessorReservation = this.reservations.get(proposalId);
+    if (predecessorReservation && !this.ownedReservations.has(predecessorReservation)) {
+      // A predecessor may still be finishing its POST (or cancelling retry).
+      // Wait for its confirmed outcome before deduping or retrying ourselves.
+      await predecessorReservation;
+      return this.handleSourceRequested(sourceId, request);
+    }
     if (this.published.has(proposalId)) {
+      // Restore this registration's loop hold without re-publishing the card.
+      this.loopBlocker?.block(proposalId, request.owner, `awaiting operator approval (${request.kind})`, request.expiresAtMs);
+      this.ensureSweepTimer();
       // Dedup by proposalId (#24): a reconnect/replay of the same event, or a
       // reconcile racing a live event for the same proposal, must never
       // re-publish.
@@ -883,6 +923,7 @@ export class GatewayApprovalsBridge {
       settleReservation = resolve;
     });
     this.reservations.set(proposalId, reservation);
+    this.ownedReservations.add(reservation);
     try {
       let payload: KernelApprovalRequestedPayload;
       try {
@@ -891,11 +932,13 @@ export class GatewayApprovalsBridge {
           privateKeyHex: this.config.agentPrivateKeyHex,
         });
       } catch (err) {
+        if (this.disposed) return;
         this.logger.error(`failed to sign operator.approval.requested for ${proposalId}: ${String(err)}`);
         this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
         await this.failClosedIfBlocking(sourceId, request, `could not sign the card (${String(err)})`);
         return;
       }
+      if (this.disposed) return;
       this.published.set(proposalId, {
         sourceId,
         owner: request.owner,
@@ -907,6 +950,7 @@ export class GatewayApprovalsBridge {
       });
       try {
         await this.publishWithRetry(sourceId, proposalId, payload);
+        if (this.disposed) return;
         this.logger.info(
           `published operator.approval.requested for ${proposalId} (source=${sourceId}, kind=${payload.kind})`,
         );
@@ -930,18 +974,21 @@ export class GatewayApprovalsBridge {
         // as brand new and gets a genuine retry instead of being deduped
         // against a publish that never actually happened.
         this.forget(proposalId);
+        if (this.disposed) return;
         this.logger.error(`failed to publish operator.approval.requested for ${proposalId}: ${String(err)}`);
         this.sources.get(sourceId)?.onPublishFailed?.(proposalId);
         await this.failClosedIfBlocking(sourceId, request, `the kernel refused or could not receive the card (${String(err)})`);
       }
     } finally {
       this.reservations.delete(proposalId);
+      this.ownedReservations.delete(reservation);
       settleReservation();
     }
   }
 
   /** Authenticated reconnect replay: closed sockets may have dropped startup bindings. */
   async republishApprovalBindings(): Promise<void> {
+    if (this.disposed) return;
     await Promise.all(Array.from(this.published, ([proposalId, tracked]) =>
       this.publishNativeApprovalBinding({ proposalId, owner: tracked.owner }, true),
     ));
@@ -952,6 +999,7 @@ export class GatewayApprovalsBridge {
     request: Pick<ApprovalSourceRequest, "proposalId" | "owner">,
     replay = false,
   ): Promise<void> {
+    if (this.disposed) return;
     if (!request.owner || !this.loopTracker?.lookupRef) return;
     try {
       // The local source owns this ref. Never trust detail.sessionKey or a
@@ -973,6 +1021,7 @@ export class GatewayApprovalsBridge {
         type: "agent",
         privateKeyHex: this.config.agentPrivateKeyHex,
       });
+      if (this.disposed) return;
       await this.publishApprovalBinding(binding);
     } catch (err) {
       // Telemetry failure must not deny a successfully published live card.
@@ -993,17 +1042,32 @@ export class GatewayApprovalsBridge {
     payload: KernelApprovalRequestedPayload,
     attempt = 0,
   ): Promise<void> {
+    if (this.disposed) throw new Error("approvals bridge retired");
     try {
       await this.kernel.publishApprovalRequested(payload);
     } catch (err) {
+      if (this.disposed) throw err;
       const delay = this.publishRetryDelaysMs[attempt];
       if (delay === undefined || !isRetryablePublishError(err)) throw err;
       this.logger.warn(
         `publish of ${proposalId} (source=${sourceId}) failed transiently, retrying in ${delay}ms: ${String(err)}`,
       );
-      if (delay > 0) await new Promise<void>((resolve) => setTimeout(resolve, delay));
+      if (delay > 0) await this.waitForRetry(delay);
       await this.publishWithRetry(sourceId, proposalId, payload, attempt + 1);
     }
+  }
+
+  private waitForRetry(delay: number): Promise<void> {
+    return new Promise((resolve) => {
+      const finish = () => {
+        clearTimeout(timer);
+        this.shutdown.signal.removeEventListener("abort", finish);
+        resolve();
+      };
+      const timer = setTimeout(finish, delay);
+      this.shutdown.signal.addEventListener("abort", finish, { once: true });
+      if (this.disposed) finish();
+    });
   }
 
   /**
@@ -1052,6 +1116,7 @@ export class GatewayApprovalsBridge {
    * and is a no-op.
    */
   async handleKernelDecision(frame: KernelBusEventFrame): Promise<DecisionOutcome> {
+    if (this.disposed) return "noop";
     if (frame.eventType !== "operator.approval.decided") return "noop";
     const proposalId = (frame.payload as { proposalId?: unknown } | undefined)?.proposalId;
     if (typeof proposalId !== "string" || proposalId.length === 0) {
@@ -1168,6 +1233,7 @@ export class GatewayApprovalsBridge {
     // be rejected exactly like a kernel-forged approve/reject, even though
     // `withdrawn` never reaches a source's `resolve()` below either way.
     const signatureCheck = await this.verifyOperatorCountersignature(tracked, rawDecision, payload);
+    if (this.disposed) return "noop";
     if (!signatureCheck.ok) {
       this.logger.warn(`rejected operator.approval.decided for ${proposalId}: ${signatureCheck.error}`);
       return "rejected";
@@ -1193,6 +1259,7 @@ export class GatewayApprovalsBridge {
       // catch-up not to advance its cursor past this event (#53).
       return "deferred";
     }
+    if (this.disposed) return "noop";
     if (!current || !current.pending) {
       // Idempotent (#24): already resolved/expired/unknown at the source.
       this.logger.info(
@@ -1220,6 +1287,7 @@ export class GatewayApprovalsBridge {
           }),
         )
       : null;
+    if (this.disposed) return "noop";
     if (!recomputedHash || recomputedHash !== tracked.contentHash) {
       await this.handleDrift(source, tracked, proposalId, "contentHash no longer matches the staged proposal");
       return "rejected";
@@ -1311,12 +1379,14 @@ export class GatewayApprovalsBridge {
     proposalId: string,
     reason: string,
   ): Promise<void> {
+    if (this.disposed) return;
     this.logger.warn(`content hash mismatch for ${proposalId} (source=${tracked.sourceId}) — refusing to apply decision`);
     try {
       await this.kernel.publishMismatch(proposalId, reason);
     } catch (err) {
       this.logger.error(`failed to publish operator.approval.mismatch for ${proposalId}: ${String(err)}`);
     }
+    if (this.disposed) return;
     if (source.onDriftPolicy === "restage") {
       // Keep the loop-block hold across the restage (#66): only the tracked
       // entry is evicted so the re-list republishes the card, and the re-block
@@ -1430,6 +1500,8 @@ export function createHttpKernelNotifyClient(opts: {
 }
 
 export interface StartGatewayApprovalsBridgeDeps {
+  /** Retire resources even while asynchronous source startup is pending. */
+  signal?: AbortSignal;
   did?: string;
   keypairPath?: string;
   nodeUrl: string;
@@ -1501,6 +1573,30 @@ export async function startGatewayApprovalsBridge(
   config: ApprovalsBridgePluginConfig | undefined,
   deps: StartGatewayApprovalsBridgeDeps,
 ): Promise<StartedGatewayApprovalsBridge | undefined> {
+  if (deps.signal?.aborted) return undefined;
+  const resources = new RegistrationLifecycle();
+  const dispose = () => resources.dispose();
+  deps.signal?.addEventListener("abort", dispose, { once: true });
+  resources.add(() => deps.signal?.removeEventListener("abort", dispose));
+  try {
+    const started = await startOwnedGatewayApprovalsBridge(api, config, deps, resources);
+    if (!started || !resources.active) {
+      resources.dispose();
+      return undefined;
+    }
+    return started;
+  } catch (err) {
+    resources.dispose();
+    throw err;
+  }
+}
+
+async function startOwnedGatewayApprovalsBridge(
+  api: { runtime?: { config?: { current?: () => Record<string, unknown> } } },
+  config: ApprovalsBridgePluginConfig | undefined,
+  deps: StartGatewayApprovalsBridgeDeps,
+  resources: RegistrationLifecycle,
+): Promise<StartedGatewayApprovalsBridge | undefined> {
   if (!isApprovalsBridgeConfigured(config, deps.did)) {
     if (config?.enabled) {
       console.warn(
@@ -1514,6 +1610,7 @@ export async function startGatewayApprovalsBridge(
     resolveApprovalsSecret(api, config!.gatewayToken, "IMAJIN_APPROVALS_GATEWAY_TOKEN"),
     resolveApprovalsSecret(api, config!.notifyWebhookSecret, NOTIFY_WEBHOOK_SECRET_ENV),
   ]);
+  if (!resources.active) return undefined;
 
   if (!notifySecretResult.value) {
     console.warn(
@@ -1530,6 +1627,7 @@ export async function startGatewayApprovalsBridge(
     return undefined;
   }
 
+  if (!resources.active) return undefined;
   const kernel = createHttpKernelNotifyClient({
     nodeUrl: deps.nodeUrl,
     webhookSecret: notifySecretResult.value,
@@ -1540,24 +1638,45 @@ export async function startGatewayApprovalsBridge(
   // #52: an ask-gated exec that never reaches /jin must not fail silently.
   logExecApprovalPreflight(enabledSourceIds, api.runtime?.config?.current?.(), console);
   const sources = new Map<string, ApprovalSource>();
-  const stoppers: Array<() => void> = [];
+  // Own each connection before awaiting start(), including partial startups.
+  const startConnection = async <T extends { start: () => Promise<void>; stop: () => void }>(
+    pending: Promise<T>,
+  ): Promise<T | undefined> => {
+    const live = await pending;
+    if (!resources.active) {
+      live.stop();
+      return undefined;
+    }
+    resources.add(live.stop);
+    try {
+      await live.start();
+    } catch (err) {
+      live.stop();
+      throw err;
+    }
+    if (!resources.active) {
+      live.stop();
+      return undefined;
+    }
+    return live;
+  };
   // Late-bound: the Gateway connection opens before the bridge exists.
   let bridgeRef: GatewayApprovalsBridge | undefined;
 
   if (enabledSourceIds.has("system-agent")) {
     try {
-      const live = await createLiveGatewayApprovalsClient(api, {
+      const live = await startConnection(createLiveGatewayApprovalsClient(api, {
         gatewayTokenOverride: gatewayTokenResult.value,
         clientDisplayName: "Imajin Gateway approvals bridge (system-agent)",
-      });
-      await live.start();
+      }));
+      if (!live) return undefined;
       sources.set("system-agent", createSystemAgentSource(live.client));
-      stoppers.push(live.stop);
     } catch (err) {
       console.error(`[imajin-approvals-bridge] failed to start system-agent source: ${String(err)}`);
     }
   }
 
+  if (!resources.active) return undefined;
   if (enabledSourceIds.has("skill-workshop")) {
     try {
       const { scopes: operatorScopes, defaulted } = resolveSkillWorkshopOperatorScopes(
@@ -1569,27 +1688,27 @@ export async function startGatewayApprovalsBridge(
           `[imajin-approvals-bridge] approvals.skillWorkshop.operatorScopes not set — defaulting to ${JSON.stringify(operatorScopes)} (set ["operator.approvals"] to opt out)`,
         );
       }
-      const live = await createLiveSkillWorkshopConnection(api, {
+      const live = await startConnection(createLiveSkillWorkshopConnection(api, {
         gatewayTokenOverride: gatewayTokenResult.value,
         clientDisplayName: "Imajin Gateway approvals bridge (skill-workshop)",
         operatorScopes,
-      });
-      await live.start();
+      }));
+      if (!live) return undefined;
       sources.set("skill-workshop", createSkillWorkshopSource(live.client));
-      stoppers.push(live.stop);
     } catch (err) {
       console.error(`[imajin-approvals-bridge] failed to start skill-workshop source: ${String(err)}`);
     }
   }
 
+  if (!resources.active) return undefined;
   if (enabledSourceIds.has("imajin-catalog")) {
     if (deps.imajinCatalog) {
       try {
-        const live = await createLiveImajinCatalogConnection(api, {
+        const live = await startConnection(createLiveImajinCatalogConnection(api, {
           gatewayTokenOverride: gatewayTokenResult.value,
           clientDisplayName: "Imajin Gateway approvals bridge (imajin-catalog)",
-        });
-        await live.start();
+        }));
+        if (!live) return undefined;
         sources.set(
           "imajin-catalog",
           createImajinCatalogSource({
@@ -1598,7 +1717,6 @@ export async function startGatewayApprovalsBridge(
             gateway: live.client,
           }),
         );
-        stoppers.push(live.stop);
       } catch (err) {
         console.error(`[imajin-approvals-bridge] failed to start imajin-catalog source: ${String(err)}`);
       }
@@ -1609,9 +1727,10 @@ export async function startGatewayApprovalsBridge(
     }
   }
 
+  if (!resources.active) return undefined;
   if (enabledSourceIds.has("gateway-exec")) {
     try {
-      const live = await createLiveGatewayExecConnection(api, {
+      const live = await startConnection(createLiveGatewayExecConnection(api, {
         gatewayTokenOverride: gatewayTokenResult.value,
         clientDisplayName: "Imajin Gateway approvals bridge (gateway-exec)",
         // #52: broadcasts raised while the loopback socket was down are never
@@ -1621,10 +1740,9 @@ export async function startGatewayApprovalsBridge(
             console.error(`[imajin-approvals-bridge] gateway-exec reconnect reconcile failed: ${String(err)}`);
           });
         },
-      });
-      await live.start();
+      }));
+      if (!live) return undefined;
       sources.set("gateway-exec", createGatewayExecSource(live.client, { agentDid: deps.did! }));
-      stoppers.push(live.stop);
       // Outcome reporting (#38) is a side channel alongside the source
       // itself, not part of the generic ApprovalSource contract — see
       // gateway-exec.ts's module doc.
@@ -1632,7 +1750,7 @@ export async function startGatewayApprovalsBridge(
         nodeUrl: deps.nodeUrl,
         webhookSecret: notifySecretResult.value,
       });
-      stoppers.push(wireGatewayExecOutcomeReporting(live.client, outcomeClient));
+      resources.add(wireGatewayExecOutcomeReporting(live.client, outcomeClient));
     } catch (err) {
       console.error(
         `[imajin-approvals-bridge] failed to start gateway-exec source — ask-gated exec will NOT reach /jin: ${String(err)}`,
@@ -1640,6 +1758,7 @@ export async function startGatewayApprovalsBridge(
     }
   }
 
+  if (!resources.active) return undefined;
   if (sources.size === 0) {
     console.warn("[imajin-approvals-bridge] no approval sources could be started — bridge not started");
     return undefined;
@@ -1666,9 +1785,11 @@ export async function startGatewayApprovalsBridge(
       executionRegistry: deps.executionRegistry,
       publishApprovalBinding: deps.publishApprovalBinding,
       loopBlockSweepIntervalMs: resolveLoopBlockSweepIntervalMs(config!.loopBlockSweepIntervalMs),
+      publicationLedger: processPublicationLedger(JSON.stringify([deps.nodeUrl, deps.did, config!.operatorDid])),
     },
   );
   bridgeRef = bridge;
+  resources.add(() => bridge.dispose());
 
   const operatorDid = config!.operatorDid!;
   const kernelHttp = deps.kernelHttp;
@@ -1678,6 +1799,7 @@ export async function startGatewayApprovalsBridge(
     { nodeUrl: deps.nodeUrl, agentDid: deps.did! },
   );
   await cursorStore.load();
+  if (!resources.active) return undefined;
 
   if (kernelHttp) {
     // #53 startup preflight: know whether the kernel will push decisions to this
@@ -1690,6 +1812,7 @@ export async function startGatewayApprovalsBridge(
     );
   }
 
+  if (!resources.active) return undefined;
   try {
     await bridge.reconcile();
   } catch (err) {
@@ -1699,6 +1822,7 @@ export async function startGatewayApprovalsBridge(
   // Serialized: two reconnects in quick succession share one sync run.
   let syncInFlight: Promise<void> | undefined;
   const onKernelConnected = (): Promise<void> => {
+    if (!resources.active) return Promise.resolve();
     syncInFlight ??= (async () => {
       // WS sends before auth-ok may be dropped. Bindings do not depend on
       // operator:approvals entitlement and must replay even without HTTP.
@@ -1716,6 +1840,7 @@ export async function startGatewayApprovalsBridge(
 
   return {
     onKernelFrame: (frame: unknown) => {
+      if (!resources.active) return;
       if (!isKernelBusEventFrame(frame)) return;
       void bridge.handleKernelDecision(frame).catch((err: unknown) => {
         console.error(`[imajin-approvals-bridge] failed to handle kernel decision frame: ${String(err)}`);
@@ -1723,9 +1848,6 @@ export async function startGatewayApprovalsBridge(
     },
     onKernelConnected,
     isDegraded: () => bridge.isDegraded(),
-    dispose: () => {
-      bridge.dispose();
-      for (const stop of stoppers) stop();
-    },
+    dispose: () => resources.dispose(),
   };
 }

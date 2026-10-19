@@ -71,6 +71,7 @@ import {
 import { createLoopbackSessionGateway, type LoopbackSessionGateway } from "./src/session-command-gateway.js";
 import { ApprovalExecutionRegistry } from "./src/approval-execution.js";
 import { createWakeReportTool } from "./src/wake-report-tool.js";
+import { beginRegistration } from "./src/registration-lifecycle.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -114,6 +115,10 @@ export default definePluginEntry({
     "MJNx/MJN settlement, and network discovery.",
 
   register(api: any) {
+    const lifecycle = beginRegistration();
+    // Retained hooks and services must not resurrect retired clients.
+    const on = (hook: string, handler: (...args: any[]) => unknown, options?: { name?: string }) =>
+      api.on(hook, (...args: any[]) => lifecycle.active ? handler(...args) : undefined, options);
     const config = api.pluginConfig as {
       nodeUrl?: string;
       did?: string;
@@ -174,16 +179,19 @@ export default definePluginEntry({
     // the timer is stopped with the plugin; `startDiscovery` never throws
     // (failures are recorded in the cache and logged once).
     let discoveryHandle: ImajinDiscoveryHandle | undefined;
+    const stopDiscovery = () => {
+      discoveryHandle?.stop();
+      discoveryHandle = undefined;
+    };
+    lifecycle.add(stopDiscovery);
     api.registerService({
       id: "imajin-model-discovery",
       start: () => {
-        discoveryHandle?.stop();
+        if (!lifecycle.active) return;
+        stopDiscovery();
         discoveryHandle = imajinProvider.startDiscovery();
       },
-      stop: () => {
-        discoveryHandle?.stop();
-        discoveryHandle = undefined;
-      },
+      stop: stopDiscovery,
     });
 
     if (!config?.nodeUrl || !client) {
@@ -219,7 +227,7 @@ export default definePluginEntry({
     // Loop lifecycle → kernel loops rail (#46): signed loop.* events for
     // primary sessions, subagents, cron automations and keepers. Observe hooks
     // only; a publish failure is logged and dropped, never surfaced to the loop.
-    const loopLifecycle = registerLoopLifecycle(api, {
+    const loopLifecycle = registerLoopLifecycle({ on }, {
       nodeUrl: config.nodeUrl,
       did: config.did,
       keypairPath: config.keypairPath,
@@ -240,6 +248,8 @@ export default definePluginEntry({
         },
       );
 
+      lifecycle.add(() => wsService.stop());
+
       // WS notification → agent session injection (#1672), acked after the
       // durable enqueue step (#26) via `wsService.send` bound below.
       const {
@@ -252,8 +262,9 @@ export default definePluginEntry({
         sendFrame: (frame) => wsService.send(frame),
         keypairPath: config.keypairPath,
       });
+      lifecycle.add(disposeInjector);
       for (const [hook, handler] of Object.entries(wakeRuntimeHooks)) {
-        api.on(hook, handler, { name: `imajin-wake:${hook}` });
+        on(hook, handler, { name: `imajin-wake:${hook}` });
       }
       api.registerTool((ctx: { sessionKey?: string; runId?: string }) => createWakeReportTool(ctx, reportWake),
         { names: ["imajin_wake_report"] });
@@ -267,10 +278,12 @@ export default definePluginEntry({
         sendFrame: (frame) => wsService.send(frame),
       });
 
+      lifecycle.add(() => reachEvents.dispose());
+
       // Supervise every wake (#79), independently of optional reportTo (#47).
       // Completion observes local agent_end; the kernel never reads a transcript.
       if (onWakeAgentEnd) {
-        api.on(
+        on(
           "agent_end",
           (event: AgentEndEvent, ctx?: { sessionKey?: string }) => {
             void onWakeAgentEnd(event, ctx).catch(() => {
@@ -347,6 +360,8 @@ export default definePluginEntry({
           sessionGateway = createLoopbackSessionGateway({
             getConfig: () => (api.runtime?.config?.current?.() ?? {}) as Record<string, unknown>,
           });
+          const ownedGateway = sessionGateway;
+          lifecycle.add(() => ownedGateway.dispose());
           sessionCommandExecutor = createSessionCommandExecutor(
             {
               agentDid: config.did,
@@ -381,6 +396,7 @@ export default definePluginEntry({
       // never delay the rest of plugin registration.
       let approvalsBridgeFrameHandler: ((frame: unknown) => void) | undefined;
       const approvalsBridgeReady = startGatewayApprovalsBridge(api, config.approvals, {
+        signal: lifecycle.signal,
         did: config.did,
         keypairPath: config.keypairPath,
         nodeUrl: config.nodeUrl,
@@ -419,6 +435,11 @@ export default definePluginEntry({
         },
       })
         .then((started) => {
+          if (!lifecycle.active) {
+            started?.dispose();
+            return undefined;
+          }
+          if (started) lifecycle.add(() => started.dispose());
           approvalsBridgeFrameHandler = started?.onKernelFrame;
           return started;
         })
@@ -433,10 +454,11 @@ export default definePluginEntry({
       // a connect that races registration is not dropped.
       wsService.onConnected(async () => {
         const started = await approvalsBridgeReady;
-        await started?.onKernelConnected();
+        if (lifecycle.active) await started?.onKernelConnected();
       });
 
       wsService.onFrame((frame) => {
+        if (!lifecycle.active) return;
         // Consume before generic logging/injection; even invalid reach events
         // must never become trusted instructions or automatic Warp pings.
         if (isReachFrame(frame)) {
@@ -488,9 +510,14 @@ export default definePluginEntry({
       api.registerService({
         id: "imajin-ws",
         start: async () => {
+          if (!lifecycle.active) return;
           console.log("[imajin-ws] service start called");
           try {
             await wsService.start();
+            if (!lifecycle.active) {
+              wsService.stop();
+              return;
+            }
             console.log("[imajin-ws] service started successfully");
           } catch (err) {
             console.error("[imajin-ws] service start failed:", err);
@@ -498,11 +525,7 @@ export default definePluginEntry({
         },
         stop: () => {
           console.log("[imajin-ws] service stop called");
-          wsService.stop();
-          disposeInjector();
-          reachEvents.dispose();
-          sessionGateway?.dispose();
-          void approvalsBridgeReady.then((started) => started?.dispose());
+          lifecycle.dispose();
         },
       });
     }
@@ -516,7 +539,7 @@ export default definePluginEntry({
       enabled: config.attestation?.enabled,
     });
     if (turnUsageHandler) {
-      api.on("agent_end", turnUsageHandler, { name: "turn-usage-attestation" });
+      on("agent_end", turnUsageHandler, { name: "turn-usage-attestation" });
     }
 
     // TODO: registerMemoryCorpusSupplement — agent's chain as searchable memory
