@@ -51,6 +51,7 @@ export type GatewayApprovalStatus = "pending" | "allowed" | "denied" | "expired"
 /** Current-state projection synthesized from the runtime-visible pending list. */
 export interface GatewayApprovalSnapshot {
   status: GatewayApprovalStatus;
+  expiresAtMs?: number;
   presentation?: { proposalHash?: string; [key: string]: unknown };
 }
 
@@ -98,6 +99,8 @@ function toApprovalSourceRequest(record: SystemAgentApprovalRequestRecord): Appr
     kind: `system-agent:${deriveProposalKind(record.request)}`,
     summary: truncateSummary(record.request.description || record.request.title || record.id),
     sourceRevision: record.request.proposalHash,
+    ...(Number.isFinite(record.expiresAtMs)
+      ? { detail: { expiresAt: new Date(record.expiresAtMs).toISOString() } } : {}),
     ...(typeof sessionKey === "string" && sessionKey.trim().length > 0 ? { owner: { sessionKey } } : {}),
     ...(typeof record.expiresAtMs === "number" ? { expiresAtMs: record.expiresAtMs } : {}),
   };
@@ -133,10 +136,8 @@ export function createSystemAgentSource(client: GatewayApprovalsClient): Approva
       return {
         pending: snapshot.status === "pending",
         sourceRevision: snapshot.presentation?.proposalHash ?? null,
-        // system-agent has no structured detail to refresh here (see module
-        // doc) — the bridge's recomputed digest for this source therefore
-        // only ever varies with `sourceRevision`, matching #24's original
-        // (proposalHash-only) anti-tamper check exactly.
+        ...(Number.isFinite(snapshot.expiresAtMs)
+          ? { detail: { expiresAt: new Date(snapshot.expiresAtMs!).toISOString() } } : {}),
       };
     },
 
@@ -230,6 +231,7 @@ export async function createLiveGatewayApprovalsClient(
       if (!record) return null;
       return {
         status: "pending",
+        expiresAtMs: record.expiresAtMs,
         presentation: { proposalHash: record.request.proposalHash },
       };
     },

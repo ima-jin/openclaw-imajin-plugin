@@ -188,7 +188,7 @@ export function describeMissingApprovalsGrant(params: { agentDid: string; operat
       `, or add the capability to an existing active grant for this agent: ` +
       `PUT /auth/api/grants/{grantId}/capabilities/${OPERATOR_APPROVALS_CAPABILITY}.`,
     `The audience must allow both the operator DID and the agent DID (the kernel publishes a decided event addressed to each). ` +
-      `Once granted, the next WS reconnect re-checks and catches up missed decisions automatically.`,
+      `Renew at /auth/agents → the grant → Renew. Once granted, the bridge re-checks and catches up missed decisions within 5 min without a restart.`,
   ].join(" ");
 }
 
@@ -201,7 +201,8 @@ export function buildDegradedPublishWarning(params: {
   return (
     `⚠ bridge cannot apply: agent lacks ${OPERATOR_APPROVALS_CAPABILITY}. ` +
     `The /jin card for ${params.kind} (${params.proposalId}) is live, but approving it there will NOT be applied ` +
-    `until the owner grants ${OPERATOR_APPROVALS_CAPABILITY} to ${params.agentDid}.`
+    `until the owner grants ${OPERATOR_APPROVALS_CAPABILITY} to ${params.agentDid}. ` +
+    `Renew at /auth/agents → the grant → Renew; the bridge recovers within 5 min without a restart.`
   );
 }
 
