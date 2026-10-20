@@ -164,7 +164,7 @@ describe("process-wide plugin registration (#86)", () => {
         hooks.set(name, [...hooks.get(name) ?? [], handler]),
     });
     return {
-      emit: (name: string) => hooks.get(name)?.forEach((handler) => handler({})),
+      emit: (name: string, event?: object) => hooks.get(name)?.forEach((handler) => handler(event ?? {})),
       ws: services.find((service) => service.id === "imajin-ws")!,
       discovery: services.find((service) => service.id === "imajin-model-discovery")!,
     };
@@ -280,9 +280,14 @@ describe("process-wide plugin registration (#86)", () => {
     replacement.ws.stop();
     expect(mocks.sockets).toHaveLength(1);
     expect(mocks.sockets[0].stop).not.toHaveBeenCalled();
-    active.emit("session_start");
-    replacement.emit("session_start");
+    // The same host event dispatched through both registries is handled once.
+    const event = {};
+    active.emit("session_start", event);
+    replacement.emit("session_start", event);
     expect(mocks.loopHook).toHaveBeenCalledOnce();
+    // #92: a registry the host builds later but never starts still reaches the started owner.
+    replacement.emit("session_start");
+    expect(mocks.loopHook).toHaveBeenCalledTimes(2);
     await replacement.ws.start();
     await ready();
     expect(mocks.sockets).toHaveLength(2);
@@ -465,10 +470,12 @@ describe("process-wide plugin registration (#86)", () => {
     await old.ws.start();
     old.discovery.start();
     old.ws.stop();
-    for (const hook of ["session_start", "before_agent_run", "agent_end"]) old.emit(hook);
+    const events = new Map(["session_start", "before_agent_run", "agent_end"].map((hook) => [hook, {}]));
+    for (const [hook, event] of events) old.emit(hook, event);
     expect(mocks.sockets[0].start).toHaveBeenCalledOnce();
-    for (const hook of [mocks.loopHook, mocks.wakeHook, mocks.usageHook]) expect(hook).not.toHaveBeenCalled();
-    for (const hook of ["session_start", "before_agent_run", "agent_end"]) current.emit(hook);
+    // #92: hooks fired through a superseded registry reach the current owner, never retired work.
+    for (const hook of [mocks.loopHook, mocks.wakeHook, mocks.usageHook]) expect(hook).toHaveBeenCalledOnce();
+    for (const [hook, event] of events) current.emit(hook, event);
     for (const hook of [mocks.loopHook, mocks.wakeHook, mocks.usageHook]) expect(hook).toHaveBeenCalledOnce();
     expect(systems[1].stop).not.toHaveBeenCalled();
     expect(mocks.sockets[1].stop).not.toHaveBeenCalled();
