@@ -1543,6 +1543,33 @@ its source, applying it fails, or its `expiresAtMs` passes with no decision.
   `loop.blocked`. If the item does not come back (resolved meanwhile) or its
   re-publish fails, the block is released as before.
 
+### Harness horizon sync (imajin-ai#2881)
+
+The opt-in `horizon` service reads
+`~/.openclaw/workspace/horizon/horizon.json` (configurable), diffs it against
+a private persisted cursor, and pushes signed `step.*` observations through
+the same `/api/loops` signer/transport as loop lifecycle events. It runs on
+startup, file replacement/change and a periodic tick; the kernel never calls
+a gateway, session or transcript.
+
+Set `horizon.enabled: true`, `horizon.loopId` to an **existing** owning loop,
+and `horizon.repository` to the repository used for bare `#N` refs. The
+publisher uses the plugin's `did` / `keypairPath` and optional `actAs`; a second
+harness uses its own DID and keypair with the same loop/principal.
+`horizon.filePath`, `horizon.stateDir` and `horizon.syncIntervalMs` customize
+the source, durable state location and tick interval (default 30 seconds).
+Unlike lifecycle hooks' dropped-on-error observations, horizon requests are
+saved before delivery and retried byte-identically after uncertain responses.
+
+Zones remain kernel-derived. `past`/`closed` publishes finished and closure
+facts, not fabricated release/deployment success. The base bridge lacks an
+issue OUTCOME, which the merged kernel contract currently requires before
+closure can project as `past`; this and stale exact-retry reconciliation are
+tracked in [imajin-ai#2931](https://github.com/ima-jin/imajin-ai/issues/2931).
+See [configuration, field mapping and recovery](docs/horizon-sync.md) for
+optional explicit evidence, limitations and verification. Inbound claims and
+wake outcome inference are not part of this one-way publisher.
+
 ### Session commands (#51)
 
 Signed, DID-addressed `session.send` / `session.approve` / `session.deny` /

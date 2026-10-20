@@ -60,6 +60,7 @@ import {
 } from "./src/imajin-provider.js";
 import { isImajinModelAllowedByPolicy } from "./src/sources/imajin-catalog.js";
 import { registerLoopLifecycle, LOOP_LIFECYCLE_HOOKS, type LoopLifecycle, type LoopsConfig } from "./src/loop-hooks.js";
+import { registerHorizonSync, type HorizonConfig } from "./src/horizon/sync.js";
 import { resolveImajinMcpUrl } from "./src/kernel-mcp.js";
 import { createIdentityClientOperatorKeyResolver } from "./src/operator-signature.js";
 import {
@@ -120,6 +121,7 @@ interface PluginConfig {
   inferProxyBaseUrl?: string;
   modelDiscovery?: ImajinModelDiscoveryConfig;
   loops?: LoopsConfig;
+  horizon?: HorizonConfig;
   sessionCommands?: SessionCommandsSettings;
   mcpUrl?: string;
 }
@@ -255,6 +257,19 @@ async function startPluginRuntime(
     keypairPath: config.keypairPath,
     actAs: config.actAs,
     config: config.loops,
+  });
+
+  registerHorizonSync({
+    registerService: ({ start, stop }) => {
+      lifecycle.add(() => { void stop(); });
+      start();
+    },
+  }, {
+    nodeUrl: config.nodeUrl,
+    did: config.did,
+    keypairPath: config.keypairPath,
+    principal: config.actAs,
+    config: config.horizon,
   });
 
   // Background WebSocket service for real-time notifications (#1653)
