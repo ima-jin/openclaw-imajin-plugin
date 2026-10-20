@@ -56,6 +56,51 @@ describe("PluginServiceRuntime", () => {
     expect(sender).toHaveBeenCalledOnce();
   });
 
+  it("routes hooks from a registry that never started to the started owner (#92)", async () => {
+    const handler = vi.fn(() => ({ block: true, blockReason: "delegate" }));
+    const owner = new PluginServiceRuntime("full", async (_lifecycle, on) => {
+      on("before_tool_call", handler, { name: "imajin-wake:before_tool_call" });
+    });
+    const ownerApi = { on: vi.fn() };
+    owner.registerHook(ownerApi, "before_tool_call", "imajin-wake:before_tool_call");
+    await owner.start();
+
+    // Later full-mode registries (config reloads) register hooks but are never started.
+    const reloads = [1, 2, 3].map(() => {
+      const api = { on: vi.fn() };
+      new PluginServiceRuntime("full", async () => {}).registerHook(api, "before_tool_call", "imajin-wake:before_tool_call");
+      return api.on.mock.calls[0][1];
+    });
+    const latest = reloads.at(-1)!;
+    const event = { toolName: "exec", params: { command: "gh pr review 1 --approve" } };
+    expect(latest(event, { sessionKey: "agent:main:warp-events:abc" })).toEqual({ block: true, blockReason: "delegate" });
+    expect(handler).toHaveBeenCalledOnce();
+
+    // If the host ever dispatches the same event through several registrations, handle it once.
+    expect(ownerApi.on.mock.calls[0][1](event, {})).toBeUndefined();
+    expect(reloads[0](event, {})).toBeUndefined();
+    expect(handler).toHaveBeenCalledOnce();
+
+    owner.stop();
+    expect(latest({ toolName: "exec", params: {} }, {})).toBeUndefined();
+    expect(handler).toHaveBeenCalledOnce();
+  });
+
+  it("routes the wake report tool from any registration to the started owner (#92)", async () => {
+    const sender = vi.fn(async () => {});
+    const owner = new PluginServiceRuntime("full", async () => {
+      owner.setWakeSender(sender);
+    });
+    const reload = new PluginServiceRuntime("full", async () => {});
+    const disclosure = { outcome: "completed" as const, message: "Done" };
+    await expect(reload.reportWake({}, disclosure)).rejects.toThrow("not started");
+    await owner.start();
+    await reload.reportWake({ sessionKey: "agent:main:warp-events:abc" }, disclosure);
+    expect(sender).toHaveBeenCalledWith({ sessionKey: "agent:main:warp-events:abc" }, disclosure);
+    owner.stop();
+    await expect(reload.reportWake({}, disclosure)).rejects.toThrow("not started");
+  });
+
   it("cannot revive a retired service or dispose a replacement from a stale stop", async () => {
     const firstCleanup = vi.fn();
     const secondCleanup = vi.fn();

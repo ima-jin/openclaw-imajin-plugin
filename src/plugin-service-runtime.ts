@@ -6,6 +6,37 @@ export type RuntimeHookRegister = (
   hook: string, handler: HookHandler, options?: { name?: string },
 ) => void;
 
+/**
+ * The host may build several full-mode registries in one process (config hot
+ * reload, scoped loads), but starts the plugin's services only once. Hooks and
+ * tools from a registry that never started must still reach the runtime that
+ * did, or every wake guard, the option-c decision router and the wake report
+ * tool go blind (#92). Ownership lives on the process, like the registration
+ * lifecycle, so a re-imported module sees the same owner.
+ */
+const ownerKey = Symbol.for("imajin.plugin.serviceRuntime");
+const dispatchedKey = Symbol.for("imajin.plugin.dispatchedHookEvents");
+type ProcessState = typeof globalThis & {
+  [ownerKey]?: PluginServiceRuntime;
+  [dispatchedKey]?: WeakMap<object, Set<string>>;
+};
+
+function processState(): ProcessState {
+  return globalThis as ProcessState;
+}
+
+/** True when this hook event was already forwarded by another registration's proxy. */
+function alreadyDispatched(event: unknown, name: string): boolean {
+  if (!event || typeof event !== "object") return false;
+  const state = processState();
+  state[dispatchedKey] ??= new WeakMap();
+  const seen = state[dispatchedKey].get(event);
+  if (seen?.has(name)) return true;
+  if (seen) seen.add(name);
+  else state[dispatchedKey].set(event, new Set([name]));
+  return false;
+}
+
 /** Registry construction is metadata only; only a full service start owns IO. */
 export class PluginServiceRuntime {
   private lifecycle?: RegistrationLifecycle;
@@ -21,11 +52,18 @@ export class PluginServiceRuntime {
     this.full = mode === undefined || mode === "full";
   }
 
+  /** The started runtime that owns IO in this process, if any. */
+  static owner(): PluginServiceRuntime | undefined {
+    const owner = processState()[ownerKey];
+    return owner?.lifecycle?.active ? owner : undefined;
+  }
+
   registerHook(api: { on: RuntimeHookRegister }, hook: string, name: string): void {
     if (!this.full) return;
     api.on(hook, (...args) => {
-      if (this.lifecycle?.active) return this.handlers.get(name)?.(...args);
-      return undefined;
+      const owner = PluginServiceRuntime.owner();
+      if (!owner || alreadyDispatched(args[0], name)) return undefined;
+      return owner.handlers.get(name)?.(...args);
     }, { name });
   }
 
@@ -33,9 +71,12 @@ export class PluginServiceRuntime {
     if (!this.full || this.lifecycle) return this.started ?? Promise.resolve();
     const lifecycle = beginRegistration();
     this.lifecycle = lifecycle;
+    const state = processState();
+    state[ownerKey] = this;
     lifecycle.add(() => {
       this.handlers.clear();
       this.wakeSender = undefined;
+      if (state[ownerKey] === this) delete state[ownerKey];
     });
     this.started = Promise.resolve().then(async () => {
       if (!lifecycle.active) return;
@@ -58,7 +99,8 @@ export class PluginServiceRuntime {
   }
 
   readonly reportWake: WakeDisclosureSender = async (ctx, disclosure) => {
-    if (!this.lifecycle?.active || !this.wakeSender) throw new Error("Imajin runtime is not started");
-    await this.wakeSender(ctx, disclosure);
+    const sender = PluginServiceRuntime.owner()?.wakeSender;
+    if (!sender) throw new Error("Imajin runtime is not started");
+    await sender(ctx, disclosure);
   };
 }
