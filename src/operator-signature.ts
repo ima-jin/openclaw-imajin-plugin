@@ -4,8 +4,11 @@
  *
  * `operator.approval.decided` may carry `operatorSignature` — a signature
  * by the OPERATOR's own key (produced client-side on /jin, NEVER the
- * kernel's node/witness key) over `canonicalize({contentHash, decision,
- * decidedAt})`. Before #44, this bridge trusted only the kernel's witness
+ * kernel's node/witness key) over `canonicalize({contentHash, decidedAt,
+ * decision, mode?, replyMessage?})`. The signed `contentHash` is the bare
+ * lowercase 64-character SHA-256 hex digest, NOT the `sha256:<hex>` wire
+ * value. Optional fields are included exactly when present, including an
+ * empty `replyMessage`. Before #44, this bridge trusted only the kernel's witness
  * signature on the WS envelope (`issuer`/`subject`/`decidedBy` ==
  * `approvals.operatorDid`) — that proves the kernel RECORDED a decision,
  * never that the operator actually MADE it, so a compromised kernel alone
@@ -37,15 +40,20 @@ export interface OperatorCountersignature {
   /** Hex-encoded Ed25519 public key that produced `sig`. */
   keyId: string;
   alg: OperatorSignatureAlg;
-  /** Hex-encoded Ed25519 signature over canonicalize({contentHash, decision, decidedAt}). */
+  /** Hex-encoded Ed25519 signature over canonicalize(OperatorCountersignFields). */
   sig: string;
 }
 
 /** The exact fields the operator's countersignature covers (kernel contract, #2082). */
 export interface OperatorCountersignFields {
+  /** Bare lowercase 64-character SHA-256 hex digest; no `sha256:` prefix. */
   contentHash: string;
   decision: string;
   decidedAt: string;
+  /** Optional signed decision mode, included only when present. */
+  mode?: string;
+  /** Optional signed operator reply, included verbatim when present (even empty). */
+  replyMessage?: string;
 }
 
 export type ParsedOperatorSignature =

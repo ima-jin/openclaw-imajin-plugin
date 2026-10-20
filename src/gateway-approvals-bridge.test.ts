@@ -533,7 +533,12 @@ describe("GatewayApprovalsBridge + operator countersignature (#44)", () => {
     privateKeyHex: string,
   ): Promise<string> {
     const { canonicalize } = await import("./approval-bridge.js");
-    const message = new TextEncoder().encode(canonicalize(fields));
+    // /jin signs the bare digest; the bus event still echoes the prefixed wire hash.
+    expect(fields.contentHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const message = new TextEncoder().encode(canonicalize({
+      ...fields,
+      contentHash: fields.contentHash.slice("sha256:".length),
+    }));
     const sig = await ed.signAsync(message, Uint8Array.from(Buffer.from(privateKeyHex, "hex")));
     return Buffer.from(sig).toString("hex");
   }

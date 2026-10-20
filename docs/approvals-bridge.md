@@ -346,6 +346,17 @@ changed after the operator decided is caught even when the underlying
 
 ## Trust chain summary
 
+The operator signs `canonicalize({contentHash, decidedAt, decision, mode?,
+replyMessage?})`: `contentHash` is the **bare lowercase 64-character hex
+digest**, while the kernel bus event echoes the original `sha256:<hex>`
+wire value. The bridge first checks that exact wire echo, then removes
+exactly one `sha256:` prefix from its own staged hash for signature
+verification. Optional `mode` and `replyMessage` are signed when present,
+including an empty reply; they must never be dropped or rewritten during
+verification. A supplied invalid signature is rejected regardless of the
+`requireOperatorCountersignature` setting; that setting only controls
+whether an absent signature is permitted.
+
 `plugin-signed request` → `kernel recomputes + verifies contentHash` →
 `operator decides + countersigns on /jin` → `kernel witnesses` → `plugin
 verifies operator signature + hash (twice)` → `Gateway approval store`.
