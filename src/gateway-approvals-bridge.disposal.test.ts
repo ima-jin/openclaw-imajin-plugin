@@ -378,6 +378,8 @@ describe("GatewayApprovalsBridge disposal boundaries (#86)", () => {
     };
     const first = newBridge({ publicationLedger });
     const initialReconciliation = first.reconcile();
+    // Orphan reconciliation finishes before a new publish reserves its slot.
+    await Promise.resolve();
     await Promise.resolve();
     expect(publicationLedger.reservations.size).toBe(1);
     expect(kernel.publishApprovalRequested).not.toHaveBeenCalled();

@@ -295,6 +295,7 @@ async function loadEd25519() {
       // A host may have configured the hash implementation already.
     }
   }
+
   return ed;
 }
 
@@ -840,10 +841,12 @@ export class GatewayApprovalsBridge {
       }
       this.markDegraded("agent lacks operator:approvals");
     } else if (entitlement.state === "entitled") {
-      if (this.isDegraded()) {
+      const recovered = this.isDegraded();
+      if (recovered) {
         this.logger.info("operator:approvals grant detected — bridge recovered, catching up missed decisions");
       }
       this.clearDegraded();
+      if (recovered) this.scheduleRecovery();
     } else {
       this.logger.warn(
         `could not verify operator:approvals entitlement (${entitlement.reason}) — will re-check within 5 min`,
@@ -1018,27 +1021,31 @@ export class GatewayApprovalsBridge {
     }
   }
 
-  private async refreshStaleEntitlement(proposalId: string): Promise<void> {
+  private scheduleRecovery(): void {
+    const deps = this.syncDeps;
+    if (!deps || this.syncInFlight || this.disposed) return;
+    // A publish may itself be awaiting preflight. Let its reservation finish
+    // before reconcile inspects it, without awaiting recovery from preflight.
+    void Promise.all([...this.reservations.values()]).then(() => this.syncWithKernel(deps)).catch((err: unknown) => {
+      this.logger.error(`approval recovery sync failed: ${String(err)}`);
+    });
+  }
+
+  private async refreshStaleEntitlement(): Promise<void> {
     if (this.syncDeps && this.now() - this.lastEntitlementCheck >= ENTITLEMENT_CHECK_INTERVAL_MS) {
-      const wasDegraded = this.isDegraded();
       await this.runPreflight(this.syncDeps.http, this.syncDeps.operatorDid);
-      if (wasDegraded && !this.isDegraded()) {
-        // Reconcile must not await the reservation from inside that same reservation.
-        const deps = this.syncDeps;
-        void this.reservations.get(proposalId)?.then(() => this.syncWithKernel(deps)).catch((err: unknown) => {
-          this.logger.error(`approval recovery sync failed: ${String(err)}`);
-        });
-      }
     }
   }
 
-  private async publishSourceRequest(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
+  private async prepareSourcePayload(
+    sourceId: string, request: ApprovalSourceRequest,
+  ): Promise<KernelApprovalRequestedPayload | undefined> {
     const proposalId = request.proposalId;
     if (request.expiresAtMs !== undefined && request.expiresAtMs <= this.now()) {
       await this.retireProposal(proposalId);
       return;
     }
-    await this.refreshStaleEntitlement(proposalId);
+    await this.refreshStaleEntitlement();
     if (this.disposed) return;
     const detail = {
       ...request.detail,
@@ -1046,9 +1053,8 @@ export class GatewayApprovalsBridge {
         bridge: { degraded: true, reason: this.degradedReason, fix: "/auth/agents" },
       } : {}),
     };
-    let payload: KernelApprovalRequestedPayload;
     try {
-      payload = await buildApprovalRequestedPayload(sourceId, { ...request, detail }, {
+      return await buildApprovalRequestedPayload(sourceId, { ...request, detail }, {
         did: this.config.agentDid,
         privateKeyHex: this.config.agentPrivateKeyHex,
       });
@@ -1059,7 +1065,12 @@ export class GatewayApprovalsBridge {
       await this.failClosedIfBlocking(sourceId, request, `could not sign the card (${String(err)})`);
       return;
     }
-    if (this.disposed) return;
+  }
+
+  private async publishSourceRequest(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
+    const proposalId = request.proposalId;
+    const payload = await this.prepareSourcePayload(sourceId, request);
+    if (!payload || this.disposed) return;
     const rejectionKey = `${sourceId}:${proposalId}`;
     if (this.holdRejectedPublish(sourceId, proposalId, payload.contentHash)) return;
     this.published.set(proposalId, {
@@ -1067,7 +1078,7 @@ export class GatewayApprovalsBridge {
       owner: request.owner,
       kind: request.kind,
       summary: request.summary,
-      detail,
+      detail: payload.detail,
       expiresAtMs: request.expiresAtMs,
       sourceRevision: request.sourceRevision,
       contentHash: payload.contentHash,

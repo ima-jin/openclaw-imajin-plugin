@@ -120,12 +120,21 @@ function systemConnection() {
   return {
     client: {
       list: vi.fn(async () => records),
-      get: vi.fn(async () => ({ status: "pending", presentation: { proposalHash: "revision" } })),
-      resolve: vi.fn(async () => ({ applied: true })),
+      get: vi.fn(async (id: string) => {
+        const live = records.find((entry) => entry.id === id);
+        return live ? {
+          status: "pending", expiresAtMs: live.expiresAtMs,
+          presentation: { proposalHash: live.request.proposalHash },
+        } : null;
+      }),
+      resolve: vi.fn(async (id: string) => {
+        records = records.filter((entry) => entry.id !== id);
+        return { applied: true };
+      }),
       onRequested: vi.fn((handler) => { listener = handler; }),
     },
     start: vi.fn(async () => {}), stop: vi.fn(),
-    emit(record: SystemAgentApprovalRequestRecord) { listener?.(record); },
+    emit(record: SystemAgentApprovalRequestRecord) { records = [record]; listener?.(record); },
     stage(record: SystemAgentApprovalRequestRecord) { records = [record]; },
   };
 }
@@ -253,7 +262,7 @@ describe("process-wide plugin registration (#86)", () => {
     workshops[0].client.list.mockClear();
     await vi.advanceTimersByTimeAsync(30_000); // Beyond the observed ~20s failure.
     expect(workshops[0].client.list).toHaveBeenCalledTimes(2);
-    expect(vi.getTimerCount()).toBe(4);
+    expect(vi.getTimerCount()).toBe(5); // Includes the single approvals entitlement timer.
     for (let index = 0; index < 4; index++) systems[0].emit(record);
     await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce());
     const data = JSON.parse(publish.mock.calls[0][1].body).data;
@@ -323,7 +332,7 @@ describe("process-wide plugin registration (#86)", () => {
       expect(systems).toHaveLength(1);
       expect(mocks.sockets).toHaveLength(1);
       expect(mocks.sockets[0].stop).not.toHaveBeenCalled();
-      expect(vi.getTimerCount()).toBe(4);
+      expect(vi.getTimerCount()).toBe(5);
     },
   );
 
@@ -337,7 +346,7 @@ describe("process-wide plugin registration (#86)", () => {
     expect(systems).toHaveLength(1);
     expect(mocks.sockets[0].start).toHaveBeenCalledOnce();
     expect(mocks.discovery).toHaveLength(1);
-    expect(vi.getTimerCount()).toBe(4);
+    expect(vi.getTimerCount()).toBe(5);
   });
 
   it("N=3 leaves one client per source, one poller and one publish/notification", async () => {
@@ -357,7 +366,7 @@ describe("process-wide plugin registration (#86)", () => {
     expect(mocks.discovery.slice(0, 2).every((handle) => handle.stop.mock.calls.length === 1)).toBe(true);
     expect(mocks.helpers.slice(0, 4).every((handle) => handle.dispose.mock.calls.length === 1)).toBe(true);
     expect(mocks.sessionGateways.slice(0, 2).every((handle) => handle.dispose.mock.calls.length === 1)).toBe(true);
-    expect(vi.getTimerCount()).toBe(4); // Helpers + discovery + real Skill Workshop poller.
+    expect(vi.getTimerCount()).toBe(5); // Helpers + discovery + real Skill Workshop poller + entitlement.
     workshops.forEach((live) => live.client.list.mockClear());
     await vi.advanceTimersByTimeAsync(15_000);
     expect(workshops.map((live) => live.client.list.mock.calls.length)).toEqual([0, 0, 1]);
@@ -366,7 +375,7 @@ describe("process-wide plugin registration (#86)", () => {
     expect(JSON.parse(publish.mock.calls[0][1].body)).toMatchObject({
       scope: "operator.approval.requested", data: { proposalId: "proposal" },
     });
-    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(6)); // + expiry and sweep.
+    await vi.waitFor(() => expect(vi.getTimerCount()).toBe(7)); // + expiry and sweep.
     registrations[2].ws.stop();
     expect(vi.getTimerCount()).toBe(0);
   });
@@ -437,7 +446,7 @@ describe("process-wide plugin registration (#86)", () => {
     mocks.preflight.mockReturnValueOnce(pending.promise);
     await start();
     await vi.waitFor(() => expect(mocks.preflight).toHaveBeenCalledOnce());
-    expect(vi.getTimerCount()).toBe(4);
+    expect(vi.getTimerCount()).toBe(5);
     await start({ nodeUrl: undefined });
     expect(vi.getTimerCount()).toBe(1);
     pending.resolve({
@@ -517,7 +526,7 @@ describe("process-wide plugin registration (#86)", () => {
     await start();
     await ready();
     expect(publish).toHaveBeenCalledOnce();
-    expect(vi.getTimerCount()).toBe(6); // Helpers + discovery + poller + restored expiry and sweep.
+    expect(vi.getTimerCount()).toBe(7); // Helpers + discovery + poller + entitlement + restored expiry and sweep.
     replacement.emit(record);
     await vi.advanceTimersByTimeAsync(1);
     expect(publish).toHaveBeenCalledOnce();

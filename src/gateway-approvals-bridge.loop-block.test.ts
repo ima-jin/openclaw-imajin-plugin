@@ -126,7 +126,7 @@ describe("GatewayApprovalsBridge → loop block/unblock (#64)", () => {
     );
     expect(tracker.unblock).not.toHaveBeenCalled();
 
-    gateway.get.mockResolvedValue({ status: "pending", presentation: { proposalHash: rec.request.proposalHash } });
+    gateway.get.mockResolvedValue({ status: "pending", expiresAtMs: rec.expiresAtMs, presentation: { proposalHash: rec.request.proposalHash } });
     expect(await bridge.handleKernelDecision(decided(rec.id, lastHash()))).toBe("applied");
     expect(tracker.unblock).toHaveBeenCalledTimes(1);
     expect(tracker.unblock).toHaveBeenCalledWith({ sessionKey: SESSION });
@@ -197,7 +197,7 @@ describe("GatewayApprovalsBridge → loop block/unblock (#64)", () => {
     expect(bridge.isPublished(rec.id)).toBe(true);
     expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
 
-    gateway.get.mockResolvedValue({ status: "pending", presentation: { proposalHash: rec.request.proposalHash } });
+    gateway.get.mockResolvedValue({ status: "pending", expiresAtMs: rec.expiresAtMs, presentation: { proposalHash: rec.request.proposalHash } });
     expect(await bridge.handleKernelDecision(decided(rec.id, lastHash()))).toBe("applied");
     expect(gateway.resolve).toHaveBeenCalledTimes(1);
     expect(tracker.unblock).toHaveBeenCalledTimes(1);
@@ -219,7 +219,7 @@ describe("GatewayApprovalsBridge → loop block/unblock (#64)", () => {
 });
 
 describe("approval sources expose the owning session (#64)", () => {
-  it("system-agent carries sessionKey + expiry, outside detail", async () => {
+  it("system-agent keeps sessionKey local and publishes the native expiry in detail", async () => {
     const rec = record();
     const source = createSystemAgentSource({
       list: async () => [rec],
@@ -227,7 +227,7 @@ describe("approval sources expose the owning session (#64)", () => {
     const [req] = await source.list();
     expect(req.owner).toEqual({ sessionKey: SESSION });
     expect(req.expiresAtMs).toBe(rec.expiresAtMs);
-    expect(req.detail).toBeUndefined();
+    expect(req.detail).toEqual({ expiresAt: new Date(rec.expiresAtMs).toISOString() });
   });
 
   it("gateway-exec carries the raw sessionKey, never the 'unspecified' placeholder", async () => {
