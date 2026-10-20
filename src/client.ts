@@ -20,6 +20,18 @@ export interface ImajinClientConfig {
   keypairPath?: string;
   actAs?: string;
 }
+export type CloudflareResource = "dns" | "settings" | "ssl" | "cache-rules" | "custom-hostnames" | "bulk" | "history";
+
+export class CloudflareRequestError extends Error {
+  constructor(public readonly status: number, public readonly code: string) {
+    let message = `Cloudflare request failed (${status}): ${code}`;
+    if (status === 403) message = "no Cloudflare authority for this zone — grant it on /jin";
+    if (status === 409 && code === "credential_unavailable") {
+      message = "token not sealed for this zone — seal it on /jin";
+    }
+    super(message);
+  }
+}
 
 interface Keypair {
   did: string;
@@ -823,6 +835,53 @@ export class ImajinClient {
       text: await res.text(),
     };
   }
+
+  /**
+   * Cloudflare is kernel-only: this uses the same agent session and delegation
+   * headers as get/post. requestRaw preserves 202 and avoids embedding raw
+   * error bodies in exceptions. The kernel attributes the actual agent DID,
+   * resolves the verified owner/grant and retains custody of the credential.
+   */
+  async cloudflareRequest(
+    zoneId: string,
+    domain: string,
+    resource: CloudflareResource,
+    opts: {
+      method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+      id?: string;
+      body?: unknown;
+      onBehalfOf?: string;
+    } = {},
+  ): Promise<Record<string, unknown>> {
+    const suffix = opts.id === undefined ? "" : `/${encodeURIComponent(opts.id)}`;
+    const path = `/cloudflare/api/zones/${encodeURIComponent(zoneId)}/${resource}${suffix}?domain=${encodeURIComponent(domain)}`;
+    const res = await this.requestRaw(path, opts);
+    let data: Record<string, unknown>;
+    try {
+      data = JSON.parse(res.text) as Record<string, unknown>;
+      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Invalid envelope");
+    } catch {
+      throw new CloudflareRequestError(res.status, "invalid_response");
+    }
+    if (res.status < 200 || res.status >= 300) {
+      const code = typeof data.error === "string" && /^[a-z][a-z0-9_]{0,79}$/.test(data.error)
+        ? data.error : "cloudflare_request_failed";
+      throw new CloudflareRequestError(res.status, code);
+    }
+    if (res.status === 202) {
+      const approval = data.approval as { proposalId?: unknown } | undefined;
+      if (typeof approval?.proposalId !== "string" || !approval.proposalId) {
+        throw new CloudflareRequestError(502, "invalid_proposal_response");
+      }
+      return {
+        status: "pending_approval",
+        proposalId: approval.proposalId,
+        next: "A human must countersign on /jin (Operator approvals). Nothing has changed.",
+      };
+    }
+    return data;
+  }
+
 
   // --- Warp Cloud Agent dispatch (#1428 / #1619) ---
 

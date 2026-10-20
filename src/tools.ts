@@ -23,6 +23,8 @@ import { buildUsageReport, formatDay, parseDay, resolveUsageRange } from "./usag
 import { ackGrant, fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
 import { containsLiveSecret, createSecretHandle } from "./vault/secret-handle-store.js";
 
+export { createCloudflareTool } from "./cloudflare-tool.js";
+
 type ToolContent = { type: "text"; text: string };
 type ToolResult = {
   content: ToolContent[];

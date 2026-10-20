@@ -16,6 +16,56 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_vault`    | Vault       | Fetch owner-granted secrets (delegation grants) as protected handles — values never enter model context (#40); `ack` signs what the agent did with a fetched grant (#42) |
 | `imajin_usage`    | Usage       | Read-only spend: `summary` (UTC range → totals + per-day, per provider/vendor/source; **incurred** = our meter and **billed** = counterparty statement kept separate and labeled, plus drift) and `rollup` (public signed `usage.rollup` attestation). Acts for `onBehalfOf` (default `actAs`); the kernel's 401/403 surface as errors (#72) |
 | `imajin_warp`     | Warp        | Dispatch/inspect Warp cloud agents; `list_runs` takes `compact: true` to drop `statusMessage` + artifact `data` per run (plugin-side, kernel call unchanged) for wide spend/volume pulls (#72) |
+| `imajin_cloudflare` | Cloudflare | DNS/proxy, settings/SSL, cache-rule previews/proposals, custom hostnames and signed history through kernel-only zone grants; never fetches a Cloudflare token (#98) |
+
+### Cloudflare zone access (#98)
+
+Setup: **seal the zone token on /jin, then grant the agent DID the zone capabilities on the zone card**.
+Use this plugin's own `did` and normal `keypairPath` session, not the MCP proxy's
+app identity. There is no Cloudflare config field, environment variable, token
+import/fetch/export action, or direct provider request in this tool.
+
+Every action takes `zoneId` (32 lowercase hexadecimal characters) and `domain`
+(the exact lowercase verified zone domain, not a record's subdomain):
+
+- `dns_list`, `dns_create` (`record`: `type`, `name`, `content`, `ttl`, optional
+  `proxied`), `dns_update` (`recordId` + partial `record`), `dns_delete`
+  (`recordId`), `proxy_set` (`recordId` + boolean `proxied`, a single PATCH).
+- `settings`, `ssl`, `cache_rules_list`.
+- `cache_rules_replace` (`rules`, at most 20 ordered cache rules). Each rule has
+  `expression`, `action: "set_cache_settings"`, `action_parameters` (`cache`
+  and/or `edge_ttl`), `enabled`, and optional `ref`/`description`.
+- `bulk_proxy` (`changes`: 1–20 `{recordId, proxied}` pairs).
+- `hostnames_list`, `hostname_create` (`hostname`, `ssl: {method: "txt" | "http",
+  type: "dv"}`), `hostname_status` / `hostname_delete` (`hostnameId`, a UUID).
+- `history` returns the kernel's node-signed envelope unchanged, including
+  `issuerDid`, `issuedAt`, `payload.actorDid`, `payload.onBehalfOf`, before/after
+  state and `signature`. The kernel attributes every change to the authenticated
+  **agent DID**, on behalf of the verified zone owner from the grant.
+
+`onBehalfOf` follows the other tools: omitted uses `actAs`, an explicit DID
+sets the delegation header, and `"self"` suppresses that header. None of these
+replace the authenticated agent or the kernel's exact-zone grant checks.
+Reads require `cloudflare:read`; DNS/proxy requires `cloudflare:dns`, SSL
+requires `cloudflare:ssl`, cache replacement requires `cloudflare:cache`, and
+hostname writes require `cloudflare:custom-hostnames`.
+
+`bulk_proxy` and `cache_rules_replace` default **`dryRun: true`**, returning the
+kernel's before/after preview without mutation. Explicit `dryRun: false` stages
+a proposal and returns `{status: "pending_approval", proposalId, next}`:
+**pending — approve on /jin (proposal &lt;id&gt;)**. A human must countersign on
+`/jin` → Operator approvals; nothing changes until then. The plugin cannot
+approve, poll-and-approve, or call an operator-approval decision route. Single
+DNS/hostname writes are immediate; they do not support `dryRun`.
+
+403 returns “no Cloudflare authority for this zone — grant it on /jin” with
+the kernel error code; 409 `credential_unavailable` returns “token not sealed
+for this zone — seal it on /jin”. Other conflicts retain their own code
+(for example stale before-state), never claim a missing token. No retries
+or fallback authority. Zone discovery is intentionally absent: the auth
+contract currently lists delegator-owned grants, not the agent's received
+zone grants. Route classification and automatic proxy/cache decisions remain
+`ima-jin/imajin-ai#2996`.
 
 ## Configuration
 
@@ -1596,4 +1646,3 @@ Imajin (今人) is sovereign technology infrastructure — federated identity, .
 - **Protocol:** [protocol.dfos.com](https://protocol.dfos.com)
 - **Code:** [github.com/ima-jin/imajin-ai](https://github.com/ima-jin/imajin-ai)
 
-Cloudflare zone operations are managed through Imajin; seal and grant access on /jin.
