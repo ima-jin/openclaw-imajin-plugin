@@ -1,4 +1,4 @@
-import { CloudflareRequestError, type CloudflareResource, type ImajinClient } from "./client.js";
+import { CloudflareRequestError, validateDid, type CloudflareResource, type ImajinClient } from "./client.js";
 
 interface Schema {
   type: string;
@@ -132,9 +132,9 @@ function validateObject(value: unknown, schema: Schema, field: string): void {
     if (values[key] === undefined) invalid(key);
   }
   for (const [key, entry] of Object.entries(values)) {
-    const child = schema.properties?.[key];
-    if (!child) invalid(field);
-    if (entry !== undefined) validate(entry, child, key);
+    const properties = schema.properties ?? {};
+    if (!Object.hasOwn(properties, key)) invalid(field);
+    if (entry !== undefined) validate(entry, properties[key], key);
   }
 }
 
@@ -199,6 +199,9 @@ export function createCloudflareTool(client: ImajinClient) {
     async execute(_id: string, params: CloudflareToolParams) {
       try {
         validate(params, parameters, "request");
+        if (params.onBehalfOf && params.onBehalfOf !== "self" && !validateDid(params.onBehalfOf)) {
+          invalid("onBehalfOf");
+        }
         const operation = operations[params.action];
         for (const field of operation.required ?? []) {
           if (params[field] === undefined) invalid(field);
