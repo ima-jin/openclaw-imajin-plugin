@@ -64,7 +64,9 @@ for this zone — seal it on /jin”. Other conflicts retain their own code
 (for example stale before-state), never claim a missing token. No retries
 or fallback authority. Zone discovery is intentionally absent: the auth
 contract currently lists delegator-owned grants, not the agent's received
-zone grants. Route classification and automatic proxy/cache decisions remain
+zone grants ([kernel gap #3005](https://github.com/ima-jin/imajin-ai/issues/3005),
+native sub-issue of [#2995](https://github.com/ima-jin/imajin-ai/issues/2995)).
+Route classification and automatic proxy/cache decisions remain
 `ima-jin/imajin-ai#2996`.
 
 ## Configuration
