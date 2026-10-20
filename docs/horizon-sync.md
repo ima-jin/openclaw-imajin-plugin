@@ -76,9 +76,9 @@ The supported base shape is:
 - New code items declare exactly `issue_closed`, `release_contains`, and
   `deployed` conditions. The condition ids are those same literal names,
   scoped by step id. A PR URL or `prDraft: false` never satisfies an exit.
-- Local `past` or explicit `closed: true` emits `step.finished` and, when an
+- Local `past` / `done` or explicit `closed: true` emits `step.finished` and, when an
   issue ref exists, an `issue_closed` observation. This is the bridge writer's
-  signed assertion, not a fetched GitHub status. `waitingOn` and `prDraft`
+  signed assertion, not a fetched GitHub status. `doneAt`, `waitingOn` and `prDraft`
   do not become completion evidence. Other local zones never grant a claim.
 - Removing an item does not cancel or delete registry history. Reintroducing
   its id resumes the existing step without re-queuing it. Facts are additive:

@@ -13,7 +13,7 @@ export interface StepFact {
 }
 export interface HorizonItem {
   id: string;
-  zone: "head" | "near" | "middle" | "tail" | "past";
+  zone: "head" | "near" | "middle" | "tail" | "past" | "done";
   title: string;
   refs: string[];
   addedAt: string;
@@ -115,7 +115,7 @@ function validateItem(value: unknown): HorizonItem {
   text(item.id);
   text(item.title);
   timestamp(item.addedAt);
-  if (!["head", "near", "middle", "tail", "past"].includes(text(item.zone))) throw new Error("invalid zone");
+  if (!["head", "near", "middle", "tail", "past", "done"].includes(text(item.zone))) throw new Error("invalid zone");
   texts(item.refs);
   if (item.waitingOn !== undefined) texts(item.waitingOn);
   if (item.movedAt !== undefined) timestamp(item.movedAt);
@@ -173,7 +173,7 @@ function sharpening(item: HorizonItem, rank: number, issue?: string): Record<str
 }
 function completionFacts(item: HorizonItem, issue?: string): Record<string, StepFact> {
   const facts: Record<string, StepFact> = {};
-  if (item.zone === "past" || item.closed) {
+  if (item.zone === "past" || item.zone === "done" || item.closed) {
     facts.finished = { type: "step.finished", data: {} };
     if ((item.stepKind ?? "code") === "code" && issue) facts.closed = {
       type: "step.observed",

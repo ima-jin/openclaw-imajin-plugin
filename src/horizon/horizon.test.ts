@@ -37,6 +37,7 @@ async function setup(overrides: Partial<HorizonSyncOptions> = {}) {
     requests.push(JSON.parse(String(init?.body)) as StepRequest);
     return new Response("{}", { status: 201 });
   });
+
   const logger = { info: vi.fn(), warn: vi.fn() };
   const options: HorizonSyncOptions = {
     nodeUrl: "https://kernel.test", did: DID, principal: PRINCIPAL, keypairPath, fetchImpl: fetchImpl as typeof fetch,
@@ -55,6 +56,11 @@ async function setup(overrides: Partial<HorizonSyncOptions> = {}) {
 }
 
 describe("bridge mapping", () => {
+  it("still rejects an unknown zone", () => {
+    expect(() => parseHorizon(JSON.stringify({
+      depthTarget: 12, items: [{ ...item(), zone: "unknown-zone" }],
+    }))).toThrow("invalid zone");
+  });
   it.each([
     "Add self-serve reach bearer for static-header clients",
     "Basic setup",
@@ -80,20 +86,41 @@ describe("bridge mapping", () => {
     expect(() => text(`Bearer ${value}`)).toThrow("credential-shaped text");
   });
 
-  it("parses and publishes the full bridge-shaped fixture while ignoring its extra metadata", async () => {
+  it("publishes the mixed bridge snapshot with 12 done items and paired OUTCOME, without resends", async () => {
     const raw = await readFile(new URL("./fixtures/bridge.json", import.meta.url), "utf8");
     const parsed = parseHorizon(raw);
     const mapped = parsed.items.map((entry, rank) => mapItem(entry, rank, context));
     expect(parsed.items).toHaveLength(20);
+    expect(new Set(parsed.items.map(entry => entry.zone))).toEqual(new Set(["head", "near", "middle", "tail", "past", "done"]));
+    expect(parsed.items.filter(entry => entry.zone === "done")).toHaveLength(12);
     expect(mapped[1]?.declaration.intention).toBe("Add self-serve reach bearer for static-header clients");
     expect(mapped.map(entry => entry.declaration.rank)).toEqual(Array.from({ length: 20 }, (_, rank) => rank));
     const test = await setup();
     await writeFile(test.filePath, raw);
-    await test.create().sync();
+    const service = test.create();
+    await service.sync();
     expect(test.requests.filter(request => request.type === "step.queued")).toHaveLength(20);
+    for (const entry of parsed.items.filter(entry => entry.zone === "done")) {
+      const stepId = deriveStepId(context.loopId, DID, entry.id);
+      const facts = test.requests.filter(request => request.payload.stepId === stepId);
+      expect(facts.filter(request => request.type === "step.finished")).toHaveLength(1);
+      expect(facts.find(request => request.type === "step.observed")?.payload.observation).toEqual({
+        conditionId: "issue_closed", evidence: { kind: "issue_closed", issue: `${context.repository}${entry.refs[0]}` },
+      });
+    }
+    const outcomeStepId = deriveStepId(context.loopId, DID, "h6");
+    expect(test.requests.find(request => request.payload.stepId === outcomeStepId && request.type === "step.updated")?.payload.update).toEqual({
+      issue: { ref: "ima-jin/imajin-ai#2870", outcome: "OUTCOME · The operator can see the queued work on the loop horizon" },
+    });
+    expect(test.requests.every(request => !("zone" in request.payload) && request.payload.state !== "exited")).toBe(true);
     for (const field of ["doneAt", "exit", "note", "owner", "prManual"]) {
       expect(JSON.stringify(test.requests)).not.toContain(`"${field}":`);
     }
+    const count = test.requests.length;
+    await service.sync();
+    await service.stop();
+    await test.create().sync();
+    expect(test.requests).toHaveLength(count);
   });
   it("declares rank and three immutable code exits without authoring a zone or claim", () => {
     const mapped = mapItem(item({ zone: "head", pr: 2909, prDraft: true }), 3, context);
@@ -113,12 +140,13 @@ describe("bridge mapping", () => {
     expect(deriveStepId("another-loop", DID, item().id)).not.toBe(mapped.stepId);
   });
 
-  it("maps past to finished plus closure, never a release/deploy assertion", () => {
-    const mapped = mapItem(item({ zone: "past", waitingOn: ["release"] }), 0, context);
+  it.each(["past", "done"] as const)("maps %s to finished plus closure, never a release/deploy assertion", zone => {
+    const mapped = mapItem(item({ zone, waitingOn: ["release"] }), 0, context);
     expect(Object.keys(mapped.facts)).toEqual(["finished", "closed"]);
     expect(mapped.facts.closed?.data).toEqual({
       observation: { conditionId: "issue_closed", evidence: { kind: "issue_closed", issue: "ima-jin/imajin-ai#2866" } },
     });
+    expect(mapped.stepId).toBe(deriveStepId(context.loopId, DID, item().id));
   });
 
   it("sharpening and explicit release/prod evidence match the kernel contract", () => {
@@ -186,6 +214,25 @@ describe("cursor diff", () => {
 });
 
 describe("signed durable sync", () => {
+  it("does not resend published completion facts when past moves to done with doneAt", async () => {
+    const test = await setup();
+    const previous = item({ zone: "past", outcome: "OUTCOME · The work is complete" });
+    await test.write([previous]);
+    const service = test.create();
+    await service.sync();
+    expect(test.requests.map(request => request.type)).toEqual([
+      "step.queued", "step.updated", "step.finished", "step.observed",
+    ]);
+    const published = structuredClone(test.requests);
+    await writeFile(test.filePath, JSON.stringify({
+      depthTarget: 12, items: [{ ...previous, zone: "done", doneAt: "2026-10-20T12:00:00Z" }],
+    }));
+    await service.sync();
+    await service.stop();
+    await test.create().sync();
+    expect(test.requests).toEqual(published);
+    expect(test.logger.warn).not.toHaveBeenCalled();
+  });
   it("publishes through /api/loops under configured DID and verifies the exact signature", async () => {
     const test = await setup();
     const service = test.create();
