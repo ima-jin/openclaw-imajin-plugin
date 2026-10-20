@@ -1,34 +1,77 @@
-/**
- * The plugin's one deterministic, no-model-in-the-loop human-facing delivery
- * mechanism: a plain `openclaw message send` CLI call (Telegram by default),
- * configured via `wsNotifications.directSend`.
- *
- * Extracted from `notification-injector.ts` (#53) so the approvals bridge can
- * reuse the exact same path to warn the operator, instead of growing a second
- * one. Behavior is unchanged: same CLI, same args, same 20s timeout.
- */
+/** Shared deterministic in-process channel delivery. No model or subprocess. */
 
 export interface DirectSendConfig {
   /** Channel id, default `telegram`. */
   channel?: string;
   /** Chat/recipient target, e.g. `8321865723`. */
   target?: string;
-  /** Absolute path to the openclaw CLI binary; default `openclaw` (PATH). */
+  /** @deprecated Accepted for compatibility, ignored. Delivery is in-process. */
   cliPath?: string;
 }
 
-/** Rejects when `directSend` is not configured or the CLI call fails. */
+/**
+ * Narrow subset verified from published openclaw@2026.10.4:
+ * agent-harness-runtime-DZjstJNb.d.ts, PluginRuntimeChannel.outbound.loadAdapter;
+ * outbound.types-B8D3jrzb.d.ts, ChannelOutboundAdapter.sendText;
+ * types-DemD-QhX.d.ts, ChannelMessageSendTextContext (cfg/to/text/signal).
+ * The gateway injects these methods; no SDK runtime import is necessary.
+ */
+export interface DirectChannelApi {
+  config?: Record<string, unknown>;
+  runtime?: {
+    config?: { current?: () => Record<string, unknown> };
+    channel?: {
+      outbound?: {
+        loadAdapter?: (channel: string) => Promise<{
+          sendText?: (ctx: {
+            cfg: Record<string, unknown>;
+            to: string;
+            text: string;
+            signal?: AbortSignal;
+          }) => Promise<{ outcome?: string } | undefined>;
+        } | undefined>;
+      };
+    };
+  };
+}
+
+export const DIRECT_SEND_TIMEOUT_MS = 20_000;
+
+/** Rejects on missing configuration/adapter, refused delivery, or timeout. */
 export async function sendDirectChannelMessage(
   ds: DirectSendConfig | undefined,
   text: string,
+  api?: DirectChannelApi,
 ): Promise<void> {
   if (!ds?.target) {
     throw new Error("directSend not configured");
   }
-  const { execFile } = await import("node:child_process");
-  const cli = ds.cliPath ?? "openclaw";
-  const args = ["message", "send", "--channel", ds.channel ?? "telegram", "--target", ds.target, "-m", text];
-  await new Promise<void>((resolve, reject) => {
-    execFile(cli, args, { timeout: 20_000 }, (err) => (err ? reject(err) : resolve()));
-  });
+  const outbound = api?.runtime?.channel?.outbound;
+  if (!outbound?.loadAdapter) throw new Error("OpenClaw channel outbound runtime unavailable");
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      (async () => {
+        const adapter = await outbound.loadAdapter!(ds.channel ?? "telegram");
+        if (controller.signal.aborted) throw new Error("directSend timed out");
+        if (!adapter?.sendText) throw new Error("OpenClaw channel text adapter unavailable");
+        const result = await adapter.sendText({
+          cfg: api?.runtime?.config?.current?.() ?? api?.config ?? {},
+          to: ds.target!,
+          text,
+          signal: controller.signal,
+        });
+        if (result?.outcome === "not_sent") throw new Error("OpenClaw channel delivery refused");
+      })(),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => {
+          controller.abort();
+          reject(new Error("directSend timed out"));
+        }, DIRECT_SEND_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

@@ -152,15 +152,8 @@ export interface WsNotificationsConfig {
    * Invalid entries are logged once and ignored.
    */
   reportTo?: string[];
-  /** Direct channel ping via the OpenClaw CLI — deterministic, no model turn. */
-  directSend?: {
-    /** Channel id, default `telegram`. */
-    channel?: string;
-    /** Chat/recipient target, e.g. `8321865723`. */
-    target?: string;
-    /** Absolute path to the openclaw CLI binary; default `openclaw` (PATH). */
-    cliPath?: string;
-  };
+  /** In-process OpenClaw channel delivery — deterministic, no model turn. */
+  directSend?: DirectSendConfig;
 }
 
 /** External adapters/metadata cannot wedge the wake lane. */
@@ -980,6 +973,7 @@ export function createNotificationInjector(
       await sendDirectChannelMessage(
         { ...wsNotifications?.directSend, channel: match[1], target: match[2] },
         `Warp wake ${disclosure.outcome} (${batchId}): ${disclosure.message}`,
+        api,
       );
       guards.recordDisclosure(batchId, target.sessionKey);
     }));
@@ -1140,13 +1134,13 @@ export function createNotificationInjector(
 
   /**
    * The one real human-facing delivery mechanism this plugin has: a plain
-   * `openclaw message send` CLI call, no model in the loop. Used both for
+   * in-process OpenClaw channel adapter, no model in the loop. Used both for
    * the instant completion ping (`inject`) and the #13 wake-failure
    * escalation (`flushWakeTurn`) — if this fails too there is genuinely
    * nothing left to try, so callers must log the rejection themselves.
    */
   async function sendChannelMessage(text: string): Promise<void> {
-    await sendDirectChannelMessage(ds, text);
+    await sendDirectChannelMessage(ds, text, api);
   }
   async function discloseTerminalSubjects(message: string): Promise<boolean> {
     try {

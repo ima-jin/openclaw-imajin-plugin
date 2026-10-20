@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { execFile } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -24,9 +23,9 @@ const TOTAL_RETRY_WINDOW_MS =
   HOOK_RETRY_DELAYS_MS.reduce((sum, delay) => sum + delay, 0) +
   (HOOK_RETRY_DELAYS_MS.length + 1) * HOOK_REQUEST_TIMEOUT_MS;
 
-vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
+
 vi.mock("./wake-session-metadata.js", () => ({ readWakeSessionTokens: vi.fn(async () => 0) }));
-const execFileMock = vi.mocked(execFile);
+const sendTextMock = vi.fn(async (_ctx: { cfg: unknown; to: string; text: string }) => ({}));
 
 // #20: `resolveHookToken`'s SecretRef branch dynamically `import()`s these two
 // plugin-sdk specifiers — mocked here so the SecretRef-shaped `hookToken`
@@ -136,13 +135,11 @@ describe("Warp wake batching", () => {
 // never acted.
 // ---------------------------------------------------------------------------
 
-type ExecCb = (err: Error | null, stdout: string, stderr: string) => void;
-
-function stubExecFile(outcome: "ok" | "fail") {
-  execFileMock.mockImplementation(((_cli: string, _args: string[], _opts: unknown, cb: ExecCb) => {
-    cb(outcome === "ok" ? null : new Error("openclaw message send: boom"), "", "");
-    return {} as never;
-  }) as never);
+function stubSendText(outcome: "ok" | "fail") {
+  sendTextMock.mockImplementation(async () => {
+    if (outcome === "fail") throw new Error("channel send failed");
+    return {};
+  });
 }
 
 type FetchResponse = { status: number; text: () => Promise<string>; json: () => Promise<unknown> };
@@ -178,6 +175,7 @@ function makeApi(gatewayPort?: number) {
   const api = {
     runtime: {
       system: { enqueueSystemEvent },
+      channel: { outbound: { loadAdapter: async () => ({ sendText: sendTextMock }) } },
       config: {
         current: () => (gatewayPort === undefined ? {} : { gateway: { port: gatewayPort } }),
       },
@@ -208,7 +206,7 @@ function frame(id: string, title = `Warp run ${id} SUCCEEDED`): NotificationFram
 }
 
 function wakeFailureCalls() {
-  return execFileMock.mock.calls.filter((call) => String((call[1] as string[])[7] ?? "").includes("automatic wake failed"));
+  return sendTextMock.mock.calls.filter((call) => call[0].text.includes("automatic wake failed"));
 }
 
 describe("createNotificationInjector.inject — direct send AND wake hook", () => {
@@ -218,7 +216,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
+    sendTextMock.mockReset();
     ({ fetchMock, calls, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -232,19 +230,16 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
   });
 
   it("calls the wake hook even when direct send succeeds (regression)", async () => {
-    stubExecFile("ok");
+    stubSendText("ok");
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
     const { api, enqueueSystemEvent } = makeApi();
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
 
     await inject(frame("1"));
 
-    // Instant ping went out via the CLI…
-    expect(execFileMock).toHaveBeenCalledTimes(1);
-    expect(execFileMock.mock.calls[0][0]).toBe("/usr/bin/openclaw");
-    expect(execFileMock.mock.calls[0][1]).toEqual(
-      expect.arrayContaining(["message", "send", "--channel", "telegram", "--target", "1"]),
-    );
+    // Instant ping went out through the in-process channel adapter…
+    expect(sendTextMock).toHaveBeenCalledTimes(1);
+    expect(sendTextMock.mock.calls[0][0]).toMatchObject({ to: "1", text: expect.any(String) });
     // …durable context was queued…
     expect(enqueueSystemEvent).toHaveBeenCalledTimes(1);
     expect(enqueueSystemEvent.mock.calls[0][1]).toMatchObject({ sessionKey: SESSION, contextKey: "imajin-ws:warp.run.completed" });
@@ -259,13 +254,13 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
   });
 
   it("still calls the wake hook when direct send fails", async () => {
-    stubExecFile("fail");
+    stubSendText("fail");
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
     const { api } = makeApi();
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
 
     await inject(frame("1"));
-    expect(execFileMock).toHaveBeenCalledTimes(1);
+    expect(sendTextMock).toHaveBeenCalledTimes(1);
     expect(fetchMock).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
@@ -274,7 +269,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
   });
 
   it("coalesces several successful-ping completions into one wake hook call", async () => {
-    stubExecFile("ok");
+    stubSendText("ok");
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
     const { api } = makeApi();
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
@@ -283,7 +278,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
     await inject(frame("2", "Warp run 2 FAILED"));
     await inject(frame("3"));
 
-    expect(execFileMock).toHaveBeenCalledTimes(3); // one ping per completion
+    expect(sendTextMock).toHaveBeenCalledTimes(3); // one ping per completion
     expect(fetchMock).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
@@ -301,7 +296,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
     const { inject, dispose } = createNotificationInjector(api, noDirect);
 
     await inject(frame("1"));
-    expect(execFileMock).not.toHaveBeenCalled();
+    expect(sendTextMock).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
@@ -309,14 +304,14 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
   });
 
   it("ignores frames outside injectScopes", async () => {
-    stubExecFile("ok");
+    stubSendText("ok");
     const { api, enqueueSystemEvent } = makeApi();
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
 
     await inject({ ...frame("1"), scope: "warp.run.started" } as NotificationFrame);
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
 
-    expect(execFileMock).not.toHaveBeenCalled();
+    expect(sendTextMock).not.toHaveBeenCalled();
     expect(enqueueSystemEvent).not.toHaveBeenCalled();
     expect(fetchMock).not.toHaveBeenCalled();
     dispose();
@@ -325,7 +320,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
   it.each(["warp.run.failed", "warp.run.timeout"])(
     "injects a %s frame into the session when the scope is in injectScopes",
     async (scope) => {
-      stubExecFile("ok");
+      stubSendText("ok");
       setImpl(async () => jsonResponse(200, { runId: "run-1" }));
       const { api, enqueueSystemEvent } = makeApi();
       const { inject, dispose } = createNotificationInjector(api, {
@@ -348,7 +343,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
   );
 
   it("keeps the newest notification when coalescing three completions", async () => {
-    stubExecFile("ok");
+    stubSendText("ok");
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
     const { api } = makeApi();
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
@@ -370,7 +365,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
   });
 
   it("does not dedupe a resumed run's completion (same runId, new sessionId)", async () => {
-    stubExecFile("ok");
+    stubSendText("ok");
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
     const { api } = makeApi();
     const { inject, dispose } = createNotificationInjector(api, CONFIG);
@@ -389,7 +384,7 @@ describe("createNotificationInjector.inject — direct send AND wake hook", () =
 
     // Same runId, different sessionId (a resumed segment) — both notifications
     // must reach the human and both must be coalesced into the wake hook call.
-    expect(execFileMock).toHaveBeenCalledTimes(2);
+    expect(sendTextMock).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
     const body = JSON.parse(calls[0][1].body);
     expect(String(body.message)).toContain("warp.run.completed × 2");
@@ -411,8 +406,8 @@ describe("createNotificationInjector — wake hook request shape", () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, calls, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -515,8 +510,8 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -555,7 +550,7 @@ describe("createNotificationInjector — wake hook outcomes (#18)", () => {
 
     await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(HOOK_RETRY_DELAYS_MS.length + 1));
     expect(wakeFailureCalls()).toHaveLength(1);
-    expect(String(wakeFailureCalls()[0][1])).toContain("automatic wake failed");
+    expect(wakeFailureCalls()[0][0].text).toContain("automatic wake failed");
     dispose();
   });
 
@@ -659,8 +654,8 @@ describe("createNotificationInjector — idempotency key (#18)", () => {
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, calls, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
@@ -715,8 +710,8 @@ describe("createNotificationInjector — hook token is never logged (#18)", () =
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     logSpy = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -785,8 +780,8 @@ describe("createNotificationInjector — wsNotifications.hookToken as a SecretRe
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     isSecretRefMock.mockClear();
     resolveSecretRefValuesMock.mockReset();
     ({ fetchMock, calls, setImpl } = makeFetchMock());
@@ -1043,8 +1038,8 @@ describe("createNotificationInjector.inject — wake hook message is evidence (#
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, calls, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
@@ -1060,7 +1055,9 @@ describe("createNotificationInjector.inject — wake hook message is evidence (#
 
   it("POSTs a body whose message carries the SUCCEEDED run's evidence and no instructions", async () => {
     const { api } = makeApi();
-    const { inject, dispose } = createNotificationInjector(api, CONFIG);
+    const { inject, dispose } = createNotificationInjector(api, CONFIG, {
+      liveStateLookup: async () => ({ state: "OPEN", isDraft: true }),
+    });
 
     await inject(
       evidenceFrame("ntf-1", "#2028 README rebuild — replay 1", {
@@ -1135,8 +1132,8 @@ describe("createNotificationInjector.inject — wake hook message is evidence (#
 describe("createNotificationInjector — notification_ack (#26)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     vi.spyOn(console, "log").mockImplementation(() => {});
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "error").mockImplementation(() => {});
@@ -1211,8 +1208,8 @@ describe("createNotificationInjector — dedup by id across a kernel replay (#26
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
@@ -1234,13 +1231,13 @@ describe("createNotificationInjector — dedup by id across a kernel replay (#26
 
     await inject(f);
     expect(enqueueSystemEvent).toHaveBeenCalledTimes(1);
-    expect(execFileMock).toHaveBeenCalledTimes(1);
+    expect(sendTextMock).toHaveBeenCalledTimes(1);
     sendFrame.mockClear();
 
     await inject(f); // the kernel replays the same id (e.g. after a reconnect)
 
     expect(enqueueSystemEvent).toHaveBeenCalledTimes(1); // still just once
-    expect(execFileMock).toHaveBeenCalledTimes(1); // not re-pinged
+    expect(sendTextMock).toHaveBeenCalledTimes(1); // not re-pinged
     expect(sendFrame).toHaveBeenCalledWith({ type: "notification_ack", id: "dup-1" });
 
     await vi.advanceTimersByTimeAsync(COALESCE_MS);
@@ -1257,8 +1254,8 @@ describe("createNotificationInjector — persisted state across a simulated rest
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), "imajin-ws-injector-test-"));
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -1357,7 +1354,7 @@ describe("createNotificationInjector — persisted state across a simulated rest
     dispose();
 
     fetchMock.mockClear();
-    execFileMock.mockClear();
+    sendTextMock.mockClear();
     const restarted = createNotificationInjector(api, CONFIG, { sendFrame: vi.fn(), keypairPath });
     await restarted.ready;
 
@@ -1389,8 +1386,8 @@ describe("createNotificationInjector — leading-edge + trailing wake coalescing
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, calls, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     setImpl(async () => jsonResponse(200, { runId: "run-1" }));
@@ -1553,8 +1550,8 @@ describe("createNotificationInjector — wake-pending classification (#31)", () 
 
   beforeEach(() => {
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -1672,8 +1669,8 @@ describe("createNotificationInjector — owed-wake replay drains, doesn't fan ou
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), "imajin-ws-owed-replay-test-"));
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, calls, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -1873,8 +1870,8 @@ describe("createNotificationInjector — wake-pending marker survives a restart 
   beforeEach(async () => {
     tmpDir = await mkdtemp(join(tmpdir(), "imajin-ws-pending-restart-test-"));
     vi.useFakeTimers();
-    execFileMock.mockReset();
-    stubExecFile("ok");
+    sendTextMock.mockReset();
+    stubSendText("ok");
     ({ fetchMock, setImpl } = makeFetchMock());
     vi.stubGlobal("fetch", fetchMock);
     vi.spyOn(console, "log").mockImplementation(() => {});

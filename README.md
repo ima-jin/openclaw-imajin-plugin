@@ -59,6 +59,7 @@ In `openclaw.json`:
   - **`approvalBridge.pinnedApproverPublicKeyHex`** — Ed25519 public key (hex) of the sole trusted human approver; see "Approval bridge" below
 - **`wsNotifications`** (optional) — WS notification → agent session wiring (#1672); see "Wake on Warp completion" below:
   - **`wsNotifications.hookToken`** — Bearer token for the Gateway's `POST /hooks/agent`; a plain string, or (recommended, #20) a SecretRef object resolved via the plugin SDK; falls back to the `IMAJIN_WAKE_HOOK_TOKEN` env var
+  - **`wsNotifications.directSend`** — deterministic in-process OpenClaw channel delivery for completion pings, wake disclosures/alerts, bridge warnings, and opt-in reach escalation. `channel` defaults to `telegram`; `target` is the configured recipient. Uses the host's `runtime.channel.outbound.loadAdapter(channel)` and `sendText({ cfg, to, text })` contract (verified from published `openclaw@2026.10.4`), with a 20-second deadline and abort signal. Hosts without that outbound runtime fail explicitly; no CLI fallback or subprocess is used. `cliPath` remains accepted but is deprecated and ignored. No configuration migration is needed.
   - **`wsNotifications.hooksPath`** — Gateway hooks base path; defaults to `/hooks`
   - **`wsNotifications.hookAgentId`** — agent id to route the wake hook to; defaults to `main`
   - **`wsNotifications.sessionPerWake`** — defaults to `true`; derives fresh batch sessions from `wakeSessionKey`/`targetSession` (default `agent:main:warp-events`); `false` opts into guarded fixed-key reuse without template tokens
@@ -150,7 +151,7 @@ Configure `plugins.entries.imajin.config.wsNotifications`:
   embedded instructions. No reply handle is surfaced as an actionable callback.
 - `reach.telegramEscalation` defaults to `false`. Explicit `true` also sends the
   verified, bounded untrusted block to the existing `directSend.target` using
-  its CLI path, only if `directSend.channel` is `telegram` or omitted. No target
+  the in-process channel adapter, only if `directSend.channel` is `telegram` or omitted. No target
   means no escalation. Non-Telegram destinations are not used.
   Reach does not use generic Warp wakes, wake-failure pings, or `reportTo`.
   Adding reach scopes to `injectScopes` cannot bypass verification or this flag.
@@ -158,7 +159,7 @@ Configure `plugins.entries.imajin.config.wsNotifications`:
   next to `keypairPath`) prevents repeated signed deliveries/replies from being
   enqueued or escalated twice, including reconnects/restarts. Notification ACKs
   follow successful enqueue only; refused enqueues remain retryable. Dedup is
-  best-effort if the state directory cannot be written; CLI failures are logged
+  best-effort if the state directory cannot be written; adapter failures are logged
   without message content and are not automatically retried.
 
 ### Kernel contract and current gap
