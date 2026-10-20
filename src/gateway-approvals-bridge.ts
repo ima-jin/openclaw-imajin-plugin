@@ -684,6 +684,7 @@ export class GatewayApprovalsBridge {
       publicationLedger?: PublicationLedger;
       stateStore?: ApprovalsStateStore;
       now?: () => number;
+      kernelSync?: KernelSyncDeps;
     } = {},
   ) {
     this.stateStore = options.stateStore ?? new ApprovalsStateStore(undefined, {
@@ -694,6 +695,7 @@ export class GatewayApprovalsBridge {
       if (!this.published.has(id)) this.published.set(id, proposal);
     }
     this.now = options.now ?? Date.now;
+    this.syncDeps = options.kernelSync;
     this.reservations = options.publicationLedger?.reservations ?? new Map();
     if (options.publicationLedger) options.publicationLedger.rejectedPublishes ??= new Map();
     this.rejectedPublishes = options.publicationLedger?.rejectedPublishes ?? new Map();
@@ -807,13 +809,14 @@ export class GatewayApprovalsBridge {
     const entitlement = await this.runPreflight(deps.http, deps.operatorDid);
     try {
       await this.reconcile();
-      if (this.disposed || entitlement.state !== "entitled") return entitlement;
-      await runApprovalsCatchUp({
-        http: deps.http,
-        store: deps.cursorStore,
-        applyDecision: (frame) => this.handleKernelDecision(frame),
-        logger: this.logger,
-      });
+      if (!this.disposed && entitlement.state === "entitled") {
+        await runApprovalsCatchUp({
+          http: deps.http,
+          store: deps.cursorStore,
+          applyDecision: (frame) => this.handleKernelDecision(frame),
+          logger: this.logger,
+        });
+      }
     } catch (err) {
       this.logger.error(`approvals catch-up failed (will retry on next reconnect): ${String(err)}`);
     }
@@ -952,12 +955,11 @@ export class GatewayApprovalsBridge {
     }
     if (this.disposed) return;
     const present = new Set(requests.map((request) => request.proposalId));
-    for (const [id, tracked] of this.published) {
-      if (tracked.sourceId === source.id &&
-          (!present.has(id) || (tracked.expiresAtMs !== undefined && tracked.expiresAtMs <= this.now()))) {
-        await this.retireProposal(id);
-      }
-    }
+    const orphanIds = [...this.published].filter(([id, tracked]) =>
+      tracked.sourceId === source.id &&
+      (!present.has(id) || (tracked.expiresAtMs !== undefined && tracked.expiresAtMs <= this.now())),
+    ).map(([id]) => id);
+    await Promise.all(orphanIds.map((id) => this.retireProposal(id)));
     for (const request of requests) {
       await this.handleSourceRequested(source.id, request);
     }
@@ -1016,12 +1018,7 @@ export class GatewayApprovalsBridge {
     }
   }
 
-  private async publishSourceRequest(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
-    const proposalId = request.proposalId;
-    if (request.expiresAtMs !== undefined && request.expiresAtMs <= this.now()) {
-      await this.retireProposal(proposalId);
-      return;
-    }
+  private async refreshStaleEntitlement(proposalId: string): Promise<void> {
     if (this.syncDeps && this.now() - this.lastEntitlementCheck >= ENTITLEMENT_CHECK_INTERVAL_MS) {
       const wasDegraded = this.isDegraded();
       await this.runPreflight(this.syncDeps.http, this.syncDeps.operatorDid);
@@ -1033,6 +1030,15 @@ export class GatewayApprovalsBridge {
         });
       }
     }
+  }
+
+  private async publishSourceRequest(sourceId: string, request: ApprovalSourceRequest): Promise<void> {
+    const proposalId = request.proposalId;
+    if (request.expiresAtMs !== undefined && request.expiresAtMs <= this.now()) {
+      await this.retireProposal(proposalId);
+      return;
+    }
+    await this.refreshStaleEntitlement(proposalId);
     if (this.disposed) return;
     const detail = {
       ...request.detail,
@@ -1085,7 +1091,7 @@ export class GatewayApprovalsBridge {
       this.ensureSweepTimer();
       await this.publishNativeApprovalBinding(request);
       if (!this.disposed && this.isDegraded()) {
-        // Fire-and-forget: a slow notify CLI must never hold the publish reservation.
+        // Fire-and-forget: channel delivery must never hold the publish reservation.
         void this.warnDegradedPublish(proposalId, payload.kind);
       }
     } catch (err) {
@@ -1448,6 +1454,7 @@ export class GatewayApprovalsBridge {
 
     try {
       // Async key/source/hash reads cannot let an approval cross its native deadline.
+      if (this.published.get(proposalId) !== tracked) return "noop";
       if (tracked.expiresAtMs !== undefined && tracked.expiresAtMs <= this.now()) {
         await this.retireProposal(proposalId);
         return "noop";
@@ -1483,11 +1490,10 @@ export class GatewayApprovalsBridge {
    * `contentHash` value read off the wire event. The fields verified are
    * reconstructed from `tracked.contentHash` (THIS bridge's own record of
    * what it published in the matching `operator.approval.requested`),
-   * since that is exactly the value the operator's /jin client actually
-   * signed over — the kernel's own `effectiveContentHash` invariant
-   * guarantees the two are identical for a legitimately-decided proposal,
-   * so there is nothing to gain (and a spoofable field to lose) by trusting
-   * a wire-supplied value instead.
+   * with exactly one wire prefix removed: /jin signs the bare lowercase
+   * digest, not the sha256:-prefixed bus value (#102). Optional mode and
+   * replyMessage are included verbatim when present. The wire echo check
+   * above remains exact; no event-supplied hash replaces the staged pin.
    *
    * Mirrors the kernel's own config semantics
    * (`OPERATOR_COUNTERSIGN_REQUIRED`, see `GatewayApprovalsBridgeConfig`):
@@ -1922,6 +1928,16 @@ async function prepareBridgeCredentials(
   return { keypair, gatewayToken: gatewayTokenResult.value, notifySecret: notifySecretResult.value };
 }
 
+async function loadApprovalsState(deps: StartGatewayApprovalsBridgeDeps, operatorDid: string): Promise<ApprovalsStateStore> {
+  const stateDir = resolveStateDir(deps.stateDir, deps.keypairPath);
+  const store = new ApprovalsStateStore(
+    stateDir ? path.join(stateDir, APPROVALS_STATE_FILENAME) : undefined,
+    { nodeUrl: deps.nodeUrl, agentDid: deps.did!, operatorDid },
+  );
+  await store.load();
+  return store;
+}
+
 async function loadApprovalsCursor(deps: StartGatewayApprovalsBridgeDeps): Promise<ApprovalsCursorStore> {
   const stateDir = resolveStateDir(deps.stateDir, deps.keypairPath);
   const cursorStore = new ApprovalsCursorStore(
@@ -1941,13 +1957,8 @@ async function startOwnedGatewayApprovalsBridge(
   const credentials = await prepareBridgeCredentials(api, config, deps, resources);
   if (!credentials) return undefined;
   const { keypair, gatewayToken, notifySecret } = credentials;
-  const stateDir = resolveStateDir(deps.stateDir, deps.keypairPath);
-  const stateStore = new ApprovalsStateStore(
-    stateDir ? path.join(stateDir, APPROVALS_STATE_FILENAME) : undefined,
-    { nodeUrl: deps.nodeUrl, agentDid: deps.did!, operatorDid: config!.operatorDid! },
-  );
-  await stateStore.load();
-  if (!resources.active) return undefined;
+  const stateStore = await loadApprovalsState(deps, config!.operatorDid!);
+  const cursorStore = await loadApprovalsCursor(deps);
   const kernel = createHttpKernelNotifyClient({
     nodeUrl: deps.nodeUrl,
     webhookSecret: notifySecret,
@@ -1996,6 +2007,9 @@ async function startOwnedGatewayApprovalsBridge(
       loopBlockSweepIntervalMs: resolveLoopBlockSweepIntervalMs(config!.loopBlockSweepIntervalMs),
       publicationLedger: processPublicationLedger(JSON.stringify([deps.nodeUrl, deps.did, config!.operatorDid])),
       stateStore,
+      kernelSync: deps.kernelHttp ? {
+        http: deps.kernelHttp, cursorStore, operatorDid: config!.operatorDid!,
+      } : undefined,
     },
   );
   bridgeRef = bridge;
@@ -2003,15 +2017,14 @@ async function startOwnedGatewayApprovalsBridge(
 
   const operatorDid = config!.operatorDid!;
   const kernelHttp = deps.kernelHttp;
-  const cursorStore = await loadApprovalsCursor(deps);
   if (!resources.active) return undefined;
 
   if (kernelHttp) {
     // #53 startup preflight: know whether the kernel will push decisions to this
     // agent BEFORE the first reconcile publishes any card, so those cards are
     // already surfaced as unappliable when the grant is missing.
-    await bridge.runPreflight(kernelHttp, operatorDid);
     bridge.startEntitlementMonitoring({ http: kernelHttp, cursorStore, operatorDid });
+    await bridge.runPreflight(kernelHttp, operatorDid);
   } else {
     console.warn(
       "[imajin-approvals-bridge] no kernel HTTP client wired — operator:approvals preflight and decided-event catch-up are disabled",

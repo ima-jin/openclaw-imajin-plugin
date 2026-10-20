@@ -7,7 +7,7 @@ export const APPROVALS_STATE_FILENAME = "approvals-bridge-state.json";
 
 export interface StoredApprovalProposal {
   sourceId: string;
-  owner?: ApprovalSourceRequest["owner"];
+  owner?: NonNullable<ApprovalSourceRequest["owner"]>;
   kind: string;
   summary: string;
   detail?: Record<string, unknown>;

@@ -487,7 +487,7 @@ diagrams, including the generic leg.
    event (delivered via the kernel's #1884 grant-bound event-subscription
    fan-out — the agent's own DID needs an active delegation grant for the
    `operator:approvals` capability on the kernel side; the bridge checks
-   this at startup and on every reconnect and fails loudly when it is
+   this at startup, every five minutes, before stale publishes, and on every reconnect and fails loudly when it is
    missing, and replays anything the socket missed — see "Approvals grant
    preflight, degraded mode, and catch-up (#53)" below; also "Live check
    before enabling"). Before ever touching a source, it verifies the
@@ -523,7 +523,8 @@ kernel's to auto-grant), so it now:
 
 1. **Preflights** the capability — once at bridge startup (before the first
    reconcile publishes any card) and again after the kernel's auth-ok on
-   EVERY WS (re)connect. It reads the agent's own effective entitlement
+   EVERY WS (re)connect, every five minutes while connected, and before a
+   publish if the previous check is at least five minutes old. It reads the agent's own effective entitlement
    from `GET /auth/api/events/subscriptions/catchup` (as the agent itself,
    never through `actAs`): `entitledEventTypes` contains
    `operator.approval.decided` exactly when an active grant carries
@@ -538,13 +539,15 @@ kernel's to auto-grant), so it now:
    The bridge is marked **degraded** and, for every proposal it publishes
    while degraded, logs and sends (via `wsNotifications.directSend`, Telegram
    by default) `⚠ bridge cannot apply: agent lacks operator:approvals …`.
-   The card contract has no unhashed note field (every card field —
-   including `summary` — is covered by `contentHash` and the signature), and
-   putting the warning in `summary` would make the hash depend on bridge
-   state at publish time, so the warning travels the notify path instead.
+   Warnings use the in-process channel outbound adapter (never the CLI),
+   deduped across publish attempts and boots. The signed request also carries
+   `detail.bridge = {degraded:true, reason, fix:"/auth/agents"}`. This marker
+   remains pinned to the original card during decision-time hash checks;
+   recovery never silently rewrites what the operator signed.
    An inconclusive check (kernel unreachable) is NOT treated as degraded and
-   is retried on the next reconnect.
-3. **Catches up** on every (re)connect once entitled: re-reconciles pending
+   is retried within five minutes.
+3. **Catches up** on every (re)connect and periodic check once entitled,
+   including immediately after renewal is detected: re-reconciles pending
    source items, then reads `operator.approval.decided` events from the
    kernel's durable `kernel.event_subscription_log` (the same catch-up route)
    since the persisted cursor and applies each through the SAME handler as
@@ -557,7 +560,7 @@ kernel's to auto-grant), so it now:
    default: `imajin-ws-state/` next to `keypairPath`), is scoped to node URL +
    agent DID, only ever advances (never from a live frame — live pushes can
    skip a seq, the durable read cannot), and stops at the first event whose
-   handling failed transiently so the next reconnect retries it. A missing or
+   handling failed transiently so the next check/reconnect retries it. A missing or
    corrupt cursor file just replays the retention window (safe, idempotent).
 
 The decided event addressed to the agent has `subject` = the agent DID (the
@@ -571,6 +574,29 @@ agent DID passes the preflight yet still receives nothing (catch-up applies
 nothing either). Cards published while degraded keep their original content
 after recovery; the grant simply makes them applicable.
 
+**Native expiry and orphan safety (#103).** Both `system-agent` and
+`gateway-exec` publish `detail.expiresAt` from the Gateway record's own
+`expiresAtMs` (never an invented TTL), so the panel's existing expiry check
+disables stale pending cards. An untracked, source-gone, or expired proposal
+can never resolve an approval. Boot/reconnect and periodic reconcile compare
+persisted proposals against successful source lists; a failed list is not
+evidence of deletion. Proposal metadata, terminal local outcomes and successful
+warning dedupe are scoped to node + agent + operator in
+`<stateDir>/approvals-bridge-state.json`, with ordered atomic writes.
+
+**Kernel gaps verified against live `/spec` (2026-10-20).** No grantee-readable
+grant expiry is exposed ([imajin-ai#3018](https://github.com/ima-jin/imajin-ai/issues/3018)),
+so T-24h/T-1h warnings cannot be scheduled honestly; startup logs that limitation.
+Renew at **/auth/agents → the grant → Renew**; effective entitlement recovers
+within five minutes without a Gateway restart. There is no documented signer
+expiry/withdrawal route ([imajin-ai#3019](https://github.com/ima-jin/imajin-ai/issues/3019)),
+so orphan outcomes are recorded locally as `expired/superseded`, logged and
+warned once through Telegram rather than forging an operator decision. The
+kernel card cannot yet be terminalized remotely. The current panel also ignores
+the generic signed `detail.bridge` marker
+([imajin-ai#3020](https://github.com/ima-jin/imajin-ai/issues/3020)); Telegram/log
+remain the visible degraded warning until that renderer lands.
+
 ### Operator countersignature (#44, `ima-jin/imajin-ai#2082`/`#2158`)
 
 Before #44, this bridge trusted the kernel's own witness signature on the
@@ -580,7 +606,9 @@ the kernel *recorded* a decision, never that the operator *actually made*
 it — a compromised kernel alone could forge an approval. The kernel now
 ships a second, independent signature (`operatorSignature`), produced
 client-side on /jin with the operator's OWN key, over
-`canonicalize({contentHash, decision, decidedAt})`. This bridge verifies
+`canonicalize({contentHash, decision, decidedAt, mode?, replyMessage?})`, with
+the **bare lowercase hex** hash (the bus event retains `sha256:<hex>`).
+This bridge verifies
 that signature **directly against the operator DID's registered Ed25519
 public key** (resolved via this plugin's EXISTING DID resolver,
 `ImajinClient.getIdentity` — `GET /registry/api/identity/:did` — never a
@@ -1519,9 +1547,9 @@ its source, applying it fails, or its `expiresAtMs` passes with no decision.
 - Several pending approvals for one session block it once and unblock it only
   when the last is settled. A rejected/unverifiable decision, drift, or a
   `withdrawn` decision leaves the approval pending, so the loop stays blocked.
-- The reason carries the card `kind` only, never the command text. The owner and
-  expiry ride on the in-process `ApprovalSourceRequest`, not in the card `detail`,
-  so `contentHash` and the kernel contract are unchanged.
+- The reason carries the card `kind` only, never the command text. The owner
+  rides only on the in-process `ApprovalSourceRequest`. Native expiry also
+  rides in signed card `detail.expiresAt` for system-agent and gateway-exec.
 - Observe-only (`src/approval-loop-blocker.ts`): a throwing `block` / `unblock`
   is logged and dropped and never affects publishing or applying a decision.
   With the loops feature off (`loops.enabled: false` or unconfigured) nothing is

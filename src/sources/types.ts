@@ -90,8 +90,8 @@ export interface ApprovalSourceRequest {
   sourceRevision: string;
   /**
    * Optional bounded structured payload for a per-kind /jin card renderer
-   * (#2152). Omitted entirely for sources with nothing structured to add
-   * (system-agent). Must fit the kernel's 16 KB cap — enforced by the
+   * (#2152). Omitted entirely for sources with nothing structured to add.
+   * System-agent and gateway-exec include native expiresAt. Must fit the kernel's 16 KB cap — enforced by the
    * source that populates it. Covered by the bridge's `contentHash` digest
    * (#2084) — mutating `detail` without changing `sourceRevision` still
    * changes the digest.
@@ -104,7 +104,7 @@ export interface ApprovalSourceRequest {
    * rail while the approval is pending. Omit when unknown.
    */
   owner?: { sessionKey?: string; jobId?: string };
-  /** Epoch ms after which the item can no longer be decided; the owning loop is unblocked then (#64). Not sent to the kernel. */
+  /** Native epoch-ms deadline; blocks execution after expiry and unblocks the loop. Gateway sources also expose it as detail.expiresAt. */
   expiresAtMs?: number;
 }
 
