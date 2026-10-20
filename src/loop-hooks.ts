@@ -30,6 +30,11 @@ export interface LoopsConfig {
   keeperJobs?: string[];
 }
 
+export const LOOP_LIFECYCLE_HOOKS = [
+  "session_start", "session_end", "agent_end", "subagent_spawned",
+  "subagent_progress", "subagent_ended", "cron_changed", "cron_reconciled",
+] as const;
+
 export interface LoopHooksDeps {
   nodeUrl?: string;
   did?: string;
@@ -82,7 +87,7 @@ export function registerLoopLifecycle(api: HookApi, deps: LoopHooksDeps): LoopLi
     logger: deps.logger,
   });
 
-  const register = (hook: string, handler: (...args: any[]) => unknown): void => {
+  const register = (hook: (typeof LOOP_LIFECYCLE_HOOKS)[number], handler: (...args: any[]) => unknown): void => {
     try {
       api.on(hook, handler, { name: `imajin-loops:${hook}` });
     } catch {

@@ -14,7 +14,10 @@
  *   - `skills.proposals.list` (scope `operator.read`) returns
  *     `{ proposals: [{id, kind: "create"|"update", status, title,
  *     description, skillName, skillKey, createdAt, updatedAt,
- *     scanState: "clean"|"failed", revisionHash}], installedSkills }`.
+ *     scanState: "clean"|"failed"}], installedSkills }`. Some Gateway
+ *     versions also include `revisionHash`; otherwise
+ *     `skills.proposals.inspect` returns the real top-level `revisionHash`
+ *     for `{proposalId, agentId?}` (scope `operator.read`).
  *   - `skills.proposals.apply` / `skills.proposals.reject` (scope
  *     `operator.admin`) take `{proposalId, expectedRevisionHash,
  *     correlationId?, reason?}`. The Gateway itself throws a
@@ -30,15 +33,15 @@
  *     not a cross-proposal "a new proposal appeared" feed, and no such feed
  *     is exposed anywhere in the SDK at this version. `subscribe()` below is
  *     therefore an honest interval poll of `skills.proposals.list` (the same
- *     method `list()` uses), diffing against proposal ids already seen in
+ *     method `list()` uses), diffing against request fingerprints seen in
  *     this process — not an invented push stream.
  *
  * `detail.diffSummary` is populated from the proposal's `description`
  * (bounded separately below): `skills.proposals.list`'s lightweight
  * projection carries no diff-only field distinct from the human
  * `description` — a real content diff would require `skills.proposals.
- * inspect`'s full draft body, which this lightweight polling list
- * deliberately avoids fetching for every pending proposal on every poll.
+ * inspect`'s full draft body. Inspect is used only to hydrate missing
+ * revisions, cached by agent/id/updatedAt when that timestamp is available.
  * This is the same disclosed-heuristic posture as the system-agent source's
  * `keysTouched: []` (see `system-agent.ts`).
  */
@@ -61,8 +64,10 @@ export interface SkillWorkshopProposalSummary {
   skillName: string;
   skillKey?: string;
   scanState: SkillWorkshopScanState;
-  revisionHash: string;
+  updatedAt?: string;
+  revisionHash?: string;
 }
+type RevisionedProposal = SkillWorkshopProposalSummary & { revisionHash: string };
 
 export interface SkillWorkshopListResult {
   proposals: SkillWorkshopProposalSummary[];
@@ -79,6 +84,8 @@ export interface SkillWorkshopGatewayClient {
    * once per agent from `listAgentIds` and passes `agentId` through.
    */
   list(agentId?: string): Promise<SkillWorkshopListResult>;
+  /** Optional for older adapters whose list already supplies valid revisions. */
+  inspect?(proposalId: string, agentId?: string): Promise<{ revisionHash?: unknown }>;
   /** `agents.list` (scope `operator.read`) — every configured agent id. Optional: absent/empty means one unscoped list. */
   listAgentIds?(): Promise<string[]>;
   apply(
@@ -116,7 +123,11 @@ function boundDetail(detail: Record<string, unknown>): Record<string, unknown> {
   return { ...rest, diffSummary: "" };
 }
 
-function toApprovalSourceRequest(proposal: SkillWorkshopProposalSummary): ApprovalSourceRequest {
+function isValidRevision(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function toApprovalSourceRequest(proposal: RevisionedProposal): ApprovalSourceRequest {
   const description = truncate(proposal.description || proposal.title || proposal.id, MAX_DESCRIPTION_LENGTH);
   return {
     proposalId: proposal.id,
@@ -194,7 +205,9 @@ export function createSkillWorkshopSource(
   opts: { pollIntervalMs?: number } = {},
 ): ApprovalSource {
   const pollIntervalMs = opts.pollIntervalMs ?? 15_000;
-  const known = new Set<string>();
+  const known = new Map<string, { fingerprint: string; retryAtMs?: number }>();
+  const revisions = new Map<string, { updatedAt: string; revisionHash: string }>();
+  const revisionWarned = new Set<string>();
   /** Which agent's workshop each listed proposal belongs to — apply/reject must target the same agent. */
   const agentByProposal = new Map<string, string>();
   let missingScopeWarned = false;
@@ -211,10 +224,51 @@ export function createSkillWorkshopSource(
     );
   }
 
-  /** Wraps one scoped list so every call site gets the one-time missing-scope warning without changing its own error propagation. */
-  async function pendingFor(agentId?: string): Promise<SkillWorkshopProposalSummary[]> {
+  /** A failed inspect excludes only this proposal, never other valid cards. */
+  async function hydrate(
+    proposal: SkillWorkshopProposalSummary,
+    agentId?: string,
+  ): Promise<RevisionedProposal | null> {
+    const key = JSON.stringify([agentId ?? null, proposal.id]);
+    if (isValidRevision(proposal.revisionHash)) {
+      revisions.delete(key);
+      return { ...proposal, revisionHash: proposal.revisionHash };
+    }
+    const updatedAt = typeof proposal.updatedAt === "string" && proposal.updatedAt.length > 0
+      ? proposal.updatedAt
+      : undefined;
+    const cached = revisions.get(key);
+    if (updatedAt && cached?.updatedAt === updatedAt) {
+      return { ...proposal, revisionHash: cached.revisionHash };
+    }
+    revisions.delete(key);
     try {
-      return await currentPending(client, agentId);
+      if (!client.inspect) throw new Error("skills.proposals.inspect is unavailable");
+      const inspected = await (agentId ? client.inspect(proposal.id, agentId) : client.inspect(proposal.id));
+      if (!isValidRevision(inspected?.revisionHash)) throw new Error("inspect returned no valid revisionHash");
+      if (updatedAt) revisions.set(key, { updatedAt, revisionHash: inspected.revisionHash });
+      return { ...proposal, revisionHash: inspected.revisionHash };
+    } catch (err) {
+      if (!revisionWarned.has(key)) {
+        revisionWarned.add(key);
+        console.warn(
+          `[imajin-approvals-bridge] skill-workshop proposal ${proposal.id} ` +
+            `(agent ${agentId ?? "default"}) has no verified revisionHash; withholding approval: ${String(err)}`,
+        );
+      }
+      return null;
+    }
+  }
+
+  /** Every list/current/poll uses the same fail-closed revision hydration. */
+  async function pendingFor(agentId?: string, requireRevisionFor?: string): Promise<RevisionedProposal[]> {
+    try {
+      const list = await currentPending(client, agentId);
+      const hydrated = await Promise.all(list.map((proposal) => hydrate(proposal, agentId)));
+      if (list.some((proposal, index) => proposal.id === requireRevisionFor && hydrated[index] === null)) {
+        throw new Error(`skill-workshop proposal ${requireRevisionFor} is pending but its revisionHash could not be verified`);
+      }
+      return hydrated.filter((proposal): proposal is RevisionedProposal => proposal !== null);
     } catch (err) {
       if (isMissingScopeError(err)) warnMissingScopeOnce(err);
       throw err;
@@ -247,12 +301,12 @@ export function createSkillWorkshopSource(
    * logged loudly and does not hide the others; only when every agent fails
    * does this throw (so the bridge logs the list failure).
    */
-  async function pending(): Promise<SkillWorkshopProposalSummary[]> {
+  async function pending(requireRevisionFor?: string): Promise<RevisionedProposal[]> {
     const agentIds = await resolveAgentIds();
-    if (agentIds.length === 0) return pendingFor();
-    const settled = await Promise.allSettled(agentIds.map((agentId) => pendingFor(agentId)));
+    if (agentIds.length === 0) return pendingFor(undefined, requireRevisionFor);
+    const settled = await Promise.allSettled(agentIds.map((agentId) => pendingFor(agentId, requireRevisionFor)));
     const seen = new Set<string>();
-    const merged: SkillWorkshopProposalSummary[] = [];
+    const merged: RevisionedProposal[] = [];
     let firstError: unknown;
     let failures = 0;
     settled.forEach((outcome, index) => {
@@ -273,7 +327,7 @@ export function createSkillWorkshopSource(
         merged.push(proposal);
       }
     });
-    if (failures === agentIds.length) throw firstError;
+    if (failures === agentIds.length || (requireRevisionFor && failures > 0)) throw firstError;
     return merged;
   }
 
@@ -282,15 +336,25 @@ export function createSkillWorkshopSource(
     onDriftPolicy: "restage",
     decisionLabels: { approve: "Apply", reject: "Reject" },
 
-    onPublishFailed(proposalId: string): void {
-      // Forget it so the next poll re-emits the proposal and the bridge retries the publish.
-      known.delete(proposalId);
+    onPublishFailed(proposalId: string, failure?: { retryAtMs: number }): void {
+      const previous = known.get(proposalId);
+      if (previous && failure) {
+        known.set(proposalId, { fingerprint: previous.fingerprint, retryAtMs: failure.retryAtMs });
+      } else {
+        // Transient failures retry on the next poll.
+        known.delete(proposalId);
+      }
     },
 
     async list(): Promise<ApprovalSourceRequest[]> {
       const list = await pending();
-      for (const proposal of list) known.add(proposal.id);
-      return list.map(toApprovalSourceRequest);
+      const requests = list.map(toApprovalSourceRequest);
+      for (const request of requests) {
+        const fingerprint = JSON.stringify(request);
+        const previous = known.get(request.proposalId);
+        if (previous?.fingerprint !== fingerprint) known.set(request.proposalId, { fingerprint });
+      }
+      return requests;
     },
 
     subscribe(onRequested) {
@@ -310,9 +374,13 @@ export function createSkillWorkshopSource(
           .then((list) => {
             backoff = false;
             for (const proposal of list) {
-              if (known.has(proposal.id)) continue;
-              known.add(proposal.id);
-              onRequested(toApprovalSourceRequest(proposal));
+              const request = toApprovalSourceRequest(proposal);
+              const fingerprint = JSON.stringify(request);
+              const previous = known.get(proposal.id);
+              if (previous?.fingerprint === fingerprint &&
+                  (previous.retryAtMs === undefined || Date.now() <= previous.retryAtMs)) continue;
+              known.set(proposal.id, { fingerprint });
+              onRequested(request);
             }
           })
           .catch((err: unknown) => {
@@ -338,7 +406,7 @@ export function createSkillWorkshopSource(
       // Ask only the owning agent when known: a failure listing some OTHER
       // agent must never make this proposal look resolved.
       const owner = agentByProposal.get(proposalId);
-      const list = owner ? await pendingFor(owner) : await pending();
+      const list = owner ? await pendingFor(owner, proposalId) : await pending(proposalId);
       const match = list.find((proposal) => proposal.id === proposalId);
       if (!match) return { pending: false, sourceRevision: null };
       // #2084: return the CURRENT `detail` too (built the same way `list()`
@@ -355,6 +423,9 @@ export function createSkillWorkshopSource(
       decision: ApprovalDecision,
       expectedSourceRevision: string,
     ): Promise<{ applied: boolean }> {
+      if (!isValidRevision(expectedSourceRevision)) {
+        throw new Error(`skill-workshop proposal ${proposalId} requires a non-empty expectedSourceRevision`);
+      }
       const agentId = agentByProposal.get(proposalId);
       try {
         if (decision === "approve") {
@@ -408,6 +479,12 @@ export function createLiveSkillWorkshopGatewayClient(gatewayClient: {
     async listAgentIds() {
       const result = await gatewayClient.request<{ agents?: Array<{ id?: unknown }> }>("agents.list", {});
       return (result?.agents ?? []).flatMap((agent) => (typeof agent.id === "string" ? [agent.id] : []));
+    },
+    async inspect(proposalId: string, agentId?: string) {
+      return gatewayClient.request<{ revisionHash?: unknown }>("skills.proposals.inspect", {
+        proposalId,
+        ...(agentId ? { agentId } : {}),
+      });
     },
     async apply(proposalId: string, expectedRevisionHash: string, agentId?: string) {
       return gatewayClient.request<{ applied?: boolean }>("skills.proposals.apply", {

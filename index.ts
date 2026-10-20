@@ -27,7 +27,7 @@ import {
 import { ImajinChat } from "./src/chat.js";
 import { ImajinClient } from "./src/client.js";
 import { ImajinWsService, type NotificationFrame } from "./src/ws-service.js";
-import { createNotificationInjector, type WsNotificationsConfig } from "./src/notification-injector.js";
+import { createNotificationInjector, WAKE_RUNTIME_HOOKS, type WsNotificationsConfig } from "./src/notification-injector.js";
 import { createReachEventHandler, isReachFrame } from "./src/reach-events.js";
 import {
   startGatewayApprovalsBridge,
@@ -55,11 +55,11 @@ import {
 import {
   registerImajinProvider,
   isImajinCatalogInvalidationScope,
-  type ImajinDiscoveryHandle,
+  type RegisteredImajinProvider,
   type ImajinModelDiscoveryConfig,
 } from "./src/imajin-provider.js";
 import { isImajinModelAllowedByPolicy } from "./src/sources/imajin-catalog.js";
-import { registerLoopLifecycle, type LoopsConfig } from "./src/loop-hooks.js";
+import { registerLoopLifecycle, LOOP_LIFECYCLE_HOOKS, type LoopLifecycle, type LoopsConfig } from "./src/loop-hooks.js";
 import { registerHorizonSync, type HorizonConfig } from "./src/horizon/sync.js";
 import { resolveImajinMcpUrl } from "./src/kernel-mcp.js";
 import { createIdentityClientOperatorKeyResolver } from "./src/operator-signature.js";
@@ -72,6 +72,9 @@ import {
 import { createLoopbackSessionGateway, type LoopbackSessionGateway } from "./src/session-command-gateway.js";
 import { ApprovalExecutionRegistry } from "./src/approval-execution.js";
 import { createWakeReportTool } from "./src/wake-report-tool.js";
+import type { RegistrationLifecycle } from "./src/registration-lifecycle.js";
+import { PluginServiceRuntime, type RuntimeHookRegister } from "./src/plugin-service-runtime.js";
+import type { WakeDisclosureSender } from "./src/wake-report-tool.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -106,6 +109,400 @@ function toGatewayDecision(decision: GatewayApprovalDecision): "allow-once" | "d
   return decision === "approve" ? "allow-once" : "deny";
 }
 
+interface PluginConfig {
+  nodeUrl?: string;
+  did?: string;
+  keypairPath?: string;
+  actAs?: string;
+  wsNotifications?: WsNotificationsConfig;
+  attestation?: TurnUsageAttestationConfig;
+  approvalBridge?: ApprovalBridgeSettings;
+  approvals?: ApprovalsBridgePluginConfig;
+  inferProxyBaseUrl?: string;
+  modelDiscovery?: ImajinModelDiscoveryConfig;
+  loops?: LoopsConfig;
+  horizon?: HorizonConfig;
+  sessionCommands?: SessionCommandsSettings;
+  mcpUrl?: string;
+}
+
+function createLegacyApprovalBridge(
+  api: any,
+  config: PluginConfig,
+  wsService: ImajinWsService,
+  approvalExecutions: ApprovalExecutionRegistry,
+): ApprovalBridge | undefined {
+  const keypairPath = config.keypairPath;
+  if (!keypairPath) return undefined;
+  let approvalBridge: ApprovalBridge | undefined;
+  if (config.did && config.approvalBridge?.pinnedApproverPublicKeyHex) {
+    approvalBridge = new ApprovalBridge(
+      {
+        did: config.did,
+        keypairPath,
+        pinnedApproverPublicKeyHex: config.approvalBridge.pinnedApproverPublicKeyHex,
+      },
+      (frame) => wsService.send(frame),
+    );
+
+    // Decision leg: only a signature-verified `approve`/`reject` ever
+    // reaches here (ApprovalBridge.handleFrame already rejected + logged
+    // anything expired, mismatched, or unsigned) — this is the one place
+    // that actually resolves the OpenClaw gateway's pending approval.
+    // No `reviewer` identity is passed: this bridge is not a registered
+    // channel route for the request (see the registerChannel TODO below),
+    // so custody checks that key off a channel/accountId/senderId triple
+    // don't apply here; omitting all three is the documented no-reviewer form.
+    approvalBridge.onResolved(async (requestId, decision, kind: GatewayApprovalKind) => {
+      if (!approvalExecutions.claim(requestId)) return;
+      try {
+        const result = await resolveApprovalOverGateway({
+          cfg: api.config,
+          approvalId: requestId,
+          approvalKind: kind,
+          decision: toGatewayDecision(decision),
+          clientDisplayName: "Imajin /jin approval",
+        });
+        console.log(
+          `[imajin-approval] gateway resolve ${requestId} -> applied=${result.applied}, status=${result.approval.status}`,
+        );
+      } catch (err) {
+        console.error(`[imajin-approval] gateway resolve failed for ${requestId}:`, err);
+      }
+    });
+  } else if (config.approvalBridge?.pinnedApproverPublicKeyHex) {
+    console.warn(
+      "[imajin-plugin] approvalBridge.pinnedApproverPublicKeyHex is set but no agent `did` " +
+        "is configured — the approval bridge will not be registered",
+    );
+  }
+
+  return approvalBridge;
+}
+
+function createSessionCommands(
+  api: any,
+  config: PluginConfig,
+  client: ImajinClient,
+  loopLifecycle: LoopLifecycle | undefined,
+  wsService: ImajinWsService,
+  lifecycle: RegistrationLifecycle,
+  approvalExecutions: ApprovalExecutionRegistry,
+): SessionCommandExecutor | undefined {
+  const keypairPath = config.keypairPath;
+  if (!keypairPath) return undefined;
+  let sessionCommandExecutor: SessionCommandExecutor | undefined;
+  let sessionGateway: LoopbackSessionGateway | undefined;
+  if (config.sessionCommands?.enabled === true) {
+    const settings = config.sessionCommands;
+    if (!config.did || !settings.kernelPublicKeyHex || !loopLifecycle) {
+      console.warn(
+        "[imajin-plugin] sessionCommands.enabled needs an agent `did` and " +
+          "sessionCommands.kernelPublicKeyHex with loop lifecycle tracking enabled — session commands will not be accepted",
+      );
+    } else {
+      const keyResolver = createIdentityClientOperatorKeyResolver(client);
+      sessionGateway = createLoopbackSessionGateway({
+        getConfig: () => (api.runtime?.config?.current?.() ?? {}) as Record<string, unknown>,
+      });
+      const ownedGateway = sessionGateway;
+      lifecycle.add(() => ownedGateway.dispose());
+      sessionCommandExecutor = createSessionCommandExecutor(
+        {
+          agentDid: config.did,
+          kernelPublicKeyHex: settings.kernelPublicKeyHex,
+          kernelDid: settings.kernelDid,
+          allowedPrincipal: config.actAs,
+          requirePrincipalCountersignature: settings.requirePrincipalCountersignature,
+        },
+        {
+          gateway: sessionGateway.gateway,
+          loopTracker: loopLifecycle?.tracker,
+          executionRegistry: approvalExecutions,
+          attest: createSessionCommandAttester({
+            did: config.did,
+            keypairPath,
+            send: (frame) => wsService.send(frame),
+          }),
+          resolveServiceOf: (agentDid) => client.getServiceOf(agentDid),
+          resolvePublicKey: (did) => keyResolver.resolveOperatorPublicKey(did),
+        },
+      );
+      console.log("[imajin-plugin] session command executor enabled");
+    }
+  }
+
+  return sessionCommandExecutor;
+}
+
+async function startPluginRuntime(
+  api: any,
+  config: PluginConfig | undefined,
+  client: ImajinClient | undefined,
+  imajinProvider: RegisteredImajinProvider,
+  lifecycle: RegistrationLifecycle,
+  on: RuntimeHookRegister,
+  setWakeSender: (sender: WakeDisclosureSender) => void,
+): Promise<void> {
+  const discovery = imajinProvider.startDiscovery();
+  lifecycle.add(() => discovery.stop());
+  if (!config?.nodeUrl || !client) return;
+  let startWs = async () => {};
+  // Loop lifecycle → kernel loops rail (#46): signed loop.* events for
+  // primary sessions, subagents, cron automations and keepers. Observe hooks
+  // only; a publish failure is logged and dropped, never surfaced to the loop.
+  const loopLifecycle = registerLoopLifecycle({ on }, {
+    nodeUrl: config.nodeUrl,
+    did: config.did,
+    keypairPath: config.keypairPath,
+    actAs: config.actAs,
+    config: config.loops,
+  });
+
+  registerHorizonSync({
+    registerService: ({ start, stop }) => {
+      lifecycle.add(() => { void stop(); });
+      start();
+    },
+  }, {
+    nodeUrl: config.nodeUrl,
+    did: config.did,
+    keypairPath: config.keypairPath,
+    principal: config.actAs,
+    config: config.horizon,
+  });
+
+  // Background WebSocket service for real-time notifications (#1653)
+  console.log("[imajin-plugin] keypairPath:", config.keypairPath ? "configured" : "missing");
+  if (config.keypairPath) {
+    console.log("[imajin-plugin] registering imajin-ws service");
+    const wsService = new ImajinWsService(
+      {
+        nodeUrl: config.nodeUrl,
+        did: config.did,
+        keypairPath: config.keypairPath,
+        actAs: config.actAs,
+      },
+    );
+
+    lifecycle.add(() => wsService.stop());
+
+    // WS notification → agent session injection (#1672), acked after the
+    // durable enqueue step (#26) via `wsService.send` bound below.
+    const {
+      inject: injector,
+      dispose: disposeInjector,
+      onAgentEnd: onWakeAgentEnd,
+      runtimeHooks: wakeRuntimeHooks,
+      reportWake,
+    } = createNotificationInjector(api, config.wsNotifications, {
+      sendFrame: (frame) => wsService.send(frame),
+      keypairPath: config.keypairPath,
+    });
+    lifecycle.add(disposeInjector);
+    for (const [hook, handler] of Object.entries(wakeRuntimeHooks)) {
+      on(hook, handler, { name: `imajin-wake:${hook}` });
+    }
+    setWakeSender(reportWake);
+    const reachEvents = createReachEventHandler(api, config.wsNotifications?.reach, {
+      principalDid: config.actAs ?? config.did,
+      targetSession: config.wsNotifications?.targetSession,
+      identityClient: client,
+      directSend: config.wsNotifications?.directSend,
+      stateDir: config.wsNotifications?.stateDir,
+      keypairPath: config.keypairPath,
+      sendFrame: (frame) => wsService.send(frame),
+    });
+
+    lifecycle.add(() => reachEvents.dispose());
+
+    // Supervise every wake (#79), independently of optional reportTo (#47).
+    // Completion observes local agent_end; the kernel never reads a transcript.
+    if (onWakeAgentEnd) {
+      on(
+        "agent_end",
+        (event: AgentEndEvent, ctx?: { sessionKey?: string }) => {
+          void onWakeAgentEnd(event, ctx).catch(() => {
+            console.error("[imajin-ws] wake outcome handling failed");
+          });
+        },
+        { name: "wake-outcome" },
+      );
+    }
+
+    // OpenClaw gateway approval bridge (#1816). Registered only when both a
+    // signing identity (did + keypairPath, already required above for the WS
+    // itself) and a pinned approver public key are configured — an install
+    // with neither behaves exactly as before.
+    const approvalExecutions = new ApprovalExecutionRegistry();
+    const approvalBridge = createLegacyApprovalBridge(api, config, wsService, approvalExecutions);
+
+    // Session command executor (#51): signed, DID-addressed session commands
+    // arrive over this same outbound WS, are verified, executed against the
+    // local gateway, and attested back as signed `loop.session.*` frames.
+    // Opt-in; needs the agent DID + a pinned kernel command-signing key.
+    const sessionCommandExecutor = createSessionCommands(
+      api, config, client, loopLifecycle, wsService, lifecycle, approvalExecutions,
+    );
+
+    // Gateway approvals bridge (#24): publishes staged Gateway system-agent
+    // proposals to the kernel and applies signed operator decisions back to
+    // the Gateway. Off unless `approvals.enabled` + `approvals.operatorDid`
+    // (+ the token/secret it needs) are configured — see
+    // `src/gateway-approvals-bridge.ts` for the full trust chain. Started
+    // fire-and-forget so a slow/unavailable Gateway loopback connection can
+    // never delay the kernel WebSocket service start.
+    let approvalsBridgeFrameHandler: ((frame: unknown) => void) | undefined;
+    const approvalsBridgeReady = startGatewayApprovalsBridge(api, config.approvals, {
+      signal: lifecycle.signal,
+      did: config.did,
+      keypairPath: config.keypairPath,
+      nodeUrl: config.nodeUrl,
+      // Reuses this plugin's EXISTING DID resolver (#44) to verify an
+      // operator's countersignature on `operator.approval.decided`
+      // against their registered public key — never a second resolver.
+      identityClient: client,
+      // #53: the same challenge-response session, reused for the
+      // `operator:approvals` entitlement preflight + decided-event catch-up.
+      kernelHttp: client,
+      stateDir: config.wsNotifications?.stateDir,
+      directSend: config.wsNotifications?.directSend,
+      // #64: a pending approval blocks its owning loop on the loops rail.
+      loopTracker: loopLifecycle?.tracker,
+      executionRegistry: approvalExecutions,
+      publishApprovalBinding: (attestation) => {
+        wsService.send({ type: "loop.approval.bound", attestation });
+        return Promise.resolve();
+      },
+      // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
+      // enabled via `approvals.sources` alongside system-agent/skill-
+      // workshop. Reads the config's live `modelPolicy.allow` on every
+      // check rather than a snapshot, so an operator edit takes effect
+      // without a plugin restart.
+      imajinCatalog: {
+        listDiscoveredModels: () => imajinProvider.cache.peek()?.models ?? [],
+        isModelAllowed: (modelId: string) => {
+          const liveConfig = api.runtime?.config?.current?.() as
+            | { agents?: { defaults?: { modelPolicy?: { allow?: string[] } } } }
+            | undefined;
+          return isImajinModelAllowedByPolicy(
+            liveConfig?.agents?.defaults?.modelPolicy?.allow,
+            modelId,
+          );
+        },
+      },
+    })
+      .then((started) => {
+        if (!lifecycle.active) {
+          started?.dispose();
+          return undefined;
+        }
+        if (started) lifecycle.add(() => started.dispose());
+        approvalsBridgeFrameHandler = started?.onKernelFrame;
+        return started;
+      })
+      .catch((err: unknown) => {
+        console.error("[imajin-approvals-bridge] failed to start:", err);
+        return undefined;
+      });
+
+    // #53: on EVERY (re)connect, after the kernel's auth-ok, re-verify the
+    // agent still holds `operator:approvals` and replay any
+    // `operator.approval.decided` the socket missed. Awaits bridge startup so
+    // a connect that races registration is not dropped.
+    wsService.onConnected(async () => {
+      const started = await approvalsBridgeReady;
+      if (lifecycle.active) await started?.onKernelConnected();
+    });
+
+    wsService.onFrame((frame) => {
+      if (!lifecycle.active) return;
+      // Consume before generic logging/injection; even invalid reach events
+      // must never become trusted instructions or automatic Warp pings.
+      if (isReachFrame(frame)) {
+        void reachEvents.handle(frame);
+        return;
+      }
+      if (frame.type === "notification") {
+        const nf = frame as NotificationFrame;
+        console.log(
+          `[imajin-ws] notification: ${nf.scope} — ${nf.title}`,
+        );
+        // WS-driven catalog refresh (#36 item 2): a `connector.credential.
+        // sealed` / `connector.credential.unsealed` / `connector.models.
+        // changed` kernel notification (confirmed scopes, ima-jin/imajin-
+        // ai#2219) invalidates the imajin provider's discovery cache so the
+        // NEXT `catalog.run` call refetches immediately instead of waiting
+        // out the 60s TTL. See `IMAJIN_CATALOG_INVALIDATION_SCOPES`.
+        // Also refetches right away (#55) so a model added kernel-side
+        // shows up without waiting for the next periodic refresh;
+        // `refresh()` never rejects.
+        if (isImajinCatalogInvalidationScope(nf.scope)) {
+          console.log(`[imajin-plugin] invalidating imajin catalog cache (scope=${nf.scope})`);
+          imajinProvider.cache.invalidate();
+          void imajinProvider.cache.refresh();
+        }
+        // The WS socket callback runs outside any agent turn, so injection is
+        // fire-and-forget: never let a rejected promise reach the socket.
+        void injector(nf).catch((err: unknown) => {
+          console.error(`[imajin-ws] injection failed for ${nf.scope}:`, err);
+        });
+      } else if (approvalBridge && isApprovalDecisionFrame(frame)) {
+        void approvalBridge.handleFrame(frame).catch((err: unknown) => {
+          console.error(`[imajin-approval] handleFrame failed for ${frame.requestId}:`, err);
+        });
+      } else if (sessionCommandExecutor && isSessionCommandFrame(frame)) {
+        // handleFrame never throws and always attests; the catch is belt and braces.
+        void sessionCommandExecutor.handleFrame(frame).catch((err: unknown) => {
+          console.error(`[imajin-session-commands] handleFrame failed for ${frame.type}:`, err);
+        });
+      } else if (frame.type === "bus_event") {
+        // Kernel bus-event fan-out (#1884) — currently only consumed by the
+        // gateway approvals bridge's `operator.approval.decided` handler.
+        approvalsBridgeFrameHandler?.(frame);
+      } else {
+        console.log(`[imajin-ws] frame: type=${frame.type}`, JSON.stringify(frame).slice(0, 200));
+      }
+    });
+
+    startWs = async () => {
+      if (!lifecycle.active) return;
+      console.log("[imajin-ws] service start called");
+      try {
+        await wsService.start();
+        if (!lifecycle.active) {
+          wsService.stop();
+          return;
+        }
+        console.log("[imajin-ws] service started successfully");
+      } catch (err) {
+        console.error("[imajin-ws] service start failed:", err);
+      }
+    };
+  }
+
+  // agent_end → agent.turn.usage attestation (#1843). Self-signed, fire-
+  // and-forget; never registered at all when unconfigured, so a plugin
+  // install with no attestation config behaves exactly as before.
+  const turnUsageHandler = createTurnUsageAttestationHandler(config.did, {
+    serviceUrl: config.attestation?.serviceUrl ?? config.nodeUrl,
+    internalApiKey: config.attestation?.internalApiKey,
+    enabled: config.attestation?.enabled,
+  });
+  if (turnUsageHandler) {
+    on("agent_end", turnUsageHandler, { name: "turn-usage-attestation" });
+  }
+
+  await startWs();
+}
+
+function registerRuntimeHooks(api: any, runtime: PluginServiceRuntime): void {
+  for (const hook of LOOP_LIFECYCLE_HOOKS) runtime.registerHook(api, hook, `imajin-loops:${hook}`);
+  for (const hook of WAKE_RUNTIME_HOOKS) runtime.registerHook(api, hook, `imajin-wake:${hook}`);
+  runtime.registerHook(api, "agent_end", "wake-outcome");
+  runtime.registerHook(api, "agent_end", "turn-usage-attestation");
+}
+
 export default definePluginEntry({
   id: "imajin",
   name: "Imajin Network",
@@ -115,22 +512,7 @@ export default definePluginEntry({
     "MJNx/MJN settlement, and network discovery.",
 
   register(api: any) {
-    const config = api.pluginConfig as {
-      nodeUrl?: string;
-      did?: string;
-      keypairPath?: string;
-      actAs?: string;
-      wsNotifications?: WsNotificationsConfig;
-      attestation?: TurnUsageAttestationConfig;
-      approvalBridge?: ApprovalBridgeSettings;
-      approvals?: ApprovalsBridgePluginConfig;
-      inferProxyBaseUrl?: string;
-      modelDiscovery?: ImajinModelDiscoveryConfig;
-      loops?: LoopsConfig;
-      horizon?: HorizonConfig;
-      sessionCommands?: SessionCommandsSettings;
-      mcpUrl?: string;
-    };
+    const config = api.pluginConfig as PluginConfig | undefined;
 
     // The one kernel client (agent DID challenge-response session) shared by
     // the primitive tools AND model discovery (#55). Built before the provider
@@ -171,22 +553,12 @@ export default definePluginEntry({
       }),
     );
 
-    // Discovery at plugin start + periodic refresh (#55). This is the fix for
-    // "discovery never runs": the cache used to be purely lazy. A service so
-    // the timer is stopped with the plugin; `startDiscovery` never throws
-    // (failures are recorded in the cache and logged once).
-    let discoveryHandle: ImajinDiscoveryHandle | undefined;
-    api.registerService({
-      id: "imajin-model-discovery",
-      start: () => {
-        discoveryHandle?.stop();
-        discoveryHandle = imajinProvider.startDiscovery();
-      },
-      stop: () => {
-        discoveryHandle?.stop();
-        discoveryHandle = undefined;
-      },
-    });
+    const runtime = new PluginServiceRuntime(api.registrationMode, (lifecycle, on) =>
+      startPluginRuntime(api, config, client, imajinProvider, lifecycle, on,
+        (sender) => runtime.setWakeSender(sender)),
+    );
+    // Both host service IDs share one idempotent full-mode runtime start.
+    api.registerService({ id: "imajin-model-discovery", start: runtime.start, stop: runtime.stop });
 
     if (!config?.nodeUrl || !client) {
       console.warn(
@@ -218,315 +590,11 @@ export default definePluginEntry({
       }
     }
 
-    // Loop lifecycle → kernel loops rail (#46): signed loop.* events for
-    // primary sessions, subagents, cron automations and keepers. Observe hooks
-    // only; a publish failure is logged and dropped, never surfaced to the loop.
-    const loopLifecycle = registerLoopLifecycle(api, {
-      nodeUrl: config.nodeUrl,
-      did: config.did,
-      keypairPath: config.keypairPath,
-      actAs: config.actAs,
-      config: config.loops,
-    });
-
-    registerHorizonSync(api, {
-      nodeUrl: config.nodeUrl,
-      did: config.did,
-      keypairPath: config.keypairPath,
-      principal: config.actAs,
-      config: config.horizon,
-    });
-
-    // Background WebSocket service for real-time notifications (#1653)
-    console.log("[imajin-plugin] keypairPath:", config.keypairPath ? "configured" : "missing");
+    registerRuntimeHooks(api, runtime);
     if (config.keypairPath) {
-      console.log("[imajin-plugin] registering imajin-ws service");
-      const wsService = new ImajinWsService(
-        {
-          nodeUrl: config.nodeUrl,
-          did: config.did,
-          keypairPath: config.keypairPath,
-          actAs: config.actAs,
-        },
-      );
-
-      // WS notification → agent session injection (#1672), acked after the
-      // durable enqueue step (#26) via `wsService.send` bound below.
-      const {
-        inject: injector,
-        dispose: disposeInjector,
-        onAgentEnd: onWakeAgentEnd,
-        runtimeHooks: wakeRuntimeHooks,
-        reportWake,
-      } = createNotificationInjector(api, config.wsNotifications, {
-        sendFrame: (frame) => wsService.send(frame),
-        keypairPath: config.keypairPath,
-      });
-      for (const [hook, handler] of Object.entries(wakeRuntimeHooks)) {
-        api.on(hook, handler, { name: `imajin-wake:${hook}` });
-      }
-      api.registerTool((ctx: { sessionKey?: string; runId?: string }) => createWakeReportTool(ctx, reportWake),
+      api.registerTool((ctx: { sessionKey?: string; runId?: string }) => createWakeReportTool(ctx, runtime.reportWake),
         { names: ["imajin_wake_report"] });
-      const reachEvents = createReachEventHandler(api, config.wsNotifications?.reach, {
-        principalDid: config.actAs ?? config.did,
-        targetSession: config.wsNotifications?.targetSession,
-        identityClient: client,
-        directSend: config.wsNotifications?.directSend,
-        stateDir: config.wsNotifications?.stateDir,
-        keypairPath: config.keypairPath,
-        sendFrame: (frame) => wsService.send(frame),
-      });
-
-      // Supervise every wake (#79), independently of optional reportTo (#47).
-      // Completion observes local agent_end; the kernel never reads a transcript.
-      if (onWakeAgentEnd) {
-        api.on(
-          "agent_end",
-          (event: AgentEndEvent, ctx?: { sessionKey?: string }) => {
-            void onWakeAgentEnd(event, ctx).catch(() => {
-              console.error("[imajin-ws] wake outcome handling failed");
-            });
-          },
-          { name: "wake-outcome" },
-        );
-      }
-
-      // OpenClaw gateway approval bridge (#1816). Registered only when both a
-      // signing identity (did + keypairPath, already required above for the WS
-      // itself) and a pinned approver public key are configured — an install
-      // with neither behaves exactly as before.
-      const approvalExecutions = new ApprovalExecutionRegistry();
-      let approvalBridge: ApprovalBridge | undefined;
-      if (config.did && config.approvalBridge?.pinnedApproverPublicKeyHex) {
-        approvalBridge = new ApprovalBridge(
-          {
-            did: config.did,
-            keypairPath: config.keypairPath,
-            pinnedApproverPublicKeyHex: config.approvalBridge.pinnedApproverPublicKeyHex,
-          },
-          (frame) => wsService.send(frame),
-        );
-
-        // Decision leg: only a signature-verified `approve`/`reject` ever
-        // reaches here (ApprovalBridge.handleFrame already rejected + logged
-        // anything expired, mismatched, or unsigned) — this is the one place
-        // that actually resolves the OpenClaw gateway's pending approval.
-        // No `reviewer` identity is passed: this bridge is not a registered
-        // channel route for the request (see the registerChannel TODO below),
-        // so custody checks that key off a channel/accountId/senderId triple
-        // don't apply here; omitting all three is the documented no-reviewer form.
-        approvalBridge.onResolved(async (requestId, decision, kind: GatewayApprovalKind) => {
-          if (!approvalExecutions.claim(requestId)) return;
-          try {
-            const result = await resolveApprovalOverGateway({
-              cfg: api.config,
-              approvalId: requestId,
-              approvalKind: kind,
-              decision: toGatewayDecision(decision),
-              clientDisplayName: "Imajin /jin approval",
-            });
-            console.log(
-              `[imajin-approval] gateway resolve ${requestId} -> applied=${result.applied}, status=${result.approval.status}`,
-            );
-          } catch (err) {
-            console.error(`[imajin-approval] gateway resolve failed for ${requestId}:`, err);
-          }
-        });
-      } else if (config.approvalBridge?.pinnedApproverPublicKeyHex) {
-        console.warn(
-          "[imajin-plugin] approvalBridge.pinnedApproverPublicKeyHex is set but no agent `did` " +
-            "is configured — the approval bridge will not be registered",
-        );
-      }
-
-      // Session command executor (#51): signed, DID-addressed session commands
-      // arrive over this same outbound WS, are verified, executed against the
-      // local gateway, and attested back as signed `loop.session.*` frames.
-      // Opt-in; needs the agent DID + a pinned kernel command-signing key.
-      let sessionCommandExecutor: SessionCommandExecutor | undefined;
-      let sessionGateway: LoopbackSessionGateway | undefined;
-      if (config.sessionCommands?.enabled === true) {
-        const settings = config.sessionCommands;
-        if (!config.did || !settings.kernelPublicKeyHex || !loopLifecycle) {
-          console.warn(
-            "[imajin-plugin] sessionCommands.enabled needs an agent `did` and " +
-              "sessionCommands.kernelPublicKeyHex with loop lifecycle tracking enabled — session commands will not be accepted",
-          );
-        } else {
-          const keyResolver = createIdentityClientOperatorKeyResolver(client);
-          sessionGateway = createLoopbackSessionGateway({
-            getConfig: () => (api.runtime?.config?.current?.() ?? {}) as Record<string, unknown>,
-          });
-          sessionCommandExecutor = createSessionCommandExecutor(
-            {
-              agentDid: config.did,
-              kernelPublicKeyHex: settings.kernelPublicKeyHex,
-              kernelDid: settings.kernelDid,
-              allowedPrincipal: config.actAs,
-              requirePrincipalCountersignature: settings.requirePrincipalCountersignature,
-            },
-            {
-              gateway: sessionGateway.gateway,
-              loopTracker: loopLifecycle?.tracker,
-              executionRegistry: approvalExecutions,
-              attest: createSessionCommandAttester({
-                did: config.did,
-                keypairPath: config.keypairPath,
-                send: (frame) => wsService.send(frame),
-              }),
-              resolveServiceOf: (agentDid) => client.getServiceOf(agentDid),
-              resolvePublicKey: (did) => keyResolver.resolveOperatorPublicKey(did),
-            },
-          );
-          console.log("[imajin-plugin] session command executor enabled");
-        }
-      }
-
-      // Gateway approvals bridge (#24): publishes staged Gateway system-agent
-      // proposals to the kernel and applies signed operator decisions back to
-      // the Gateway. Off unless `approvals.enabled` + `approvals.operatorDid`
-      // (+ the token/secret it needs) are configured — see
-      // `src/gateway-approvals-bridge.ts` for the full trust chain. Started
-      // fire-and-forget so a slow/unavailable Gateway loopback connection can
-      // never delay the rest of plugin registration.
-      let approvalsBridgeFrameHandler: ((frame: unknown) => void) | undefined;
-      const approvalsBridgeReady = startGatewayApprovalsBridge(api, config.approvals, {
-        did: config.did,
-        keypairPath: config.keypairPath,
-        nodeUrl: config.nodeUrl,
-        // Reuses this plugin's EXISTING DID resolver (#44) to verify an
-        // operator's countersignature on `operator.approval.decided`
-        // against their registered public key — never a second resolver.
-        identityClient: client,
-        // #53: the same challenge-response session, reused for the
-        // `operator:approvals` entitlement preflight + decided-event catch-up.
-        kernelHttp: client,
-        stateDir: config.wsNotifications?.stateDir,
-        directSend: config.wsNotifications?.directSend,
-        // #64: a pending approval blocks its owning loop on the loops rail.
-        loopTracker: loopLifecycle?.tracker,
-        executionRegistry: approvalExecutions,
-        publishApprovalBinding: (attestation) => {
-          wsService.send({ type: "loop.approval.bound", attestation });
-          return Promise.resolve();
-        },
-        // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
-        // enabled via `approvals.sources` alongside system-agent/skill-
-        // workshop. Reads the config's live `modelPolicy.allow` on every
-        // check rather than a snapshot, so an operator edit takes effect
-        // without a plugin restart.
-        imajinCatalog: {
-          listDiscoveredModels: () => imajinProvider.cache.peek()?.models ?? [],
-          isModelAllowed: (modelId: string) => {
-            const liveConfig = api.runtime?.config?.current?.() as
-              | { agents?: { defaults?: { modelPolicy?: { allow?: string[] } } } }
-              | undefined;
-            return isImajinModelAllowedByPolicy(
-              liveConfig?.agents?.defaults?.modelPolicy?.allow,
-              modelId,
-            );
-          },
-        },
-      })
-        .then((started) => {
-          approvalsBridgeFrameHandler = started?.onKernelFrame;
-          return started;
-        })
-        .catch((err: unknown) => {
-          console.error("[imajin-approvals-bridge] failed to start:", err);
-          return undefined;
-        });
-
-      // #53: on EVERY (re)connect, after the kernel's auth-ok, re-verify the
-      // agent still holds `operator:approvals` and replay any
-      // `operator.approval.decided` the socket missed. Awaits bridge startup so
-      // a connect that races registration is not dropped.
-      wsService.onConnected(async () => {
-        const started = await approvalsBridgeReady;
-        await started?.onKernelConnected();
-      });
-
-      wsService.onFrame((frame) => {
-        // Consume before generic logging/injection; even invalid reach events
-        // must never become trusted instructions or automatic Warp pings.
-        if (isReachFrame(frame)) {
-          void reachEvents.handle(frame);
-          return;
-        }
-        if (frame.type === "notification") {
-          const nf = frame as NotificationFrame;
-          console.log(
-            `[imajin-ws] notification: ${nf.scope} — ${nf.title}`,
-          );
-          // WS-driven catalog refresh (#36 item 2): a `connector.credential.
-          // sealed` / `connector.credential.unsealed` / `connector.models.
-          // changed` kernel notification (confirmed scopes, ima-jin/imajin-
-          // ai#2219) invalidates the imajin provider's discovery cache so the
-          // NEXT `catalog.run` call refetches immediately instead of waiting
-          // out the 60s TTL. See `IMAJIN_CATALOG_INVALIDATION_SCOPES`.
-          // Also refetches right away (#55) so a model added kernel-side
-          // shows up without waiting for the next periodic refresh;
-          // `refresh()` never rejects.
-          if (isImajinCatalogInvalidationScope(nf.scope)) {
-            console.log(`[imajin-plugin] invalidating imajin catalog cache (scope=${nf.scope})`);
-            imajinProvider.cache.invalidate();
-            void imajinProvider.cache.refresh();
-          }
-          // The WS socket callback runs outside any agent turn, so injection is
-          // fire-and-forget: never let a rejected promise reach the socket.
-          void injector(nf).catch((err: unknown) => {
-            console.error(`[imajin-ws] injection failed for ${nf.scope}:`, err);
-          });
-        } else if (approvalBridge && isApprovalDecisionFrame(frame)) {
-          void approvalBridge.handleFrame(frame).catch((err: unknown) => {
-            console.error(`[imajin-approval] handleFrame failed for ${frame.requestId}:`, err);
-          });
-        } else if (sessionCommandExecutor && isSessionCommandFrame(frame)) {
-          // handleFrame never throws and always attests; the catch is belt and braces.
-          void sessionCommandExecutor.handleFrame(frame).catch((err: unknown) => {
-            console.error(`[imajin-session-commands] handleFrame failed for ${frame.type}:`, err);
-          });
-        } else if (frame.type === "bus_event") {
-          // Kernel bus-event fan-out (#1884) — currently only consumed by the
-          // gateway approvals bridge's `operator.approval.decided` handler.
-          approvalsBridgeFrameHandler?.(frame);
-        } else {
-          console.log(`[imajin-ws] frame: type=${frame.type}`, JSON.stringify(frame).slice(0, 200));
-        }
-      });
-
-      api.registerService({
-        id: "imajin-ws",
-        start: async () => {
-          console.log("[imajin-ws] service start called");
-          try {
-            await wsService.start();
-            console.log("[imajin-ws] service started successfully");
-          } catch (err) {
-            console.error("[imajin-ws] service start failed:", err);
-          }
-        },
-        stop: () => {
-          console.log("[imajin-ws] service stop called");
-          wsService.stop();
-          disposeInjector();
-          reachEvents.dispose();
-          sessionGateway?.dispose();
-          void approvalsBridgeReady.then((started) => started?.dispose());
-        },
-      });
-    }
-
-    // agent_end → agent.turn.usage attestation (#1843). Self-signed, fire-
-    // and-forget; never registered at all when unconfigured, so a plugin
-    // install with no attestation config behaves exactly as before.
-    const turnUsageHandler = createTurnUsageAttestationHandler(config.did, {
-      serviceUrl: config.attestation?.serviceUrl ?? config.nodeUrl,
-      internalApiKey: config.attestation?.internalApiKey,
-      enabled: config.attestation?.enabled,
-    });
-    if (turnUsageHandler) {
-      api.on("agent_end", turnUsageHandler, { name: "turn-usage-attestation" });
+      api.registerService({ id: "imajin-ws", start: runtime.start, stop: runtime.stop });
     }
 
     // TODO: registerMemoryCorpusSupplement — agent's chain as searchable memory

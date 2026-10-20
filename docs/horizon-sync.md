@@ -158,6 +158,7 @@ keyed by the request hash so a crash cannot duplicate its entry. A warning names
 the rejected `stepId`, never the server body. A failed dead-letter write keeps
 the request pending rather than losing it. HTTP 408/429, 5xx and network errors
 still retain the exact head request for retry.
+Dead-lettered requests, including 401/403 from a revoked or misconfigured grant, are not replayed automatically: they live in `<cursorPath>.dead-letter.json`, and an operator replays them after fixing auth.
 
 This includes stale-timestamp 4xx rejections outside the kernel's signed-message
 clock window (tracked in #2931). They are dead-lettered, not restamped or

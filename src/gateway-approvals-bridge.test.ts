@@ -258,8 +258,8 @@ describe("GatewayApprovalsBridge", () => {
   it("clears the reservation on publish failure so a later event can retry (#48)", async () => {
     const bridge = newBridge();
     const record = makeRecord();
-    // A permanent (4xx) rejection is not retried inside one publish (#52), so the
-    // reservation is cleared and a later real event gets a fresh attempt.
+    // A permanent rejection clears the reservation, but #94 holds unchanged
+    // content. A later event with a changed revision gets a fresh attempt.
     kernel.publishApprovalRequested.mockRejectedValueOnce(new KernelNotifyError(400, "kernel rejected the card"));
 
     requestedHandler!(record);
@@ -267,7 +267,7 @@ describe("GatewayApprovalsBridge", () => {
     await vi.waitFor(() => expect(logger.error).toHaveBeenCalled());
     expect(bridge.isPublished(record.id)).toBe(false);
 
-    requestedHandler!(record);
+    requestedHandler!({ ...record, request: { ...record.request, proposalHash: "changed-revision" } });
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(2));
     expect(bridge.isPublished(record.id)).toBe(true);
   });
