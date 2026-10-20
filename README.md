@@ -1595,3 +1595,5 @@ Imajin (今人) is sovereign technology infrastructure — federated identity, .
 - **Network:** [jin.imajin.ai](https://jin.imajin.ai)
 - **Protocol:** [protocol.dfos.com](https://protocol.dfos.com)
 - **Code:** [github.com/ima-jin/imajin-ai](https://github.com/ima-jin/imajin-ai)
+
+Cloudflare zone operations are managed through Imajin; seal and grant access on /jin.
