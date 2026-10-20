@@ -1026,7 +1026,7 @@ export class GatewayApprovalsBridge {
     if (!deps || this.syncInFlight || this.disposed) return;
     // A publish may itself be awaiting preflight. Let its reservation finish
     // before reconcile inspects it, without awaiting recovery from preflight.
-    void Promise.all([...this.reservations.values()]).then(() => this.syncWithKernel(deps)).catch((err: unknown) => {
+    void Promise.all(this.reservations.values()).then(() => this.syncWithKernel(deps)).catch((err: unknown) => {
       this.logger.error(`approval recovery sync failed: ${String(err)}`);
     });
   }
@@ -1750,6 +1750,9 @@ export interface StartedGatewayApprovalsBridge {
   dispose: () => void;
 }
 type BridgeApi = DirectChannelApi;
+function createOperatorNotifier(api: BridgeApi, directSend: DirectSendConfig | undefined) {
+  return directSend?.target ? (text: string) => sendDirectChannelMessage(directSend, text, api) : undefined;
+}
 interface LiveSourceOptions {
   api: BridgeApi;
   config: ApprovalsBridgePluginConfig;
@@ -2010,7 +2013,7 @@ async function startOwnedGatewayApprovalsBridge(
     kernel,
     undefined,
     keyResolver,
-    deps.directSend?.target ? (text) => sendDirectChannelMessage(deps.directSend, text, api) : undefined,
+    createOperatorNotifier(api, deps.directSend),
     {
       loopTracker: deps.loopTracker,
       executionRegistry: deps.executionRegistry,
