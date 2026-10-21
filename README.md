@@ -126,6 +126,7 @@ In `openclaw.json`:
 - **`nodeUrl`** (required) — URL of the Imajin node
 - **`did`** (optional) — Agent's DID for authenticated requests
 - **`keypairPath`** (optional) — Path to Ed25519 keypair for signing attestations
+- **`warp.usdPerCredit`** (optional) — USD estimate per Warp credit; defaults to `0.0154` ($100 per 6,500 credits, approximately).
 - **`attestation`** (optional) — configures the `agent_end` → `agent.turn.usage` hook (#1843):
   - **`attestation.enabled`** — explicit opt-out; defaults to `true` when `serviceUrl` + the key both resolve
   - **`attestation.serviceUrl`** — base URL for `POST /auth/api/attestations/internal`; defaults to `nodeUrl`
