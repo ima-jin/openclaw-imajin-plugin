@@ -178,6 +178,34 @@ describe("wakeModel (#117)", () => {
     expect(sdk.loadModelCatalog).toHaveBeenCalledWith({ config: CONFIG, agentId: "worker", readOnly: true });
     expect(sdk.resolveAllowedModelRef).toHaveBeenCalledWith(expect.objectContaining({ raw: "wake-alias", agentId: "worker" }));
   });
+  it("records a fast root input before HTTP admission completes, without overriding reports", async () => {
+    config.wakeModel = "imajin/kimi-k3";
+    config.reportTo = ["agent:main:telegram:direct:123"];
+    create();
+    vi.mocked(fetch).mockImplementation(async (_url, init) => {
+      const post: Post = JSON.parse(String(init?.body));
+      posts.push(post);
+      if (post.name === "imajin-wake") input(0, WAKE);
+      return { status: 200, json: async () => ({ runId: "admitted-1" }) } as Response;
+    });
+    await wake();
+    expect(modelLogs()).toHaveLength(1);
+    const ctx = { sessionKey: posts[0].sessionKey, runId: "runner-0" };
+    await injector.runtimeHooks.after_tool_call({
+      toolName: "message",
+      params: { action: "send", channel: "telegram", target: "123" },
+      result: { ok: true },
+    }, ctx);
+    await injector.onAgentEnd!({
+      success: true, runId: ctx.runId,
+      messages: [{ role: "user", content: posts[0].message }, { role: "assistant", content: "Reported." }],
+    }, ctx);
+    expect(posts).toHaveLength(2);
+    expect(posts[1].name).toBe("imajin-wake-report");
+    expect(posts[1]).not.toHaveProperty("model");
+    input(1, DEFAULT);
+    expect(modelLogs()).toHaveLength(1);
+  });
 
   it("logs the actual model, not an assumed/requested model, and ignores non-wake/child inputs", async () => {
     config.wakeModel = "imajin/kimi-k3";

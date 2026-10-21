@@ -1241,6 +1241,13 @@ export function createNotificationInjector(
       ? deriveWakeSessionKey(wakeSessionKey, idempotencyKey, summarizeWakeRuns(frames).map((r) => r.runId), sessionPerWake)
       : await guardedReuseSession(frames);
     const gatewayPort = resolveGatewayPort(api);
+    const selection = await withWakeDeadline(resolveWakeModel(
+      wsNotifications?.wakeModel, wsNotifications?.model, hookAgentId,
+      () => api?.runtime?.config?.current?.() ?? api?.config ?? {},
+    )).catch((): WakeModelSelection => {
+      console.warn(`[imajin-ws] wakeModel could not be resolved or is not allowed; using gateway default batch=${idempotencyKey}`);
+      return { source: "default" };
+    });
     // Tracked BEFORE the POST so a fast turn can't finish unmatched (#47).
     const batch = { batchId: idempotencyKey, scope, runs: summarizeWakeRuns(frames), sessionKey, uniqueSession: freshSessions };
     wakeReporter?.track(batch);
@@ -1257,13 +1264,6 @@ export function createNotificationInjector(
     }
     decisionRouter.track(sessionKey, idempotencyKey, {
       hasPr: liveState.subjects.length > 0, failedRun: frames.every(isFailedWakeFrame),
-    });
-    const selection = await withWakeDeadline(resolveWakeModel(
-      wsNotifications?.wakeModel, wsNotifications?.model, hookAgentId,
-      () => api?.runtime?.config?.current?.() ?? api?.config ?? {},
-    )).catch((): WakeModelSelection => {
-      console.warn(`[imajin-ws] wakeModel could not be resolved or is not allowed; using gateway default batch=${idempotencyKey}`);
-      return { source: "default" };
     });
     if (wakeModelSources.size >= 100) wakeModelSources.delete(wakeModelSources.keys().next().value!);
     wakeModelSources.set(idempotencyKey, selection.source);
