@@ -36,11 +36,78 @@ describe("wake completion watchdog", () => {
   function track(timeoutMs?: number) {
     const alert = vi.fn(async () => {});
     const complete = vi.fn(async () => {});
-    const supervisor = new WakeSupervisor({ timeoutMs, alert, complete, sessionTokens: async () => 0 });
+    const abort = vi.fn(async () => {});
+    const sessionTokens = vi.fn(async (): Promise<number | undefined> => 0);
+    const supervisor = new WakeSupervisor({ timeoutMs, alert, abort, complete, sessionTokens });
     supervisors.push(supervisor);
     supervisor.track({ batchId: "batch", sessionKey: BASE, scope: "scope", runs: [], uniqueSession: true });
-    return { supervisor, alert, complete };
+    return { supervisor, alert, abort, complete, sessionTokens };
   }
+
+  it.each([42_123, undefined, "throws"] as const)("logs timeout tokens from metadata (%s) without disclosing reader errors", async (tokens) => {
+    const { sessionTokens, abort, alert } = track(10);
+    sessionTokens.mockImplementation(async () => {
+      if (tokens === "throws") throw new Error("private metadata details");
+      return tokens;
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(console.log).toHaveBeenCalledTimes(1);
+    expect(console.log).toHaveBeenCalledWith(
+      `[imajin-ws] wake ended batch=batch sessionTokens=${typeof tokens === "number" ? tokens : "unavailable"} reason=timeout`,
+    );
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(alert).toHaveBeenCalledTimes(1);
+  });
+
+  it("aborts and writes back without waiting for metadata", async () => {
+    const { sessionTokens, abort, alert, complete } = track(10);
+    let resolve!: (tokens: number) => void;
+    sessionTokens.mockReturnValue(new Promise((done) => { resolve = done; }));
+    await vi.advanceTimersByTimeAsync(10);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(console.log).not.toHaveBeenCalled();
+    resolve(123);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(console.log).toHaveBeenCalledWith("[imajin-ws] wake ended batch=batch sessionTokens=123 reason=timeout");
+  });
+
+  it("aborts capacity evictions with one alert and does not expire the same wake twice", async () => {
+    const { supervisor, abort, alert, complete, sessionTokens } = track(10);
+    for (let i = 1; i < 100; i++) {
+      supervisor.track({ batchId: `batch-${i}`, sessionKey: `${BASE}:${i}`, scope: "scope", runs: [] });
+    }
+    supervisor.track({ batchId: "overflow", sessionKey: `${BASE}:overflow`, scope: "scope", runs: [] });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ batchId: "batch" }), "wake supervision capacity exceeded");
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(sessionTokens).toHaveBeenCalledWith(BASE);
+    expect(console.log).toHaveBeenCalledWith("[imajin-ws] wake ended batch=batch sessionTokens=0 reason=timeout");
+    await vi.advanceTimersByTimeAsync(10);
+    expect(abort).toHaveBeenCalledTimes(101);
+    // The oldest retained wake already timed out, so eviction cannot abort or alert again.
+    supervisor.track({ batchId: "after-timeout", sessionKey: `${BASE}:after`, scope: "scope", runs: [] });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(abort).toHaveBeenCalledTimes(101);
+    expect(alert).toHaveBeenCalledTimes(101);
+    expect(complete).toHaveBeenCalledTimes(101);
+  });
+
+  it("keeps alert and writeback independent of a failed abort without retrying disclosure", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const { abort, alert, complete } = track(10);
+    abort.mockRejectedValue(new Error("private abort failure"));
+    await vi.advanceTimersByTimeAsync(10);
+    await vi.advanceTimersByTimeAsync(100);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(complete).toHaveBeenCalledTimes(1);
+    expect(console.error).toHaveBeenCalledTimes(1);
+    expect(console.error).toHaveBeenCalledWith("[imajin-ws] wake timeout abort failed");
+  });
 
   it.each([
     { timeoutMs: undefined, expectedMs: 900_000 },
@@ -52,13 +119,19 @@ describe("wake completion watchdog", () => {
     { timeoutMs: 3_600_000, expectedMs: 3_600_000 },
     { timeoutMs: 3_600_001, expectedMs: 3_600_000 },
   ])("uses $expectedMs ms for configured timeout $timeoutMs", async ({ timeoutMs, expectedMs }) => {
-    const { alert, complete } = track(timeoutMs);
+    const { alert, abort, complete, sessionTokens } = track(timeoutMs);
     await vi.advanceTimersByTimeAsync(expectedMs - 1);
     expect(alert).not.toHaveBeenCalled();
     expect(complete).not.toHaveBeenCalled();
+    expect(abort).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
     expect(alert).toHaveBeenCalledWith(expect.objectContaining({ batchId: "batch" }), "wake completion timeout");
     expect(complete).toHaveBeenCalledWith(expect.any(Object), expect.objectContaining({ wakeWatchdog: true }));
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledWith(expect.objectContaining({ batchId: "batch" }), "wake completion timeout");
+    expect(sessionTokens).toHaveBeenCalledTimes(1);
+    expect(sessionTokens).toHaveBeenCalledWith(BASE);
+    expect(console.log).toHaveBeenCalledWith("[imajin-ws] wake ended batch=batch sessionTokens=0 reason=timeout");
   });
 
   it("keeps runtime and config-schema defaults/bounds aligned at 15 and 60 minutes", async () => {
@@ -71,7 +144,7 @@ describe("wake completion watchdog", () => {
   });
 
   it("does not alert or write a timeout verdict for a healthy turn finishing after 60 seconds", async () => {
-    const { supervisor, alert, complete } = track();
+    const { supervisor, alert, abort, complete, sessionTokens } = track();
     await vi.advanceTimersByTimeAsync(120_000);
     expect(alert).not.toHaveBeenCalled();
     expect(complete).not.toHaveBeenCalled();
@@ -82,6 +155,8 @@ describe("wake completion watchdog", () => {
     await vi.advanceTimersByTimeAsync(DEFAULT_WAKE_TIMEOUT_MS);
     expect(alert).not.toHaveBeenCalled();
     expect(complete).toHaveBeenCalledTimes(1);
+    expect(abort).not.toHaveBeenCalled();
+    expect(sessionTokens).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -377,7 +452,7 @@ describe("fresh wake bridge (#79)", () => {
 describe("wake supervision pure contracts", () => {
   it("correlates fixed queued batches by current evidence, not a previous transcript turn", async () => {
     const complete = vi.fn(async () => {});
-    const supervisor = new WakeSupervisor({ complete, alert: async () => {}, sessionTokens: async () => 0 });
+    const supervisor = new WakeSupervisor({ complete, alert: async () => {}, abort: async () => {}, sessionTokens: async () => 0 });
     for (const id of ["one", "two"]) {
       supervisor.track({ batchId: `imajin-wake:${id}`, sessionKey: BASE, scope: "scope", runs: [] });
       supervisor.bindRun(`imajin-wake:${id}`, `admission-${id}`);
@@ -397,7 +472,7 @@ describe("wake supervision pure contracts", () => {
   });
   it("buffers early completions until the exact gateway run ID is bound", async () => {
     const complete = vi.fn(async () => {});
-    const supervisor = new WakeSupervisor({ complete, alert: async () => {}, sessionTokens: async () => 0 });
+    const supervisor = new WakeSupervisor({ complete, alert: async () => {}, abort: async () => {}, sessionTokens: async () => 0 });
     supervisor.track({ batchId: "a", sessionKey: BASE, scope: "scope", runs: [] });
     supervisor.track({ batchId: "b", sessionKey: BASE, scope: "scope", runs: [] });
     await supervisor.onAgentEnd({ runId: "second", messages: [{ role: "assistant", content: "result" }] }, { sessionKey: BASE });
@@ -444,7 +519,7 @@ describe("wake supervision pure contracts", () => {
     vi.useFakeTimers();
     const complete = vi.fn(async () => {});
     const alert = vi.fn(async () => {});
-    const supervisor = new WakeSupervisor({ timeoutMs: 50_000, alert, complete, sessionTokens: async () => 0 });
+    const supervisor = new WakeSupervisor({ timeoutMs: 50_000, alert, abort: async () => {}, complete, sessionTokens: async () => 0 });
     supervisor.track({ batchId: "batch", sessionKey: `${BASE}:fresh`, scope: "scope", runs: [] });
     supervisor.bindRun("batch", "real");
     await supervisor.onAgentEnd({ runId: "wrong", messages: [] }, { sessionKey: `${BASE}:fresh` });

@@ -882,6 +882,11 @@ export function createNotificationInjector(
     maxTokens: maxWakeTokens,
     checkEmptyReply: disclosureTargets.length > 0,
     sessionTokens: readTokens,
+    abort: (batch, reason) => {
+      // The watchdog alert owns disclosure, including an immediate abort ending.
+      wakeReporter?.untrack(batch.batchId);
+      return guards.stop(batch.batchId, reason);
+    },
     alert: async (batch, reason) => {
       const frames: NotificationFrame[] = batch.runs.map((r) => ({
         type: "notification", id: r.runId, title: r.title, scope: batch.scope,

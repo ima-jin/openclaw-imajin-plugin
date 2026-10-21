@@ -6,6 +6,9 @@ import { createNotificationInjector, type WsNotificationsConfig } from "./notifi
 import { sendDirectChannelMessage } from "./channel-notify.js";
 import { createWakeReportTool } from "./wake-report-tool.js";
 import type { NotificationFrame } from "./ws-service.js";
+import { PluginServiceRuntime } from "./plugin-service-runtime.js";
+import { beginRegistration } from "./registration-lifecycle.js";
+import { WakeGuards } from "./wake-guards.js";
 
 vi.mock("./channel-notify.js", () => ({ sendDirectChannelMessage: vi.fn(async () => {}) }));
 const PR = "https://github.com/ima-jin/openclaw-imajin-plugin/pull/80";
@@ -32,6 +35,25 @@ describe("guarded wake acceptance (#82)", () => {
     createdAt: "", data: { runId: `run-${id}`, expectedPr: pr },
   });
 
+  async function registeredHooks() {
+    const owner = new PluginServiceRuntime("full", async (_lifecycle, on) => {
+      for (const [name, handler] of Object.entries({ ...injector.runtimeHooks, agent_end: injector.onAgentEnd! })) {
+        on(name, handler, { name: `imajin-wake:${name}` });
+      }
+    });
+    await owner.start();
+    const registries = Array.from({ length: 3 }, () => {
+      const hooks: Record<string, (event: any, ctx?: any) => unknown> = {};
+      const runtime = new PluginServiceRuntime("full", async () => {});
+      for (const name of [...Object.keys(injector.runtimeHooks), "agent_end"]) {
+        runtime.registerHook({ on: (_name: string, handler: typeof hooks[string]) => { hooks[name] = handler; } },
+          name, `imajin-wake:${name}`);
+      }
+      return hooks;
+    });
+    return registries.at(-1)!;
+  }
+
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "guarded-wakes-"));
     posts = [];
@@ -50,10 +72,39 @@ describe("guarded wake acceptance (#82)", () => {
     for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation(() => {});
   });
   afterEach(async () => {
+    beginRegistration().dispose();
     injector?.dispose();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     await rm(dir, { recursive: true, force: true });
+  });
+
+  it("stops a watchdog timeout once through the guards despite extra registrations and late hooks", async () => {
+    vi.useFakeTimers();
+    config.wakeTimeoutMs = 5_000;
+    const stop = vi.spyOn(WakeGuards.prototype, "stop");
+    create();
+    await start();
+    const hooks = await registeredHooks();
+    await vi.advanceTimersByTimeAsync(5_000);
+    const batchId = /Wake batch ID: ([^\n]+)/.exec(wakes()[0].message)![1];
+    expect(stop).toHaveBeenCalledTimes(1);
+    expect(stop).toHaveBeenCalledWith(batchId, "wake completion timeout");
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(abort).toHaveBeenCalledWith(ctx().sessionKey, ctx().runId);
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0][1]).toContain("wake completion timeout");
+    expect(console.log).toHaveBeenCalledWith(
+      `[imajin-ws] wake ended batch=${batchId} sessionTokens=0 reason=timeout`,
+    );
+    expect(hooks.before_tool_call({ toolName: "session_status", params: {} }, ctx())).toMatchObject({ block: true });
+    await hooks.agent_end({ success: false, runId: ctx().runId, messages: [] }, ctx());
+    await hooks.agent_end({ success: false, runId: ctx().runId, messages: [] }, ctx());
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(abort).toHaveBeenCalledTimes(1);
+    expect(alerts()).toHaveLength(1);
+    expect(posts.filter((post) => post.name === "imajin-wake-report")).toHaveLength(0);
   });
 
   it("makes main-session copies fire-and-forget and blocks inter-session ping-pong after disclosure", async () => {
@@ -91,12 +142,15 @@ describe("guarded wake acceptance (#82)", () => {
   it("does not apply the 50k reuse threshold to a healthy 60k final context", async () => {
     create();
     await start();
+    const hooks = await registeredHooks();
     await messageReceipt();
-    await injector.onAgentEnd!({ success: true, runId: ctx().runId, messages: [
+    await hooks.agent_end({ success: true, runId: ctx().runId, messages: [
       { role: "user", content: wakes()[0].message },
       { role: "assistant", content: "Completed and reported", usage: { input: 60_000 } },
     ] }, ctx());
     expect(alerts()).toHaveLength(0);
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("sessionTokens=60000 source=final-assistant"));
+    expect(abort).not.toHaveBeenCalled();
   });
 
   function create() {
@@ -182,8 +236,9 @@ describe("guarded wake acceptance (#82)", () => {
   it("stops after the third unchanged normalized tool result and alerts with complete evidence", async () => {
     create();
     await start();
+    const hooks = await registeredHooks();
     for (let i = 0; i < 3; i++) {
-      await injector.runtimeHooks.after_tool_call({
+      await hooks.after_tool_call({
         toolName: "session_status", toolCallId: `poll-${i}`,
         params: i % 2 ? { b: 2, a: 1 } : { a: 1, b: 2 },
         result: { content: [{ type: "text", text: "unchanged" }] },
