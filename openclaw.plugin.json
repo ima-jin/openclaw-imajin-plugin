@@ -18,6 +18,7 @@
       "imajin_chat",
       "imajin_status",
       "imajin_vault",
+      "imajin_cloudflare",
       "imajin_wake_report"
     ]
   },

@@ -46,6 +46,7 @@ import {
   createChatTool,
   createImajinStatusTool,
   createVaultTool,
+  createCloudflareTool,
 } from "./src/tools.js";
 import {
   createTurnUsageAttestationHandler,
@@ -578,6 +579,7 @@ export default definePluginEntry({
     api.registerTool(createInferTool(client));
     api.registerTool(createUsageTool(client));
     api.registerTool(createVaultTool(client));
+    api.registerTool(createCloudflareTool(client));
 
     // Chat — requires keypair for auth
     if (config.keypairPath) {
