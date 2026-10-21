@@ -172,6 +172,7 @@ export class WakeSupervisor {
   }
 
   private expire(batch: PendingWake, reason: string): void {
+    // Watchdog expiry must stop the turn as well as disclose its outcome.
     console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=unavailable reason=timeout`);
     void this.alert(batch.batchId, reason).catch(() => {
       console.error("[imajin-ws] wake timeout alert delivery failed");
