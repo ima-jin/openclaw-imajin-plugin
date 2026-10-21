@@ -23,6 +23,10 @@
     ]
   },
   "uiHints": {
+    "warp.usdPerCredit": {
+      "label": "Warp: USD Per Credit",
+      "help": "USD estimate per Warp credit for imajin_warp get_run/list_runs. Default 0.0154 (approximately $100 per 6,500 credits). Raw requestUsage costs are credits, not dollars."
+    },
     "nodeUrl": {
       "label": "Imajin Node URL",
       "help": "URL of the Imajin node to connect to (e.g. https://jin.imajin.ai)",
@@ -211,6 +215,18 @@
       "actAs": {
         "type": "string",
         "description": "Default acting-for DID (X-Acting-For). Delegated writes default to this principal unless onBehalfOf is passed explicitly."
+      },
+      "warp": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "usdPerCredit": {
+            "type": "number",
+            "minimum": 0,
+            "default": 0.0154,
+            "description": "USD estimate per Warp credit; raw requestUsage costs are credits, not dollars. Approximately $100 per 6,500 credits."
+          }
+        }
       },
       "inferProxyBaseUrl": {
         "type": "string",

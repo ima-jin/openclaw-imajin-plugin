@@ -179,11 +179,16 @@ export interface WarpAgentRun {
   sessionLink: string | null;
   title: string | null;
   configName: string | null;
+  /** Raw Warp credits, not USD; fields may be null while a run is in progress. */
+  requestUsage?: {
+    inferenceCost?: number | null;
+    computeCost?: number | null;
+    platformCost?: number | null;
+  } | null;
   /**
    * The kernel's list/get responses also carry these (see `WarpAgentRun` in
-   * ima-jin/imajin-ai `apps/kernel/src/lib/warp/dispatch.ts`); only the two the
-   * compact `list_runs` view drops are typed here; any other field the kernel
-   * returns is passed through untouched.
+   * ima-jin/imajin-ai `apps/kernel/src/lib/warp/dispatch.ts`). The compact view
+   * drops statusMessage and artifact data; other kernel fields pass through.
    */
   statusMessage?: { message: string; errorCode: string | null; retryable: boolean | null } | null;
   artifacts?: Array<{

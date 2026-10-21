@@ -63,6 +63,28 @@ export function compactWarpRun(run: WarpAgentRun): WarpAgentRun {
 
 const KERNEL_MAX_RUNS_PAGE = 500;
 
+export interface WarpToolConfig {
+  usdPerCredit?: number;
+}
+
+const DEFAULT_WARP_USD_PER_CREDIT = 0.0154;
+
+/** Add explicit units without mutating the kernel response or its raw fields. */
+function withWarpUsage(run: WarpAgentRun, usdPerCredit: number) {
+  const usage = run.requestUsage;
+  const credits = (usage?.inferenceCost ?? 0) +
+    (usage?.computeCost ?? 0) + (usage?.platformCost ?? 0);
+  return {
+    ...run,
+    requestUsage: {
+      ...usage,
+      credits,
+      usdEst: Number((credits * usdPerCredit).toFixed(2)),
+      unit: "warp_credits" as const,
+    },
+  };
+}
+
 function truncateResults(data: unknown[], max = 20): unknown[] {
   if (data.length <= max) return data;
   return [...data.slice(0, max), { _truncated: true, total: data.length, showing: max }];
@@ -513,7 +535,11 @@ export function createDiscoverTool(client: ImajinClient) {
   };
 }
 
-export function createWarpTool(client: ImajinClient) {
+export function createWarpTool(client: ImajinClient, config: WarpToolConfig = {}) {
+  const usdPerCredit = config.usdPerCredit ?? DEFAULT_WARP_USD_PER_CREDIT;
+  if (!Number.isFinite(usdPerCredit) || usdPerCredit < 0) {
+    throw new Error("warp.usdPerCredit must be a finite, non-negative number");
+  }
   return {
     name: "imajin_warp",
     label: "Imajin Warp",
@@ -524,7 +550,7 @@ export function createWarpTool(client: ImajinClient) {
       "dispatch (fire a cloud agent with a prompt; optional skillSpec 'owner/repo:skill' and " +
       "mcpServers map to compose skills + scoped MCP servers; optional conversationId to continue " +
       "an existing conversation and parentRunId for an orchestration hierarchy (#1939)), " +
-      "get_run (read a run's lifecycle state + session link by runId), " +
+      "get_run (read a run's lifecycle state + session link by runId; optional compact), " +
       "cancel_run (kill a queued or in-progress run by runId — the revocation half of dispatch; " +
       "the kernel's 400/409/422 refusals for an already-terminal, still-PENDING, or " +
       "non-cancellable run surface as errors), " +
@@ -536,6 +562,11 @@ export function createWarpTool(client: ImajinClient) {
       "environmentId/createdAfter/limit/cursor/ancestorRunId filters — ancestorRunId lists every " +
       "run spawned, directly or transitively, from that run's parentRunId lineage (#1939); " +
       "compact: true drops statusMessage + artifact data per run for wide pulls (#72)), " +
+      "get_run/list_runs requestUsage inferenceCost/computeCost/platformCost are Warp credits, " +
+      "NOT dollars: credits is their null-safe sum, unit is 'warp_credits', and usdEst is the " +
+      "2-decimal USD estimate at configured warp.usdPerCredit (default 0.0154). " +
+      "list_runs totals { credits, usdEst } cover the fetched page before display truncation, " +
+      "not other pages; total usdEst is rounded after summing credits. " +
       "get_transcript (read a run's raw transcript by runId — the self-diagnosis path for a failed run; " +
       "optional maxChars caps the returned text), " +
       "seal_key (seal a Warp Agent API key for the principal as a delegation-grant vault field — " +
@@ -661,7 +692,7 @@ export function createWarpTool(client: ImajinClient) {
           description:
             "Drop each run's statusMessage and each artifact's data (keeps artifactType/createdAt, " +
             "requestUsage and the rest) — ~3KB less per run; applied plugin-side, the kernel call is " +
-            "unchanged. Use for wide spend/volume pulls (for list_runs)",
+            "unchanged. Use for wide spend/volume pulls (for get_run/list_runs)",
         },
         maxChars: {
           type: "number" as const,
@@ -747,7 +778,7 @@ export function createWarpTool(client: ImajinClient) {
           case "get_run": {
             if (!params.runId) return errorResult("get_run requires 'runId'");
             const run = await client.getWarpRun(params.runId, params.onBehalfOf);
-            return jsonResult(run);
+            return jsonResult(withWarpUsage(params.compact ? compactWarpRun(run) : run, usdPerCredit));
           }
           case "cancel_run": {
             if (!params.runId) return errorResult("cancel_run requires 'runId'");
@@ -787,13 +818,16 @@ export function createWarpTool(client: ImajinClient) {
               },
               params.onBehalfOf,
             );
-            if (!page.runs.length) return textResult("No Warp runs found");
             // Compact runs are small, so the display cap rises to the kernel's own
             // 500-run page ceiling — that is what lets one call cover a wide spend pull.
-            const runs = params.compact ? page.runs.map(compactWarpRun) : page.runs;
+            const runs = page.runs.map((run) =>
+              withWarpUsage(params.compact ? compactWarpRun(run) : run, usdPerCredit),
+            );
+            const credits = runs.reduce((sum, run) => sum + run.requestUsage.credits, 0);
             return jsonResult({
               ...page,
               runs: truncateResults(runs, params.compact ? KERNEL_MAX_RUNS_PAGE : undefined),
+              totals: { credits, usdEst: Number((credits * usdPerCredit).toFixed(2)) },
             });
           }
           case "get_transcript": {

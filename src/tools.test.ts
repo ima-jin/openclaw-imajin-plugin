@@ -404,10 +404,12 @@ describe("imajin_warp tool post-dispatch control (#1639, plugin surface #1)", ()
     expect(JSON.parse(result.content[0].text).runs).toHaveLength(1);
   });
 
-  it("list_runs reports when there are no runs", async () => {
+  it("list_runs returns zero totals when there are no runs", async () => {
     vi.mocked(client.listWarpRuns).mockResolvedValue({ runs: [], hasNextPage: false, nextCursor: null });
     const result = await tool.execute("1", { action: "list_runs" });
-    expect(result.content[0].text).toMatch(/No Warp runs found/);
+    expect(JSON.parse(result.content[0].text)).toEqual({
+      runs: [], hasNextPage: false, nextCursor: null, totals: { credits: 0, usdEst: 0 },
+    });
   });
 
   describe("list_runs compact (#72)", () => {
@@ -436,7 +438,9 @@ describe("imajin_warp tool post-dispatch control (#1639, plugin surface #1)", ()
       expect(body.runs[0].artifacts).toEqual([
         { artifactType: "PULL_REQUEST", createdAt: "2026-10-07T00:00:00Z", data: null },
       ]);
-      expect(body.runs[0].requestUsage).toEqual(fullRun.requestUsage);
+      expect(body.runs[0].requestUsage).toEqual({
+        ...fullRun.requestUsage, credits: 2, usdEst: 0.03, unit: "warp_credits",
+      });
       expect(body.runs[0].runId).toBe("r1");
       expect(body.nextCursor).toBe("cur");
       expect(result.content[0].text.length).toBeLessThan(JSON.stringify(fullRun).length);
@@ -455,7 +459,10 @@ describe("imajin_warp tool post-dispatch control (#1639, plugin surface #1)", ()
         nextCursor: null,
       });
       const result = await tool.execute("1", { action: "list_runs" });
-      expect(JSON.parse(result.content[0].text).runs[0]).toEqual(fullRun);
+      expect(JSON.parse(result.content[0].text).runs[0]).toEqual({
+        ...fullRun,
+        requestUsage: { ...fullRun.requestUsage, credits: 2, usdEst: 0.03, unit: "warp_credits" },
+      });
     });
 
     it("shows more than the default 20-run cap when compact", async () => {
