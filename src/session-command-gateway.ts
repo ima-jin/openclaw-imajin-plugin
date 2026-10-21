@@ -1,7 +1,7 @@
 /**
  * Local-gateway adapter for the session command executor (#51).
  *
- * Maps the five DID-addressed session commands onto the OpenClaw gateway's own
+ * Maps DID-addressed session commands onto the OpenClaw gateway's own
  * RPC methods. Method names, params and required operator scopes were verified
  * against the published `openclaw@2026.9.5` package (`dist/method-scopes-*.mjs`,
  * `ChatSendParamsSchema` / `ChatAbortParamsSchema` / `SessionsCreateParamsSchema`
@@ -201,10 +201,9 @@ export interface LoopbackSessionGateway {
 }
 
 /**
- * Lazily-connected loopback gateway client with exactly the scopes the five
- * commands need (`operator.write` + `operator.approvals`). Connects on the
- * first command rather than at plugin start, so an install that never
- * receives a command never opens the extra connection.
+ * Shared loopback client with the existing write + approvals scope ceiling.
+ * Inventory explicitly starts it when loops are enabled; otherwise the first
+ * request connects lazily. Reset requires admin and is rejected, not escalated.
  */
 export function createLoopbackSessionGateway(opts: {
   getConfig: () => Record<string, unknown>;
@@ -215,6 +214,7 @@ export function createLoopbackSessionGateway(opts: {
 }): LoopbackSessionGateway {
   type Started = { request: GatewayRequest; stop: () => void };
   let started: Promise<Started> | undefined;
+  let disposed = false;
 
   const connect = async (): Promise<Started> => {
     const { startGatewayClientWhenEventLoopReady } = await import("openclaw/plugin-sdk/gateway-runtime");
@@ -233,8 +233,8 @@ export function createLoopbackSessionGateway(opts: {
     const client = await createOperatorGatewayClient({
       config,
       scopes: [...SESSION_GATEWAY_SCOPES],
-      onHelloOk: opts.onConnected,
-      onEvent: opts.onEvent,
+      onHelloOk: () => { if (!disposed) opts.onConnected?.(); },
+      onEvent: (event) => { if (!disposed) opts.onEvent?.(event); },
       clientDisplayName: opts.clientDisplayName ?? "Imajin session commands",
       onConnectError: (err) => {
         console.error(`[imajin-session-commands] gateway connect error: ${String(err)}`);
@@ -252,17 +252,21 @@ export function createLoopbackSessionGateway(opts: {
   };
 
   const request: GatewayRequest = async (method, params) => {
+    if (disposed) throw new Error("session Gateway disposed");
     started ??= connect().catch((err: unknown) => {
       started = undefined; // let the next command retry the connection
       throw err;
     });
-    return (await started).request(method, params);
+    const connection = await started;
+    if (disposed) throw new Error("session Gateway disposed");
+    return connection.request(method, params);
   };
 
   return {
     gateway: createSessionGateway(request),
     start: async () => { await request("sessions.subscribe", {}); },
     dispose: () => {
+      disposed = true;
       const pending = started;
       started = undefined;
       void pending?.then((s) => s.stop()).catch(() => undefined);

@@ -46,7 +46,7 @@ beforeAll(async () => {
   await writeFile(keypairPath, JSON.stringify({ privateKey: agentKey }));
 });
 
-function setup(scopes?: string[]) {
+function setup(scopes?: string[], auth?: { serviceOf: string[] | null }) {
   const rows: GatewaySession[] = [{ key: "agent:main:dashboard", sessionId: "native-1", label: "Dashboard", updatedAt: now }];
   const events: LoopTransition[] = [];
   const tracker = createLoopTracker({ did: agent, emit: (event) => events.push(event) });
@@ -65,7 +65,7 @@ function setup(scopes?: string[]) {
   const executor = createSessionCommandExecutor({ agentDid: agent, kernelDid: issuer, kernelPublicKeyHex, allowedPrincipal: principal }, {
     gateway, loopTracker: tracker, publishHistory: inventory.history, refreshInventory: inventory.refresh,
     attest: createSessionCommandAttester({ did: agent, keypairPath, send: ws.send }),
-    resolveServiceOf: async () => [principal], resolvePublicKey: async () => ownerPublicKeyHex,
+    resolveServiceOf: async () => auth ? auth.serviceOf : [principal], resolvePublicKey: async () => ownerPublicKeyHex,
     now: () => now, logger: { warn: vi.fn(), info: vi.fn(), error: vi.fn() },
   });
   const handle = (command: SessionCommandFrame) => {
@@ -82,7 +82,7 @@ describe("signed lifecycle/history commands over the fake kernel WS", () => {
     expect(h.rows).toHaveLength(1);
     expect(h.rows[0]).toMatchObject({ sessionId: "native-1", archived: true });
     expect(h.tracker.resolveLoop(h.loopId)).toBeUndefined();
-    expect(h.events).toContainEqual(expect.objectContaining({ type: "loop.finished", state: "archived", loopId: h.loopId }));
+    expect(h.events).toContainEqual(expect.objectContaining({ type: "loop.finished", state: "archived", loopId: h.loopId, label: "Dashboard" }));
     expect(h.request.mock.calls.some(([method]) => method === "sessions.delete")).toBe(false);
     const attestation = h.ws.send.mock.calls[0][0].attestation;
     expect(attestation.payload).toMatchObject({ command: "session.archive", outcome: "completed", loopId: h.loopId });
@@ -125,10 +125,12 @@ describe("signed lifecycle/history commands over the fake kernel WS", () => {
   });
 
   it.each(newTypes)("%s rejects and signs every authentication and target boundary", async (type) => {
-    for (const rejection of ["unsigned", "expired", "misaddressed", "issuer_mismatch", "principal_mismatch", "invalid_signature", "missing_countersignature", "invalid_countersignature", "loop_not_found"] as const) {
-      const h = setup();
+    for (const rejection of ["unsigned", "expired", "not_yet_valid", "misaddressed", "issuer_mismatch", "principal_mismatch", "not_service_of", "service_binding_unverifiable", "invalid_signature", "missing_countersignature", "invalid_countersignature", "loop_not_found"] as const) {
+      const h = setup(undefined, rejection === "not_service_of" ? { serviceOf: [] }
+        : rejection === "service_binding_unverifiable" ? { serviceOf: null } : undefined);
       const overrides: Partial<SessionCommandFrame> = {};
       if (rejection === "expired") overrides.issuedAt = new Date(now - 600_000).toISOString();
+      if (rejection === "not_yet_valid") overrides.issuedAt = new Date(now + 120_000).toISOString();
       if (rejection === "misaddressed") overrides.to = "did:imajin:other";
       if (rejection === "issuer_mismatch") overrides.issuer = "did:imajin:other";
       if (rejection === "principal_mismatch") overrides.principal = "did:imajin:other";

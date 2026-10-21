@@ -26,10 +26,9 @@
  * primary session we have not seen start (plugin reloaded mid-session), its
  * loop is lazily started first so the parent always exists.
  *
- * ## Out of scope: transcript content
- * Only ids, state, and a short redacted summary are published. Assistant text,
- * tool args/results and the like are NOT published: the loops rail envelope has
- * no payload field for them (see ima-jin/imajin-ai#2552).
+ * Inventory snapshots enrich primary loops with label/activity metadata.
+ * session-inventory.ts supplies bounded, redacted #2406 history output through
+ * publishSessionOutput; this tracker never reads a transcript or does I/O.
  */
 
 import {
@@ -157,6 +156,7 @@ const SESSION_END_STATE: Record<string, string> = {
   shutdown: "interrupted",
   restart: "interrupted",
   deleted: "cancelled",
+  archived: "archived",
 };
 
 const SUBAGENT_OUTCOME_STATE: Record<string, string> = {
@@ -490,6 +490,14 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     return open.get(fresh.loopId) ?? fresh;
   };
 
+  const updateSessionMetadata = (loop: OpenLoop, session: GatewaySession): void => {
+    loop.inventory = true;
+    loop.label = str(session.label) ?? "session";
+    loop.agentId = str(session.agentId) ?? session.key.split(":")[1] ?? "main";
+    const activity = session.lastActivityAt ?? session.updatedAt;
+    if (typeof activity === "number" && Number.isFinite(activity) && activity >= 0) loop.lastActivityAt = activity;
+  };
+
   const onSessionSnapshot = guard("session_snapshot", (session: GatewaySession): void => {
     const key = str(session?.key);
     if (!key || !isPrimarySessionKey(key) || session.spawnedBy) return;
@@ -508,11 +516,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
       }
     }
     if (id) loop.sessionId = id;
-    loop.inventory = true;
-    loop.label = str(session.label) ?? "session";
-    loop.agentId = str(session.agentId) ?? key.split(":")[1] ?? "main";
-    const activity = session.lastActivityAt ?? session.updatedAt;
-    if (typeof activity === "number" && Number.isFinite(activity) && activity >= 0) loop.lastActivityAt = activity;
+    updateSessionMetadata(loop, session);
     if (session.archived === true) {
       if (!ended.has(loop.loopId)) finish(loop, "archived", "session archived");
     } else if (open.has(loop.loopId)) {
@@ -541,7 +545,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
       if (!loop) return;
       const outcome = event?.success === false ? "error" : "ok";
       const duration = typeof event?.durationMs === "number" ? `, ${event.durationMs}ms` : "";
-      send("loop.progress", loop, "running", `turn ended (${outcome}${duration})`);
+      send("loop.progress", loop, loop.blockedOnYou ? "blocked" : "running", `turn ended (${outcome}${duration})`);
     },
   );
 

@@ -5,22 +5,22 @@
  * envelopes to the kernel's `POST /api/loops` ingest. The kernel never calls
  * into the gateway: this plugin is the translator, and the kernel's knowledge
  * of a loop is exactly the events published here — lifecycle metadata only
- * (ids, kind, state, a short redacted summary). No transcript content.
+ * (ids, kind, state, a short redacted summary), plus bounded redacted #2406
+ * output and session inventory metadata.
  *
- * ## Wire contract (copied exactly from the kernel, do not extend)
+ * ## Wire contract (#2295 lifecycle, #2406 typed output)
  *
  *   POST {nodeUrl}/api/loops
  *   { type, payload, publisherDid, signature: { keyId, alg: "ed25519", sig } }
  *
- *   payload = { loopId, kind, principal, parentLoopId, refs, state, summary, at }
+ *   payload = { loopId, kind, principal, parentLoopId, refs, state, summary, at, output?, ...metadata }
  *   refs    = { issue?, pr?, runId?, sessionKey? }   (any other key => 400)
  *   sig     = Ed25519 over canonicalize({ type, payload })  (hex)
  *   keyId   = hex Ed25519 public key currently registered for publisherDid
  *
- * The kernel verifies the signature over the payload it *parsed*, which always
- * carries `parentLoopId` (null when absent) and `refs`. We therefore always
- * send both explicitly (`parentLoopId: null`, `refs: {}`) so the bytes we sign
- * are the bytes the kernel reconstructs. `canonicalize` renders a missing key
+ * The kernel verifies the exact payload, preserving signed extensions (#2406).
+ * We continue sending `parentLoopId: null` and `refs: {}` explicitly for older
+ * lifecycle consumers. `canonicalize` renders a missing key
  * as nothing but an `undefined` value as the string `undefined`, so omitting
  * `refs` would make every refs-less event fail verification.
  *

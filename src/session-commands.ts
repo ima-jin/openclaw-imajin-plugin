@@ -614,7 +614,7 @@ export function createSessionCommandExecutor(
     }
     if (command.type === "session.archive") {
       await deps.gateway.archive({ sessionKey: target.sessionKey });
-      loops.onSessionSnapshot({ key: target.sessionKey, archived: true });
+      loops.onSessionEnd({ sessionKey: target.sessionKey, reason: "archived" });
     } else if (command.type === "session.label") {
       await deps.gateway.label({ sessionKey: target.sessionKey, label: p.label as string });
     } else {

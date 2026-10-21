@@ -183,12 +183,10 @@ function createLegacyApprovalBridge(
 }
 
 function createSessionCommands(
-  api: any,
   config: PluginConfig,
   client: ImajinClient,
   loopLifecycle: LoopLifecycle | undefined,
   wsService: ImajinWsService,
-  lifecycle: RegistrationLifecycle,
   approvalExecutions: ApprovalExecutionRegistry,
   sessionGateway: LoopbackSessionGateway | undefined,
   inventory: SessionInventory | undefined,
@@ -361,7 +359,7 @@ async function startPluginRuntime(
     // local gateway, and attested back as signed `loop.session.*` frames.
     // Opt-in; needs the agent DID + a pinned kernel command-signing key.
     const sessionCommandExecutor = createSessionCommands(
-      api, config, client, loopLifecycle, wsService, lifecycle, approvalExecutions,
+      config, client, loopLifecycle, wsService, approvalExecutions,
       sessionGateway, inventory,
     );
 

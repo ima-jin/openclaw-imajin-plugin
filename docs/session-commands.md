@@ -65,6 +65,10 @@ defaults to `issuedAt + 5 min`.
 | `session.deny` | `{ approvalId, loopId?, kind? }` | same, `deny` |
 | `session.abort` | `{ loopId, runId? }` | locally resolved `chat.abort` (`operator.write`) |
 | `session.spawn` | `{ task, parentLoopId?, label?, agentId?, group?, model? }` | `sessions.create` (`operator.write`), `idempotencyKey = commandId` |
+| `session.archive` | `{ loopId }` | `sessions.patch({key,expectedSessionId,archived:true})` (`operator.write`) |
+| `session.reset` | `{ loopId }` | `sessions.reset({key,expectedSessionId,reason:"reset"})` (`operator.admin`; rejected on the production connection) |
+| `session.label` | `{ loopId, label }` | `sessions.patch({key,expectedSessionId,label})` (`operator.write`) |
+| `session.history` | `{ loopId }` | local `chat.history({sessionKey,limit:20,maxBytes:65536})`, publishes typed signed loop output |
 
 Send/abort accept a local `sessionKey` instead of `loopId` for compatibility.
 Parented spawn likewise accepts local `parentSessionKey` instead of
@@ -75,7 +79,7 @@ takes precedence: unknown, foreign, ended or superseded loops fail closed as
 forms fail as `loop_target_mismatch`. Malformed IDs fail as `invalid_payload`.
 Lookups use only the plugin's currently active registry, not a gateway lookup,
 transcript scrape, or reverse derivation from an untrusted loop ID. After a
-restart an unobserved loop is unavailable until lifecycle hooks establish it.
+restart an unobserved loop is unavailable until inventory or lifecycle hooks establish it.
 Loop-addressed commands require loop lifecycle tracking to be enabled.
 
 An unparented spawn creates a root loop. A parented spawn resolves its parent
@@ -87,8 +91,58 @@ lineage registration and produces a failure, not a claim that no child ran.
 
 `allow-always` is unreachable, and `sessions.create` is never sent
 `permissionMode` / `toolOverrides` / `execNode` / `incognito`, so a remote command
-can never need `operator.admin`. The loopback gateway connection is opened lazily
-on the first command with scopes `operator.write` + `operator.approvals`.
+does not request `operator.admin`. The shared loopback connection starts for
+inventory when loops are enabled, retaining scopes `operator.write` +
+`operator.approvals` (`operator.write` implies read in OpenClaw).
+
+## Inventory, lifecycle and history (#109)
+
+With loops enabled, boot and each Gateway reconnect subscribe using
+`sessions.subscribe({})`, then enumerate **all pages** of `sessions.list`
+(including archived/global/unknown rows, no age or configured-agent filter).
+`sessions.changed` triggers a coalesced refresh, not periodic polling. Kernel
+WS reconnect also re-publishes the inventory. Dashboard, Telegram DM, and
+warp-events top-level threads publish `openclaw.session`; subagent/cron/ACP
+and `spawnedBy` rows are excluded. Children keep the parent session's loop ID.
+Labels, agent ID, last activity (epoch ms), and blocked-on-you accompany signed
+lifecycle events; harness keys stay in the established `refs.sessionKey`.
+Metadata reconciliation does not wait for history backfill.
+
+Archive is the delete: `archived:true` hides the Gateway row and publishes
+`loop.finished` / `archived`, without removing the record or transcript.
+Reset/label/archive require an observed active loop, and patches check that
+the Gateway row still exists, guarded by `expectedSessionId`; they never create
+a missing session. Extra payload fields (including local session keys) are
+rejected for the four new command types. Labels must be nonblank, at most 256
+characters. Every success/rejection uses the same signed attestation chain.
+
+**Reset limitation:** published `openclaw@2026.9.5` and `@2026.10.5` classify
+`sessions.reset` as `operator.admin` (`dist/method-scopes-*.mjs` and
+`core-method-policy-*.mjs`). The plugin does **not** hold or request that scope:
+reset attests `missing_scope` with a static, explicit reason and makes no reset
+RPC. Archive/label are verified write-scope mutations in
+`session-method-scopes-base-*.mjs`. No scope escalation or `sessions.delete`.
+
+When an active thread is first inventoried (or reset to a new native ID),
+recent history is backfilled. On thread open, the kernel can send a signed
+`session.history` wish through the existing WS. Only the plugin reads
+`chat.history`; it signs `loop.progress` envelopes with #2406 `output` shapes:
+`{kind:"text",text,role?}`, `{kind:"tool_call",callId,name,args}`, and
+`{kind:"tool_result",callId,result,isError?}`. Blocking state is preserved.
+
+Bounds: last **20 Gateway message entries** (a conservative turn cap, so a
+user/assistant exchange counts as two), at most 8 blocks per entry, 80 blocks
+per snapshot, 2048 characters per string, 6 JSON levels / 200 visited nodes,
+20 children per collection, and **12 KiB UTF-8 per output** (below the kernel's
+16 KiB inline cap). Oversized args/results become `[truncated]`. Existing
+`wake-redaction.ts` and loop redaction mask secret fields, quoted assignments,
+bearer headers, key/token patterns and opaque credential-shaped strings before
+clipping/signing. System/thinking/image/raw transcript metadata are excluded.
+History remains in the event record when a session is archived.
+
+Kernel enum/routing and Runs controls, including history-on-open dispatch, are
+tracked in [imajin-ai#3036](https://github.com/ima-jin/imajin-ai/issues/3036),
+a native child of [#2288](https://github.com/ima-jin/imajin-ai/issues/2288).
 
 ## Verification (nothing executes until all pass)
 
@@ -141,7 +195,8 @@ Reasons: `malformed`, `unsigned`, `misaddressed`, `issuer_mismatch`,
 `not_service_of`, `service_binding_unverifiable`, `missing_countersignature`,
 `invalid_countersignature`, `invalid_payload`, `gateway_error`,
 `approval_not_found`, `approval_already_executed`, `approval_binding_mismatch`,
-`loop_not_found`, `loop_target_mismatch`, `nothing_to_abort`.
+`loop_not_found`, `loop_target_mismatch`, `nothing_to_abort`, `missing_scope`,
+`session_not_found`.
 
 ## Native approval → loop binding
 
@@ -216,4 +271,4 @@ loops ingest only accepts `loop.started|progress|blocked|finished`
 (`LOOP_LIFECYCLE_TYPES`), and would 400 a `loop.session.*` type. The kernel half
 must accept them from the socket (or extend the ingest vocabulary).
 
-Session inventory and lifecycle work is tracked in #109.
+Session inventory and lifecycle are implemented by #109.

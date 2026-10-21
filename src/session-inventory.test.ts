@@ -33,6 +33,7 @@ function setup() {
       return new Response("{}", { status: 200 });
     }) as typeof fetch,
   });
+
   const tracker = createLoopTracker({ did: "did:imajin:inventory", emit: sender.publish });
   const request = vi.fn(async (method: string, _params: Record<string, unknown>) => {
     if (method === "sessions.list") return { sessions: structuredClone(rows) };
@@ -50,6 +51,21 @@ function setup() {
 }
 
 describe("top-level session inventory", () => {
+  it("publishes every inventory row and later changes without waiting for a stalled history request", async () => {
+    const h = setup();
+    let resolve!: (messages: unknown[]) => void;
+    h.gateway.history = vi.fn().mockImplementationOnce(() => new Promise<unknown[]>((done) => { resolve = done; })).mockResolvedValue([]);
+    await h.inventory.refresh();
+    expect(h.requests.filter((r) => r.type === "loop.started")).toHaveLength(3);
+    h.rows[2].label = "Changed during history";
+    h.inventory.onEvent({ event: "sessions.changed" });
+    await h.inventory.refresh();
+    expect(h.requests).toContainEqual(expect.objectContaining({
+      payload: expect.objectContaining({ label: "Changed during history" }),
+    }));
+    resolve([]);
+    await h.inventory.idle();
+  });
   it("publishes dashboard, Telegram and warp-events metadata plus redacted typed history at boot", async () => {
     const h = setup();
     h.inventory.onConnected();
@@ -103,10 +119,12 @@ describe("top-level session inventory", () => {
   it("re-subscribes on Gateway reconnect and replays metadata on kernel reconnect without duplicate starts or history", async () => {
     const h = setup();
     await h.inventory.refresh();
+    await h.inventory.idle();
     h.request.mockClear();
     h.inventory.onConnected();
     await vi.waitFor(() => expect(h.request).toHaveBeenCalledWith("sessions.subscribe", {}));
     await h.inventory.refresh();
+    await h.inventory.idle();
     expect(h.requests.filter((r) => r.type === "loop.started")).toHaveLength(3);
     expect(h.request.mock.calls.filter(([method]) => method === "chat.history")).toHaveLength(0);
     expect(h.requests.filter((r) => r.type === "loop.progress" && !r.payload.output).length).toBeGreaterThanOrEqual(3);
@@ -118,6 +136,9 @@ describe("top-level session inventory", () => {
     const key = h.rows[0].key;
     const target = h.tracker.lookupSession(key)!;
     h.tracker.block({ sessionKey: key }, "operator decision");
+    h.tracker.onAgentEnd({ success: true }, { sessionKey: key });
+    await h.sender.idle();
+    expect(h.requests.at(-1)?.payload.state).toBe("blocked");
     await h.inventory.history(target.loopId);
     await h.inventory.refresh();
     const last = h.requests.filter((r) => r.payload.loopId === target.loopId).at(-1)!;
@@ -148,8 +169,10 @@ describe("top-level session inventory", () => {
     const h = setup();
     h.gateway.history = vi.fn().mockRejectedValueOnce(new Error("private Gateway text")).mockResolvedValue([]);
     await h.inventory.refresh();
+    await h.inventory.idle();
     expect(h.warn).toHaveBeenCalledWith("[imajin-sessions] inventory/history unavailable");
     await h.inventory.refresh();
+    await h.inventory.idle();
     expect(h.gateway.history).toHaveBeenCalledTimes(4);
     h.request.mockClear();
     h.inventory.onEvent({ event: "unrelated" });
@@ -170,6 +193,8 @@ describe("top-level session inventory", () => {
     await pending;
     await h.inventory.refresh();
     expect(h.requests).toHaveLength(0);
-    await expect(h.inventory.history("unknown")).rejects.toThrow("not active");
+    await h.inventory.history("unknown");
+    h.inventory.onConnected();
+    expect(h.request).not.toHaveBeenCalled();
   });
 });

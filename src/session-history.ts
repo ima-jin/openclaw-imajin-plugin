@@ -10,17 +10,21 @@ function text(value: unknown): string {
   return typeof value === "string"
     ? redactLoopText(redactWakeText(value)).slice(0, MAX_TEXT_CHARS) : "";
 }
+function identifier(value: unknown): string {
+  return text(value).slice(0, 128);
+}
 
 /** Allowlisted, bounded JSON; redact keys and strings BEFORE clipping. */
-function json(value: unknown, depth = 0, budget = { left: 200 }): unknown {
-  if (depth >= 6 || budget.left-- <= 0) return "[truncated]";
+function json(value: unknown, depth = 0, budget?: { left: number }): unknown {
+  const remaining = budget ?? { left: 200 };
+  if (depth >= 6 || remaining.left-- <= 0) return "[truncated]";
   if (typeof value === "string") return text(value);
   if (value === null || typeof value === "boolean") return value;
   if (typeof value === "number") return Number.isFinite(value) ? value : null;
-  if (Array.isArray(value)) return value.slice(0, 20).map((item) => json(item, depth + 1, budget));
+  if (Array.isArray(value)) return value.slice(0, 20).map((item) => json(item, depth + 1, remaining));
   if (!value || typeof value !== "object") return null;
   return Object.fromEntries(Object.entries(value).slice(0, 20).map(([key, item]) =>
-    [text(key), SECRET_KEY.test(key) ? "[redacted]" : json(item, depth + 1, budget)]));
+    [text(key), SECRET_KEY.test(key) ? "[redacted]" : json(item, depth + 1, remaining)]));
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -39,7 +43,7 @@ function turnOutputs(raw: unknown): SessionLoopOutput[] {
   if (!["user", "assistant", "toolResult", "tool"].includes(String(message.role))) return [];
   if (message.role === "toolResult" || message.role === "tool") {
     return [{
-      kind: "tool_result", callId: text(message.toolCallId ?? message.tool_call_id),
+      kind: "tool_result", callId: identifier(message.toolCallId ?? message.tool_call_id),
       result: json(message.content), isError: message.isError === true,
     }];
   }
@@ -48,10 +52,10 @@ function turnOutputs(raw: unknown): SessionLoopOutput[] {
     const block = record(rawBlock);
     if (block.type === "text") return [{ kind: "text", text: text(block.text), role: String(message.role) }];
     if (block.type === "toolCall" || block.type === "tool_use") {
-      return [{ kind: "tool_call", callId: text(block.id), name: text(block.name), args: json(block.arguments ?? block.input) }];
+      return [{ kind: "tool_call", callId: identifier(block.id), name: identifier(block.name), args: json(block.arguments ?? block.input) }];
     }
     if (block.type === "tool_result") {
-      return [{ kind: "tool_result", callId: text(block.tool_use_id), result: json(block.content), isError: block.is_error === true }];
+      return [{ kind: "tool_result", callId: identifier(block.tool_use_id), result: json(block.content), isError: block.is_error === true }];
     }
     // Never export thinking, system messages, images, or arbitrary raw fields.
     return [];

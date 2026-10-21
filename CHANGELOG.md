@@ -9,6 +9,14 @@
   agent session. Config-only; injector logic unchanged.
 
 ### Added
+- **Top-level session inventory and lifecycle/history commands (#109).** Boot,
+  Gateway/kernel reconnect and `sessions.changed` publish signed session loops
+  with labels/activity, child lineage, and bounded redacted #2406 history.
+  Signed `session.archive`/`label` patch existing Gateway rows; archive retains
+  record/transcript and finishes the loop. `session.reset` fails explicitly with
+  `missing_scope` because it requires admin, never requested by this plugin.
+  `session.history` reuses the signed WS command path on open. Kernel enum and
+  controls: ima-jin/imajin-ai#3036 (native child of #2288).
 - **Signed reach events for Jin (#68).** Verify kernel delivery signatures and
   principal reply signatures on the existing WebSocket path; enqueue bounded,
   escaped UNTRUSTED context with UNVERIFIED onBehalfOf claims. Optional
