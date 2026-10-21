@@ -160,6 +160,7 @@ describe("imajin_cloudflare — kernel-only contract", () => {
       expect(url.pathname).toMatch(new RegExp(`^/cloudflare/api/zones/${ZONE_ID}/`));
       expect(url.searchParams.get("domain")).toBe(DOMAIN);
       expect(url.hostname).not.toBe("api.cloudflare.com");
+      expect(url.pathname).not.toMatch(/^\/jin\/api\/operator-approvals\/[^/]+\/decision$/);
       expect(url.pathname).not.toMatch(/approval|proposal|decision|vault|seal/);
     }
   }
