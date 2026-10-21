@@ -28,19 +28,23 @@ export { createCloudflareTool } from "./cloudflare-tool.js";
 type ToolContent = { type: "text"; text: string };
 type ToolResult = {
   content: ToolContent[];
-  details?: Record<string, unknown>;
+  /**
+   * Structured result. OpenClaw code mode (2026.10.5+) hands `details` to the
+   * calling program and drops `content`, so every result must carry it.
+   */
+  details?: unknown;
 };
 
-function textResult(text: string, details?: Record<string, unknown>): ToolResult {
-  return { content: [{ type: "text" as const, text }], details };
+function textResult(text: string, details?: unknown): ToolResult {
+  return { content: [{ type: "text" as const, text }], details: details ?? { text } };
 }
 
 function errorResult(msg: string): ToolResult {
-  return textResult(`Error: ${msg}`, { error: true });
+  return textResult(`Error: ${msg}`, { error: true, message: msg });
 }
 
 function jsonResult(data: unknown): ToolResult {
-  return textResult(JSON.stringify(data, null, 2));
+  return textResult(JSON.stringify(data, null, 2), data ?? null);
 }
 
 /**

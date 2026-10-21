@@ -48,6 +48,8 @@ describe("imajin_media tool", () => {
       assetId: "asset_123",
       folderIds: ["folder_456"],
     });
+    // Code mode (OpenClaw 2026.10.5+) reads `details`, never `content`.
+    expect(result.details).toEqual(JSON.parse(result.content[0].text));
   });
 
   it("move-to-folder requires assetId and folderId", async () => {
@@ -750,7 +752,7 @@ describe("imajin_usage tool (#72, read-only)", () => {
   it("summary rejects bad ranges without calling the kernel", async () => {
     const result = await tool.execute("1", { action: "summary", from: "nope" });
     expect(result.content[0].text).toMatch(/Invalid 'from'/);
-    expect(result.details).toEqual({ error: true });
+    expect(result.details).toMatchObject({ error: true });
     expect(client.getUsageSummary).not.toHaveBeenCalled();
   });
 
@@ -767,7 +769,7 @@ describe("imajin_usage tool (#72, read-only)", () => {
     const result = await tool.execute("1", { action: "summary", daily: false });
     expect(result.content[0].text).toMatch(/^Error: Imajin API 403/);
     expect(result.content[0].text).toMatch(/actingFor/);
-    expect(result.details).toEqual({ error: true });
+    expect(result.details).toMatchObject({ error: true });
   });
 
   it("surfaces a non-auth kernel error verbatim", async () => {
