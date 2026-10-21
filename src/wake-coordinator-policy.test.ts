@@ -42,7 +42,7 @@ describe("option c: enforced wake coordinator boundary", () => {
     injector?.dispose();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    await rm(directory, { recursive: true, force: true });
+    await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
   });
 
   async function start(frames: NotificationFrame[], live = LIVE) {

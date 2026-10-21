@@ -58,9 +58,10 @@ describe("wakeModel (#117)", () => {
 
   afterEach(async () => {
     injector?.dispose();
+    vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
-    await rm(dir, { recursive: true, force: true });
+    await rm(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });
   });
 
   function create() {
@@ -226,11 +227,15 @@ describe("wakeModel (#117)", () => {
   });
 
   it("applies the override and one log per leading and trailing wake", async () => {
+    vi.useFakeTimers();
+    config.wakeCoalesceMs = 10_000;
     config.wakeModel = "imajin/kimi-k3";
     create();
     await wake();
     input(0, WAKE);
-    await wake("two", 2);
+    await injector.inject(frame("two"));
+    await vi.advanceTimersByTimeAsync(10_000);
+    await vi.waitFor(() => expect(posts).toHaveLength(2), { interval: 5 });
     input(1, WAKE);
     input(1, WAKE);
     expect(posts.map((post) => post.model)).toEqual(["imajin/kimi-k3", "imajin/kimi-k3"]);
