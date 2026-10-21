@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createNotificationInjector, type WsNotificationsConfig } from "./notification-injector.js";
+import { createNotificationInjector, DEFAULT_WAKE_OWED_MAX_AGE_MS, type WsNotificationsConfig } from "./notification-injector.js";
 import { sendDirectChannelMessage } from "./channel-notify.js";
 import { DEFAULT_WAKE_TIMEOUT_MS, MAX_WAKE_TIMEOUT_MS, deriveWakeSessionKey, wakeEventTokens, WakeSupervisor } from "./wake-supervisor.js";
 import { buildWakeOutcome } from "./wake-outcome.js";
@@ -192,7 +192,7 @@ describe("fresh wake bridge (#79)", () => {
       wakeSettleMs: 2, wakeCoalesceMs: 2, stateDir: dir, directSend,
     };
     api = { runtime: { system: { enqueueSystemEvent: vi.fn(() => true) }, config: { current: () => ({}) } } };
-    vi.mocked(sendDirectChannelMessage).mockClear();
+    vi.mocked(sendDirectChannelMessage).mockReset().mockResolvedValue();
     vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
       posts.push(JSON.parse(init.body));
       return { status: 200, json: async () => ({ runId: `hook-${posts.length}` }), text: async () => "" };
@@ -347,13 +347,46 @@ describe("fresh wake bridge (#79)", () => {
     expect(posts[1].message).toContain("watched");
   });
 
-  it("does not silently expire old fresh evidence on startup", async () => {
+  it.each([
+    { maxAge: undefined, deliveryFails: false },
+    { maxAge: undefined, deliveryFails: true },
+    { maxAge: 1_000, deliveryFails: false },
+    { maxAge: 1_000, deliveryFails: true },
+  ])("expires fresh evidence on load with one disclosure attempt: %j", async ({ maxAge, deliveryFails }) => {
     const store = new PendingWakeStore(join(dir, "pending-wakes.json"));
-    await store.set("warp.run.completed:1:leading", { scope: "warp.run.completed", sinceTs: 1, frames: [frame("old")], injected: false });
-    const injector = create();
-    await injector.ready;
+    const sinceTs = Date.now() - (maxAge ?? DEFAULT_WAKE_OWED_MAX_AGE_MS) - 1;
+    await store.set(`warp.run.completed:${sinceTs}:leading`, {
+      scope: "warp.run.completed", sinceTs, frames: [frame("old")], injected: false,
+    });
+    if (deliveryFails) vi.mocked(sendDirectChannelMessage).mockRejectedValue(new Error("private delivery error"));
+    for (let registration = 0; registration < 5; registration++) {
+      const injector = create({ ...config, wakeOwedMaxAgeMs: maxAge });
+      await injector.ready;
+      injector.dispose();
+      expect(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes).toEqual({});
+    }
+    expect(posts).toHaveLength(0);
+    expect(sendDirectChannelMessage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sendDirectChannelMessage).mock.calls[0][1]).toContain("expired");
+    const bridge = JSON.parse(await readFile(join(dir, "wake-bridge.json"), "utf8"));
+    expect(bridge.records).toContainEqual(expect.objectContaining({
+      runId: "old", status: "open", lastVerdict: expect.stringContaining("expired"),
+    }));
+    expect(console.error).not.toHaveBeenCalledWith(expect.stringContaining("private delivery error"));
+  });
+
+  it.each([999, 1_000])("replays fresh evidence at or below the configured age bound (%s ms)", async (age) => {
+    const now = Date.now();
+    vi.spyOn(Date, "now").mockReturnValue(now);
+    const sinceTs = now - age;
+    const store = new PendingWakeStore(join(dir, "pending-wakes.json"));
+    await store.set(`warp.run.completed:${sinceTs}:leading`, {
+      scope: "warp.run.completed", sinceTs, frames: [frame("recent")], injected: false,
+    });
+    await create({ ...config, wakeOwedMaxAgeMs: 1_000 }).ready;
     await posted(1);
-    expect(posts[0].message).toContain("old");
+    expect(posts[0].message).toContain("recent");
+    expect(sendDirectChannelMessage).not.toHaveBeenCalled();
   });
 
   it("does not acknowledge fresh evidence without a durable state directory", async () => {

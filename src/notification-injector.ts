@@ -106,12 +106,11 @@ export interface WsNotificationsConfig {
   wakeCoalesceMs?: number;
   /**
    * Age bound (ms, #30) for a persisted "wake owed" marker replayed at
-   * startup: when a marker is older than this, its frames were already
-   * durably injected (`enqueueSystemEvent` succeeded before the marker was
-   * ever written — see `PendingWakeRecord.injected`), so instead of firing a
-   * possibly very stale wake turn, the marker is dropped with a log line
-   * (`owed wake expired for <scope> … — injected only`) and the agent picks
-   * the context up on its next natural turn. Default 3600000 (1h). Guards
+   * startup, regardless of whether its frames reached the legacy inbox or
+   * only local fresh-session storage. Expired fresh markers get one direct
+   * disclosure attempt; their evidence and expiry verdict remain in the
+   * bridge even if delivery fails. Legacy injected markers keep their
+   * inject-only log. Default 3600000 (1h). Guards
    * against exactly the 2026-09-09 incident: ~20 owed markers, some many
    * hours stale, all replaying as live wakes the moment the hook token was
    * fixed.
@@ -188,10 +187,9 @@ export const DEFAULT_WAKE_SETTLE_MS = 10_000;
 // single completion waited the entire window; leading-edge + trailing now
 // surfaces a single completion in ~DEFAULT_WAKE_SETTLE_MS instead.
 export const DEFAULT_WAKE_COALESCE_MS = 30_000;
-// Age bound for a persisted owed-wake marker replayed at startup (#30):
-// beyond this, the marker's frames are treated as inject-only (they already
-// reached the agent's context via `enqueueSystemEvent`) rather than worth a
-// fresh, possibly very stale, wake turn.
+// Owed-marker lifetime is bounded in both fresh-session and fixed-session modes.
+// Age bound for a persisted owed-wake marker replayed at startup (#30, #93):
+// stale frames stay in the bridge, never becoming a fresh wake turn.
 export const DEFAULT_WAKE_OWED_MAX_AGE_MS = 3_600_000;
 // Gateway hooks defaults (#18, docs/automation/webhook.md).
 const DEFAULT_HOOKS_PATH = "/hooks";
@@ -1036,8 +1034,8 @@ export function createNotificationInjector(
   // still moves the in-memory scope back to idle, so the next notification
   // opens a brand-new window) — replaying each one as its own wake is
   // exactly the fan-out that storms the gateway. Group by scope first, drop
-  // anything older than `wakeOwedMaxAgeMs` (already durably injected, so
-  // nothing is lost), then merge whatever's left into ONE leading-phase
+  // anything older than `wakeOwedMaxAgeMs` (evidence retained in the bridge),
+  // then merge whatever's left into ONE leading-phase
   // wake with the union of frames and the earliest `sinceTs`.
   interface OwedEntry {
     key: string;
@@ -1053,35 +1051,29 @@ export function createNotificationInjector(
         .map(([key]) => key);
       await pendingWakeStore.deleteMany(reachKeys);
       await bridge.ingest(pendingWakeStore.all().flatMap(([, owed]) => owed.frames));
+      const now = Date.now();
+      await Promise.all(pendingWakeStore.all()
+        .filter(([, owed]) => now - owed.sinceTs > wakeOwedMaxAgeMs)
+        .map(async ([key, owed]) => {
+          const age = now - owed.sinceTs;
+          const expired = `Owed wake expired for ${owed.scope} (${owed.frames.length} frame(s), age ${age}ms); wake skipped.`;
+          const delivered = owed.injected !== false || await discloseWakeOutcome(expired);
+          await bridge.recordOutcome({
+            runIds: summarizeWakeRuns(owed.frames).map((run) => run.runId),
+            lastVerdict: delivered ? expired : `${expired} Expiry disclosure delivery failed; no retry.`,
+          });
+          console.log(
+            `[imajin-ws] owed wake expired for ${owed.scope} (${owed.frames.length} frame(s), age ${age}ms) — ${owed.injected === false ? "evidence retained in bridge" : "injected only"}`,
+          );
+          await pendingWakeStore.delete(key);
+        }));
       for (const [key, owed] of pendingWakeStore.all()) {
         const list = owedByScope.get(owed.scope) ?? [];
         list.push({ key, owed });
         owedByScope.set(owed.scope, list);
       }
 
-      for (const [scope, entries] of owedByScope) {
-        const now = Date.now();
-        const live: OwedEntry[] = [];
-        for (const entry of entries) {
-          const age = now - entry.owed.sinceTs;
-          if (age > wakeOwedMaxAgeMs && entry.owed.injected !== false) {
-            // Every frame that ever reaches this store already passed
-            // `enqueueSystemEvent` successfully (`inject()` below only pushes
-            // into the coalesce buffer — and therefore this store — after
-            // that durable step succeeds), so "injected only" always holds
-            // here; `PendingWakeRecord.injected` documents that guarantee
-            // rather than gating on it.
-            console.log(
-              `[imajin-ws] owed wake expired for ${scope} (${entry.owed.frames.length} frame(s), age ${age}ms) — injected only`,
-            );
-            await pendingWakeStore.delete(entry.key);
-          } else {
-            live.push(entry);
-          }
-        }
-        if (live.length === 0) {
-          continue;
-        }
+      for (const [scope, live] of owedByScope) {
 
         const framesById = new Map<string, NotificationFrame>();
         let earliestSinceTs = live[0].owed.sinceTs;
@@ -1147,12 +1139,12 @@ export function createNotificationInjector(
   async function sendChannelMessage(text: string): Promise<void> {
     await sendDirectChannelMessage(ds, text, api);
   }
-  async function discloseTerminalSubjects(message: string): Promise<boolean> {
+  async function discloseWakeOutcome(message: string): Promise<boolean> {
     try {
       await sendChannelMessage(message);
       return true;
     } catch {
-      console.error("[imajin-ws] terminal wake disclosure delivery failed");
+      console.error("[imajin-ws] wake disclosure delivery failed");
       return false;
     }
   }
@@ -1221,7 +1213,7 @@ export function createNotificationInjector(
       lookup: deps.liveStateLookup, githubCliPath: wsNotifications?.githubCliPath,
     });
     const message = `Wake batch ID: ${idempotencyKey}\n\n${liveState.preamble}\n\n${buildWakeTurnMessage(scope, frames)}\n\n${continuity}`;
-    if (await handleTerminalSubjects(liveState, scope, frames, pendingKey)) return;
+    if (await handleTerminalSubjects(liveState, frames, pendingKey)) return;
 
     if (!hookToken) {
       // The single startup warning already fired in `hookTokenReady`'s
@@ -1312,21 +1304,19 @@ export function createNotificationInjector(
     // The first real failed attempt already alerted, before the retry ladder.
   }
 
-  /** A successful terminal disclosure consumes only an entirely terminal batch. */
+  /** One disclosure attempt consumes an entirely terminal batch, even on delivery failure. */
   async function handleTerminalSubjects(
-    liveState: WakeLiveState, scope: string, frames: NotificationFrame[], pendingKey: string,
+    liveState: WakeLiveState, frames: NotificationFrame[], pendingKey: string,
   ): Promise<boolean> {
     if (!liveState.terminalSubjects.length) return false;
     const disclosure = liveState.terminalSubjects.map((subject) =>
       `${subject.url} is already ${subject.state}; wake skipped — no review or merge action taken.`).join("\n");
-    if (!await discloseTerminalSubjects(disclosure)) {
-      await escalateWakeFailure(scope, frames, "terminal subject disclosure failed; wake retained for retry");
-      return true;
-    }
+    const delivered = await discloseWakeOutcome(disclosure);
     if (!liveState.allSubjectsTerminal) return false;
     await bridge.recordOutcome({
       runIds: summarizeWakeRuns(frames).map((run) => run.runId),
-      lastVerdict: disclosure, status: "closed",
+      lastVerdict: delivered ? disclosure : `Terminal disclosure delivery failed; no retry. ${disclosure}`,
+      status: "closed",
     });
     await pendingWakeStore.delete(pendingKey);
     return true;
