@@ -1051,35 +1051,29 @@ export function createNotificationInjector(
         .map(([key]) => key);
       await pendingWakeStore.deleteMany(reachKeys);
       await bridge.ingest(pendingWakeStore.all().flatMap(([, owed]) => owed.frames));
+      const now = Date.now();
+      await Promise.all(pendingWakeStore.all()
+        .filter(([, owed]) => now - owed.sinceTs > wakeOwedMaxAgeMs)
+        .map(async ([key, owed]) => {
+          const age = now - owed.sinceTs;
+          const expired = `Owed wake expired for ${owed.scope} (${owed.frames.length} frame(s), age ${age}ms); wake skipped.`;
+          const delivered = owed.injected !== false || await discloseWakeOutcome(expired);
+          await bridge.recordOutcome({
+            runIds: summarizeWakeRuns(owed.frames).map((run) => run.runId),
+            lastVerdict: delivered ? expired : `${expired} Expiry disclosure delivery failed; no retry.`,
+          });
+          console.log(
+            `[imajin-ws] owed wake expired for ${owed.scope} (${owed.frames.length} frame(s), age ${age}ms) — ${owed.injected === false ? "evidence retained in bridge" : "injected only"}`,
+          );
+          await pendingWakeStore.delete(key);
+        }));
       for (const [key, owed] of pendingWakeStore.all()) {
         const list = owedByScope.get(owed.scope) ?? [];
         list.push({ key, owed });
         owedByScope.set(owed.scope, list);
       }
 
-      for (const [scope, entries] of owedByScope) {
-        const now = Date.now();
-        const live: OwedEntry[] = [];
-        for (const entry of entries) {
-          const age = now - entry.owed.sinceTs;
-          if (age > wakeOwedMaxAgeMs) {
-            const expired = `Owed wake expired for ${scope} (${entry.owed.frames.length} frame(s), age ${age}ms); wake skipped.`;
-            const delivered = entry.owed.injected !== false || await discloseWakeOutcome(expired);
-            await bridge.recordOutcome({
-              runIds: summarizeWakeRuns(entry.owed.frames).map((run) => run.runId),
-              lastVerdict: delivered ? expired : `${expired} Expiry disclosure delivery failed; no retry.`,
-            });
-            console.log(
-              `[imajin-ws] owed wake expired for ${scope} (${entry.owed.frames.length} frame(s), age ${age}ms) — ${entry.owed.injected === false ? "evidence retained in bridge" : "injected only"}`,
-            );
-            await pendingWakeStore.delete(entry.key);
-          } else {
-            live.push(entry);
-          }
-        }
-        if (live.length === 0) {
-          continue;
-        }
+      for (const [scope, live] of owedByScope) {
 
         const framesById = new Map<string, NotificationFrame>();
         let earliestSinceTs = live[0].owed.sinceTs;
