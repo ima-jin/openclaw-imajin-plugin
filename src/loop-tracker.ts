@@ -39,7 +39,9 @@ import {
   type LoopLifecycleType,
   type LoopRefs,
   type LoopTransition,
+  type SessionLoopOutput,
 } from "./loop-publisher.js";
+import type { GatewaySession } from "./session-command-gateway.js";
 
 export interface LoopTrackerLogger {
   warn: (message: string) => void;
@@ -130,6 +132,10 @@ interface OpenLoop {
   label: string;
   /** Learnt from hooks even when initially registered by session key. */
   sessionId?: string;
+  agentId?: string;
+  lastActivityAt?: number;
+  blockedOnYou?: boolean;
+  inventory?: boolean;
 }
 
 const MAX_RECONCILE_EMISSIONS = 200;
@@ -193,6 +199,8 @@ export interface LocalLoopTarget {
 }
 
 export interface LoopTracker {
+  onSessionSnapshot(session: GatewaySession): void;
+  publishSessionOutput(loopId: string, output: SessionLoopOutput): void;
   /** Only resolves locally observed, currently active execution targets. */
   resolveLoop(loopId: string): LocalLoopTarget | undefined;
   lookupSession(sessionKey: string): LocalLoopTarget | undefined;
@@ -248,6 +256,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     loop: OpenLoop,
     state: string,
     summary: string,
+    output?: SessionLoopOutput,
   ): void => {
     emit({
       type,
@@ -257,6 +266,13 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
       refs: loop.refs,
       state,
       summary: sanitizeSummary(summary),
+      ...(output ? { output } : {}),
+      ...(loop.inventory ? {
+        label: sanitizeSummary(loop.label),
+        ...(loop.agentId ? { agentId: loop.agentId } : {}),
+        ...(loop.lastActivityAt !== undefined ? { lastActivityAt: loop.lastActivityAt } : {}),
+        blockedOnYou: loop.blockedOnYou ?? false,
+      } : {}),
     });
   };
 
@@ -474,6 +490,38 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     return open.get(fresh.loopId) ?? fresh;
   };
 
+  const onSessionSnapshot = guard("session_snapshot", (session: GatewaySession): void => {
+    const key = str(session?.key);
+    if (!key || !isPrimarySessionKey(key) || session.spawnedBy) return;
+    let loop = openLoopForKey(key);
+    const id = str(session.sessionId);
+    if (loop?.sessionId && id && loop.sessionId !== id) {
+      finish(loop, "interrupted", "session reset or replaced");
+      loop = undefined;
+    }
+    if (!loop) {
+      loop = sessionLoop(key, id);
+      // Only authoritative snapshots may reopen an unarchived row.
+      if (session.archived !== true) {
+        ended.delete(loop.loopId);
+        endedSessionKeys.delete(key);
+      }
+    }
+    if (id) loop.sessionId = id;
+    loop.inventory = true;
+    loop.label = str(session.label) ?? "session";
+    loop.agentId = str(session.agentId) ?? key.split(":")[1] ?? "main";
+    const activity = session.lastActivityAt ?? session.updatedAt;
+    if (typeof activity === "number" && Number.isFinite(activity) && activity >= 0) loop.lastActivityAt = activity;
+    if (session.archived === true) {
+      if (!ended.has(loop.loopId)) finish(loop, "archived", "session archived");
+    } else if (open.has(loop.loopId)) {
+      send("loop.progress", loop, loop.blockedOnYou ? "blocked" : "running", loop.label);
+    } else {
+      start(loop, loop.label);
+    }
+  });
+
   const onSessionEnd = guard("session_end", (event: SessionEndEvent): void => {
     const key = str(event?.sessionKey);
     const id = str(event?.sessionId);
@@ -562,11 +610,13 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
 
   const onBlock = guard("block", (ref: LoopRef, reason: string): void => {
     const loop = findOpen(ref);
+    if (loop) loop.blockedOnYou = true;
     if (loop) send("loop.blocked", loop, "blocked", `blocked: ${reason}`);
   });
 
   const onUnblock = guard("unblock", (ref: LoopRef): void => {
     const loop = findOpen(ref);
+    if (loop) loop.blockedOnYou = false;
     if (loop) send("loop.progress", loop, "running", "unblocked");
   });
   const localTarget = (loop: OpenLoop | undefined): LocalLoopTarget | undefined => {
@@ -633,6 +683,11 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     lookupSession: (sessionKey) => localTarget(openLoopForKey(sessionKey)),
     lookupRef: (ref) => localTarget(findOpen(ref)),
     registerSpawn,
+    onSessionSnapshot,
+    publishSessionOutput: guard("session_output", (loopId: string, output: SessionLoopOutput) => {
+      const loop = open.get(loopId);
+      if (loop) send("loop.progress", loop, loop.blockedOnYou ? "blocked" : "running", "recent session turn", output);
+    }),
     onSessionStart,
     onSessionEnd,
     onAgentEnd,

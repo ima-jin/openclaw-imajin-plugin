@@ -71,6 +71,7 @@ import {
   type SessionCommandExecutor,
 } from "./src/session-commands.js";
 import { createLoopbackSessionGateway, type LoopbackSessionGateway } from "./src/session-command-gateway.js";
+import { createSessionInventory, type SessionInventory } from "./src/session-inventory.js";
 import { ApprovalExecutionRegistry } from "./src/approval-execution.js";
 import { createWakeReportTool } from "./src/wake-report-tool.js";
 import type { RegistrationLifecycle } from "./src/registration-lifecycle.js";
@@ -189,25 +190,21 @@ function createSessionCommands(
   wsService: ImajinWsService,
   lifecycle: RegistrationLifecycle,
   approvalExecutions: ApprovalExecutionRegistry,
+  sessionGateway: LoopbackSessionGateway | undefined,
+  inventory: SessionInventory | undefined,
 ): SessionCommandExecutor | undefined {
   const keypairPath = config.keypairPath;
   if (!keypairPath) return undefined;
   let sessionCommandExecutor: SessionCommandExecutor | undefined;
-  let sessionGateway: LoopbackSessionGateway | undefined;
   if (config.sessionCommands?.enabled === true) {
     const settings = config.sessionCommands;
-    if (!config.did || !settings.kernelPublicKeyHex || !loopLifecycle) {
+    if (!config.did || !settings.kernelPublicKeyHex || !loopLifecycle || !sessionGateway) {
       console.warn(
         "[imajin-plugin] sessionCommands.enabled needs an agent `did` and " +
           "sessionCommands.kernelPublicKeyHex with loop lifecycle tracking enabled — session commands will not be accepted",
       );
     } else {
       const keyResolver = createIdentityClientOperatorKeyResolver(client);
-      sessionGateway = createLoopbackSessionGateway({
-        getConfig: () => (api.runtime?.config?.current?.() ?? {}) as Record<string, unknown>,
-      });
-      const ownedGateway = sessionGateway;
-      lifecycle.add(() => ownedGateway.dispose());
       sessionCommandExecutor = createSessionCommandExecutor(
         {
           agentDid: config.did,
@@ -218,6 +215,8 @@ function createSessionCommands(
         },
         {
           gateway: sessionGateway.gateway,
+          publishHistory: inventory?.history,
+          refreshInventory: inventory?.refresh,
           loopTracker: loopLifecycle?.tracker,
           executionRegistry: approvalExecutions,
           attest: createSessionCommandAttester({
@@ -259,6 +258,25 @@ async function startPluginRuntime(
     actAs: config.actAs,
     config: config.loops,
   });
+  let inventory: SessionInventory | undefined;
+  let sessionGateway: LoopbackSessionGateway | undefined;
+  if (loopLifecycle) {
+    sessionGateway = createLoopbackSessionGateway({
+      getConfig: () => (api.runtime?.config?.current?.() ?? {}) as Record<string, unknown>,
+      onConnected: () => inventory?.onConnected(),
+      onEvent: (event) => inventory?.onEvent(event),
+    });
+    inventory = createSessionInventory({
+      gateway: sessionGateway.gateway,
+      tracker: loopLifecycle.tracker,
+      sender: loopLifecycle.sender,
+      warn: console.warn,
+    });
+    const ownedGateway = sessionGateway;
+    const ownedInventory = inventory;
+    lifecycle.add(() => { ownedInventory.dispose(); ownedGateway.dispose(); });
+    void sessionGateway.start().catch(() => console.warn("[imajin-sessions] Gateway inventory unavailable"));
+  }
 
   registerHorizonSync({
     registerService: ({ start, stop }) => {
@@ -344,6 +362,7 @@ async function startPluginRuntime(
     // Opt-in; needs the agent DID + a pinned kernel command-signing key.
     const sessionCommandExecutor = createSessionCommands(
       api, config, client, loopLifecycle, wsService, lifecycle, approvalExecutions,
+      sessionGateway, inventory,
     );
 
     // Gateway approvals bridge (#24): publishes staged Gateway system-agent
@@ -412,6 +431,7 @@ async function startPluginRuntime(
     // `operator.approval.decided` the socket missed. Awaits bridge startup so
     // a connect that races registration is not dropped.
     wsService.onConnected(async () => {
+      void inventory?.refresh().catch(() => console.warn("[imajin-sessions] kernel reconnect inventory unavailable"));
       const started = await approvalsBridgeReady;
       if (lifecycle.active) await started?.onKernelConnected();
     });

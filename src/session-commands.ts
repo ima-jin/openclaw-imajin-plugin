@@ -49,6 +49,7 @@ import { canonicalize, signMessage, type SignedMessage } from "./approval-bridge
 import { sanitizeSummary } from "./loop-publisher.js";
 import { parseOperatorSignature, type OperatorCountersignature } from "./operator-signature.js";
 import type { SessionGateway, SessionApprovalKind } from "./session-command-gateway.js";
+import { SessionGatewayFailure } from "./session-command-gateway.js";
 import { createLoopTracker, type LoopTracker, type LocalLoopTarget, isPrimarySessionKey } from "./loop-tracker.js";
 import { ApprovalExecutionRegistry } from "./approval-execution.js";
 
@@ -58,6 +59,10 @@ export const SESSION_COMMAND_TYPES = [
   "session.deny",
   "session.abort",
   "session.spawn",
+  "session.archive",
+  "session.reset",
+  "session.label",
+  "session.history",
 ] as const;
 export type SessionCommandType = (typeof SESSION_COMMAND_TYPES)[number];
 
@@ -67,6 +72,10 @@ const VERBS = {
   "session.deny": "deny",
   "session.abort": "abort",
   "session.spawn": "spawn",
+  "session.archive": "archive",
+  "session.reset": "reset",
+  "session.label": "label",
+  "session.history": "history",
 } as const satisfies Record<SessionCommandType, string>;
 
 export type SessionCommandEventType =
@@ -96,7 +105,9 @@ export type SessionCommandFailureReason =
   | "approval_binding_mismatch"
   | "loop_not_found"
   | "loop_target_mismatch"
-  | "nothing_to_abort";
+  | "nothing_to_abort"
+  | "missing_scope"
+  | "session_not_found";
 
 export const DEFAULT_COMMAND_TTL_MS = 5 * 60_000;
 export const MAX_CLOCK_SKEW_MS = 60_000;
@@ -303,6 +314,8 @@ export interface SessionCommandExecutorConfig {
 
 export interface SessionCommandExecutorDeps {
   gateway: SessionGateway;
+  publishHistory?: (loopId: string) => Promise<void>;
+  refreshInventory?: () => Promise<void>;
   /** The plugin's live, local-only lifecycle registry. */
   loopTracker?: LoopTracker;
   /** MUST be the same instance the legacy approval executors use. */
@@ -584,9 +597,38 @@ export function createSessionCommandExecutor(
     result.childLoopId = child.loopId;
   }
 
+  async function lifecycle(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
+    const allowed = command.type === "session.label" ? ["loopId", "label"] : ["loopId"];
+    if (Object.keys(p).some((key) => !allowed.includes(key))) invalid("unsupported lifecycle payload field");
+    if (!nonEmpty(p.loopId)) invalid("loopId is required");
+    if (command.type === "session.label" && (!nonEmpty(p.label) || !p.label.trim())) invalid("label must be a non-empty string of at most 256 characters");
+    const target = resolveTarget(p.loopId, undefined);
+    address(result, target);
+    if (command.type === "session.history") {
+      if (!deps.publishHistory) throw new Rejection("gateway_error", "session history publisher unavailable");
+      // A retired Gateway row must not be read even when the local registry is stale.
+      const exists = (await deps.gateway.list()).some((s) => s.key === target.sessionKey && !s.archived);
+      if (!exists) throw new Rejection("session_not_found");
+      await deps.publishHistory(target.loopId);
+      return;
+    }
+    if (command.type === "session.archive") {
+      await deps.gateway.archive({ sessionKey: target.sessionKey });
+      loops.onSessionSnapshot({ key: target.sessionKey, archived: true });
+    } else if (command.type === "session.label") {
+      await deps.gateway.label({ sessionKey: target.sessionKey, label: p.label as string });
+    } else {
+      await deps.gateway.reset({ sessionKey: target.sessionKey });
+    }
+    // A refresh failure cannot turn a committed mutation into a failed command.
+    void deps.refreshInventory?.().catch(() => log.warn("session inventory refresh unavailable"));
+  }
+
   const handlers = {
     "session.send": send, "session.abort": abort, "session.spawn": spawn,
     "session.approve": resolveApproval, "session.deny": resolveApproval,
+    "session.archive": lifecycle, "session.reset": lifecycle,
+    "session.label": lifecycle, "session.history": lifecycle,
   } satisfies Record<SessionCommandType, (command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult) => Promise<void>>;
 
   async function execute(command: SessionCommandFrame, result: ExecutionResult): Promise<void> {
@@ -606,6 +648,7 @@ export function createSessionCommandExecutor(
         await execute(command, result);
       } catch (err) {
         if (err instanceof Rejection) throw err;
+        if (err instanceof SessionGatewayFailure) throw new Rejection(err.reason, err.message);
         // Gateway messages may contain harness keys or task text. Neither is
         // part of the kernel contract, even in a signed failure.
         throw new Rejection("gateway_error", "local gateway execution failed");
