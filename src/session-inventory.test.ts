@@ -15,7 +15,7 @@ beforeAll(async () => {
   await writeFile(keypairPath, JSON.stringify({ privateKey: randomBytes(32).toString("hex") }));
 });
 
-function setup() {
+function setup(statePath?: string) {
   const rows: GatewaySession[] = [
     { key: "agent:main:dashboard", sessionId: "dashboard-id", label: "Dashboard", updatedAt: 123 },
     { key: "agent:main:telegram:direct:42", sessionId: "telegram-id", label: "Telegram", updatedAt: 456 },
@@ -35,22 +35,134 @@ function setup() {
   });
 
   const tracker = createLoopTracker({ did: "did:imajin:inventory", emit: sender.publish });
+  const messages: unknown[] = [
+    { id: "turn-1", role: "user", content: "token=synthetic-private-value hello" },
+    { id: "turn-2", role: "assistant", content: [{ type: "toolCall", id: "call", name: "read", arguments: { password: "synthetic-private-value" } }] },
+    { id: "turn-3", role: "toolResult", toolCallId: "call", content: "done" },
+  ];
   const request = vi.fn(async (method: string, _params: Record<string, unknown>) => {
     if (method === "sessions.list") return { sessions: structuredClone(rows) };
-    if (method === "chat.history") return { messages: [
-      { role: "user", content: "token=synthetic-private-value hello" },
-      { role: "assistant", content: [{ type: "toolCall", id: "call", name: "read", arguments: { password: "synthetic-private-value" } }] },
-      { role: "toolResult", toolCallId: "call", content: "done" },
-    ] };
+    if (method === "chat.history") return { messages: structuredClone(messages) };
     return {};
   });
   const gateway = createSessionGateway(request);
   const warn = vi.fn();
-  const inventory = createSessionInventory({ gateway, tracker, sender, warn });
-  return { rows, requests, request, gateway, tracker, sender, inventory, warn };
+  const inventory = createSessionInventory({ gateway, tracker, sender, warn, statePath });
+  return { rows, requests, request, gateway, tracker, sender, inventory, warn, messages };
 }
 
 describe("top-level session inventory", () => {
+  it("resumes after the last emitted block when disposed during a multi-block backfill", async () => {
+    const statePath = join(await mkdtemp(join(tmpdir(), "inventory-partial-")), "sessions.json");
+    const turn = { id: "multi-block", role: "assistant", content: [
+      { type: "text", text: "first block" }, { type: "text", text: "second block" },
+    ] };
+    const first = setup(statePath);
+    first.rows.splice(1);
+    first.messages.splice(0, first.messages.length, turn);
+    const publish = first.tracker.publishSessionOutput;
+    vi.spyOn(first.tracker, "publishSessionOutput").mockImplementation((loopId, output) => {
+      publish(loopId, output);
+      first.inventory.dispose();
+    });
+    await first.inventory.refresh();
+    await first.inventory.idle();
+    expect(first.requests.filter((r) => r.payload.output)).toHaveLength(1);
+    const second = setup(statePath);
+    second.rows.splice(1);
+    second.messages.splice(0, second.messages.length, turn);
+    await second.inventory.refresh();
+    await second.inventory.idle();
+    const outputs = second.requests.filter((r) => r.payload.output);
+    expect(outputs).toHaveLength(1);
+    expect(outputs[0].payload.output).toMatchObject({ text: "second block" });
+    const loopId = second.tracker.lookupSession(second.rows[0].key)!.loopId;
+    await Promise.all([second.inventory.history(loopId), second.inventory.history(loopId)]);
+    expect(second.requests.filter((r) => r.payload.output)).toHaveLength(1);
+  });
+  it("persists unarchive before a later archive and does not replay either archived snapshot after restart", async () => {
+    const statePath = join(await mkdtemp(join(tmpdir(), "inventory-unarchive-")), "sessions.json");
+    const first = setup(statePath);
+    first.rows[0].archived = true;
+    await first.inventory.refresh();
+    await first.inventory.idle();
+    first.inventory.dispose();
+    const second = setup(statePath); // Same native row, explicitly unarchived.
+    await second.inventory.refresh();
+    await second.inventory.idle();
+    expect(second.requests.filter((r) => r.type === "loop.finished")).toHaveLength(0);
+    second.rows[0].archived = true;
+    await second.inventory.refresh();
+    await second.inventory.idle();
+    expect(second.requests.filter((r) => r.type === "loop.finished")).toHaveLength(1);
+    second.inventory.dispose();
+    const third = setup(statePath);
+    third.rows[0].archived = true;
+    await third.inventory.refresh();
+    await third.inventory.idle();
+    expect(third.requests.filter((r) => r.type === "loop.finished")).toHaveLength(0);
+  });
+
+  it("fails closed on a corrupt checkpoint rather than re-emitting an entire transcript", async () => {
+    const statePath = join(await mkdtemp(join(tmpdir(), "inventory-corrupt-")), "sessions.json");
+    await writeFile(statePath, "corrupt");
+    const h = setup(statePath);
+    await expect(h.inventory.refresh()).rejects.toThrow();
+    expect(h.requests).toHaveLength(0);
+    expect(h.request).not.toHaveBeenCalled();
+  });
+  it("persists per-session history/archive watermarks across two boots and emits only a new turn after restart", async () => {
+    const statePath = join(await mkdtemp(join(tmpdir(), "inventory-restart-")), "sessions.json");
+    const archived = { key: "agent:main:archived", sessionId: "archived-id", archived: true };
+    const first = setup(statePath);
+    first.rows.push(archived);
+    await first.inventory.refresh();
+    await first.inventory.idle();
+    expect(first.requests.filter((r) => r.payload.output)).toHaveLength(9);
+    expect(first.requests.filter((r) => r.type === "loop.finished")).toHaveLength(1);
+    first.inventory.dispose();
+
+    const second = setup(statePath); // Fresh tracker, sender, store and Gateway client.
+    second.rows.push(archived);
+    await second.inventory.refresh();
+    await second.inventory.idle();
+    expect(second.requests.filter((r) => r.payload.output)).toHaveLength(0);
+    expect(second.requests.filter((r) => r.type === "loop.finished")).toHaveLength(0);
+    second.tracker.onSessionStart({ sessionKey: archived.key, sessionId: archived.sessionId });
+    expect(second.tracker.lookupSession(archived.key)).toBeUndefined();
+    second.gateway.history = vi.fn(async (key) => key === second.rows[0].key
+      ? [...second.messages, { id: "turn-4", role: "assistant", content: "new after restart" }]
+      : second.messages);
+    second.inventory.onEvent({ event: "sessions.changed" });
+    await second.inventory.refresh();
+    await second.inventory.idle();
+    const outputs = second.requests.filter((r) => r.payload.output);
+    expect(outputs).toHaveLength(1);
+    expect(outputs[0].payload.output).toEqual({ kind: "text", role: "assistant", text: "new after restart" });
+    await second.inventory.history(second.tracker.lookupSession(second.rows[0].key)!.loopId);
+    expect(second.requests.filter((r) => r.payload.output)).toHaveLength(1);
+    second.inventory.dispose();
+
+    const third = setup(statePath);
+    third.rows.push(archived);
+    third.gateway.history = second.gateway.history;
+    await third.inventory.refresh();
+    await third.inventory.idle();
+    expect(third.requests.filter((r) => r.payload.output || r.type === "loop.finished")).toHaveLength(0);
+  });
+
+  it("starts a separate watermark for a new native sessionId on an already backfilled key", async () => {
+    const statePath = join(await mkdtemp(join(tmpdir(), "inventory-reset-")), "sessions.json");
+    const first = setup(statePath);
+    await first.inventory.refresh();
+    await first.inventory.idle();
+    first.inventory.dispose();
+    const second = setup(statePath);
+    second.rows[0].sessionId = "replacement-id";
+    await second.inventory.refresh();
+    await second.inventory.idle();
+    expect(second.requests.filter((r) => r.payload.output)).toHaveLength(3);
+  });
   it("publishes every inventory row and later changes without waiting for a stalled history request", async () => {
     const h = setup();
     let resolve!: (messages: unknown[]) => void;
@@ -126,7 +238,8 @@ describe("top-level session inventory", () => {
     await h.inventory.refresh();
     await h.inventory.idle();
     expect(h.requests.filter((r) => r.type === "loop.started")).toHaveLength(3);
-    expect(h.request.mock.calls.filter(([method]) => method === "chat.history")).toHaveLength(0);
+    expect(h.request.mock.calls.some(([method]) => method === "chat.history")).toBe(true);
+    expect(h.requests.filter((r) => r.payload.output)).toHaveLength(9);
     expect(h.requests.filter((r) => r.type === "loop.progress" && !r.payload.output).length).toBeGreaterThanOrEqual(3);
   });
 
@@ -173,7 +286,7 @@ describe("top-level session inventory", () => {
     expect(h.warn).toHaveBeenCalledWith("[imajin-sessions] inventory/history unavailable");
     await h.inventory.refresh();
     await h.inventory.idle();
-    expect(h.gateway.history).toHaveBeenCalledTimes(4);
+    expect(h.gateway.history).toHaveBeenCalledTimes(6);
     h.request.mockClear();
     h.inventory.onEvent({ event: "unrelated" });
     expect(h.request).not.toHaveBeenCalled();
@@ -188,6 +301,7 @@ describe("top-level session inventory", () => {
     let resolve!: (rows: GatewaySession[]) => void;
     h.gateway.list = vi.fn(() => new Promise<GatewaySession[]>((done) => { resolve = done; }));
     const pending = h.inventory.refresh();
+    await vi.waitFor(() => expect(h.gateway.list).toHaveBeenCalledOnce());
     h.inventory.dispose();
     resolve(h.rows);
     await pending;

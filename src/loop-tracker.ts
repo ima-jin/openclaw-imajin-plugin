@@ -199,7 +199,7 @@ export interface LocalLoopTarget {
 }
 
 export interface LoopTracker {
-  onSessionSnapshot(session: GatewaySession): void;
+  onSessionSnapshot(session: GatewaySession, archiveAlreadyPublished?: boolean): void;
   publishSessionOutput(loopId: string, output: SessionLoopOutput): void;
   /** Only resolves locally observed, currently active execution targets. */
   resolveLoop(loopId: string): LocalLoopTarget | undefined;
@@ -286,7 +286,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     send("loop.started", loop, "running", summary);
   };
 
-  const finish = (loop: OpenLoop, state: string, summary: string): void => {
+  const finish = (loop: OpenLoop, state: string, summary: string, publish = true): void => {
     open.delete(loop.loopId);
     ended.add(loop.loopId);
     if (loop.sessionId) ended.add(deriveLoopId(did, "openclaw.session", loop.sessionId));
@@ -296,7 +296,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
       bySessionKey.delete(loop.refs.sessionKey);
       endedSessionKeys.add(loop.refs.sessionKey);
     }
-    send("loop.finished", loop, state, summary);
+    if (publish) send("loop.finished", loop, state, summary);
   };
 
   const sessionLoop = (sessionKey: string | undefined, sessionId: string | undefined): OpenLoop => ({
@@ -498,7 +498,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     if (typeof activity === "number" && Number.isFinite(activity) && activity >= 0) loop.lastActivityAt = activity;
   };
 
-  const onSessionSnapshot = guard("session_snapshot", (session: GatewaySession): void => {
+  const onSessionSnapshot = guard("session_snapshot", (session: GatewaySession, archiveAlreadyPublished = false): void => {
     const key = str(session?.key);
     if (!key || !isPrimarySessionKey(key) || session.spawnedBy) return;
     let loop = openLoopForKey(key);
@@ -518,7 +518,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     if (id) loop.sessionId = id;
     updateSessionMetadata(loop, session);
     if (session.archived === true) {
-      if (!ended.has(loop.loopId)) finish(loop, "archived", "session archived");
+      if (!ended.has(loop.loopId)) finish(loop, "archived", "session archived", !archiveAlreadyPublished);
     } else if (open.has(loop.loopId)) {
       send("loop.progress", loop, loop.blockedOnYou ? "blocked" : "running", loop.label);
     } else {

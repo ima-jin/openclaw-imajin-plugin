@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
-import { MAX_HISTORY_OUTPUT_BYTES, sessionHistoryOutputs } from "./session-history.js";
+import { MAX_HISTORY_OUTPUT_BYTES, sessionHistoryOutputs, sessionHistoryEntries } from "./session-history.js";
 
 describe("redacted typed session history", () => {
+  it("keeps native turn/block points stable as the bounded window slides, without collapsing identical distinct turns", () => {
+    const messages = Array.from({ length: 21 }, (_, index) => ({ id: `native-${index}`, role: "user", content: "same text" }));
+    const first = sessionHistoryEntries(messages.slice(0, 20));
+    const next = sessionHistoryEntries(messages);
+    expect(next.slice(0, 19)).toEqual(first.slice(1));
+    expect(next.at(-1)?.point).not.toBe(first.at(-1)?.point);
+    expect(new Set(next.map((entry) => entry.point)).size).toBe(20);
+    expect(sessionHistoryEntries([{ role: "user", content: "same" }, { role: "user", content: "same" }])[0].point)
+      .not.toBe(sessionHistoryEntries([{ role: "user", content: "same" }, { role: "user", content: "same" }])[1].point);
+  });
   it("exports only #2406 text/tool_call/tool_result shapes, with no raw transcript fields", () => {
     const output = sessionHistoryOutputs([
       { role: "system", content: "hidden system text" },

@@ -72,6 +72,7 @@ import {
 } from "./src/session-commands.js";
 import { createLoopbackSessionGateway, type LoopbackSessionGateway } from "./src/session-command-gateway.js";
 import { createSessionInventory, type SessionInventory } from "./src/session-inventory.js";
+import { sessionInventoryStatePath } from "./src/session-inventory-state.js";
 import { ApprovalExecutionRegistry } from "./src/approval-execution.js";
 import { createWakeReportTool } from "./src/wake-report-tool.js";
 import type { RegistrationLifecycle } from "./src/registration-lifecycle.js";
@@ -269,6 +270,10 @@ async function startPluginRuntime(
       tracker: loopLifecycle.tracker,
       sender: loopLifecycle.sender,
       warn: console.warn,
+      statePath: sessionInventoryStatePath(
+        config.wsNotifications?.stateDir, config.keypairPath,
+        JSON.stringify([config.nodeUrl, config.did, config.actAs ?? config.did]),
+      ),
     });
     const ownedGateway = sessionGateway;
     const ownedInventory = inventory;

@@ -1,7 +1,8 @@
 import type { SessionGateway, GatewaySession } from "./session-command-gateway.js";
 import { isPrimarySessionKey, type LoopTracker } from "./loop-tracker.js";
 import type { LoopSender } from "./loop-publisher.js";
-import { sessionHistoryOutputs } from "./session-history.js";
+import { sessionHistoryEntries } from "./session-history.js";
+import { SessionInventoryState } from "./session-inventory-state.js";
 
 export interface SessionInventory {
   refresh(): Promise<void>;
@@ -18,46 +19,63 @@ export function createSessionInventory(opts: {
   tracker: LoopTracker;
   sender: LoopSender;
   warn?: (message: string) => void;
+  statePath?: string;
 }): SessionInventory {
   let disposed = false;
   let pending: Promise<void> | undefined;
   let dirty = false;
-  const known = new Map<string, string>();
+  const identities = new Map<string, string>();
+  const state = new SessionInventoryState(opts.statePath);
   const scheduled = new Set<string>();
   let historyChain = Promise.resolve();
   const warn = () => opts.warn?.("[imajin-sessions] inventory/history unavailable");
-  const history = async (loopId: string): Promise<void> => {
+  const publishHistory = async (loopId: string): Promise<void> => {
     if (disposed) return;
+    await state.load();
     const target = opts.tracker.resolveLoop(loopId);
     if (!target) throw new Error("session loop is not active");
+    let identity = identities.get(target.sessionKey);
+    if (!identity) {
+      const row = (await opts.gateway.list()).find((s) => s.key === target.sessionKey);
+      identity = row?.sessionId ?? target.sessionKey;
+    }
     const messages = await opts.gateway.history(target.sessionKey);
-    await sessionHistoryOutputs(messages).reduce(async (previous, output) => {
+    const entries = sessionHistoryEntries(messages);
+    const point = state.get(identity).point;
+    const last = entries.findIndex((entry) => entry.point === point);
+    await entries.slice(last + 1).reduce(async (previous, entry) => {
       await previous;
       if (disposed || !opts.tracker.resolveLoop(loopId)) return;
-      opts.tracker.publishSessionOutput(loopId, output);
+      opts.tracker.publishSessionOutput(loopId, entry.output);
       await opts.sender.idle();
+      await state.set(identity, { point: entry.point });
     }, Promise.resolve());
+  };
+  const history = (loopId: string): Promise<void> => {
+    // Manual opens and automatic backfills share the same cursor/write order.
+    const work = historyChain.then(() => publishHistory(loopId));
+    historyChain = work.catch(() => undefined);
+    return work;
   };
   const observe = async (session: GatewaySession): Promise<(() => void) | undefined> => {
     if (!isPrimarySessionKey(session.key) || session.spawnedBy) return;
     const identity = session.sessionId ?? session.key;
-    const first = known.get(session.key) !== identity;
-    opts.tracker.onSessionSnapshot(session);
+    identities.set(session.key, identity);
+    const checkpoint = state.get(identity);
+    opts.tracker.onSessionSnapshot(session, checkpoint.archived === true);
     await opts.sender.idle();
     if (disposed) return;
-    if (session.archived) { known.delete(session.key); return; }
-    if (first) {
-      const target = opts.tracker.lookupSession(session.key);
-      if (!target || scheduled.has(target.loopId)) return;
-      return () => {
-        scheduled.add(target.loopId);
-        historyChain = historyChain.then(async () => {
-          if (disposed || !opts.tracker.resolveLoop(target.loopId)) return;
-          await history(target.loopId);
-          known.set(session.key, identity);
-        }).catch(warn).finally(() => { scheduled.delete(target.loopId); });
-      };
+    if (session.archived) {
+      if (!checkpoint.archived) await state.set(identity, { archived: true });
+      return;
     }
+    if (checkpoint.archived) await state.set(identity, { archived: false });
+    const target = opts.tracker.lookupSession(session.key);
+    if (!target || scheduled.has(target.loopId)) return;
+    return () => {
+      scheduled.add(target.loopId);
+      void history(target.loopId).catch(warn).finally(() => { scheduled.delete(target.loopId); });
+    };
   };
   const refresh = (): Promise<void> => {
     if (disposed) return Promise.resolve();
@@ -65,6 +83,7 @@ export function createSessionInventory(opts: {
     const reconcile = async (): Promise<void> => {
       if (!dirty || disposed) return;
       dirty = false;
+      await state.load();
       const sessions = await opts.gateway.list();
       const backfills: Array<() => void> = [];
       await sessions.reduce(async (previous, session) => {
@@ -91,6 +110,6 @@ export function createSessionInventory(opts: {
     onEvent(event) {
       if (event.event === "sessions.changed") void refresh().catch(warn);
     },
-    dispose() { disposed = true; known.clear(); scheduled.clear(); },
+    dispose() { disposed = true; identities.clear(); scheduled.clear(); },
   };
 }

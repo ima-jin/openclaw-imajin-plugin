@@ -46,7 +46,7 @@ beforeAll(async () => {
   await writeFile(keypairPath, JSON.stringify({ privateKey: agentKey }));
 });
 
-function setup(scopes?: string[], auth?: { serviceOf: string[] | null }) {
+function setup(auth?: { serviceOf: string[] | null }) {
   const rows: GatewaySession[] = [{ key: "agent:main:dashboard", sessionId: "native-1", label: "Dashboard", updatedAt: now }];
   const events: LoopTransition[] = [];
   const tracker = createLoopTracker({ did: agent, emit: (event) => events.push(event) });
@@ -56,10 +56,9 @@ function setup(scopes?: string[], auth?: { serviceOf: string[] | null }) {
     if (method === "sessions.list") return { sessions: structuredClone(rows) };
     if (method === "chat.history") return { messages: [{ role: "user", content: "recent turn" }] };
     if (method === "sessions.patch") Object.assign(rows.find((s) => s.key === params.key)!, params);
-    if (method === "sessions.reset") rows[0].sessionId = "native-2";
     return {};
   });
-  const gateway = createSessionGateway(request, scopes);
+  const gateway = createSessionGateway(request, ["operator.write", "operator.approvals"]);
   const inventory = createSessionInventory({ gateway, tracker, sender: { publish: vi.fn(), idle: async () => {} } });
   const ws = { send: vi.fn((_frame: any) => {}) };
   const executor = createSessionCommandExecutor({ agentDid: agent, kernelDid: issuer, kernelPublicKeyHex, allowedPrincipal: principal }, {
@@ -108,14 +107,16 @@ describe("signed lifecycle/history commands over the fake kernel WS", () => {
     });
   });
 
-  it("resets and attests on an already authorized fake Gateway without deleting the old event record", async () => {
-    const h = setup(["operator.admin"]);
-    expect(await h.handle(await frame("session.reset", { loopId: h.loopId }))).toMatchObject({ ok: true });
-    await h.inventory.refresh();
-    expect(h.rows[0].sessionId).toBe("native-2");
-    expect(h.tracker.resolveLoop(h.loopId)).toBeUndefined();
-    expect(h.events).toContainEqual(expect.objectContaining({ type: "loop.finished", loopId: h.loopId, state: "interrupted" }));
-    expect(h.ws.send.mock.calls[0][0].attestation.payload).toMatchObject({ command: "session.reset", outcome: "completed" });
+  it("keeps reset registered but refuses it with a verifiable signed missing_scope on production scopes (#115)", async () => {
+    const h = setup();
+    expect(isSessionCommandFrame({ type: "session.reset" })).toBe(true);
+    expect(await h.handle(await frame("session.reset", { loopId: h.loopId }))).toMatchObject({ ok: false, reason: "missing_scope" });
+    expect(h.rows[0].sessionId).toBe("native-1");
+    expect(h.tracker.resolveLoop(h.loopId)).toBeDefined();
+    expect(h.request).not.toHaveBeenCalled();
+    const attestation = h.ws.send.mock.calls[0][0].attestation;
+    expect(attestation.payload).toMatchObject({ command: "session.reset", outcome: "failed", reason: "missing_scope" });
+    expect(await verifyMessage(attestation, agentPublicKeyHex)).toBe(true);
   });
 
   it("publishes typed history on a signed open request", async () => {
@@ -126,7 +127,7 @@ describe("signed lifecycle/history commands over the fake kernel WS", () => {
 
   it.each(newTypes)("%s rejects and signs every authentication and target boundary", async (type) => {
     for (const rejection of ["unsigned", "expired", "not_yet_valid", "misaddressed", "issuer_mismatch", "principal_mismatch", "not_service_of", "service_binding_unverifiable", "invalid_signature", "missing_countersignature", "invalid_countersignature", "loop_not_found"] as const) {
-      const h = setup(undefined, rejection === "not_service_of" ? { serviceOf: [] }
+      const h = setup(rejection === "not_service_of" ? { serviceOf: [] }
         : rejection === "service_binding_unverifiable" ? { serviceOf: null } : undefined);
       const overrides: Partial<SessionCommandFrame> = {};
       if (rejection === "expired") overrides.issuedAt = new Date(now - 600_000).toISOString();

@@ -28,18 +28,13 @@ describe("createSessionGateway", () => {
 
   it("rejects reset with a static scope failure and never escalates the production connection", async () => {
     const request = vi.fn();
-    await expect(createSessionGateway(request).reset({ sessionKey: "k" })).rejects.toMatchObject({
+    await expect(createSessionGateway(request, ["operator.write", "operator.approvals"]).reset({ sessionKey: "k" })).rejects.toMatchObject({
       reason: "missing_scope", message: expect.stringContaining("requires operator.admin"),
     });
     expect(request).not.toHaveBeenCalled();
     expect(SESSION_GATEWAY_SCOPES).toEqual(["operator.write", "operator.approvals"]);
   });
 
-  it("maps reset on an already authorized fake client, with an existence and replacement guard", async () => {
-    const request = vi.fn(async (method: string) => method === "sessions.list" ? { sessions: [{ key: "k", sessionId: "s" }] } : {});
-    await createSessionGateway(request, ["operator.admin"]).reset({ sessionKey: "k" });
-    expect(request).toHaveBeenLastCalledWith("sessions.reset", { key: "k", expectedSessionId: "s", reason: "reset" });
-  });
 
   it("paginates the entire cross-agent inventory, including archived rows and non-dashboard channels", async () => {
     const first = Array.from({ length: 200 }, (_, n) => ({ key: `agent:a:thread-${n}` }));

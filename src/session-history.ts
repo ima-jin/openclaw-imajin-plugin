@@ -1,5 +1,7 @@
 import { redactLoopText, type SessionLoopOutput } from "./loop-publisher.js";
 import { redactWakeText, SECRET_KEY } from "./wake-redaction.js";
+import { createHash } from "node:crypto";
+import { canonicalize } from "./approval-bridge.js";
 
 export const MAX_HISTORY_TURNS = 20;
 export const MAX_HISTORY_OUTPUTS = 80;
@@ -9,6 +11,23 @@ const MAX_TEXT_CHARS = 2048;
 function text(value: unknown): string {
   return typeof value === "string"
     ? redactLoopText(redactWakeText(value)).slice(0, MAX_TEXT_CHARS) : "";
+}
+
+/** Cursor hashes cover native message identity and redacted output, never raw text. */
+export function sessionHistoryEntries(messages: readonly unknown[]): Array<{ point: string; output: SessionLoopOutput }> {
+  const occurrences = new Map<string, number>();
+  return messages.slice(-MAX_HISTORY_TURNS).flatMap((raw) => {
+    const message = record(raw);
+    return turnOutputs(raw).map((item, block) => {
+      const output = bounded(item);
+      const identity = canonicalize([message.id ?? null, message.timestamp ?? null, block, output]);
+      // ID-less Gateway rows fall back to a content hash plus occurrence ordinal.
+      const occurrence = occurrences.get(identity) ?? 0;
+      occurrences.set(identity, occurrence + 1);
+      const point = createHash("sha256").update(identity).update(String(occurrence)).digest("hex");
+      return { point, output };
+    });
+  }).slice(-MAX_HISTORY_OUTPUTS);
 }
 function identifier(value: unknown): string {
   return text(value).slice(0, 128);
@@ -64,5 +83,5 @@ function turnOutputs(raw: unknown): SessionLoopOutput[] {
 
 /** Last 20 Gateway message entries, at most 80 output blocks, 12 KiB each. */
 export function sessionHistoryOutputs(messages: readonly unknown[]): SessionLoopOutput[] {
-  return messages.slice(-MAX_HISTORY_TURNS).flatMap(turnOutputs).slice(-MAX_HISTORY_OUTPUTS).map(bounded);
+  return sessionHistoryEntries(messages).map((entry) => entry.output);
 }
