@@ -188,6 +188,7 @@ export const DEFAULT_WAKE_SETTLE_MS = 10_000;
 // single completion waited the entire window; leading-edge + trailing now
 // surfaces a single completion in ~DEFAULT_WAKE_SETTLE_MS instead.
 export const DEFAULT_WAKE_COALESCE_MS = 30_000;
+// Owed-marker lifetime is bounded in both fresh-session and fixed-session modes.
 // Age bound for a persisted owed-wake marker replayed at startup (#30):
 // beyond this, the marker's frames are treated as inject-only (they already
 // reached the agent's context via `enqueueSystemEvent`) rather than worth a
