@@ -20,14 +20,21 @@ export interface ImajinClientConfig {
   keypairPath?: string;
   actAs?: string;
 }
-export type CloudflareResource = "dns" | "settings" | "ssl" | "cache-rules" | "custom-hostnames" | "bulk" | "history";
+export type CloudflareResource = "dns" | "settings" | "ssl" | "cache-rules" | "custom-hostnames" | "bulk" | "history" | "classification";
+
+const CLOUDFLARE_CONFLICT_MESSAGES: Record<string, string> = {
+  credential_unavailable: "token not sealed for this zone — seal it on /jin",
+  proxy_approval_required: "Proxy changes require classification and a human countersignature on /jin. Use proxy_set or bulk_proxy to preview, then dryRun:false to request approval. DNS creation is DNS-only; omit proxied from dns_create/dns_update.",
+  disable_proxy_before_edit: "Before changing the name, type or target of a proxied record, disable its proxy through proxy_set or bulk_proxy and wait for a human countersignature on /jin. Then retry the DNS edit.",
+  proxy_classification_blocks: "The current classification blocks this proxy-on change. Read classification for blocking routes and remedies; do not retry unchanged or bypass classification. Proxy-off remediation remains available through the approval rail.",
+};
 
 export class CloudflareRequestError extends Error {
   constructor(public readonly status: number, public readonly code: string) {
     let message = `Cloudflare request failed (${status}): ${code}`;
     if (status === 403) message = "no Cloudflare authority for this zone — grant it on /jin";
-    if (status === 409 && code === "credential_unavailable") {
-      message = "token not sealed for this zone — seal it on /jin";
+    if (status === 409 && Object.hasOwn(CLOUDFLARE_CONFLICT_MESSAGES, code)) {
+      message = `${code}: ${CLOUDFLARE_CONFLICT_MESSAGES[code]}`;
     }
     super(message);
   }

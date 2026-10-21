@@ -59,7 +59,7 @@ describe("imajin_cloudflare runtime safeguards", () => {
     { action: "hostname_create", hostname: "customer.example.net", ssl: { type: "dv" } },
     { action: "dns_create", record: { type: "A", name: "www.example.com", content: "192.0.2.1", ttl: 1 }, dryRun: true },
     { action: "dns_delete", recordId: RECORD_ID, dryRun: true },
-    { action: "proxy_set", recordId: RECORD_ID, proxied: true, dryRun: false },
+    { action: "classification", dryRun: true },
     { action: "hostname_delete", hostnameId: HOSTNAME_ID, dryRun: true },
   ];
 
@@ -78,6 +78,45 @@ describe("imajin_cloudflare runtime safeguards", () => {
       expect(fetchMock).toHaveBeenCalledTimes(1);
     },
   );
+
+  it.each(["dns_create", "dns_update"].flatMap(action => [true, false].map(proxied => ({ action, proxied }))))(
+    "rejects $action record.proxied=$proxied without sending it", async ({ action, proxied }) => {
+      const result = await createCloudflareTool(client).execute("proxy-field", {
+        ...BASE, action, recordId: RECORD_ID,
+        record: { type: "A", name: "www.example.com", content: "192.0.2.1", ttl: 1, proxied },
+      } as never);
+      expect(result.details).toMatchObject({ error: true, status: 409, code: "proxy_approval_required" });
+      expect(result.content[0].text).toContain("proxy_approval_required");
+      expect(result.content[0].text).toContain("Use proxy_set or bulk_proxy");
+      expect(result.content[0].text).toContain("DNS creation is DNS-only");
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    { code: "proxy_approval_required", guidance: "Use proxy_set or bulk_proxy" },
+    { code: "disable_proxy_before_edit", guidance: "disable its proxy" },
+    { code: "proxy_classification_blocks", guidance: "Read classification for blocking routes and remedies" },
+    { code: "credential_unavailable", guidance: "token not sealed for this zone — seal it on /jin" },
+  ])("explains 409 $code with its code in text and no retries", async ({ code, guidance }) => {
+    fetchMock.mockResolvedValueOnce(json({ error: code, message: "private upstream detail" }, 409));
+    const result = await createCloudflareTool(client).execute("conflict", {
+      ...BASE, action: "proxy_set", recordId: RECORD_ID, proxied: true, dryRun: false,
+    });
+    expect(result.details).toMatchObject({ error: true, status: 409, code });
+    expect(result.content[0].text).toContain(code);
+    expect(result.content[0].text).toContain(guidance);
+    expect(JSON.stringify(result)).not.toContain("private upstream detail");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(String(fetchMock.mock.calls[0][0])).toContain("/bulk?domain=example.com");
+  });
+
+  it("keeps proxy flags out of the DNS write schema and documents the approval rail", () => {
+    const tool = createCloudflareTool(client);
+    expect(tool.parameters.properties?.record.properties).not.toHaveProperty("proxied");
+    expect(tool.description).toContain("creation is DNS-only");
+    expect(tool.description).toContain("Proxy changes require kernel classification and a human countersignature on /jin");
+  });
 
   it.each(["not-json", "null", "[]", "42"])("rejects malformed envelopes without echoing %s", async (body) => {
     fetchMock.mockResolvedValueOnce(new Response(body));

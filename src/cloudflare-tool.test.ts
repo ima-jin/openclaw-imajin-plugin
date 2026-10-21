@@ -13,13 +13,13 @@ const OWNER = "did:imajin:zone-owner";
 const BASE = { zoneId: ZONE_ID, domain: DOMAIN };
 const NEXT = "A human must countersign on /jin (Operator approvals). Nothing has changed.";
 const RAW_MARKER = "PRIVATE_PROVIDER_ERROR_FIXTURE_DO_NOT_DISCLOSE";
-const RECORD = {
+const DNS_INPUT = {
   type: "A",
   name: "www.example.com",
   content: "192.0.2.1",
   ttl: 1,
-  proxied: false,
 };
+const RECORD = { ...DNS_INPUT, proxied: false };
 const CHANGES = [{ recordId: RECORD_ID, proxied: true }];
 const RULES = [{
   ref: "static-assets",
@@ -33,7 +33,7 @@ const SSL = { method: "txt", type: "dv" };
 const ACTIONS = [
   "dns_list", "dns_create", "dns_update", "dns_delete", "proxy_set", "bulk_proxy",
   "settings", "ssl", "cache_rules_list", "cache_rules_replace", "hostnames_list",
-  "hostname_create", "hostname_status", "hostname_delete", "history",
+  "hostname_create", "hostname_status", "hostname_delete", "history", "classification",
 ];
 
 type Params = Record<string, unknown> & { action: string };
@@ -50,13 +50,13 @@ type RouteCase = {
 const ROUTES: RouteCase[] = [
   { action: "dns_list", method: "GET", path: "/dns", response: { records: [{ id: RECORD_ID, ...RECORD }] } },
   {
-    action: "dns_create", method: "POST", path: "/dns", params: { record: RECORD },
-    body: RECORD, response: { record: { id: RECORD_ID, ...RECORD } }, status: 201,
+    action: "dns_create", method: "POST", path: "/dns", params: { record: DNS_INPUT },
+    body: DNS_INPUT, response: { record: { id: RECORD_ID, ...RECORD } }, status: 201,
   },
   {
     action: "dns_update", method: "PATCH", path: `/dns/${RECORD_ID}`,
-    params: { recordId: RECORD_ID, record: { content: "192.0.2.2", ttl: 300, proxied: false } },
-    body: { content: "192.0.2.2", ttl: 300, proxied: false },
+    params: { recordId: RECORD_ID, record: { content: "192.0.2.2", ttl: 300 } },
+    body: { content: "192.0.2.2", ttl: 300 },
     response: { before: { id: RECORD_ID, ...RECORD }, after: { id: RECORD_ID, ...RECORD, content: "192.0.2.2" } },
   },
   {
@@ -64,9 +64,10 @@ const ROUTES: RouteCase[] = [
     params: { recordId: RECORD_ID }, response: { deleted: true, recordId: RECORD_ID },
   },
   {
-    action: "proxy_set", method: "PATCH", path: `/dns/${RECORD_ID}`,
-    params: { recordId: RECORD_ID, proxied: false }, body: { proxied: false },
-    response: { before: { id: RECORD_ID, ...RECORD, proxied: true }, after: { id: RECORD_ID, ...RECORD } },
+    action: "proxy_set", method: "POST", path: "/bulk",
+    params: { recordId: RECORD_ID, proxied: false },
+    body: { domain: DOMAIN, changes: [{ recordId: RECORD_ID, proxied: false }], dryRun: true },
+    response: { dryRun: true, before: [{ id: RECORD_ID, ...RECORD, proxied: true }], after: [{ id: RECORD_ID, ...RECORD }] },
   },
   {
     action: "bulk_proxy", method: "POST", path: "/bulk", params: { changes: CHANGES },
@@ -98,6 +99,19 @@ const ROUTES: RouteCase[] = [
     params: { hostnameId: HOSTNAME_ID }, response: { deleted: true, hostnameId: HOSTNAME_ID },
   },
   { action: "history", method: "GET", path: "/history", response: { history: [] } },
+  {
+    action: "classification", method: "GET", path: "/classification",
+    response: { classification: {
+      domain: DOMAIN,
+      hosts: [{
+        hostname: "www.example.com", proxied: false, reason: "Unclassified route",
+        blockingRoutes: ["/unknown"], remedy: "Keep DNS-only until compatibility is proven",
+        routes: [{ path: "/unknown", method: "GET", class: "unclassified", reason: "Unknown", source: "fixture" }],
+        records: [{ before: { id: RECORD_ID, proxied: false }, after: { id: RECORD_ID, proxied: false } }],
+      }],
+      proxyBatches: [], cacheRules: [], warnings: ["Fixture warning"],
+    } },
+  },
 ];
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -192,21 +206,23 @@ describe("imajin_cloudflare — kernel-only contract", () => {
     assertKernelOnly();
   });
 
-  it.each(["bulk_proxy", "cache_rules_replace"])("%s honors an explicit dryRun=true without staging", async (action) => {
-    const fields = action === "bulk_proxy" ? { changes: CHANGES } : { rules: RULES };
+  it.each(["proxy_set", "bulk_proxy", "cache_rules_replace"])("%s honors an explicit dryRun=true without staging", async (action) => {
+    const fields = action === "cache_rules_replace" ? { rules: RULES } : { changes: CHANGES };
+    const input = action === "proxy_set" ? { recordId: RECORD_ID, proxied: true } : fields;
     const preview = { dryRun: true, before: [], after: [], applied: false };
     fetchMock.mockResolvedValueOnce(jsonResponse(preview));
-    expect(JSON.parse((await execute({ ...BASE, action, ...fields, dryRun: true })).content[0].text)).toEqual(preview);
+    expect(JSON.parse((await execute({ ...BASE, action, ...input, dryRun: true })).content[0].text)).toEqual(preview);
     expect(JSON.parse(String(request().init.body))).toEqual({ domain: DOMAIN, ...fields, dryRun: true });
     assertKernelOnly();
   });
 
-  it.each(["bulk_proxy", "cache_rules_replace"])("%s stages once and never follows a proposal or approval-decision route", async (action) => {
-    const fields = action === "bulk_proxy" ? { changes: CHANGES } : { rules: RULES };
+  it.each(["proxy_set", "bulk_proxy", "cache_rules_replace"])("%s stages once and never follows a proposal or approval-decision route", async (action) => {
+    const fields = action === "cache_rules_replace" ? { rules: RULES } : { changes: CHANGES };
+    const input = action === "proxy_set" ? { recordId: RECORD_ID, proxied: true } : fields;
     fetchMock.mockResolvedValueOnce(jsonResponse({
       approval: { proposalId: "proposal_cloudflare_98" },
     }, 202));
-    const result = await execute({ ...BASE, action, ...fields, dryRun: false });
+    const result = await execute({ ...BASE, action, ...input, dryRun: false });
     expect(JSON.parse(result.content[0].text)).toEqual({
       status: "pending_approval", proposalId: "proposal_cloudflare_98", next: NEXT,
     });
@@ -278,7 +294,7 @@ describe("imajin_cloudflare — kernel-only contract", () => {
       provider: { errors: [{ message: RAW_MARKER }] },
       token: RAW_MARKER,
     }, status));
-    const result = await execute({ ...BASE, action: "dns_create", record: RECORD });
+    const result = await execute({ ...BASE, action: "dns_create", record: DNS_INPUT });
     expect(result.details).toMatchObject({ error: true, status, code });
     if (text) expect(result.content[0].text).toContain(text);
     if (status === 409 && code !== "credential_unavailable") {
@@ -294,7 +310,7 @@ describe("imajin_cloudflare — kernel-only contract", () => {
     fetchMock.mockResolvedValueOnce(new Response(`<html>${RAW_MARKER}</html>`, {
       status: 503, headers: { "Content-Type": "text/html" },
     }));
-    const result = await execute({ ...BASE, action: "dns_update", recordId: RECORD_ID, record: { proxied: true } });
+    const result = await execute({ ...BASE, action: "dns_update", recordId: RECORD_ID, record: { ttl: 300 } });
     expect(result.details).toMatchObject({ error: true, status: 503 });
     expect(JSON.stringify(result)).not.toContain(RAW_MARKER);
     expect(result.content[0].text).not.toMatch(/nothing (has )?changed|not applied/i);
@@ -324,7 +340,7 @@ describe("imajin_cloudflare — kernel-only contract", () => {
     { name: "missing update record", params: { ...BASE, action: "dns_update", recordId: RECORD_ID } },
     { name: "empty update record", params: { ...BASE, action: "dns_update", recordId: RECORD_ID, record: {} } },
     ...["dns_update", "dns_delete", "proxy_set"].map((action) => ({
-      name: `${action} missing recordId`, params: { ...BASE, action, record: { proxied: true }, proxied: true },
+      name: `${action} missing recordId`, params: { ...BASE, action, record: { ttl: 300 }, proxied: true },
     })),
     ...["A".repeat(32), HOSTNAME_ID, "../dns"].map((recordId) => ({
       name: `invalid recordId ${recordId}`, params: { ...BASE, action: "dns_delete", recordId },
@@ -373,7 +389,7 @@ describe("imajin_cloudflare — kernel-only contract", () => {
     const cases = [
       { action: "cache_rules_replace", rules: [] },
       { action: "hostname_create", hostname: "customer.example.net", ssl: { method: "http", type: "dv" } },
-      { action: "dns_update", recordId: RECORD_ID, record: { proxied: false } },
+      { action: "dns_update", recordId: RECORD_ID, record: { ttl: 300 } },
     ];
     for (const params of cases) {
       fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
