@@ -1564,8 +1564,9 @@ The plugin publishes signed `loop.started | loop.progress | loop.blocked |
 loop.finished` events to the kernel's loops rail (`POST /api/loops`,
 `ima-jin/imajin-ai#2295`), so the operator console's Runs lane can answer "what is
 running" without the kernel ever calling into the Gateway. The kernel's knowledge
-of a loop is these events only: ids, kind, state and a short redacted summary.
-**No transcript content is published** (assistant text, tool args/results).
+of a loop is these signed events only. Top-level inventory (#109) adds label,
+agent ID, last activity and blocked-on-you, plus bounded, redacted typed history
+(`text` / `tool_call` / `tool_result`) through the #2406 output contract.
 
 On by default once `nodeUrl`, `did` and `keypairPath` are configured; opt out
 with `loops.enabled: false`. Observe hooks only: a failed publish is logged
@@ -1624,9 +1625,17 @@ it (`imajin-ai#2358`): when `actAs` is set, grant the agent DID `loops:publish`
 from that principal, otherwise every publish is rejected with 403 (logged once a
 minute as `publish dropped ... HTTP 403`).
 
-**Not published (kernel gap).** Typed in-session events (assistant text,
-tool calls with args/results, approvals, model changes) and `refs.sessionId` have
-no place on the current rail contract; tracked in `ima-jin/imajin-ai#2552`.
+**Top-level inventory (#109).** Boot/reconnect `sessions.list` (all pages) and
+`sessions.changed` keep dashboard/Telegram/warp-events threads on the rail,
+without polling or a kernel Gateway client. Archive finishes the loop but keeps
+the record. History backfills the last 20 message entries, at most 80 redacted
+blocks of 12 KiB each. See [wire contract and bounds](docs/session-commands.md).
+Backfill and archived-state watermarks persist per native session ID in
+`<stateDir>/session-inventory-<publisher-hash>.json` (the existing
+`wsNotifications.stateDir`, or `imajin-ws-state` next to the keypair). Reboots and
+reconnects publish only history past the saved point; unchanged archived rows
+do not re-emit `loop.finished`. New turns remain event-driven. The private
+atomic checkpoint stores hashes/flags, not transcript text or harness keys.
 
 #### Blocked on an operator approval (#64)
 
@@ -1699,7 +1708,8 @@ wake outcome inference are not part of this one-way publisher.
 ### Session commands (#51)
 
 Signed, DID-addressed `session.send` / `session.approve` / `session.deny` /
-`session.abort` / `session.spawn` commands arrive over the existing outbound
+`session.abort` / `session.spawn` / `session.archive` / `session.reset` /
+`session.label` / `session.history` commands arrive over the existing outbound
 kernel WS, are verified, executed against the local gateway (`chat.send`,
 `exec`/`plugin.approval.resolve`, `chat.abort`, `sessions.create`), and attested
 back as signed `loop.session.<verb>.completed|failed` frames. Rejection (unsigned,
@@ -1710,6 +1720,16 @@ Off by default; enable with `sessionCommands.enabled: true` and pin the kernel's
 command-signing key in `sessionCommands.kernelPublicKeyHex`. Wire contract,
 verification order, attestation shape and the kernel-side assumptions are in
 [`docs/session-commands.md`](docs/session-commands.md).
+Archive/label use `sessions.patch` with an existing-session guard; archive is
+never hard delete. Reset requires `operator.admin` in the verified published
+Gateway versions and is explicitly rejected/attested as `missing_scope` on the
+plugin's unchanged write+approvals connection. The command stays registered,
+but successful reset waits on operator-approved authority in
+[plugin#115](https://github.com/ima-jin/openclaw-imajin-plugin/issues/115)
+(native child of #109); no standing admin scope is added here.
+Kernel controls/enum and signed
+history-on-open dispatch are tracked in
+[imajin-ai#3036](https://github.com/ima-jin/imajin-ai/issues/3036).
 
 ## Development
 Run `npm run typecheck` (`tsc --noEmit -p .`) and `npm test` (vitest) before sending a PR. `openclaw` is declared as an optional `peerDependency` (the gateway supplies it at runtime); the `openclaw/plugin-sdk/*` imports in `index.ts` (static) and `src/notification-injector.ts` / `src/gateway-approvals-bridge.ts` (dynamic — only on the SecretRef paths, #20, and the live Gateway/kernel wiring in `gateway-approvals-bridge.ts`'s `createLiveGatewayApprovalsClient`, #24) are typed via a minimal hand-written ambient declaration (`src/types/openclaw-plugin-sdk.d.ts`) instead of installing the full `openclaw` package locally, since it's very large and recent releases gate `npm install` behind a strict Node engine check.

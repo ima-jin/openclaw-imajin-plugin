@@ -13,6 +13,7 @@ import {
   type SessionCommandType,
 } from "./session-commands.js";
 import type { SessionGateway } from "./session-command-gateway.js";
+import { randomBytes } from "node:crypto";
 import { createLoopTracker, type LoopTracker } from "./loop-tracker.js";
 import { deriveLoopId } from "./loop-publisher.js";
 import { ApprovalExecutionRegistry } from "./approval-execution.js";
@@ -28,10 +29,10 @@ const PRINCIPAL = "did:imajin:principal";
 const KERNEL = "did:imajin:kernel";
 const NOW = Date.parse("2026-10-06T16:00:00.000Z");
 
-const KERNEL_PRIV = "11".repeat(32);
-const PRINCIPAL_PRIV = "22".repeat(32);
+const KERNEL_PRIV = randomBytes(32).toString("hex");
+const PRINCIPAL_PRIV = randomBytes(32).toString("hex");
 const AGENT_PRIV = "33".repeat(32);
-const ROGUE_PRIV = "44".repeat(32);
+const ROGUE_PRIV = randomBytes(32).toString("hex");
 
 let kernelPub = "";
 let principalPub = "";
@@ -57,6 +58,12 @@ function fakeGateway(): SessionGateway & {
   spawn: ReturnType<typeof vi.fn>;
 } {
   return {
+    list: vi.fn(async () => []),
+    subscribe: vi.fn(async () => {}),
+    history: vi.fn(async () => []),
+    archive: vi.fn(async () => {}),
+    reset: vi.fn(async () => {}),
+    label: vi.fn(async () => {}),
     send: vi.fn(async () => ({ runId: "run-1" })),
     abort: vi.fn(async () => ({ aborted: true })),
     resolveApproval: vi.fn(async ({ kind }: { kind?: "exec" | "plugin" }) => ({
