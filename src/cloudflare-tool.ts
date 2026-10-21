@@ -220,11 +220,11 @@ export function createCloudflareTool(client: ImajinClient) {
         for (const field of operation.required ?? []) {
           if (params[field] === undefined) invalid(field);
         }
-        const idField = operation.required?.find(field =>
+        const idField = operation.required?.find((field): field is "recordId" | "hostnameId" =>
           field === "hostnameId" || (field === "recordId" && operation.resource === "dns"));
         const result = await client.cloudflareRequest(params.zoneId, params.domain, operation.resource, {
           method: operation.method,
-          id: idField ? String(params[idField]) : undefined,
+          id: idField ? params[idField] : undefined,
           body: operationBody(params),
           onBehalfOf: params.onBehalfOf,
         });
