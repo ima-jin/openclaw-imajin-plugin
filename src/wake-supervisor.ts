@@ -55,6 +55,7 @@ export interface SupervisedWake extends WakeBatch {
 interface PendingWake extends SupervisedWake {
   timer: ReturnType<typeof setTimeout>;
   alerted: boolean;
+  expired?: boolean;
 }
 
 export interface WakeSupervisorOptions {
@@ -63,6 +64,7 @@ export interface WakeSupervisorOptions {
   /** No configured disclosure route means silence cannot be monitored. Other failures still alert. */
   checkEmptyReply?: boolean;
   alert: (batch: SupervisedWake, reason: string) => Promise<void>;
+  abort: (batch: SupervisedWake, reason: string) => Promise<void>;
   complete: (batch: SupervisedWake, event: AgentEndEvent, tokens?: number) => Promise<void>;
   sessionTokens: (sessionKey: string) => Promise<number | undefined>;
 }
@@ -172,14 +174,31 @@ export class WakeSupervisor {
   }
 
   private expire(batch: PendingWake, reason: string): void {
+    if (batch.expired) return;
+    batch.expired = true;
     // Watchdog expiry must stop the turn as well as disclose its outcome.
-    console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=unavailable reason=timeout`);
+    // Claim the shared alert latch before stop's guard alert can race it.
     void this.alert(batch.batchId, reason).catch(() => {
       console.error("[imajin-ws] wake timeout alert delivery failed");
     });
+    void this.options.abort(batch, reason).catch(() => {
+      console.error("[imajin-ws] wake timeout abort failed");
+    });
+    // Metadata I/O must not hold up the abort or outcome writeback.
+    void this.logTimeout(batch);
     // Keep bounded correlation after timeout: a late successful turn still updates continuity.
     void this.options.complete(batch, { success: false, error: reason, messages: [], wakeWatchdog: true }).catch(() => {
       console.error("[imajin-ws] wake timeout bridge writeback failed");
     });
+  }
+
+  private async logTimeout(batch: PendingWake): Promise<void> {
+    let tokens: number | undefined;
+    try {
+      tokens = await this.options.sessionTokens(batch.sessionKey);
+    } catch {
+      // Missing or unreadable metadata is the only unavailable-token fallback.
+    }
+    console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=${tokens ?? "unavailable"} reason=timeout`);
   }
 }
