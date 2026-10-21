@@ -88,7 +88,7 @@ vi.mock("./reach-events.js", () => ({
 }));
 vi.mock("./session-command-gateway.js", () => ({
   createLoopbackSessionGateway: () => {
-    const handle = { gateway: {}, dispose: vi.fn() };
+    const handle = { gateway: { list: vi.fn(async () => []) }, start: vi.fn(async () => {}), dispose: vi.fn() };
     mocks.sessionGateways.push(handle);
     return handle;
   },

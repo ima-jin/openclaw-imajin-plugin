@@ -5,22 +5,22 @@
  * envelopes to the kernel's `POST /api/loops` ingest. The kernel never calls
  * into the gateway: this plugin is the translator, and the kernel's knowledge
  * of a loop is exactly the events published here — lifecycle metadata only
- * (ids, kind, state, a short redacted summary). No transcript content.
+ * (ids, kind, state, a short redacted summary), plus bounded redacted #2406
+ * output and session inventory metadata.
  *
- * ## Wire contract (copied exactly from the kernel, do not extend)
+ * ## Wire contract (#2295 lifecycle, #2406 typed output)
  *
  *   POST {nodeUrl}/api/loops
  *   { type, payload, publisherDid, signature: { keyId, alg: "ed25519", sig } }
  *
- *   payload = { loopId, kind, principal, parentLoopId, refs, state, summary, at }
+ *   payload = { loopId, kind, principal, parentLoopId, refs, state, summary, at, output?, ...metadata }
  *   refs    = { issue?, pr?, runId?, sessionKey? }   (any other key => 400)
  *   sig     = Ed25519 over canonicalize({ type, payload })  (hex)
  *   keyId   = hex Ed25519 public key currently registered for publisherDid
  *
- * The kernel verifies the signature over the payload it *parsed*, which always
- * carries `parentLoopId` (null when absent) and `refs`. We therefore always
- * send both explicitly (`parentLoopId: null`, `refs: {}`) so the bytes we sign
- * are the bytes the kernel reconstructs. `canonicalize` renders a missing key
+ * The kernel verifies the exact payload, preserving signed extensions (#2406).
+ * We continue sending `parentLoopId: null` and `refs: {}` explicitly for older
+ * lifecycle consumers. `canonicalize` renders a missing key
  * as nothing but an `undefined` value as the string `undefined`, so omitting
  * `refs` would make every refs-less event fail verification.
  *
@@ -65,7 +65,21 @@ export interface LoopRefs {
 }
 
 /** A transition before the sender stamps principal + timestamp onto it. */
-export interface LoopTransition {
+export interface SessionLoopMetadata {
+  label?: string;
+  agentId?: string;
+  lastActivityAt?: number;
+  blockedOnYou?: boolean;
+  output?: SessionLoopOutput;
+}
+
+/** #2406 publisher shapes, bounded below the kernel's 16 KiB inline cap. */
+export type SessionLoopOutput =
+  | { kind: "text"; text: string; role?: string }
+  | { kind: "tool_call"; callId: string; name: string; args: unknown }
+  | { kind: "tool_result"; callId: string; result: unknown; isError?: boolean };
+
+export interface LoopTransition extends SessionLoopMetadata {
   type: LoopLifecycleType;
   loopId: string;
   kind: LoopKind;
@@ -75,7 +89,7 @@ export interface LoopTransition {
   summary: string;
 }
 
-export interface LoopEnvelope {
+export interface LoopEnvelope extends SessionLoopMetadata {
   loopId: string;
   kind: string;
   principal: string;
@@ -134,12 +148,16 @@ const REDACTIONS: ReadonlyArray<readonly [RegExp, string]> = [
  * Redacts secret-shaped substrings, collapses whitespace, and caps length.
  * Always returns a non-empty string (the kernel rejects an empty summary).
  */
-export function sanitizeSummary(text: string, fallback = "loop transition"): string {
+export function redactLoopText(text: string): string {
   let out = text;
   for (const [pattern, replacement] of REDACTIONS) {
     out = out.replace(pattern, replacement);
   }
-  out = out.replaceAll(/\s+/g, " ").trim();
+  return out;
+}
+
+export function sanitizeSummary(text: string, fallback = "loop transition"): string {
+  let out = redactLoopText(text).replaceAll(/\s+/g, " ").trim();
   if (out.length > MAX_SUMMARY_LENGTH) {
     out = `${out.slice(0, MAX_SUMMARY_LENGTH - 1)}…`;
   }
@@ -315,6 +333,11 @@ export function createLoopSender(options: LoopSenderOptions): LoopSender {
         state: transition.state,
         summary: sanitizeSummary(transition.summary),
         at,
+        ...(transition.label !== undefined ? { label: sanitizeSummary(transition.label) } : {}),
+        ...(transition.agentId !== undefined ? { agentId: sanitizeSummary(transition.agentId) } : {}),
+        ...(transition.lastActivityAt !== undefined ? { lastActivityAt: transition.lastActivityAt } : {}),
+        ...(transition.blockedOnYou !== undefined ? { blockedOnYou: transition.blockedOnYou } : {}),
+        ...(transition.output !== undefined ? { output: transition.output } : {}),
       };
       const request = await transport.sign(transition.type, payload);
       const res = await transport.post(request);

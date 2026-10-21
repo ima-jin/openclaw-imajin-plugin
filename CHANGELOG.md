@@ -3,12 +3,27 @@
 ## Unreleased
 
 ### Fixed
+- **Session inventory replay after restart (#109 / PR #110 send-back).**
+  Persist per-native-session history points and archive flags in the existing
+  private plugin state directory; resume after the saved output block, and
+  silently restore already-published archived rows. Unchanged sessions no
+  longer replay backfill at each boot. Reset stays registered with a signed
+  `missing_scope` refusal on production scopes; its approved-authority path
+  waits on plugin#115 (child of #109). Admin-enabled fake happy paths removed.
 - **`wsNotifications.injectScopes` now covers failed/timed-out Warp runs (#70).**
   The manifest default and README examples listed only `warp.run.completed`, so
   the terminal `warp.run.failed` / `warp.run.timeout` events never reached the
   agent session. Config-only; injector logic unchanged.
 
 ### Added
+- **Top-level session inventory and lifecycle/history commands (#109).** Boot,
+  Gateway/kernel reconnect and `sessions.changed` publish signed session loops
+  with labels/activity, child lineage, and bounded redacted #2406 history.
+  Signed `session.archive`/`label` patch existing Gateway rows; archive retains
+  record/transcript and finishes the loop. `session.reset` fails explicitly with
+  `missing_scope` because it requires admin, never requested by this plugin.
+  `session.history` reuses the signed WS command path on open. Kernel enum and
+  controls: ima-jin/imajin-ai#3036 (native child of #2288).
 - **Signed reach events for Jin (#68).** Verify kernel delivery signatures and
   principal reply signatures on the existing WebSocket path; enqueue bounded,
   escaped UNTRUSTED context with UNVERIFIED onBehalfOf claims. Optional

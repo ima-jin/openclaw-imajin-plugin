@@ -1,7 +1,67 @@
 import { describe, expect, it, vi } from "vitest";
-import { createSessionGateway } from "./session-command-gateway.js";
+import { createSessionGateway, SESSION_GATEWAY_SCOPES } from "./session-command-gateway.js";
 
 describe("createSessionGateway", () => {
+  it("archives and labels existing records without ever deleting a session or transcript", async () => {
+    const row = { key: "k", sessionId: "s", archived: false, label: "before" };
+    const request = vi.fn(async (method: string, params: Record<string, unknown>) => {
+      if (method === "sessions.list") return { sessions: [row] };
+      if (method === "sessions.patch") Object.assign(row, params);
+      return {};
+    });
+    const gateway = createSessionGateway(request);
+    await gateway.label({ sessionKey: "k", label: "after" });
+    expect(request).toHaveBeenCalledWith("sessions.patch", { key: "k", expectedSessionId: "s", label: "after" });
+    await gateway.archive({ sessionKey: "k" });
+    expect(request).toHaveBeenCalledWith("sessions.patch", { key: "k", expectedSessionId: "s", archived: true });
+    expect(row).toMatchObject({ sessionId: "s", archived: true, label: "after" });
+    expect(request.mock.calls.some(([method]) => method === "sessions.delete")).toBe(false);
+  });
+
+  it.each(["archive", "label"] as const)("rejects %s for nonexistent or archived sessions before patch can create a row", async (operation) => {
+    for (const sessions of [[], [{ key: "k", sessionId: "s", archived: true }], [{ key: "k" }]]) {
+      const request = vi.fn(async () => ({ sessions }));
+      await expect(createSessionGateway(request)[operation]({ sessionKey: "k", label: "new" })).rejects.toMatchObject({ reason: "session_not_found" });
+      expect(request).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it("rejects reset with a static scope failure and never escalates the production connection", async () => {
+    const request = vi.fn();
+    await expect(createSessionGateway(request, ["operator.write", "operator.approvals"]).reset({ sessionKey: "k" })).rejects.toMatchObject({
+      reason: "missing_scope", message: expect.stringContaining("requires operator.admin"),
+    });
+    expect(request).not.toHaveBeenCalled();
+    expect(SESSION_GATEWAY_SCOPES).toEqual(["operator.write", "operator.approvals"]);
+  });
+
+
+  it("paginates the entire cross-agent inventory, including archived rows and non-dashboard channels", async () => {
+    const first = Array.from({ length: 200 }, (_, n) => ({ key: `agent:a:thread-${n}` }));
+    const request = vi.fn(async (_method: string, params: Record<string, unknown>) => ({
+      sessions: params.offset === 0 ? first : [{ key: "agent:b:telegram:direct:1" }, { key: "agent:b:warp-events", archived: true }],
+    }));
+    expect(await createSessionGateway(request).list()).toHaveLength(202);
+    expect(request).toHaveBeenNthCalledWith(2, "sessions.list", {
+      limit: 200, offset: 200, archived: "all", includeGlobal: true, includeUnknown: true,
+    });
+  });
+
+  it("subscribes to change events and asks only for bounded recent history", async () => {
+    const messages = Array.from({ length: 30 }, (_, n) => ({ role: "user", content: `${n}` }));
+    const request = vi.fn(async () => ({ messages }));
+    const gateway = createSessionGateway(request);
+    await gateway.subscribe();
+    expect(request).toHaveBeenCalledWith("sessions.subscribe", {});
+    expect(await gateway.history("k")).toEqual(messages.slice(-20));
+    expect(request).toHaveBeenCalledWith("chat.history", { sessionKey: "k", limit: 20, maxBytes: 65536 });
+  });
+
+  it("fails closed for malformed Gateway read responses", async () => {
+    const gateway = createSessionGateway(vi.fn(async () => ({})));
+    await expect(gateway.list()).rejects.toThrow("invalid sessions.list");
+    await expect(gateway.history("k")).rejects.toThrow("invalid chat.history");
+  });
   it("send -> chat.send with the command id as idempotency key", async () => {
     const request = vi.fn(async () => ({ runId: "run-1", status: "started" }));
     const result = await createSessionGateway(request).send({

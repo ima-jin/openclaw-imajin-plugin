@@ -65,6 +65,10 @@ defaults to `issuedAt + 5 min`.
 | `session.deny` | `{ approvalId, loopId?, kind? }` | same, `deny` |
 | `session.abort` | `{ loopId, runId? }` | locally resolved `chat.abort` (`operator.write`) |
 | `session.spawn` | `{ task, parentLoopId?, label?, agentId?, group?, model? }` | `sessions.create` (`operator.write`), `idempotencyKey = commandId` |
+| `session.archive` | `{ loopId }` | `sessions.patch({key,expectedSessionId,archived:true})` (`operator.write`) |
+| `session.reset` | `{ loopId }` | `sessions.reset({key,expectedSessionId,reason:"reset"})` (`operator.admin`; rejected on the production connection) |
+| `session.label` | `{ loopId, label }` | `sessions.patch({key,expectedSessionId,label})` (`operator.write`) |
+| `session.history` | `{ loopId }` | local `chat.history({sessionKey,limit:20,maxBytes:65536})`, publishes typed signed loop output |
 
 Send/abort accept a local `sessionKey` instead of `loopId` for compatibility.
 Parented spawn likewise accepts local `parentSessionKey` instead of
@@ -75,7 +79,7 @@ takes precedence: unknown, foreign, ended or superseded loops fail closed as
 forms fail as `loop_target_mismatch`. Malformed IDs fail as `invalid_payload`.
 Lookups use only the plugin's currently active registry, not a gateway lookup,
 transcript scrape, or reverse derivation from an untrusted loop ID. After a
-restart an unobserved loop is unavailable until lifecycle hooks establish it.
+restart an unobserved loop is unavailable until inventory or lifecycle hooks establish it.
 Loop-addressed commands require loop lifecycle tracking to be enabled.
 
 An unparented spawn creates a root loop. A parented spawn resolves its parent
@@ -87,8 +91,96 @@ lineage registration and produces a failure, not a claim that no child ran.
 
 `allow-always` is unreachable, and `sessions.create` is never sent
 `permissionMode` / `toolOverrides` / `execNode` / `incognito`, so a remote command
-can never need `operator.admin`. The loopback gateway connection is opened lazily
-on the first command with scopes `operator.write` + `operator.approvals`.
+does not request `operator.admin`. The shared loopback connection starts for
+inventory when loops are enabled, retaining scopes `operator.write` +
+`operator.approvals` (`operator.write` implies read in OpenClaw).
+
+## Inventory, lifecycle and history (#109)
+
+With loops enabled, boot and each Gateway reconnect subscribe using
+`sessions.subscribe({})`, then enumerate **all pages** of `sessions.list`
+(including archived/global/unknown rows, no age or configured-agent filter).
+`sessions.changed` triggers a coalesced refresh, not periodic polling. Kernel
+WS reconnect also re-publishes the inventory. Dashboard, Telegram DM, and
+warp-events top-level threads publish `openclaw.session`; subagent/cron/ACP
+and `spawnedBy` rows are excluded. Children keep the parent session's loop ID.
+Labels, agent ID, last activity (epoch ms), and blocked-on-you accompany signed
+lifecycle events; harness keys stay in the established `refs.sessionKey`.
+Metadata reconciliation does not wait for history backfill.
+
+Archive is the delete: `archived:true` hides the Gateway row and publishes
+`loop.finished` / `archived`, without removing the record or transcript.
+Reset/label/archive require an observed active loop, and patches check that
+the Gateway row still exists, guarded by `expectedSessionId`; they never create
+a missing session. Extra payload fields (including local session keys) are
+rejected for the four new command types. Labels must be nonblank, at most 256
+characters. Every success/rejection uses the same signed attestation chain.
+
+**Reset limitation:** published `openclaw@2026.9.5` and `@2026.10.5` classify
+`sessions.reset` as `operator.admin` (`dist/method-scopes-*.mjs` and
+`core-method-policy-*.mjs`). The plugin does **not** hold or request that scope:
+reset attests `missing_scope` with a static, explicit reason and makes no reset
+RPC. Archive/label are verified write-scope mutations in
+`session-method-scopes-base-*.mjs`. No scope escalation or `sessions.delete`.
+`session.reset` remains registered and returns the signed refusal; a successful
+operator-approved reset path waits on
+[plugin#115](https://github.com/ima-jin/openclaw-imajin-plugin/issues/115),
+a native sub-issue of #109. Tests use only the production
+`["operator.write","operator.approvals"]` scopes, never an admin-enabled fake.
+
+When an active thread is first inventoried (or reset to a new native ID),
+recent history is backfilled. On thread open, the kernel can send a signed
+`session.history` wish through the existing WS. Only the plugin reads
+`chat.history`; it signs `loop.progress` envelopes with #2406 `output` shapes:
+`{kind:"text",text,role?}`, `{kind:"tool_call",callId,name,args}`, and
+`{kind:"tool_result",callId,result,isError?}`. Blocking state is preserved.
+
+### Restart-safe incremental backfill
+
+The plugin stores each native `sessionId`'s last emitted output point and
+archive flag in `<stateDir>/session-inventory-<publisher-hash>.json`, resolving
+the **existing** `wsNotifications.stateDir` or the `imajin-ws-state` directory
+next to `keypairPath`. The file is publisher/endpoint/principal isolated.
+It contains hashed local session identities, hashed event points and flags
+only; no raw session keys, native IDs, turns, tool args/results, or credentials.
+Writes are serialized, mode `0600`, and atomically renamed after each emitted
+block drains through the ordered sender.
+
+Boot, reconnect, changed-event refresh, and signed `session.history` opens
+read the bounded recent tail but publish **only after** the saved point.
+Two boots with the same sessions emit zero duplicate backfill events; a new
+turn emits only that turn. Native message ID/timestamp plus redacted output
+and block position define stable cursor hashes; ID-less rows fall back to
+content/occurrence hashes. If the point aged out of the last-20-entry window,
+only the available recent tail can be published. A new native session ID
+gets its own cursor even when it reuses a thread key. Manual opens and automatic
+backfills share one ordered checkpoint path to avoid concurrent replays.
+
+Archived rows restore local ended/tombstone state without republishing an
+already-recorded `loop.finished`; unarchive clears the flag without deleting
+the saved history point. Missing files are first boot. Corrupt/unreadable
+checkpoints fail closed with a generic availability warning, rather than
+silently treating all history as unseen. A write error stops that backfill
+without advancing the persisted point.
+
+These are restart checkpoints, not a cross-system exactly-once transaction:
+the existing sender remains best-effort, and a crash between emission and its
+checkpoint write can replay that final uncheckpointed block. No kernel ingest
+dedupe or transcript reads are introduced.
+
+Bounds: last **20 Gateway message entries** (a conservative turn cap, so a
+user/assistant exchange counts as two), at most 8 blocks per entry, 80 blocks
+per snapshot, 2048 characters per string, 6 JSON levels / 200 visited nodes,
+20 children per collection, and **12 KiB UTF-8 per output** (below the kernel's
+16 KiB inline cap). Oversized args/results become `[truncated]`. Existing
+`wake-redaction.ts` and loop redaction mask secret fields, quoted assignments,
+bearer headers, key/token patterns and opaque credential-shaped strings before
+clipping/signing. System/thinking/image/raw transcript metadata are excluded.
+History remains in the event record when a session is archived.
+
+Kernel enum/routing and Runs controls, including history-on-open dispatch, are
+tracked in [imajin-ai#3036](https://github.com/ima-jin/imajin-ai/issues/3036),
+a native child of [#2288](https://github.com/ima-jin/imajin-ai/issues/2288).
 
 ## Verification (nothing executes until all pass)
 
@@ -141,7 +233,8 @@ Reasons: `malformed`, `unsigned`, `misaddressed`, `issuer_mismatch`,
 `not_service_of`, `service_binding_unverifiable`, `missing_countersignature`,
 `invalid_countersignature`, `invalid_payload`, `gateway_error`,
 `approval_not_found`, `approval_already_executed`, `approval_binding_mismatch`,
-`loop_not_found`, `loop_target_mismatch`, `nothing_to_abort`.
+`loop_not_found`, `loop_target_mismatch`, `nothing_to_abort`, `missing_scope`,
+`session_not_found`.
 
 ## Native approval → loop binding
 
@@ -215,3 +308,5 @@ These typed events travel on the WS rather than `POST /api/loops`: the kernel's
 loops ingest only accepts `loop.started|progress|blocked|finished`
 (`LOOP_LIFECYCLE_TYPES`), and would 400 a `loop.session.*` type. The kernel half
 must accept them from the socket (or extend the ingest vocabulary).
+
+Session inventory and lifecycle are implemented by #109.

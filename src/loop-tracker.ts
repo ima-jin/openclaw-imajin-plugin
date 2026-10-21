@@ -26,10 +26,9 @@
  * primary session we have not seen start (plugin reloaded mid-session), its
  * loop is lazily started first so the parent always exists.
  *
- * ## Out of scope: transcript content
- * Only ids, state, and a short redacted summary are published. Assistant text,
- * tool args/results and the like are NOT published: the loops rail envelope has
- * no payload field for them (see ima-jin/imajin-ai#2552).
+ * Inventory snapshots enrich primary loops with label/activity metadata.
+ * session-inventory.ts supplies bounded, redacted #2406 history output through
+ * publishSessionOutput; this tracker never reads a transcript or does I/O.
  */
 
 import {
@@ -39,7 +38,9 @@ import {
   type LoopLifecycleType,
   type LoopRefs,
   type LoopTransition,
+  type SessionLoopOutput,
 } from "./loop-publisher.js";
+import type { GatewaySession } from "./session-command-gateway.js";
 
 export interface LoopTrackerLogger {
   warn: (message: string) => void;
@@ -130,6 +131,10 @@ interface OpenLoop {
   label: string;
   /** Learnt from hooks even when initially registered by session key. */
   sessionId?: string;
+  agentId?: string;
+  lastActivityAt?: number;
+  blockedOnYou?: boolean;
+  inventory?: boolean;
 }
 
 const MAX_RECONCILE_EMISSIONS = 200;
@@ -151,6 +156,7 @@ const SESSION_END_STATE: Record<string, string> = {
   shutdown: "interrupted",
   restart: "interrupted",
   deleted: "cancelled",
+  archived: "archived",
 };
 
 const SUBAGENT_OUTCOME_STATE: Record<string, string> = {
@@ -193,6 +199,8 @@ export interface LocalLoopTarget {
 }
 
 export interface LoopTracker {
+  onSessionSnapshot(session: GatewaySession, archiveAlreadyPublished?: boolean): void;
+  publishSessionOutput(loopId: string, output: SessionLoopOutput): void;
   /** Only resolves locally observed, currently active execution targets. */
   resolveLoop(loopId: string): LocalLoopTarget | undefined;
   lookupSession(sessionKey: string): LocalLoopTarget | undefined;
@@ -248,6 +256,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     loop: OpenLoop,
     state: string,
     summary: string,
+    output?: SessionLoopOutput,
   ): void => {
     emit({
       type,
@@ -257,6 +266,13 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
       refs: loop.refs,
       state,
       summary: sanitizeSummary(summary),
+      ...(output ? { output } : {}),
+      ...(loop.inventory ? {
+        label: sanitizeSummary(loop.label),
+        ...(loop.agentId ? { agentId: loop.agentId } : {}),
+        ...(loop.lastActivityAt !== undefined ? { lastActivityAt: loop.lastActivityAt } : {}),
+        blockedOnYou: loop.blockedOnYou ?? false,
+      } : {}),
     });
   };
 
@@ -270,7 +286,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     send("loop.started", loop, "running", summary);
   };
 
-  const finish = (loop: OpenLoop, state: string, summary: string): void => {
+  const finish = (loop: OpenLoop, state: string, summary: string, publish = true): void => {
     open.delete(loop.loopId);
     ended.add(loop.loopId);
     if (loop.sessionId) ended.add(deriveLoopId(did, "openclaw.session", loop.sessionId));
@@ -280,7 +296,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
       bySessionKey.delete(loop.refs.sessionKey);
       endedSessionKeys.add(loop.refs.sessionKey);
     }
-    send("loop.finished", loop, state, summary);
+    if (publish) send("loop.finished", loop, state, summary);
   };
 
   const sessionLoop = (sessionKey: string | undefined, sessionId: string | undefined): OpenLoop => ({
@@ -474,6 +490,42 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     return open.get(fresh.loopId) ?? fresh;
   };
 
+  const updateSessionMetadata = (loop: OpenLoop, session: GatewaySession): void => {
+    loop.inventory = true;
+    loop.label = str(session.label) ?? "session";
+    loop.agentId = str(session.agentId) ?? session.key.split(":")[1] ?? "main";
+    const activity = session.lastActivityAt ?? session.updatedAt;
+    if (typeof activity === "number" && Number.isFinite(activity) && activity >= 0) loop.lastActivityAt = activity;
+  };
+
+  const onSessionSnapshot = guard("session_snapshot", (session: GatewaySession, archiveAlreadyPublished = false): void => {
+    const key = str(session?.key);
+    if (!key || !isPrimarySessionKey(key) || session.spawnedBy) return;
+    let loop = openLoopForKey(key);
+    const id = str(session.sessionId);
+    if (loop?.sessionId && id && loop.sessionId !== id) {
+      finish(loop, "interrupted", "session reset or replaced");
+      loop = undefined;
+    }
+    if (!loop) {
+      loop = sessionLoop(key, id);
+      // Only authoritative snapshots may reopen an unarchived row.
+      if (session.archived !== true) {
+        ended.delete(loop.loopId);
+        endedSessionKeys.delete(key);
+      }
+    }
+    if (id) loop.sessionId = id;
+    updateSessionMetadata(loop, session);
+    if (session.archived === true) {
+      if (!ended.has(loop.loopId)) finish(loop, "archived", "session archived", !archiveAlreadyPublished);
+    } else if (open.has(loop.loopId)) {
+      send("loop.progress", loop, loop.blockedOnYou ? "blocked" : "running", loop.label);
+    } else {
+      start(loop, loop.label);
+    }
+  });
+
   const onSessionEnd = guard("session_end", (event: SessionEndEvent): void => {
     const key = str(event?.sessionKey);
     const id = str(event?.sessionId);
@@ -493,7 +545,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
       if (!loop) return;
       const outcome = event?.success === false ? "error" : "ok";
       const duration = typeof event?.durationMs === "number" ? `, ${event.durationMs}ms` : "";
-      send("loop.progress", loop, "running", `turn ended (${outcome}${duration})`);
+      send("loop.progress", loop, loop.blockedOnYou ? "blocked" : "running", `turn ended (${outcome}${duration})`);
     },
   );
 
@@ -562,11 +614,13 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
 
   const onBlock = guard("block", (ref: LoopRef, reason: string): void => {
     const loop = findOpen(ref);
+    if (loop) loop.blockedOnYou = true;
     if (loop) send("loop.blocked", loop, "blocked", `blocked: ${reason}`);
   });
 
   const onUnblock = guard("unblock", (ref: LoopRef): void => {
     const loop = findOpen(ref);
+    if (loop) loop.blockedOnYou = false;
     if (loop) send("loop.progress", loop, "running", "unblocked");
   });
   const localTarget = (loop: OpenLoop | undefined): LocalLoopTarget | undefined => {
@@ -633,6 +687,11 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     lookupSession: (sessionKey) => localTarget(openLoopForKey(sessionKey)),
     lookupRef: (ref) => localTarget(findOpen(ref)),
     registerSpawn,
+    onSessionSnapshot,
+    publishSessionOutput: guard("session_output", (loopId: string, output: SessionLoopOutput) => {
+      const loop = open.get(loopId);
+      if (loop) send("loop.progress", loop, loop.blockedOnYou ? "blocked" : "running", "recent session turn", output);
+    }),
     onSessionStart,
     onSessionEnd,
     onAgentEnd,

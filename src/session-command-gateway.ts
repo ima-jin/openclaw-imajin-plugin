@@ -1,7 +1,7 @@
 /**
  * Local-gateway adapter for the session command executor (#51).
  *
- * Maps the five DID-addressed session commands onto the OpenClaw gateway's own
+ * Maps DID-addressed session commands onto the OpenClaw gateway's own
  * RPC methods. Method names, params and required operator scopes were verified
  * against the published `openclaw@2026.9.5` package (`dist/method-scopes-*.mjs`,
  * `ChatSendParamsSchema` / `ChatAbortParamsSchema` / `SessionsCreateParamsSchema`
@@ -23,12 +23,42 @@
  * {@link createLoopbackSessionGateway} is unit-testable with a fake `request`.
  */
 import { createOperatorGatewayClient } from "./gateway-operator-client.js";
+/**
+ * Verified against published openclaw@2026.9.5 and @2026.10.5:
+ * sessions.list/subscribe, chat.history: operator.read (implied by write);
+ * sessions.patch {key, archived|label, expectedSessionId}: operator.write;
+ * sessions.reset {key, reason:"reset", expectedSessionId}: operator.admin.
+ * Sources: dist/method-scopes-*.mjs, session-method-scopes-base-*.mjs,
+ * dist/src-*.mjs and schema-*.mjs. Never widen the connection for reset.
+ */
+export const SESSION_GATEWAY_SCOPES = ["operator.write", "operator.approvals"] as const;
+export class SessionGatewayFailure extends Error {
+  constructor(readonly reason: "missing_scope" | "session_not_found", message: string) {
+    super(message);
+  }
+}
+export interface GatewaySession {
+  key: string;
+  sessionId?: string;
+  label?: string;
+  agentId?: string;
+  updatedAt?: number;
+  lastActivityAt?: number;
+  archived?: boolean;
+  spawnedBy?: string;
+}
 
 export type GatewayRequest = (method: string, params: Record<string, unknown>) => Promise<unknown>;
 
 export type SessionApprovalKind = "exec" | "plugin";
 
 export interface SessionGateway {
+  list(): Promise<GatewaySession[]>;
+  subscribe(): Promise<void>;
+  history(sessionKey: string): Promise<unknown[]>;
+  archive(params: { sessionKey: string }): Promise<void>;
+  reset(params: { sessionKey: string }): Promise<void>;
+  label(params: { sessionKey: string; label: string }): Promise<void>;
   send(params: {
     sessionKey: string;
     message: string;
@@ -60,7 +90,36 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-export function createSessionGateway(request: GatewayRequest): SessionGateway {
+export function createSessionGateway(
+  request: GatewayRequest,
+  scopes: readonly string[] = SESSION_GATEWAY_SCOPES,
+): SessionGateway {
+  const list = async (): Promise<GatewaySession[]> => {
+    const sessions: GatewaySession[] = [];
+    const limit = 200;
+    for (let offset = 0; ; offset += limit) {
+      const page = asRecord(await request("sessions.list", {
+        limit, offset, archived: "all", includeGlobal: true, includeUnknown: true,
+      }));
+      if (!Array.isArray(page.sessions)) throw new Error("invalid sessions.list response");
+      for (const row of page.sessions) {
+        const s = asRecord(row);
+        if (typeof s.key === "string" && s.key.length > 0 && s.key.length <= 512) {
+          sessions.push(s as unknown as GatewaySession);
+        }
+      }
+      if (page.sessions.length < limit) return sessions;
+    }
+  };
+  const existing = async (key: string): Promise<GatewaySession> => {
+    const session = (await list()).find((s) => s.key === key && s.archived !== true);
+    if (!session?.sessionId) throw new SessionGatewayFailure("session_not_found", "session is not active on this Gateway");
+    return session;
+  };
+  const patch = async (key: string, mutation: Record<string, unknown>): Promise<void> => {
+    const session = await existing(key);
+    await request("sessions.patch", { key, expectedSessionId: session.sessionId, ...mutation });
+  };
   const resolveOne = async (
     kind: SessionApprovalKind,
     id: string,
@@ -71,6 +130,22 @@ export function createSessionGateway(request: GatewayRequest): SessionGateway {
   };
 
   return {
+    list,
+    async subscribe() { await request("sessions.subscribe", {}); },
+    async history(sessionKey) {
+      const result = asRecord(await request("chat.history", { sessionKey, limit: 20, maxBytes: 65536 }));
+      if (!Array.isArray(result.messages)) throw new Error("invalid chat.history response");
+      return result.messages.slice(-20);
+    },
+    async archive({ sessionKey }) { await patch(sessionKey, { archived: true }); },
+    async label({ sessionKey, label }) { await patch(sessionKey, { label }); },
+    async reset({ sessionKey }) {
+      if (!scopes.includes("operator.admin")) {
+        throw new SessionGatewayFailure("missing_scope", "sessions.reset requires operator.admin; session client holds operator.write + operator.approvals");
+      }
+      const session = await existing(sessionKey);
+      await request("sessions.reset", { key: sessionKey, expectedSessionId: session.sessionId, reason: "reset" });
+    },
     async send({ sessionKey, message, agentId, idempotencyKey }) {
       const result = asRecord(
         await request("chat.send", {
@@ -121,22 +196,25 @@ export function createSessionGateway(request: GatewayRequest): SessionGateway {
 
 export interface LoopbackSessionGateway {
   gateway: SessionGateway;
+  start(): Promise<void>;
   dispose(): void;
 }
 
 /**
- * Lazily-connected loopback gateway client with exactly the scopes the five
- * commands need (`operator.write` + `operator.approvals`). Connects on the
- * first command rather than at plugin start, so an install that never
- * receives a command never opens the extra connection.
+ * Shared loopback client with the existing write + approvals scope ceiling.
+ * Inventory explicitly starts it when loops are enabled; otherwise the first
+ * request connects lazily. Reset requires admin and is rejected, not escalated.
  */
 export function createLoopbackSessionGateway(opts: {
   getConfig: () => Record<string, unknown>;
   gatewayTokenOverride?: string;
   clientDisplayName?: string;
+  onConnected?: () => void;
+  onEvent?: (event: { event: string; payload?: unknown }) => void;
 }): LoopbackSessionGateway {
   type Started = { request: GatewayRequest; stop: () => void };
   let started: Promise<Started> | undefined;
+  let disposed = false;
 
   const connect = async (): Promise<Started> => {
     const { startGatewayClientWhenEventLoopReady } = await import("openclaw/plugin-sdk/gateway-runtime");
@@ -154,7 +232,9 @@ export function createLoopbackSessionGateway(opts: {
       : baseConfig;
     const client = await createOperatorGatewayClient({
       config,
-      scopes: ["operator.write", "operator.approvals"],
+      scopes: [...SESSION_GATEWAY_SCOPES],
+      onHelloOk: () => { if (!disposed) opts.onConnected?.(); },
+      onEvent: (event) => { if (!disposed) opts.onEvent?.(event); },
       clientDisplayName: opts.clientDisplayName ?? "Imajin session commands",
       onConnectError: (err) => {
         console.error(`[imajin-session-commands] gateway connect error: ${String(err)}`);
@@ -172,16 +252,21 @@ export function createLoopbackSessionGateway(opts: {
   };
 
   const request: GatewayRequest = async (method, params) => {
+    if (disposed) throw new Error("session Gateway disposed");
     started ??= connect().catch((err: unknown) => {
       started = undefined; // let the next command retry the connection
       throw err;
     });
-    return (await started).request(method, params);
+    const connection = await started;
+    if (disposed) throw new Error("session Gateway disposed");
+    return connection.request(method, params);
   };
 
   return {
     gateway: createSessionGateway(request),
+    start: async () => { await request("sessions.subscribe", {}); },
     dispose: () => {
+      disposed = true;
       const pending = started;
       started = undefined;
       void pending?.then((s) => s.stop()).catch(() => undefined);
