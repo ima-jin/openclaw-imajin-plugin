@@ -42,7 +42,7 @@ export interface PendingWakeRecord {
   frames: NotificationFrame[];
   /**
    * True when frames reached the legacy host system-event inbox. False for
-   * fresh wakes persisted only here: they must not be silently age-expired.
+   * fresh wakes persisted locally: age expiry attempts disclosure once.
    * Optional on pre-#79 records, where all frames were host-enqueued.
    */
   injected?: boolean;
@@ -170,7 +170,7 @@ export class PendingWakeStore {
     return this.persist();
   }
 
-  /** Clears an owed marker — call only once its wake has been durably confirmed delivered. */
+  /** Clears a delivered, expired, or terminally consumed owed marker; evidence remains in the bridge. */
   async delete(key: string): Promise<void> {
     if (!(key in this.wakes)) {
       return;

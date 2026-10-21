@@ -9,6 +9,7 @@ import type { NotificationFrame } from "./ws-service.js";
 import { PluginServiceRuntime } from "./plugin-service-runtime.js";
 import { beginRegistration } from "./registration-lifecycle.js";
 import { WakeGuards } from "./wake-guards.js";
+import { PendingWakeStore } from "./notification-state-store.js";
 
 vi.mock("./channel-notify.js", () => ({ sendDirectChannelMessage: vi.fn(async () => {}) }));
 const PR = "https://github.com/ima-jin/openclaw-imajin-plugin/pull/80";
@@ -205,24 +206,38 @@ describe("guarded wake acceptance (#82)", () => {
     expect(alerts()).toHaveLength(0);
   });
 
-  it("does not admit or discard a terminal wake when its disclosure send fails", async () => {
+  it.each([false, true])("consumes a terminal marker after one send attempt across five registrations (failure=%s)", async (deliveryFails) => {
     lookup.mockResolvedValue({ ...OPEN, state: "MERGED", mergeable: "UNKNOWN" });
-    vi.mocked(sendDirectChannelMessage).mockImplementation(async (_ds, text) => {
-      if (text.includes("already MERGED")) throw new Error("delivery failed");
+    if (deliveryFails) vi.mocked(sendDirectChannelMessage).mockRejectedValue(new Error("private delivery error"));
+    const store = new PendingWakeStore(join(dir, "pending-wakes.json"));
+    const sinceTs = Date.now() - 300_000;
+    await store.set(`warp.run.completed:${sinceTs}:leading`, {
+      scope: "warp.run.completed", sinceTs, frames: [frame("undelivered")], injected: false,
     });
-    create();
-    await injector.inject(frame("undelivered"));
-    await vi.waitFor(() => expect(alerts()).toHaveLength(1));
-    expect(alerts()[0][1]).toContain("terminal subject disclosure failed");
+    for (let registration = 0; registration < 5; registration++) {
+      create();
+      await injector.ready;
+      await vi.waitFor(async () => expect(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes).toEqual({}));
+      injector.dispose();
+    }
+    expect(sendDirectChannelMessage).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sendDirectChannelMessage).mock.calls[0][1]).toContain("already MERGED");
+    expect(lookup).toHaveBeenCalledTimes(1);
+    expect(alerts()).toHaveLength(0);
     expect(wakes()).toHaveLength(0);
-    expect(Object.keys(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes)).toHaveLength(1);
+    const bridge = JSON.parse(await readFile(join(dir, "wake-bridge.json"), "utf8"));
+    expect(bridge.records).toContainEqual(expect.objectContaining({
+      runId: "run-undelivered", status: "closed",
+      lastVerdict: expect.stringContaining(deliveryFails ? "disclosure delivery failed" : "already MERGED"),
+    }));
   });
 
-  it("retains mixed open work and explicitly marks failed live reads unavailable", async () => {
+  it.each([false, true])("retains mixed open work and marks failed live reads unavailable (disclosure failure=%s)", async (deliveryFails) => {
     lookup.mockImplementation(async (url: string) => {
       if (url === PR) return { ...OPEN, state: "MERGED", mergeable: null };
       throw new Error("private error");
     });
+    if (deliveryFails) vi.mocked(sendDirectChannelMessage).mockRejectedValue(new Error("private delivery error"));
     config.wakeSettleMs = 20;
     create();
     await injector.inject(frame("terminal"));
