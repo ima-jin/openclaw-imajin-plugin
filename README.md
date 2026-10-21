@@ -163,6 +163,7 @@ In `openclaw.json`:
   - **`wsNotifications.maxSessionTokens`** — reuse guard threshold; default and ceiling `50000`, with a `24000`-token pre-injection reserve
   - **`wsNotifications.maxWakeTokens`** — per-session context ceiling, default `80000`; applies independently to the wake and every decision child; never adds usage across turns or sessions
   - **`wsNotifications.model`** — optional coordinator model; omitted uses the host's configured wake-agent model
+  - **`wsNotifications.wakeModel`** — optional wake-only model override (e.g. `imajin/kimi-k3`); unset or empty preserves existing routing without changing the gateway default; an unresolvable override warns and falls back to the default
   - **`wsNotifications.decisionModel`** — decision subagent model, default `anthropic/claude-opus-5-5`; review/merge/enqueue/dispatch tools run only in pinned subagents, not the coordinator
   - **`wsNotifications.wakeReadOnlyLookups`** — defaults to `false` (option c: coordinate only); explicit `true` enables allowlisted reads only when no PR is known or every run in the batch is FAILED. It never permits coordinator review, approve, merge, enqueue or dispatch.
   - **`wsNotifications.githubCliPath`** — trusted absolute GitHub CLI path for live PR reads; default `/usr/bin/gh`; set the installed absolute path (e.g. `/opt/homebrew/bin/gh` on macOS), never a PATH-resolved command
