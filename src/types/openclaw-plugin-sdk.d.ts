@@ -16,6 +16,35 @@
  * mirror the SDK's full (very large) type surface. See README.md for the
  * one-line rationale note.
  */
+/** Read-only model-selection exports verified against openclaw@2026.10.4. */
+declare module "openclaw/plugin-sdk/agent-runtime" {
+  export interface WakeModelRef {
+    provider: string;
+    model: string;
+  }
+  export interface ModelCatalogEntry {
+    provider: string;
+    id: string;
+  }
+  export function loadModelCatalog(params: {
+    config?: unknown;
+    agentId?: string;
+    readOnly?: boolean;
+  }): Promise<ModelCatalogEntry[]>;
+  export function resolveDefaultModelForAgent(params: {
+    cfg: unknown;
+    agentId?: string;
+  }): WakeModelRef;
+  export function resolveAllowedModelRef(params: {
+    cfg: unknown;
+    agentId?: string;
+    catalog: ModelCatalogEntry[];
+    raw: string;
+    defaultProvider: string;
+    defaultModel?: WakeModelRef;
+  }): { ref: WakeModelRef; key: string } | { error: string };
+}
+
 declare module "openclaw/plugin-sdk/plugin-entry" {
   export interface OpenClawPluginEntryDefinition {
     id: string;
