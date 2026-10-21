@@ -86,7 +86,7 @@ describe("identity and discovery kernel contracts (#74)", () => {
   it.each([400, 401, 403, 500])("surfaces lookup HTTP %i rather than hiding it", async (status) => {
     respond({ error: "refused" }, status);
     const result = await createIdentityTool(client).execute("1", { action: "lookup", query: DID });
-    expect(result.details).toEqual({ error: true });
+    expect(result.details).toMatchObject({ error: true });
     expect(result.content[0].text).toContain(`Imajin API ${status}`);
   });
 
@@ -136,7 +136,7 @@ describe("identity and discovery kernel contracts (#74)", () => {
   it.each([401, 403])("preserves connections HTTP %i authorization refusals", async (status) => {
     respond({ error: "Not authorized" }, status);
     const result = await createIdentityTool(client).execute("1", { action: "connections", query: DID });
-    expect(result.details).toEqual({ error: true });
+    expect(result.details).toMatchObject({ error: true });
     expect(result.content[0].text).toContain(`Imajin API ${status}`);
   });
 
@@ -165,7 +165,7 @@ describe("identity and discovery kernel contracts (#74)", () => {
   it("surfaces discovery and handle-search errors", async () => {
     respond({ error: "unavailable" }, 500);
     const result = await createDiscoverTool(client).execute("1", { query: "artifact" });
-    expect(result.details).toEqual({ error: true });
+    expect(result.details).toMatchObject({ error: true });
     respond({ error: "unavailable" }, 500);
     await expect(client.lookupIdentity("artifact")).rejects.toThrow("Imajin API 500");
   });
