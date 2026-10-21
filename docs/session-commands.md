@@ -122,6 +122,11 @@ characters. Every success/rejection uses the same signed attestation chain.
 reset attests `missing_scope` with a static, explicit reason and makes no reset
 RPC. Archive/label are verified write-scope mutations in
 `session-method-scopes-base-*.mjs`. No scope escalation or `sessions.delete`.
+`session.reset` remains registered and returns the signed refusal; a successful
+operator-approved reset path waits on
+[plugin#115](https://github.com/ima-jin/openclaw-imajin-plugin/issues/115),
+a native sub-issue of #109. Tests use only the production
+`["operator.write","operator.approvals"]` scopes, never an admin-enabled fake.
 
 When an active thread is first inventoried (or reset to a new native ID),
 recent history is backfilled. On thread open, the kernel can send a signed
@@ -129,6 +134,39 @@ recent history is backfilled. On thread open, the kernel can send a signed
 `chat.history`; it signs `loop.progress` envelopes with #2406 `output` shapes:
 `{kind:"text",text,role?}`, `{kind:"tool_call",callId,name,args}`, and
 `{kind:"tool_result",callId,result,isError?}`. Blocking state is preserved.
+
+### Restart-safe incremental backfill
+
+The plugin stores each native `sessionId`'s last emitted output point and
+archive flag in `<stateDir>/session-inventory-<publisher-hash>.json`, resolving
+the **existing** `wsNotifications.stateDir` or the `imajin-ws-state` directory
+next to `keypairPath`. The file is publisher/endpoint/principal isolated.
+It contains hashed local session identities, hashed event points and flags
+only; no raw session keys, native IDs, turns, tool args/results, or credentials.
+Writes are serialized, mode `0600`, and atomically renamed after each emitted
+block drains through the ordered sender.
+
+Boot, reconnect, changed-event refresh, and signed `session.history` opens
+read the bounded recent tail but publish **only after** the saved point.
+Two boots with the same sessions emit zero duplicate backfill events; a new
+turn emits only that turn. Native message ID/timestamp plus redacted output
+and block position define stable cursor hashes; ID-less rows fall back to
+content/occurrence hashes. If the point aged out of the last-20-entry window,
+only the available recent tail can be published. A new native session ID
+gets its own cursor even when it reuses a thread key. Manual opens and automatic
+backfills share one ordered checkpoint path to avoid concurrent replays.
+
+Archived rows restore local ended/tombstone state without republishing an
+already-recorded `loop.finished`; unarchive clears the flag without deleting
+the saved history point. Missing files are first boot. Corrupt/unreadable
+checkpoints fail closed with a generic availability warning, rather than
+silently treating all history as unseen. A write error stops that backfill
+without advancing the persisted point.
+
+These are restart checkpoints, not a cross-system exactly-once transaction:
+the existing sender remains best-effort, and a crash between emission and its
+checkpoint write can replay that final uncheckpointed block. No kernel ingest
+dedupe or transcript reads are introduced.
 
 Bounds: last **20 Gateway message entries** (a conservative turn cap, so a
 user/assistant exchange counts as two), at most 8 blocks per entry, 80 blocks

@@ -1608,6 +1608,12 @@ minute as `publish dropped ... HTTP 403`).
 without polling or a kernel Gateway client. Archive finishes the loop but keeps
 the record. History backfills the last 20 message entries, at most 80 redacted
 blocks of 12 KiB each. See [wire contract and bounds](docs/session-commands.md).
+Backfill and archived-state watermarks persist per native session ID in
+`<stateDir>/session-inventory-<publisher-hash>.json` (the existing
+`wsNotifications.stateDir`, or `imajin-ws-state` next to the keypair). Reboots and
+reconnects publish only history past the saved point; unchanged archived rows
+do not re-emit `loop.finished`. New turns remain event-driven. The private
+atomic checkpoint stores hashes/flags, not transcript text or harness keys.
 
 #### Blocked on an operator approval (#64)
 
@@ -1695,7 +1701,11 @@ verification order, attestation shape and the kernel-side assumptions are in
 Archive/label use `sessions.patch` with an existing-session guard; archive is
 never hard delete. Reset requires `operator.admin` in the verified published
 Gateway versions and is explicitly rejected/attested as `missing_scope` on the
-plugin's unchanged write+approvals connection. Kernel controls/enum and signed
+plugin's unchanged write+approvals connection. The command stays registered,
+but successful reset waits on operator-approved authority in
+[plugin#115](https://github.com/ima-jin/openclaw-imajin-plugin/issues/115)
+(native child of #109); no standing admin scope is added here.
+Kernel controls/enum and signed
 history-on-open dispatch are tracked in
 [imajin-ai#3036](https://github.com/ima-jin/imajin-ai/issues/3036).
 

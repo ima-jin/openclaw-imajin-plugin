@@ -3,6 +3,13 @@
 ## Unreleased
 
 ### Fixed
+- **Session inventory replay after restart (#109 / PR #110 send-back).**
+  Persist per-native-session history points and archive flags in the existing
+  private plugin state directory; resume after the saved output block, and
+  silently restore already-published archived rows. Unchanged sessions no
+  longer replay backfill at each boot. Reset stays registered with a signed
+  `missing_scope` refusal on production scopes; its approved-authority path
+  waits on plugin#115 (child of #109). Admin-enabled fake happy paths removed.
 - **`wsNotifications.injectScopes` now covers failed/timed-out Warp runs (#70).**
   The manifest default and README examples listed only `warp.run.completed`, so
   the terminal `warp.run.failed` / `warp.run.timeout` events never reached the
