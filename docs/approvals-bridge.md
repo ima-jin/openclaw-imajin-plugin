@@ -1,4 +1,5 @@
 # Gateway approvals bridge — sequence (#24, generalized by #33)
+Withdrawal must terminate supported source proposals so the next request is not blocked (#87).
 
 Plugin half of `ima-jin/imajin-ai#2059` (kernel half merged in
 `ima-jin/imajin-ai` PR #2078), generalized into a source-adapter model by
