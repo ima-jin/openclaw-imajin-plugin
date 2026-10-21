@@ -215,3 +215,5 @@ These typed events travel on the WS rather than `POST /api/loops`: the kernel's
 loops ingest only accepts `loop.started|progress|blocked|finished`
 (`LOOP_LIFECYCLE_TYPES`), and would 400 a `loop.session.*` type. The kernel half
 must accept them from the socket (or extend the ingest vocabulary).
+
+Session inventory and lifecycle work is tracked in #109.
