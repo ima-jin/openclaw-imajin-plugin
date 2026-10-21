@@ -47,6 +47,7 @@ import {
   createImajinStatusTool,
   createVaultTool,
   createCloudflareTool,
+  type WarpToolConfig,
 } from "./src/tools.js";
 import {
   createTurnUsageAttestationHandler,
@@ -115,6 +116,7 @@ interface PluginConfig {
   did?: string;
   keypairPath?: string;
   actAs?: string;
+  warp?: WarpToolConfig;
   wsNotifications?: WsNotificationsConfig;
   attestation?: TurnUsageAttestationConfig;
   approvalBridge?: ApprovalBridgeSettings;
@@ -575,7 +577,7 @@ export default definePluginEntry({
     api.registerTool(createFairTool(client));
     api.registerTool(createDiscoverTool(client));
     api.registerTool(createMediaTool(client));
-    api.registerTool(createWarpTool(client));
+    api.registerTool(createWarpTool(client, config.warp));
     api.registerTool(createInferTool(client));
     api.registerTool(createUsageTool(client));
     api.registerTool(createVaultTool(client));

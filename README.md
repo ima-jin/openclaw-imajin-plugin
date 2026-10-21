@@ -18,6 +18,27 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_warp`     | Warp        | Dispatch/inspect Warp cloud agents; `list_runs` takes `compact: true` to drop `statusMessage` + artifact `data` per run (plugin-side, kernel call unchanged) for wide spend/volume pulls (#72) |
 | `imajin_cloudflare` | Cloudflare | DNS-only writes, classification, proxy/cache previews and human-approved proposals, settings/SSL, custom hostnames and signed history through kernel-only zone grants; never fetches a Cloudflare token (#98) |
 
+### Warp usage units (#111)
+
+`imajin_warp` `get_run` and `list_runs`, in both full and `compact: true` output,
+label each run's `requestUsage` with `credits`, `usdEst`, and `unit: "warp_credits"`.
+The original `inferenceCost`, `computeCost`, and `platformCost` fields are **Warp
+credits, not dollars**, and remain unchanged. `credits` sums them with null/missing
+values treated as zero (including missing usage on in-progress runs).
+`usdEst` is a USD estimate rounded to two decimal places, not a billing statement.
+
+`list_runs` also returns `totals: { credits, usdEst }` for the entire fetched page,
+before the full view's 20-run display cap (compact displays up to 500 runs).
+Totals do not include other pages; follow `nextCursor` for those. Total `usdEst`
+is calculated from summed credits and then rounded, not from rounded per-run USD.
+Empty pages return `runs: []` with zero totals and the normal pagination fields.
+
+Set `plugins.entries.imajin.config.warp` to `{ "usdPerCredit": 0.0154 }` to
+override the conversion rate. The default approximates $100 per 6,500 credits;
+the rate must be finite and non-negative (zero is allowed).
+For example, `260.4375 + 12.3017 + 109.8067` yields `382.5459` credits and
+`usdEst: 5.89` at the default rate.
+
 ### Cloudflare zone access (#98)
 
 Setup: **seal the zone token on /jin, then grant the agent DID the zone capabilities on the zone card**.
@@ -126,6 +147,7 @@ In `openclaw.json`:
 - **`nodeUrl`** (required) — URL of the Imajin node
 - **`did`** (optional) — Agent's DID for authenticated requests
 - **`keypairPath`** (optional) — Path to Ed25519 keypair for signing attestations
+- **`warp.usdPerCredit`** (optional) — USD estimate per Warp credit; defaults to `0.0154` ($100 per 6,500 credits, approximately).
 - **`attestation`** (optional) — configures the `agent_end` → `agent.turn.usage` hook (#1843):
   - **`attestation.enabled`** — explicit opt-out; defaults to `true` when `serviceUrl` + the key both resolve
   - **`attestation.serviceUrl`** — base URL for `POST /auth/api/attestations/internal`; defaults to `nodeUrl`

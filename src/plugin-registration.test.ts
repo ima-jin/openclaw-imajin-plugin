@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   discovery: [] as Array<{ stop: ReturnType<typeof vi.fn> }>,
   sessionGateways: [] as Array<{ dispose: ReturnType<typeof vi.fn> }>,
   loopHook: vi.fn(), wakeHook: vi.fn(), usageHook: vi.fn(), wsStart: vi.fn(), inject: vi.fn(),
+  getWarpRun: vi.fn(),
 }));
 
 vi.mock("openclaw/plugin-sdk/plugin-entry", () => ({
@@ -32,7 +33,9 @@ vi.mock("./sources/imajin-catalog.js", async (original) => ({
 vi.mock("./sources/gateway-exec.js", async (original) => ({
   ...await original<object>(), createLiveGatewayExecConnection: mocks.exec,
 }));
-vi.mock("./client.js", () => ({ ImajinClient: class { requestRaw = mocks.preflight; } }));
+vi.mock("./client.js", () => ({
+  ImajinClient: class { requestRaw = mocks.preflight; getWarpRun = mocks.getWarpRun; },
+}));
 vi.mock("./imajin-provider.js", () => ({
   IMAJIN_PROVIDER_ID: "imajin",
   isImajinCatalogInvalidationScope: () => false,
@@ -163,6 +166,7 @@ describe("process-wide plugin registration (#86)", () => {
   let workshops: ReturnType<typeof workshopConnection>[];
   let publish: ReturnType<typeof vi.fn>;
 
+
   function register(overrides: Record<string, unknown> = {}, registrationMode?: string) {
     const services: Service[] = [];
     const hooks = new Map<string, Array<(...args: any[]) => unknown>>();
@@ -234,6 +238,22 @@ describe("process-wide plugin registration (#86)", () => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("passes warp.usdPerCredit from plugin config to the registered tool (#111)", async () => {
+    const registerTool = vi.fn();
+    plugin.register({
+      pluginConfig: { nodeUrl: "https://fixture.invalid", warp: { usdPerCredit: 0.02 } },
+      registerTool, registerService: vi.fn(), on: vi.fn(),
+    });
+    const warpTool = registerTool.mock.calls.find(([tool]) => tool.name === "imajin_warp")![0];
+    mocks.getWarpRun.mockResolvedValue({
+      runId: "fixture", state: "SUCCEEDED", requestUsage: { inferenceCost: 100 },
+    });
+    const output = JSON.parse((await warpTool.execute("1", { action: "get_run", runId: "fixture" })).content[0].text);
+    expect(output.requestUsage).toEqual({
+      inferenceCost: 100, credits: 100, usdEst: 2, unit: "warp_credits",
+    });
   });
 
   it("full/start stays live through three non-full register passes without any further starts", async () => {
