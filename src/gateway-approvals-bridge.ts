@@ -1393,8 +1393,8 @@ export class GatewayApprovalsBridge {
     // countersignature — never the kernel's witness signature checked
     // above. Runs for EVERY decision, including `withdrawn`, before
     // anything is ever treated as accepted: a kernel-forged withdrawal must
-    // be rejected exactly like a kernel-forged approve/reject, even though
-    // `withdrawn` never reaches a source's `resolve()` below either way.
+    // be rejected exactly like a kernel-forged approve/reject before it can
+    // reach a source's terminal non-apply action.
     const signatureCheck = await this.verifyOperatorCountersignature(tracked, rawDecision, payload);
     if (this.disposed) return "noop";
     if (!signatureCheck.ok) {
@@ -1402,12 +1402,10 @@ export class GatewayApprovalsBridge {
       return "rejected";
     }
 
-    if (rawDecision === "withdrawn") {
-      // No generic source analog in v1: no active source exposes a
-      // "withdraw" decision for an item already forwarded to it. Documented
-      // no-op, preserved from #24.
+    if (rawDecision === "withdrawn" && !source.withdrawalDecision) {
+      // Sources without a terminal non-apply action retain the documented no-op.
       this.logger.info(
-        `operator.approval.decided withdrawn for ${proposalId} — no source action (unsupported in v1)`,
+        `operator.approval.decided withdrawn for ${proposalId} — no source action (source has no cancel analog)`,
       );
       return "noop";
     }

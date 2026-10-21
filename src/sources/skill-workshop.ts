@@ -333,6 +333,7 @@ export function createSkillWorkshopSource(
 
   return {
     id: "skill-workshop",
+    withdrawalDecision: "reject",
     onDriftPolicy: "restage",
     decisionLabels: { approve: "Apply", reject: "Reject" },
 

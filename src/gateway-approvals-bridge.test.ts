@@ -445,7 +445,7 @@ describe("GatewayApprovalsBridge", () => {
     expect(gateway.get).not.toHaveBeenCalled();
   });
 
-  it("treats withdrawn as a no-op (no Gateway analog)", async () => {
+  it("rejects a withdrawn decision missing its staged contentHash before contacting the Gateway", async () => {
     const bridge = newBridge();
     requestedHandler!(makeRecord());
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
@@ -694,29 +694,30 @@ describe("GatewayApprovalsBridge + operator countersignature (#44)", () => {
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("malformed operatorSignature"));
   });
 
-  it("withdraw path: a valid operatorSignature over decision withdrawn is accepted as the documented no-op", async () => {
+  it("withdraw path: a valid operatorSignature resolves once with deny and forgets the proposal", async () => {
     const bridge = newBridge();
-    requestedHandler!(makeRecord());
+    const record = makeRecord();
+    requestedHandler!(record);
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1));
     const contentHash = publishedContentHash(kernel);
+    gateway.get.mockResolvedValue(pendingSnapshot(record.request.proposalHash));
 
     const decidedAt = new Date().toISOString();
     const sig = await signDecision({ contentHash, decision: "withdrawn", decidedAt }, operatorPrivateKeyHex);
-
-    await bridge.handleKernelDecision(
-      makeDecidedFrame({
-        payload: {
-          decision: "withdrawn",
-          contentHash,
-          decidedAt,
-          operatorSignature: { keyId: operatorPublicKeyHex, alg: "ed25519", sig },
-        },
-      }),
-    );
-
-    expect(gateway.get).not.toHaveBeenCalled();
-    expect(gateway.resolve).not.toHaveBeenCalled();
-    expect(logger.info).toHaveBeenCalledWith(expect.stringContaining("no source action"));
+    const frame = makeDecidedFrame({
+      payload: {
+        decision: "withdrawn",
+        contentHash,
+        decidedAt,
+        operatorSignature: { keyId: operatorPublicKeyHex, alg: "ed25519", sig },
+      },
+    });
+    expect(await bridge.handleKernelDecision(frame)).toBe("applied");
+    expect(await bridge.handleKernelDecision(frame)).toBe("noop");
+    expect(gateway.get).toHaveBeenCalledTimes(1);
+    expect(gateway.resolve).toHaveBeenCalledTimes(1);
+    expect(gateway.resolve).toHaveBeenCalledWith(record.id, "deny");
+    expect(bridge.isPublished(record.id)).toBe(false);
   });
 
   it("withdraw path: REJECTS a kernel-forged withdrawal (no operatorSignature) once the require flag is on", async () => {
@@ -726,6 +727,7 @@ describe("GatewayApprovalsBridge + operator countersignature (#44)", () => {
     const contentHash = publishedContentHash(kernel);
 
     await bridge.handleKernelDecision(makeDecidedFrame({ payload: { decision: "withdrawn", contentHash } }));
+    expect(gateway.get).not.toHaveBeenCalled();
 
     expect(gateway.resolve).not.toHaveBeenCalled();
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("operatorSignature is required"));

@@ -115,6 +115,7 @@ function toApprovalSourceRequest(record: SystemAgentApprovalRequestRecord): Appr
 export function createSystemAgentSource(client: GatewayApprovalsClient): ApprovalSource {
   return {
     id: "system-agent",
+    withdrawalDecision: "reject",
     onDriftPolicy: "leave",
 
     async list(): Promise<ApprovalSourceRequest[]> {

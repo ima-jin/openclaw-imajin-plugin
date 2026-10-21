@@ -127,6 +127,11 @@ export type Unsubscribe = () => void;
 /** One pending-approval provider the generic bridge can drive (#33). */
 export interface ApprovalSource {
   readonly id: string;
+  /**
+   * Terminal non-apply action for an operator withdrawal (#87). Omit when
+   * this source has no cancel analog; the bridge then logs a no-op.
+   */
+  readonly withdrawalDecision?: "reject";
 
   /** Startup/reconcile backfill: every currently-pending item from this source. */
   list(): Promise<ApprovalSourceRequest[]>;
