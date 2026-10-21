@@ -43,6 +43,11 @@ describe("redacted typed session history", () => {
     const output = sessionHistoryOutputs(Array.from({ length: 25 }, () => ({ role: "assistant", content: blocks })));
     expect(output).toHaveLength(80);
     for (const item of output) expect(Buffer.byteLength(JSON.stringify(item), "utf8")).toBeLessThanOrEqual(MAX_HISTORY_OUTPUT_BYTES);
+    const escaped = sessionHistoryOutputs([
+      { role: "user", content: "\0".repeat(3000) },
+      { role: "assistant", content: [{ type: "toolCall", id: "🍁 ".repeat(3000), name: "🍁 ".repeat(3000), arguments: huge }] },
+    ]);
+    for (const item of escaped) expect(Buffer.byteLength(JSON.stringify(item), "utf8")).toBeLessThanOrEqual(MAX_HISTORY_OUTPUT_BYTES);
     const cycle: Record<string, unknown> = {}; cycle.self = cycle;
     expect(() => sessionHistoryOutputs([{ role: "tool", content: cycle }])).not.toThrow();
     expect(sessionHistoryOutputs([null, 1, {}, { role: "user", content: null }])).toEqual([{ kind: "text", text: "", role: "user" }]);

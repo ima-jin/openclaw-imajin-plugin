@@ -35,7 +35,7 @@ function bounded(output: SessionLoopOutput): SessionLoopOutput {
   if (Buffer.byteLength(JSON.stringify(output), "utf8") <= MAX_HISTORY_OUTPUT_BYTES) return output;
   if (output.kind === "tool_call") return { ...output, args: "[truncated]" };
   if (output.kind === "tool_result") return { ...output, result: "[truncated]" };
-  return output;
+  return { ...output, text: output.text.slice(0, 1024) };
 }
 
 function turnOutputs(raw: unknown): SessionLoopOutput[] {
