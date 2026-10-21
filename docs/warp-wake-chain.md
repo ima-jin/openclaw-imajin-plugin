@@ -493,3 +493,5 @@ into one wake).
   `never ran (no agent_end within` line means the Cron job itself never
   fired — escalate to openclaw core, since that is entirely host-side from
   this point on.
+
+Wake packet/bootstrap integration is tracked in #107.
