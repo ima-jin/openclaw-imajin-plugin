@@ -45,7 +45,8 @@ describe("createSystemAgentSource", () => {
 
   it("list() maps records to namespaced ApprovalSourceRequest entries", async () => {
     const { client, fns } = makeClient();
-    fns.list.mockResolvedValue([makeRecord()]);
+    const record = makeRecord();
+    fns.list.mockResolvedValue([record]);
     const source = createSystemAgentSource(client);
 
     const requests = await source.list();
@@ -56,7 +57,7 @@ describe("createSystemAgentSource", () => {
       kind: "system-agent:restart",
       sourceRevision: "a".repeat(64),
     });
-    expect(requests[0].detail).toBeUndefined();
+    expect(requests[0].detail).toEqual({ expiresAt: new Date(record.expiresAtMs).toISOString() });
   });
 
   it("subscribe() forwards live openclaw.approval.requested records, namespaced", () => {

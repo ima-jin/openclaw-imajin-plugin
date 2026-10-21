@@ -39,6 +39,7 @@ async function generateKeypairHex(): Promise<{ privateKeyHex: string; publicKeyH
 
 const OPERATOR_DID = "did:imajin:operator";
 const AGENT_DID = "did:imajin:agent";
+const RECORD_EXPIRES_AT_MS = Date.parse("2035-01-01T00:00:00.000Z");
 
 function makeRecord(overrides: Partial<SystemAgentApprovalRequestRecord> = {}): SystemAgentApprovalRequestRecord {
   return {
@@ -54,7 +55,7 @@ function makeRecord(overrides: Partial<SystemAgentApprovalRequestRecord> = {}): 
       sessionId: "sess-1",
     },
     createdAtMs: Date.now(),
-    expiresAtMs: Date.now() + 600_000,
+    expiresAtMs: RECORD_EXPIRES_AT_MS,
     ...overrides,
   };
 }
@@ -211,7 +212,7 @@ describe("GatewayApprovalsBridge", () => {
   }
 
   function pendingSnapshot(proposalHash: string): GatewayApprovalSnapshot {
-    return { status: "pending", presentation: { proposalHash } };
+    return { status: "pending", expiresAtMs: RECORD_EXPIRES_AT_MS, presentation: { proposalHash } };
   }
 
   it("publishes a signed operator.approval.requested on a live openclaw.approval.requested event", async () => {
@@ -225,7 +226,9 @@ describe("GatewayApprovalsBridge", () => {
     // detail), not the raw source-native proposalHash — which now rides
     // inside detail.sourceRevision instead.
     expect(published.contentHash).toMatch(/^sha256:[0-9a-f]{64}$/);
-    expect(published.detail).toEqual({ sourceRevision: record.request.proposalHash });
+    expect(published.detail).toEqual({
+      sourceRevision: record.request.proposalHash, expiresAt: new Date(record.expiresAtMs).toISOString(),
+    });
     expect(bridge.isPublished(record.id)).toBe(true);
   });
 
@@ -525,7 +528,7 @@ describe("GatewayApprovalsBridge + operator countersignature (#44)", () => {
   }
 
   function pendingSnapshot(proposalHash: string): GatewayApprovalSnapshot {
-    return { status: "pending", presentation: { proposalHash } };
+    return { status: "pending", expiresAtMs: RECORD_EXPIRES_AT_MS, presentation: { proposalHash } };
   }
 
   async function signDecision(
@@ -533,7 +536,12 @@ describe("GatewayApprovalsBridge + operator countersignature (#44)", () => {
     privateKeyHex: string,
   ): Promise<string> {
     const { canonicalize } = await import("./approval-bridge.js");
-    const message = new TextEncoder().encode(canonicalize(fields));
+    // /jin signs the bare digest; the bus event still echoes the prefixed wire hash.
+    expect(fields.contentHash).toMatch(/^sha256:[0-9a-f]{64}$/);
+    const message = new TextEncoder().encode(canonicalize({
+      ...fields,
+      contentHash: fields.contentHash.slice("sha256:".length),
+    }));
     const sig = await ed.signAsync(message, Uint8Array.from(Buffer.from(privateKeyHex, "hex")));
     return Buffer.from(sig).toString("hex");
   }

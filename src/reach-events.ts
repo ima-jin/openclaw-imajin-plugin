@@ -6,14 +6,14 @@
 import { createPublicKey, verify } from "node:crypto";
 import { join } from "node:path";
 import { canonicalize } from "./approval-bridge.js";
-import { sendDirectChannelMessage, type DirectSendConfig } from "./channel-notify.js";
+import { sendDirectChannelMessage, type DirectChannelApi, type DirectSendConfig } from "./channel-notify.js";
 import { NotificationDedupStore, resolveStateDir } from "./notification-state-store.js";
 import { parseOperatorSignature, type IdentityLookupClient } from "./operator-signature.js";
 
 export interface ReachEventsConfig {
   /** Trusted node Ed25519 PUBLIC key, hex. Required for delivered events. */
   kernelPublicKeyHex?: string;
-  /** Explicit opt-in; reuses directSend's Telegram target/CLI. Default false. */
+  /** Explicit opt-in; reuses directSend's Telegram target/adapter. Default false. */
   telegramEscalation?: boolean;
 }
 
@@ -166,10 +166,10 @@ async function verifiedEvent(
   }
 }
 
-interface ReachApi {
+interface ReachApi extends DirectChannelApi {
   runtime?: { system?: {
     enqueueSystemEvent?: (text: string, opts: { sessionKey: string; contextKey: string }) => boolean;
-  } };
+  } } & NonNullable<DirectChannelApi["runtime"]>;
 }
 
 export function createReachEventHandler(
@@ -221,7 +221,7 @@ export function createReachEventHandler(
     if (!disposed && config?.telegramEscalation === true && deps.directSend?.target &&
         (deps.directSend.channel ?? "telegram") === "telegram") {
       // No model-generated content and no new token; default is no channel send.
-      await sendDirectChannelMessage(deps.directSend, text);
+      await sendDirectChannelMessage(deps.directSend, text, api);
     }
   }
 
@@ -229,7 +229,7 @@ export function createReachEventHandler(
     handle(frame) {
       const task = queue.then(() => processFrame(frame));
       queue = task.catch(() => {
-        // Never log sender content or resolver/CLI errors containing private data.
+        // Never log sender content or resolver/adapter errors containing private data.
         console.warn("[imajin-reach] event processing failed");
       });
       return queue;

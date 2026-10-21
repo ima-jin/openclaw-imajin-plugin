@@ -186,7 +186,28 @@ the Gateway reports an approved exec finished, to the kernel's `POST
 `ApprovalSource` contract — see `gateway-exec.ts`'s module doc for the full
 "which hook" rationale and the outcome-endpoint contract.
 
-## Reconnect leg — entitlement preflight + catch-up (#53)
+## Live lifecycle — entitlement preflight + catch-up (#53, #103)
+
+The reconnect leg below also runs every five minutes. Before a new publish,
+an entitlement check older than five minutes is refreshed. Renewal detection
+immediately reconciles sources and catches up decisions without reconnecting.
+Degraded cards carry signed `detail.bridge`; decision-time recomputation
+preserves that publish-time marker while re-reading source-owned detail.
+
+Both system-agent and gateway-exec publish the native record expiry as
+`detail.expiresAt`. Persisted proposal metadata and warning dedupe live beside
+the cursor in `approvals-bridge-state.json`, scoped to node, agent and operator.
+Successful source lists retire locally tracked orphans; failed lists preserve
+them. Expired, untracked and source-gone decisions never resolve.
+
+Live auth/notify/jin specs expose neither grantee-readable lease expiry nor a
+signer-scoped card expiry route. The current generic panel also ignores
+`detail.bridge`. These explicit fallback gaps are children of imajin-ai#2084:
+[#3018](https://github.com/ima-jin/imajin-ai/issues/3018) (ahead-of-expiry warnings),
+[#3019](https://github.com/ima-jin/imajin-ai/issues/3019) (remote orphan outcome),
+[#3020](https://github.com/ima-jin/imajin-ai/issues/3020) (visible marker).
+The plugin logs these limitations and uses one in-process Telegram warning per
+proposal; it does not guess a TTL or impersonate an operator withdrawal.
 
 ```
  WS connected (auth ok)      gateway-approvals-bridge.ts                Kernel
@@ -345,6 +366,17 @@ changed after the operator decided is caught even when the underlying
 `revisionHash` happened not to change.
 
 ## Trust chain summary
+
+The operator signs `canonicalize({contentHash, decidedAt, decision, mode?,
+replyMessage?})`: `contentHash` is the **bare lowercase 64-character hex
+digest**, while the kernel bus event echoes the original `sha256:<hex>`
+wire value. The bridge first checks that exact wire echo, then removes
+exactly one `sha256:` prefix from its own staged hash for signature
+verification. Optional `mode` and `replyMessage` are signed when present,
+including an empty reply; they must never be dropped or rewritten during
+verification. A supplied invalid signature is rejected regardless of the
+`requireOperatorCountersignature` setting; that setting only controls
+whether an absent signature is permitted.
 
 `plugin-signed request` → `kernel recomputes + verifies contentHash` →
 `operator decides + countersigns on /jin` → `kernel witnesses` → `plugin

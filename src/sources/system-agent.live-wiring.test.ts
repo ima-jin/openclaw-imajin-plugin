@@ -182,7 +182,7 @@ describe("system-agent with a runtime-only Gateway client (#88)", () => {
     await expect(bridge.handleKernelDecision(decided())).resolves.toBe("noop");
     expect(gateway.resolve).not.toHaveBeenCalled();
     expect(bridge.isPublished(pending.id)).toBe(false);
-    expect(logger.error).not.toHaveBeenCalled();
+    expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("expired/superseded"));
   });
 
   it("releases stale loop blocks when the pending list becomes empty", async () => {

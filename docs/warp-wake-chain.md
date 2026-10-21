@@ -236,7 +236,8 @@ at `notification-injector.ts:116-121`).
    on failure (in which case `inject()` returns early — no ping, no wake;
    see `:412-436`).
 2. Instant direct channel ping via `sendChannelMessage` (`:191-201`,
-   `openclaw message send` CLI, no model in the loop) — logs
+   in-process `runtime.channel.outbound.loadAdapter(channel).sendText`,
+   no model or subprocess; deprecated `cliPath` is ignored) — logs
    `"direct-sent {scope} → {channel}:{target}"`.
 3. Coalesce into `coalesceByScope` (#25, leading-edge + trailing — see
    `notification-injector.ts`'s module doc comment above `createNotificationInjector`):

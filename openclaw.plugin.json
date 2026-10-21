@@ -175,7 +175,7 @@
     },
     "wsNotifications.reach.telegramEscalation": {
       "label": "Reach Events: Telegram Escalation",
-      "help": "Default false. Explicit true sends verified, bounded UNTRUSTED reach context to the existing wsNotifications.directSend Telegram target/CLI. No new secrets; non-Telegram destinations are not used."
+      "help": "Default false. Explicit true sends verified, bounded UNTRUSTED reach context to the existing wsNotifications.directSend Telegram target through the in-process outbound adapter. No new secrets; non-Telegram destinations are not used."
     },
     "wsNotifications.reportTo": {
       "label": "Wake Report Sessions",
@@ -418,11 +418,11 @@
           },
           "directSend": {
             "type": "object",
-            "description": "Deterministic channel delivery through the OpenClaw CLI, no model turn, with a 20-second timeout. Configure a target for completion pings, terminal-subject disclosures and wake loop/token/silent-ending/failure/watchdog alerts. The CLI path also serves imajin_wake_report sends to reportTo destinations.",
+            "description": "Deterministic in-process delivery through OpenClaw runtime.channel.outbound.loadAdapter and sendText, no model turn or subprocess, with a 20-second deadline. Configure a target for completion pings, terminal disclosures, bridge warnings and wake alerts. The same adapter serves imajin_wake_report reportTo destinations. Requires a host with the channel outbound runtime.",
             "properties": {
               "channel": { "type": "string", "description": "Channel id, default telegram." },
               "target": { "type": "string", "description": "Chat/recipient target." },
-              "cliPath": { "type": "string", "description": "Absolute path to the openclaw CLI binary; default openclaw (PATH)." }
+              "cliPath": { "type": "string", "deprecated": true, "description": "Deprecated compatibility field; accepted but ignored. Channel delivery is in-process and never launches the CLI." }
             }
           }
         }

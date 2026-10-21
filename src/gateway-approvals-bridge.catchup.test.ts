@@ -35,6 +35,7 @@ const OPERATOR_DID = "did:imajin:operator";
 const AGENT_DID = "did:imajin:agent";
 const NODE_URL = "https://jin.example";
 const PROPOSAL_ID = "system-agent:abc123";
+const RECORD_EXPIRES_AT_MS = Date.parse("2035-01-01T00:00:00.000Z");
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -56,13 +57,13 @@ function makeRecord(overrides: Partial<SystemAgentApprovalRequestRecord> = {}): 
       sessionId: "sess-1",
     },
     createdAtMs: Date.now(),
-    expiresAtMs: Date.now() + 600_000,
+    expiresAtMs: RECORD_EXPIRES_AT_MS,
     ...overrides,
   };
 }
 
 function pendingSnapshot(proposalHash: string): GatewayApprovalSnapshot {
-  return { status: "pending", presentation: { proposalHash } };
+  return { status: "pending", expiresAtMs: RECORD_EXPIRES_AT_MS, presentation: { proposalHash } };
 }
 
 function decidedFrame(contentHash: string, overrides: Partial<KernelBusEventFrame> = {}): KernelBusEventFrame {
@@ -146,7 +147,10 @@ describe("GatewayApprovalsBridge — #53 preflight, degraded mode, catch-up", ()
     gateway = {
       list: vi.fn().mockResolvedValue([]),
       get: vi.fn(),
-      resolve: vi.fn().mockResolvedValue({ applied: true }),
+      resolve: vi.fn(async () => {
+        gateway.list.mockResolvedValue([]);
+        return { applied: true };
+      }),
       onRequested: vi.fn((handler: (record: SystemAgentApprovalRequestRecord) => void) => {
         requestedHandler = handler;
       }),
@@ -186,6 +190,7 @@ describe("GatewayApprovalsBridge — #53 preflight, degraded mode, catch-up", ()
   }
 
   async function publishProposal(): Promise<string> {
+    gateway.list.mockResolvedValue([makeRecord()]);
     requestedHandler!(makeRecord());
     await vi.waitFor(() => expect(kernel.publishApprovalRequested).toHaveBeenCalled());
     const calls = kernel.publishApprovalRequested.mock.calls;
@@ -250,7 +255,7 @@ describe("GatewayApprovalsBridge — #53 preflight, degraded mode, catch-up", ()
   });
 
   describe("degraded-mode publish", () => {
-    it("surfaces the warning on EVERY publish and never alters the signed card (summary/contentHash stay stable)", async () => {
+    it("warns once per proposal and includes the degraded marker in signed detail without changing the summary", async () => {
       const bridge = await newBridge();
       await bridge.runPreflight(mutableKernel({ entitled: false }).http, OPERATOR_DID);
       logger.error.mockClear();
@@ -267,10 +272,13 @@ describe("GatewayApprovalsBridge — #53 preflight, degraded mode, catch-up", ()
       expect(warning).toContain(AGENT_DID);
       expect(String(notifyOperator.mock.calls[1][0])).toContain("system-agent:second");
 
-      // Hash stability: the card is exactly what a non-degraded publish would be.
+      // Bridge state is bound to this card; recovery never rewrites this signed marker.
       const published = kernel.publishApprovalRequested.mock.calls[0][0];
       expect(published.summary).toBe(record.request.description);
       expect(published.summary).not.toContain("⚠");
+      expect(published.detail.bridge).toEqual({
+        degraded: true, reason: "agent lacks operator:approvals", fix: "/auth/agents",
+      });
       // The warning is always in the log too, so it is visible even without directSend.
       expect(logger.error).toHaveBeenCalledWith(expect.stringContaining("⚠ bridge cannot apply"));
     });

@@ -171,3 +171,4 @@
 - The static `imajin-xai` / `imajin-openai` provider blocks can be retired once
   `imajin_status` shows `outcome: ok` with your brains listed. This release does
   not touch Gateway config; see README "Retiring the static provider blocks".
+

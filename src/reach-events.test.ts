@@ -272,7 +272,7 @@ describe("signed reach events to Jin", () => {
     expect(h.enqueue).toHaveBeenCalledOnce();
     expect(sendDirectChannelMessage).toHaveBeenCalledTimes(flag === true ? 1 : 0);
     if (flag) expect(sendDirectChannelMessage).toHaveBeenCalledWith(
-      { target: "123" }, h.enqueue.mock.calls[0][0],
+      { target: "123" }, h.enqueue.mock.calls[0][0], h.api,
     );
   });
 
@@ -332,7 +332,7 @@ describe("signed reach events to Jin", () => {
     expect(h.enqueue).not.toHaveBeenCalled();
   });
 
-  it("stops handling frames after disposal and contains CLI failures without private logs", async () => {
+  it("stops handling frames after disposal and contains adapter failures without private logs", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.mocked(sendDirectChannelMessage).mockRejectedValueOnce(new Error("PRIVATE SENDER TEXT"));
     const h = harness({ kernelPublicKeyHex: NODE_PUBLIC, telegramEscalation: true });

@@ -60,7 +60,7 @@ describe("verifyOperatorSignature", () => {
   it("verifies a valid signature over the exact canonicalized fields", async () => {
     const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
     const fields: OperatorCountersignFields = {
-      contentHash: "sha256:" + "a".repeat(64),
+      contentHash: "a".repeat(64),
       decision: "approve",
       decidedAt: new Date().toISOString(),
     };
@@ -77,7 +77,7 @@ describe("verifyOperatorSignature", () => {
     const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
     const other = await generateKeypairHex();
     const fields: OperatorCountersignFields = {
-      contentHash: "sha256:" + "a".repeat(64),
+      contentHash: "a".repeat(64),
       decision: "approve",
       decidedAt: new Date().toISOString(),
     };
@@ -93,12 +93,12 @@ describe("verifyOperatorSignature", () => {
   it("rejects a tampered contentHash even when keyId matches", async () => {
     const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
     const fields: OperatorCountersignFields = {
-      contentHash: "sha256:" + "a".repeat(64),
+      contentHash: "a".repeat(64),
       decision: "approve",
       decidedAt: new Date().toISOString(),
     };
     const sig = await signFields(fields, privateKeyHex);
-    const tampered = { ...fields, contentHash: "sha256:" + "b".repeat(64) };
+    const tampered = { ...fields, contentHash: "b".repeat(64) };
     const result = await verifyOperatorSignature(tampered, { keyId: publicKeyHex, alg: "ed25519", sig }, publicKeyHex);
     expect(result).toEqual({ ok: false, error: "invalid operator signature" });
   });
@@ -106,7 +106,7 @@ describe("verifyOperatorSignature", () => {
   it("rejects a tampered decision even when keyId matches", async () => {
     const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
     const fields: OperatorCountersignFields = {
-      contentHash: "sha256:" + "a".repeat(64),
+      contentHash: "a".repeat(64),
       decision: "approve",
       decidedAt: new Date().toISOString(),
     };
@@ -119,7 +119,7 @@ describe("verifyOperatorSignature", () => {
   it("rejects a tampered decidedAt even when keyId matches", async () => {
     const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
     const fields: OperatorCountersignFields = {
-      contentHash: "sha256:" + "a".repeat(64),
+      contentHash: "a".repeat(64),
       decision: "approve",
       decidedAt: new Date(0).toISOString(),
     };
@@ -127,6 +127,52 @@ describe("verifyOperatorSignature", () => {
     const tampered = { ...fields, decidedAt: new Date().toISOString() };
     const result = await verifyOperatorSignature(tampered, { keyId: publicKeyHex, alg: "ed25519", sig }, publicKeyHex);
     expect(result).toEqual({ ok: false, error: "invalid operator signature" });
+  });
+});
+
+describe("optional countersignature fields", () => {
+  it.each([
+    {},
+    { mode: "once" },
+    { replyMessage: "" },
+    { mode: "once", replyMessage: "Reviewed and approved" },
+  ])("verifies optional fields exactly as signed: %j", async (optional) => {
+    const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
+    const fields: OperatorCountersignFields = {
+      contentHash: "a".repeat(64),
+      decision: "approve",
+      decidedAt: "2026-10-20T00:00:00.000Z",
+      ...optional,
+    };
+    const sig = await signFields(fields, privateKeyHex);
+    const signature = { keyId: publicKeyHex, alg: "ed25519" as const, sig };
+    expect(await verifyOperatorSignature(fields, signature, publicKeyHex)).toEqual({ ok: true });
+    expect(await verifyOperatorSignature(
+      { ...fields, contentHash: `sha256:${fields.contentHash}` }, signature, publicKeyHex,
+    )).toEqual({ ok: false, error: "invalid operator signature" });
+  });
+
+  it.each(["mode", "replyMessage"] as const)("rejects changed, removed, or added %s", async (field) => {
+    const { privateKeyHex, publicKeyHex } = await generateKeypairHex();
+    const fields: OperatorCountersignFields = {
+      contentHash: "a".repeat(64),
+      decision: "approve",
+      decidedAt: "2026-10-20T00:00:00.000Z",
+      [field]: "",
+    };
+    const signature = {
+      keyId: publicKeyHex, alg: "ed25519" as const,
+      sig: await signFields(fields, privateKeyHex),
+    };
+    const removed = { ...fields };
+    delete removed[field];
+    for (const changed of [{ ...fields, [field]: "tampered" }, removed]) {
+      expect(await verifyOperatorSignature(changed, signature, publicKeyHex))
+        .toEqual({ ok: false, error: "invalid operator signature" });
+    }
+    const absentSignature = { ...signature, sig: await signFields(removed, privateKeyHex) };
+    expect(await verifyOperatorSignature(fields, absentSignature, publicKeyHex))
+      .toEqual({ ok: false, error: "invalid operator signature" });
   });
 });
 
