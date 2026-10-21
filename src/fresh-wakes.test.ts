@@ -27,6 +27,23 @@ describe("wake completion watchdog", () => {
     vi.useFakeTimers();
     vi.spyOn(console, "log").mockImplementation(() => {});
   });
+  afterEach(() => {
+    for (const supervisor of supervisors.splice(0)) supervisor.dispose();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  function track(timeoutMs?: number) {
+    const alert = vi.fn(async () => {});
+    const complete = vi.fn(async () => {});
+    const abort = vi.fn(async () => {});
+    const sessionTokens = vi.fn(async (): Promise<number | undefined> => 0);
+    const supervisor = new WakeSupervisor({ timeoutMs, alert, abort, complete, sessionTokens });
+    supervisors.push(supervisor);
+    supervisor.track({ batchId: "batch", sessionKey: BASE, scope: "scope", runs: [], uniqueSession: true });
+    return { supervisor, alert, abort, complete, sessionTokens };
+  }
+
   it.each([42_123, undefined, "throws"] as const)("logs timeout tokens from metadata (%s) without disclosing reader errors", async (tokens) => {
     const { sessionTokens, abort, alert } = track(10);
     sessionTokens.mockImplementation(async () => {
@@ -91,22 +108,6 @@ describe("wake completion watchdog", () => {
     expect(console.error).toHaveBeenCalledTimes(1);
     expect(console.error).toHaveBeenCalledWith("[imajin-ws] wake timeout abort failed");
   });
-  afterEach(() => {
-    for (const supervisor of supervisors.splice(0)) supervisor.dispose();
-    vi.useRealTimers();
-    vi.restoreAllMocks();
-  });
-
-  function track(timeoutMs?: number) {
-    const alert = vi.fn(async () => {});
-    const complete = vi.fn(async () => {});
-    const abort = vi.fn(async () => {});
-    const sessionTokens = vi.fn(async (): Promise<number | undefined> => 0);
-    const supervisor = new WakeSupervisor({ timeoutMs, alert, abort, complete, sessionTokens });
-    supervisors.push(supervisor);
-    supervisor.track({ batchId: "batch", sessionKey: BASE, scope: "scope", runs: [], uniqueSession: true });
-    return { supervisor, alert, abort, complete, sessionTokens };
-  }
 
   it.each([
     { timeoutMs: undefined, expectedMs: 900_000 },

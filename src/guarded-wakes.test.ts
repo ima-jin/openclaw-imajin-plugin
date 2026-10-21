@@ -54,6 +54,32 @@ describe("guarded wake acceptance (#82)", () => {
     return registries.at(-1)!;
   }
 
+  beforeEach(async () => {
+    dir = await mkdtemp(join(tmpdir(), "guarded-wakes-"));
+    posts = [];
+    config = {
+      injectScopes: ["warp.run.completed"], targetSession: "agent:main:warp-events",
+      hookToken: "fixture-only", wakeSettleMs: 2, wakeCoalesceMs: 2, stateDir: dir,
+      reportTo: [REPORT], directSend: { channel: "telegram", target: "123", cliPath: "/fixture/openclaw" },
+    };
+    lookup = vi.fn(async () => OPEN);
+    abort = vi.fn(async () => {});
+    vi.mocked(sendDirectChannelMessage).mockReset().mockResolvedValue();
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
+      posts.push(JSON.parse(init.body));
+      return { status: 200, json: async () => ({ runId: `admission-${posts.length}` }), text: async () => "" };
+    }));
+    for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation(() => {});
+  });
+  afterEach(async () => {
+    beginRegistration().dispose();
+    injector?.dispose();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    await rm(dir, { recursive: true, force: true });
+  });
+
   it("stops a watchdog timeout once through the guards despite extra registrations and late hooks", async () => {
     vi.useFakeTimers();
     config.wakeTimeoutMs = 5_000;
@@ -79,32 +105,6 @@ describe("guarded wake acceptance (#82)", () => {
     expect(abort).toHaveBeenCalledTimes(1);
     expect(alerts()).toHaveLength(1);
     expect(posts.filter((post) => post.name === "imajin-wake-report")).toHaveLength(0);
-  });
-
-  beforeEach(async () => {
-    dir = await mkdtemp(join(tmpdir(), "guarded-wakes-"));
-    posts = [];
-    config = {
-      injectScopes: ["warp.run.completed"], targetSession: "agent:main:warp-events",
-      hookToken: "fixture-only", wakeSettleMs: 2, wakeCoalesceMs: 2, stateDir: dir,
-      reportTo: [REPORT], directSend: { channel: "telegram", target: "123", cliPath: "/fixture/openclaw" },
-    };
-    lookup = vi.fn(async () => OPEN);
-    abort = vi.fn(async () => {});
-    vi.mocked(sendDirectChannelMessage).mockReset().mockResolvedValue();
-    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: { body: string }) => {
-      posts.push(JSON.parse(init.body));
-      return { status: 200, json: async () => ({ runId: `admission-${posts.length}` }), text: async () => "" };
-    }));
-    for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation(() => {});
-  });
-  afterEach(async () => {
-    beginRegistration().dispose();
-    injector?.dispose();
-    vi.useRealTimers();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
-    await rm(dir, { recursive: true, force: true });
   });
 
   it("makes main-session copies fire-and-forget and blocks inter-session ping-pong after disclosure", async () => {
