@@ -1335,6 +1335,7 @@ describe("createNotificationInjector — persisted state across a simulated rest
     await restarted.dispose();
   });
 
+  // #95: this restart regression must also hold under full-suite worker load.
   it("retains the owed marker after retries are exhausted, and replays it on the next restart", async () => {
     const keypairPath = join(tmpDir, ".jin-identity.json");
     setImpl(async () => jsonResponse(500, { error: "boom" }));
