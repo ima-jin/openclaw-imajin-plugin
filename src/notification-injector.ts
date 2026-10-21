@@ -15,6 +15,7 @@
 import * as path from "node:path";
 import { WakeBridgeStore, type HorizonWakeAdapter } from "./wake-bridge.js";
 import { readWakeSessionTokens } from "./wake-session-metadata.js";
+import { resolveWakeModel, type WakeModelSelection } from "./wake-model.js";
 import { buildWakeOutcome } from "./wake-outcome.js";
 import { createLoopbackSessionGateway } from "./session-command-gateway.js";
 import { DEFAULT_WAKE_DECISION_MODEL, WakeDecisionRouter, type WakeHookContext, type WakeToolEvent } from "./wake-decision.js";
@@ -69,6 +70,8 @@ export interface WsNotificationsConfig {
   maxWakeTokens?: number;
   /** Coordinator model; omitted keeps the host's configured wake-agent model. */
   model?: string;
+  /** Wake-only override; empty/unset preserves legacy routing; unresolved uses default. */
+  wakeModel?: string;
   /** Model pinned on decision subagents; default anthropic/claude-opus-5-5. */
   decisionModel?: string;
   /** Default false; opt-in allowlisted reads only for no-PR or all-FAILED batches. Never decision writes. */
@@ -808,6 +811,7 @@ export function createNotificationInjector(
   let reusedSessionKey = wakeSessionKey;
   let allocatedFreshReuseKey = false;
   const reservedTokens = new Map<string, number>();
+  const wakeModelSources = new Map<string, WakeModelSelection["source"]>();
   const wakeCoalesceMs = wsNotifications?.wakeCoalesceMs ?? DEFAULT_WAKE_COALESCE_MS;
   const wakeSettleMs = wsNotifications?.wakeSettleMs ?? DEFAULT_WAKE_SETTLE_MS;
   const wakeOwedMaxAgeMs = wsNotifications?.wakeOwedMaxAgeMs ?? DEFAULT_WAKE_OWED_MAX_AGE_MS;
@@ -957,6 +961,16 @@ export function createNotificationInjector(
       if (batchId && event.runId && ctx.sessionKey === decisionRouter.root(ctx.sessionKey)) {
         guards.bindRunner(batchId, event.runId);
         decisionRouter.bindRunner(batchId, event.runId);
+      }
+      const activeBatch = decisionRouter.batch(ctx);
+      if (activeBatch && ctx.sessionKey === decisionRouter.root(ctx.sessionKey) && event.model) {
+        const source = wakeModelSources.get(activeBatch);
+        if (source) {
+          const model = event.provider && !event.model.startsWith(`${event.provider}/`)
+            ? `${event.provider}/${event.model}` : event.model;
+          console.log(`[imajin-ws] wake model=${JSON.stringify(model)} source=${source} batch=${activeBatch}`);
+          wakeModelSources.delete(activeBatch);
+        }
       }
       const wrongModel = decisionRouter.wrongDecisionModel(event, ctx);
       if (wrongModel) void guards.stop(wrongModel, "decision subagent model differs from configured decisionModel");
@@ -1227,6 +1241,13 @@ export function createNotificationInjector(
       ? deriveWakeSessionKey(wakeSessionKey, idempotencyKey, summarizeWakeRuns(frames).map((r) => r.runId), sessionPerWake)
       : await guardedReuseSession(frames);
     const gatewayPort = resolveGatewayPort(api);
+    const selection = await withWakeDeadline(resolveWakeModel(
+      wsNotifications?.wakeModel, wsNotifications?.model, hookAgentId,
+      () => api?.runtime?.config?.current?.() ?? api?.config ?? {},
+    )).catch((): WakeModelSelection => {
+      console.warn(`[imajin-ws] wakeModel could not be resolved or is not allowed; using gateway default batch=${idempotencyKey}`);
+      return { source: "default" };
+    });
     // Tracked BEFORE the POST so a fast turn can't finish unmatched (#47).
     const batch = { batchId: idempotencyKey, scope, runs: summarizeWakeRuns(frames), sessionKey, uniqueSession: freshSessions };
     wakeReporter?.track(batch);
@@ -1244,6 +1265,8 @@ export function createNotificationInjector(
     decisionRouter.track(sessionKey, idempotencyKey, {
       hasPr: liveState.subjects.length > 0, failedRun: frames.every(isFailedWakeFrame),
     });
+    if (wakeModelSources.size >= 100) wakeModelSources.delete(wakeModelSources.keys().next().value!);
+    wakeModelSources.set(idempotencyKey, selection.source);
     const result = await postWakeHookWithRetries({
       gatewayPort,
       hooksPath,
@@ -1252,12 +1275,13 @@ export function createNotificationInjector(
       sessionKey,
       message,
       idempotencyKey,
-      model: wsNotifications?.model?.trim(),
+      model: selection.model,
     }, (reason) => { void supervisor.alert(idempotencyKey, reason); }, lifecycle.signal);
     supervisor.bindRun(idempotencyKey, result.runId);
     guards.bindRun(idempotencyKey, result.runId);
     allocatedFreshReuseKey = false;
     if (!result.ok && !result.pending) {
+      wakeModelSources.delete(idempotencyKey);
       supervisor.untrack(idempotencyKey);
       guards.untrack(idempotencyKey);
       decisionRouter.untrack(idempotencyKey);
@@ -1387,6 +1411,7 @@ export function createNotificationInjector(
     supervisor.dispose();
     guards.dispose();
     decisionRouter.dispose();
+    wakeModelSources.clear();
     abortGateway.dispose();
     for (const [scope, buf] of coalesceByScope) {
       clearTimeout(buf.timeout);
@@ -1519,6 +1544,7 @@ export function createNotificationInjector(
       ]);
       guards.untrack(settled.batchId);
       decisionRouter.untrack(settled.batchId);
+      wakeModelSources.delete(settled.batchId);
     },
   };
 }

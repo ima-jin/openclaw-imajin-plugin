@@ -353,6 +353,10 @@
             "minLength": 1,
             "description": "Optional wake coordinator model. Omitted preserves the host wake-agent model."
           },
+          "wakeModel": {
+            "type": "string",
+            "description": "Optional wake-only model override, e.g. imajin/kimi-k3. Takes precedence over model. Unset or empty preserves existing routing; an unresolvable or disallowed model warns and uses the gateway default. Never changes global defaults. Each wake logs its actual model and source once."
+          },
           "decisionModel": {
             "type": "string",
             "default": "anthropic/claude-opus-5-5",
