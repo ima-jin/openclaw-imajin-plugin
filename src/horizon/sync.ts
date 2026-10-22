@@ -5,7 +5,8 @@ import { basename, dirname, join, resolve } from "node:path";
 import { createLoopTransport, type LoopSenderOptions } from "../loop-publisher.js";
 import { loadCursor, planDiff, saveCursor, type Cursor } from "./cursor.js";
 import { digest, mapItem, parseHorizon, text, type StepEnvelope, type StepRequest } from "./model.js";
-import { deliveryResult, rejectedStepWarning, saveDeadLetter } from "./outbox.js";
+import { deliveryResult, rejectedStepWarning, safeStepId, saveDeadLetter } from "./outbox.js";
+import { isStale, lookupReceipt } from "./receipts.js";
 
 export interface HorizonConfig {
   enabled?: boolean;
@@ -63,11 +64,36 @@ export function createHorizonSync(options: HorizonSyncOptions) {
   let stopped = false;
   let lastWarning = -Infinity;
   let lastIncompleteWarning = -Infinity;
+  let lastReceiptWarning = -Infinity;
 
   function warn(): void {
     if (now() - lastWarning < 60_000) return;
     lastWarning = now();
     log.warn("[imajin-horizon] sync failed; no cursor reset; pending facts retained (check file, config, identity and kernel contract)");
+  }
+  async function reconcile(request: StepRequest): Promise<void> {
+    const result = await lookupReceipt(transport, request, now());
+    if (result === "accepted") {
+      log.info(`[imajin-horizon] stepId=${safeStepId(request)} receipt accepted; reconciling exact outbox envelope without publishing`);
+      return;
+    }
+    if (now() - lastReceiptWarning >= 60_000) {
+      lastReceiptWarning = now();
+      log.warn(`[imajin-horizon] stepId=${safeStepId(request)} receipt ${result}; exact envelope retained in outbox, not restamped; retrying lookup`);
+    }
+    throw new Error("kernel receipt not confirmed");
+  }
+  async function deliver(request: StepRequest): Promise<void> {
+    if (isStale(request, now())) return reconcile(request);
+    const response = await transport.post(request);
+    const result = await deliveryResult(response);
+    if (result === "retry") throw new Error("kernel delivery is transient");
+    if (result !== "dead-letter") return;
+    // The original can age out during the POST. A stale 400 is not a rejection
+    // of its earlier ambiguous delivery; reconcile before dead-lettering it.
+    if (response.status === 400 && isStale(request, now())) return reconcile(request);
+    await saveDeadLetter(deadLetterPath, request, response.status, now());
+    log.warn(rejectedStepWarning(request, response.status));
   }
   async function drain(cursor: Cursor): Promise<Cursor> {
     if (!cursor.pending || stopped) return cursor;
@@ -77,13 +103,7 @@ export function createHorizonSync(options: HorizonSyncOptions) {
       if (request.publisherDid !== options.did || request.payload.loopId !== loopId || request.payload.principal !== principal) {
         throw new Error("outbox identity mismatch");
       }
-      const response = await transport.post(request);
-      const result = await deliveryResult(response);
-      if (result === "retry") throw new Error("kernel delivery is transient");
-      if (result === "dead-letter") {
-        await saveDeadLetter(deadLetterPath, request, response.status, now());
-        log.warn(rejectedStepWarning(request, response.status));
-      }
+      await deliver(request);
       cursor = { ...cursor, pending: { ...pending, requests: pending.requests.slice(1) } };
       await saveCursor(cursorPath, cursor);
       // Each acknowledgement depends on the preceding POST and durable write.

@@ -4,7 +4,7 @@ The opt-in horizon publisher pushes local queue facts to an existing owning
 loop through the signed `/api/loops` rail. The kernel never reads the harness,
 gateway, sessions or transcripts. Inbound `/jin` claims are a separate feature.
 
-The wire contract is `docs/loops-rail-contract.md` from merged kernel PR #2909.
+The wire contract is `docs/loops-rail-contract.md` from merged kernel PRs #2909 and #3000 (receipt lookup, imajin-ai#2931).
 Zones are kernel projections, never published fields.
 Local `head` is not a lease; local `near` is not proof of settled design.
 
@@ -160,13 +160,34 @@ the request pending rather than losing it. HTTP 408/429, 5xx and network errors
 still retain the exact head request for retry.
 Dead-lettered requests, including 401/403 from a revoked or misconfigured grant, are not replayed automatically: they live in `<cursorPath>.dead-letter.json`, and an operator replays them after fixing auth.
 
-This includes stale-timestamp 4xx rejections outside the kernel's signed-message
-clock window (tracked in #2931). They are dead-lettered, not restamped or
-allowed to strand later steps. A dead letter is **not** proof of acceptance:
-operators must reconcile rejected facts; they are not retried automatically.
-The cursor consumes that observation while preserving its rejected signed
-request for inspection. This is not a promise of unbounded offline delivery
-through the current kernel contract.
+### Stale exact outbox recovery (kernel #2931)
+
+An original envelope older than the kernel's five-minute signed-message window
+is **not** posted again or restamped. The publisher signs a separate fresh
+`loop.receipt` request to kernel-root `POST /api/loops/receipts` (never a
+`/jin` route), using its own DID key and the original loop and principal.
+`envelopeHash` is SHA-256 of the canonical parsed original ingest request,
+including its original payload and normalized lowercase signature hex. Null,
+absent and extension payload fields are preserved; this is not the cursor's
+JSON digest. The lookup uses the same live `loops:publish` authorization as ingest.
+
+Only HTTP 200 `{status: "accepted", eventId: "signed-loop:<envelopeHash>"}`
+acknowledges that exact saved request. The cursor is advanced durably before
+the next lookup; no step is published, so receipt recovery adds no history.
+The acceptance log identifies the step without logging the envelope or body.
+
+HTTP 404 `{status: "not_found"}` retains the entire remaining exact outbox:
+it is not permission to re-issue the observation, and may also mean publishing
+scope was denied or revoked. An unavailable kernel, rejected lookup signature,
+malformed/oversized body or mismatched event id likewise retains the outbox.
+A rate-limited warning identifies the step and `not_found` or `unavailable`;
+subsequent syncs retry lookup with a fresh lookup timestamp only. Changed source
+facts wait behind this unresolved batch. Operators should investigate identity,
+scope and kernel availability rather than delete/reset the cursor or restamp.
+A 400 ingest rejection that crosses the age boundary during delivery also
+uses this receipt path. Other permanent ingest failures still use the dead letter.
+Old dead letters remain available for operator reconciliation; they are not
+automatically replayed or treated as acceptance.
 
 ## Verification and wake seam
 
@@ -175,6 +196,9 @@ Run `pnpm run typecheck` and
 The horizon suite covers file mapping, rank changes, exit facts, exact
 restart replay, per-event acknowledgement, two DID signatures, malformed files
 and cursor failures, watcher replacement and service disposal.
+`src/horizon/receipts.test.ts` covers stale accepted/not-found/unreachable
+restarts, exact canonical hashing, separate Ed25519 lookup signatures, scope
+mismatches, invalid responses, partial batch recovery and cursor-write failure.
 
 Read `loops_get` / `GET /api/loops/{loopId}` under the owning principal. Inspect
 `horizon.steps` and `events[].payload.publisherProof` for the actual publisher,

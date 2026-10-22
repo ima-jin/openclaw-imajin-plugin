@@ -100,7 +100,7 @@ export interface LoopEnvelope extends SessionLoopMetadata {
   at: string;
 }
 
-export interface LoopIngestRequest<T extends string = LoopLifecycleType, P extends LoopEnvelope = LoopEnvelope> {
+export interface LoopIngestRequest<T extends string = LoopLifecycleType, P extends object = LoopEnvelope> {
   type: T;
   payload: P;
   publisherDid: string;
@@ -108,6 +108,13 @@ export interface LoopIngestRequest<T extends string = LoopLifecycleType, P exten
 }
 
 export const LOOPS_INGEST_PATH = "/api/loops";
+export const LOOPS_RECEIPTS_PATH = "/api/loops/receipts";
+export interface LoopReceiptPayload {
+  loopId: string;
+  principal: string;
+  envelopeHash: string;
+  at: string;
+}
 /** The kernel rejects summaries over 2000 chars; we stay far below that. */
 export const MAX_SUMMARY_LENGTH = 240;
 const MAX_REF_LENGTH = 512;
@@ -228,7 +235,7 @@ async function loadSigningKey(keypairPath: string): Promise<SigningKey> {
 }
 
 /** Builds the signed ingest request for one envelope. */
-export async function signLoopEvent<T extends string, P extends LoopEnvelope>(
+export async function signLoopEvent<T extends string, P extends object>(
   type: T,
   payload: P,
   publisherDid: string,
@@ -284,20 +291,27 @@ export function createLoopTransport(options: LoopSenderOptions) {
     });
     return key;
   };
+  function post(path: string, request: object): Promise<Response> {
+    return (options.fetchImpl ?? fetch)(
+      `${options.nodeUrl.replace(/\/$/, "")}${path}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+      },
+    );
+  }
   return {
     async sign<T extends string, P extends LoopEnvelope>(type: T, payload: P) {
       return signLoopEvent(type, payload, options.did, await getKey());
     },
     post(request: LoopIngestRequest<string>): Promise<Response> {
-      return (options.fetchImpl ?? fetch)(
-        `${options.nodeUrl.replace(/\/$/, "")}${LOOPS_INGEST_PATH}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(request),
-          signal: AbortSignal.timeout(POST_TIMEOUT_MS),
-        },
-      );
+      return post(LOOPS_INGEST_PATH, request);
+    },
+    async receipt(payload: LoopReceiptPayload): Promise<Response> {
+      const request = await signLoopEvent("loop.receipt", payload, options.did, await getKey());
+      return post(LOOPS_RECEIPTS_PATH, request);
     },
   };
 }
