@@ -4,7 +4,7 @@ The opt-in horizon publisher pushes local queue facts to an existing owning
 loop through the signed `/api/loops` rail. The kernel never reads the harness,
 gateway, sessions or transcripts. Inbound `/jin` claims are a separate feature.
 
-The wire contract is `docs/loops-rail-contract.md` from merged kernel PR #2909.
+The wire contract is `docs/loops-rail-contract.md` from merged kernel PRs #2909 and #3000 (receipt lookup, imajin-ai#2931).
 Zones are kernel projections, never published fields.
 Local `head` is not a lease; local `near` is not proof of settled design.
 
