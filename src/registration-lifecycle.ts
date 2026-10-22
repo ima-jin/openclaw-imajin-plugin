@@ -30,7 +30,12 @@ export class RegistrationLifecycle {
       this.controller.abort();
       for (const dispose of this.disposers.splice(0).reverse()) this.cleanup(dispose);
     }
-    while (this.pending.size) await Promise.all([...this.pending]);
+    await this.drain();
+  }
+
+  private async drain(): Promise<void> {
+    await Promise.all(this.pending);
+    if (this.pending.size) await this.drain();
   }
 
   private cleanup(dispose: Dispose): void {
@@ -52,7 +57,7 @@ export function beginRegistration(): RegistrationLifecycle {
   const processState = globalThis as typeof globalThis & {
     [registrationKey]?: RegistrationLifecycle;
   };
-  processState[registrationKey]?.dispose();
+  void processState[registrationKey]?.dispose();
   const lifecycle = new RegistrationLifecycle();
   processState[registrationKey] = lifecycle;
   return lifecycle;

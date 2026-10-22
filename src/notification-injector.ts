@@ -1493,18 +1493,19 @@ export function createNotificationInjector(
       // Startup can enqueue replay work; injections/completions can append
       // store writes after their first await. Drain producers before stores.
       await stateReady;
-      while (activeOperations.size) {
-        await Promise.allSettled([...activeOperations]);
-      }
-      await Promise.allSettled([...wakeQueueBySession.values()]);
+      await drainActiveOperations();
+      await Promise.allSettled(wakeQueueBySession.values());
       // A wake may have started a completion while admission was settling.
-      while (activeOperations.size) {
-        await Promise.allSettled([...activeOperations]);
-      }
+      await drainActiveOperations();
       await Promise.all([pendingWakeStore.drain(), bridge.drain()]);
       clearResources();
     })();
     return disposing;
+  }
+  async function drainActiveOperations(): Promise<void> {
+    if (!activeOperations.size) return;
+    await Promise.allSettled(activeOperations);
+    await drainActiveOperations();
   }
 
   async function inject(nf: NotificationFrame): Promise<void> {
