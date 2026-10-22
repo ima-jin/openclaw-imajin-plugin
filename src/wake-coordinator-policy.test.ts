@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createNotificationInjector, type WsNotificationsConfig } from "./notification-injector.js";
 import type { NotificationFrame } from "./ws-service.js";
+import { gradingFixture } from "./fixtures/wake-grading.js";
 
 vi.mock("./channel-notify.js", () => ({ sendDirectChannelMessage: vi.fn(async () => {}) }));
 const PR = "https://github.com/ima-jin/openclaw-imajin-plugin/pull/84";
@@ -47,7 +48,7 @@ describe("option c: enforced wake coordinator boundary", () => {
 
   async function start(frames: NotificationFrame[], live = LIVE) {
     injector = createNotificationInjector({ runtime: { config: { current: () => ({}) } } }, config, {
-      liveStateLookup: async () => live, abortWake: async () => {},
+      liveStateLookup: async () => live, abortWake: async () => {}, gradingSource: gradingFixture().source,
     });
     for (const event of frames) await injector.inject(event);
     await vi.waitFor(() => expect(posts).toHaveLength(1), { interval: 5 });
@@ -99,7 +100,9 @@ describe("option c: enforced wake coordinator boundary", () => {
   it("preserves existing sessions_send behavior for decision children", async () => {
     config.reportTo = [COPY_TARGET];
     await start([frame("child-copy", true, "SUCCEEDED")]);
-    const spawn = tool("sessions_spawn", { task: "Review the PR" });
+    const spawn = await injector.runtimeHooks.before_tool_call({
+      toolName: "sessions_spawn", params: { task: "Review the PR" },
+    }, ctx()) as { params: Record<string, unknown> };
     const child = { sessionKey: "agent:main:subagent:child-copy", runId: "decision-run" };
     injector.runtimeHooks.before_model_resolve({ prompt: spawn?.params?.task }, child);
     expect(injector.runtimeHooks.before_tool_call({
@@ -182,13 +185,15 @@ describe("option c: enforced wake coordinator boundary", () => {
     config.model = "imajin/kimi-k3";
     config.decisionModel = "anthropic/claude-opus-5-5";
     await start([frame("handoff", true, "SUCCEEDED")]);
-    const spawn = tool("sessions_spawn", { task: "review, approve, merge, enqueue and dispatch", model: "cheap" });
+    const spawn = await injector.runtimeHooks.before_tool_call({
+      toolName: "sessions_spawn", params: { task: "review, approve, merge, enqueue and dispatch", model: "cheap" },
+    }, ctx()) as { params: Record<string, unknown> };
     expect(spawn?.params).toMatchObject({ runtime: "subagent", model: "anthropic/claude-opus-5-5" });
     const child = { sessionKey: "agent:main:subagent:decision", runId: "decision-run" };
     expect(injector.runtimeHooks.before_model_resolve({ prompt: spawn?.params?.task }, child))
       .toEqual({ providerOverride: "anthropic", modelOverride: "claude-opus-5-5" });
     expect(injector.runtimeHooks.before_tool_call({ toolName: "exec", params: { command: "gh pr merge 84" } }, child))
-      .toBeUndefined();
+      .toMatchObject({ block: true }); // An ambiguous local-repo target is not ticket authority.
     expect(tool("exec", { command: "gh pr merge 84" })).toMatchObject({ block: true });
   });
 });

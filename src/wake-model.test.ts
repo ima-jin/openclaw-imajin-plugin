@@ -96,7 +96,7 @@ describe("wakeModel (#117)", () => {
     });
     expect(CONFIG.agents.defaults.model).toBe("default-provider/gateway-model");
     expect(injector.runtimeHooks.before_model_resolve({}, { sessionKey: posts[0].sessionKey })).toBeUndefined();
-    const decision = injector.runtimeHooks.before_tool_call({
+    const decision = await injector.runtimeHooks.before_tool_call({
       toolName: "sessions_spawn", params: { task: "Review evidence" },
     }, { sessionKey: posts[0].sessionKey });
     expect(decision).toMatchObject({ params: { model: "anthropic/claude-opus-5-5" } });

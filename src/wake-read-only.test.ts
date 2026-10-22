@@ -33,7 +33,7 @@ describe("safe optional wake lookups", () => {
     expect(wakeReadOnlyLookup({ toolName: "mcp_unknown", params: { action: "read" } }, "/usr/bin/gh")).toBeUndefined();
   });
 
-  it("does not grant unknown subject metadata or a reused batch its predecessor's read permission", () => {
+  it("does not grant unknown subject metadata or a reused batch its predecessor's read permission", async () => {
     const router = new WakeDecisionRouter("anthropic/claude-opus-5-5", [], vi.fn(), { wakeReadOnlyLookups: true });
     const sessionKey = "agent:main:warp-events";
     const read = { toolName: "imajin_warp", params: { action: "get_run" } };
@@ -42,11 +42,11 @@ describe("safe optional wake lookups", () => {
     router.untrack("unknown");
     router.track(sessionKey, "failed", { hasPr: true, failedRun: true });
     router.bindRunner("failed", "first-run");
-    expect(router.beforeToolCall(read, { sessionKey, runId: "first-run" })?.block).not.toBe(true);
+    expect((await router.beforeToolCall(read, { sessionKey, runId: "first-run" }))?.block).not.toBe(true);
     router.track(sessionKey, "open", { hasPr: true, failedRun: false });
     router.bindRunner("open", "second-run");
-    expect(router.beforeToolCall(read, { sessionKey, runId: "second-run" })).toMatchObject({ block: true });
-    expect(router.beforeToolCall(read, { sessionKey, runId: "first-run" })?.block).not.toBe(true);
+    expect(await router.beforeToolCall(read, { sessionKey, runId: "second-run" })).toMatchObject({ block: true });
+    expect((await router.beforeToolCall(read, { sessionKey, runId: "first-run" }))?.block).not.toBe(true);
     router.dispose();
   });
 });

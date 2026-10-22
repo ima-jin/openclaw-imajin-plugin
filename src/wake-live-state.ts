@@ -22,6 +22,11 @@ export interface WakeCiRollup {
   pending: number;
   other: number;
 }
+
+/** Subject discovery without a duplicate state read, including script-packet wakes. */
+export function wakeSubjectPrUrls(frames: readonly NotificationFrame[], records: readonly WakeBridgeRecord[]): string[] {
+  return discoveredSubjects(frames, records).urls;
+}
 export interface WakeLiveSubject {
   url: string;
   state: "OPEN" | "MERGED" | "CLOSED" | "UNAVAILABLE";

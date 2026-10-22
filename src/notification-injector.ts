@@ -20,7 +20,7 @@ import { buildWakeOutcome } from "./wake-outcome.js";
 import { createLoopbackSessionGateway } from "./session-command-gateway.js";
 import { DEFAULT_WAKE_DECISION_MODEL, WakeDecisionRouter, type WakeHookContext, type WakeToolEvent } from "./wake-decision.js";
 import { DEFAULT_WAKE_TOKEN_BUDGET, WakeGuards } from "./wake-guards.js";
-import { buildWakeLiveState, type WakeLiveState } from "./wake-live-state.js";
+import { buildWakeLiveState, wakeSubjectPrUrls, type WakeLiveState } from "./wake-live-state.js";
 import {
   buildWakePacket, LIGHT_WAKE_BOOTSTRAP, packetUnavailable, packetWakeMessage, recordPacketFirstAssistant, wakePacketReceipt,
   type WakePacketConfig, type WakePacketResult,
@@ -758,6 +758,7 @@ export async function postWakeHookWithRetries(
  *   were the previous approach (#11-#17); #18 replaces all of it.
  */
 export interface NotificationInjectorDeps {
+  gradingSource?: import("./wake-grading.js").WakeGradingSource;
   /**
    * Sends a frame over the authenticated WS connection — pass
    * `ImajinWsService.send` bound to the live service instance. Used only
@@ -958,7 +959,8 @@ export function createNotificationInjector(
     (parent, child, runId, batchId) => {
       if (!guards.aliasSession(parent, child, runId, batchId)) void guards.stop(batchId, "decision child could not be supervised");
     },
-    { wakeReadOnlyLookups: wsNotifications?.wakeReadOnlyLookups, githubCliPath: wsNotifications?.githubCliPath },
+    { wakeReadOnlyLookups: wsNotifications?.wakeReadOnlyLookups, githubCliPath: wsNotifications?.githubCliPath,
+      gradingSource: deps.gradingSource },
   );
   const runtimeHooks: Record<(typeof WAKE_RUNTIME_HOOKS)[number], (event: any, ctx?: any) => unknown> = {
     "agent:bootstrap": (event: any) => {
@@ -1343,6 +1345,7 @@ export function createNotificationInjector(
       return;
     }
     decisionRouter.track(sessionKey, idempotencyKey, {
+      prUrls: wakeSubjectPrUrls(frames, bridge.listOpen()),
       hasPr: liveState.subjects.length > 0, failedRun: frames.every(isFailedWakeFrame),
       packetContext: packet ? `${LIGHT_WAKE_BOOTSTRAP}\n\n${message}` : undefined,
     });

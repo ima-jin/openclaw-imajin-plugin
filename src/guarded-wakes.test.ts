@@ -10,6 +10,7 @@ import { PluginServiceRuntime } from "./plugin-service-runtime.js";
 import { beginRegistration } from "./registration-lifecycle.js";
 import { WakeGuards } from "./wake-guards.js";
 import { PendingWakeStore } from "./notification-state-store.js";
+import { gradingFixture } from "./fixtures/wake-grading.js";
 
 vi.mock("./channel-notify.js", () => ({ sendDirectChannelMessage: vi.fn(async () => {}) }));
 const PR = "https://github.com/ima-jin/openclaw-imajin-plugin/pull/80";
@@ -157,7 +158,8 @@ describe("guarded wake acceptance (#82)", () => {
   function create() {
     injector = createNotificationInjector({ runtime: {
       config: { current: () => ({}) }, system: { enqueueSystemEvent: () => true },
-    } }, config, { liveStateLookup: lookup, abortWake: abort, sessionTokens: async () => 0 });
+    } }, config, { liveStateLookup: lookup, abortWake: abort, sessionTokens: async () => 0,
+      gradingSource: gradingFixture().source });
     return injector;
   }
   async function start(id = "one", index = 0) {
@@ -313,7 +315,7 @@ describe("guarded wake acceptance (#82)", () => {
   });
 
   async function spawnChild() {
-    const spawn = injector.runtimeHooks.before_tool_call({
+    const spawn = await injector.runtimeHooks.before_tool_call({
       toolName: "sessions_spawn", params: { task: "review, merge, enqueue and dispatch", model: "cheap" },
     }, ctx()) as { params: { task: string; model: string; runtime: string } };
     const child = { sessionKey: "agent:main:subagent:decision", runId: "child-runner" };

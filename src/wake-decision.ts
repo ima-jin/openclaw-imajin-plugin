@@ -2,6 +2,8 @@ import type { AgentEndEvent } from "./turn-usage-attestation.js";
 import { compactWakeEndEvent, extractWakeBatchId } from "./wake-report.js";
 import { randomUUID } from "node:crypto";
 import { WAKE_LOOKUP_TOOLS, wakeReadOnlyLookup } from "./wake-read-only.js";
+import { createWakeGradingSource, resolveWakeGrading, type WakeGradingBlock, type WakeGradingSource } from "./wake-grading.js";
+import { gateDecisionMutation } from "./wake-merge-gate.js";
 
 export const DEFAULT_WAKE_DECISION_MODEL = "anthropic/claude-opus-5-5";
 const WORKER_TOOLS = new Set(["message", "sessions_spawn", "sessions_send", "session_status"]);
@@ -14,12 +16,14 @@ export interface WakeHookContext {
 }
 
 export interface WakeSubjectPolicy {
+  prUrls?: string[];
   hasPr?: boolean;
   failedRun?: boolean;
   packetContext?: string;
 }
 
 interface WakeDecisionOptions {
+  gradingSource?: WakeGradingSource;
   wakeReadOnlyLookups?: boolean;
   githubCliPath?: string;
 }
@@ -39,6 +43,7 @@ export interface WakeToolEvent {
 }
 
 interface DecisionWake {
+  prUrls: string[];
   batchId: string;
   sessionKey: string;
   children: Set<string>;
@@ -63,7 +68,9 @@ export class WakeDecisionRouter {
   private readonly wakes = new Map<string, DecisionWake>();
   private readonly roots = new Map<string, string>();
   private readonly runners = new Map<string, string>();
-  private readonly tickets = new Map<string, string>();
+  private readonly tickets = new Map<string, { batchId: string; blocks: WakeGradingBlock[] }>();
+  private readonly childGrading = new Map<string, WakeGradingBlock[]>();
+  private readonly gradingSource: WakeGradingSource;
   private readonly retired = new Set<string>();
   private readonly ignoredRuns = new Set<string>();
 
@@ -72,12 +79,15 @@ export class WakeDecisionRouter {
     private readonly reportTo: readonly string[],
     private readonly childAdded: (parent: string, child: string, runId: string | undefined, batchId: string) => void,
     private readonly options: WakeDecisionOptions = {},
-  ) {}
+  ) {
+    this.gradingSource = options.gradingSource ?? createWakeGradingSource(options.githubCliPath);
+  }
 
   track(sessionKey: string, batchId = sessionKey, subject: WakeSubjectPolicy = {}): void {
     if (this.wakes.has(batchId)) return;
     if (this.wakes.size >= 100) this.untrack(this.wakes.keys().next().value!);
     this.wakes.set(batchId, {
+      prUrls: subject.prUrls ?? [],
       batchId, sessionKey, children: new Set(), failed: false, delegations: 0, disclosed: false, copyRequested: false,
       lookupAllowed: subject.packetContext === undefined && this.options.wakeReadOnlyLookups === true
         && (subject.hasPr === false || subject.failedRun === true),
@@ -95,18 +105,24 @@ export class WakeDecisionRouter {
     return { block: true, blockReason: `Wake review/approve/merge/enqueue/dispatch actions must run in a sessions_spawn subagent on ${this.model}. Only explicitly enabled, eligible read-only lookups may run here.` };
   }
 
-  private delegateDecision(event: WakeToolEvent, wake: DecisionWake): WakeToolPolicy {
+  private async delegateDecision(event: WakeToolEvent, wake: DecisionWake): Promise<WakeToolPolicy> {
     if (typeof event.params.task !== "string" || !event.params.task.trim()) {
       return { block: true, blockReason: "Decision delegation requires a nonempty task." };
     }
     if (wake.delegations >= MAX_CHILDREN) return { block: true, blockReason: "Wake decision delegation capacity exceeded; report the blocker." };
     const ticket = randomUUID();
-    this.tickets.set(ticket, wake.batchId);
     wake.delegations++;
+    const blocks = await Promise.all(wake.prUrls.map((url) => resolveWakeGrading(url, this.gradingSource)));
+    if (this.wakes.get(wake.batchId) !== wake || wake.disclosed) {
+      return { block: true, blockReason: "Wake ended while resolving grading context; report blocked." };
+    }
+    this.tickets.set(ticket, { batchId: wake.batchId, blocks });
     const packet = wake.packetContext ? "\n\n" + wake.packetContext : "";
+    const grading = "\n\n" + (blocks.length ? blocks.map((block) => block.text).join("\n\n")
+      : "UNRESOLVED: no subject PR grading block. Report blocked for approve, merge and enqueue.");
     return { params: {
       ...event.params, runtime: "subagent", model: this.model,
-      task: `Wake decision ticket: ${ticket}\n${event.params.task}${packet}`,
+      task: `Wake decision ticket: ${ticket}\n${event.params.task}${packet}${grading}`,
     } };
   }
 
@@ -182,6 +198,7 @@ export class WakeDecisionRouter {
         : reporting;
       return { appendSystemContext: [
         "This is delegated Warp decision work. Review/approve/merge/enqueue/dispatch here, using live state before acting.",
+        "Grade only against the plugin-resolved OUTCOME and verbatim DECISION ruled lines on your ticket, not the coordinator's interpretation. If any grading chain is UNRESOLVED, report blocked instead of approving. Merge-side calls require an exact PR URL (or explicit --repo), and a fresh head/review check. A current-head imajin-jin CHANGES_REQUESTED stands until a new head lands. A changed head requires a new ticket. Approval bodies are prefixed by the plugin with the grading yardstick.",
         ...(wake.packetContext ? ["Start from the supplied script-built packet. Do not re-fetch PR state, checks, Sonar, brief or horizon supplied there unless that section has a GAP:. Report packet provenance and every GAP:."] : []),
         childReporting,
         "Do not poll CI or mergeable in a loop: use one bounded `gh pr checks <n> --watch` call, or report blocked with CI pending; the next wake picks it up.",
@@ -203,7 +220,7 @@ export class WakeDecisionRouter {
     return { providerOverride: this.model.slice(0, slash), modelOverride: this.model.slice(slash + 1) };
   }
 
-  beforeToolCall(event: WakeToolEvent, ctx: WakeHookContext): WakeToolPolicy | undefined {
+  beforeToolCall(event: WakeToolEvent, ctx: WakeHookContext): WakeToolPolicy | Promise<WakeToolPolicy | undefined> | undefined {
     const wake = this.find(ctx);
     if (!wake) {
       if (this.retired.has(ctx.sessionKey ?? "") && event.toolName !== "session_status") {
@@ -219,6 +236,8 @@ export class WakeDecisionRouter {
       return this.delegateDecision(event, wake);
     }
     if (ctx.sessionKey === wake.sessionKey) return this.coordinatorTool(event, wake);
+    return gateDecisionMutation(event, this.childGrading.get(ctx.sessionKey!), this.gradingSource,
+      this.options.githubCliPath ?? "/usr/bin/gh");
   }
 
   onSubagentSpawned(
@@ -238,12 +257,15 @@ export class WakeDecisionRouter {
   private correlateTicket(prompt: string | undefined, ctx: WakeHookContext): void {
     if (!ctx.sessionKey?.includes(":subagent:") || !prompt) return;
     const ticket = /Wake decision ticket: ([a-f0-9-]{36})/.exec(prompt)?.[1];
-    const batchId = ticket ? this.tickets.get(ticket) : undefined;
-    const wake = batchId ? this.wakes.get(batchId) : undefined;
+    const issued = ticket ? this.tickets.get(ticket) : undefined;
+    const wake = issued ? this.wakes.get(issued.batchId) : undefined;
     if (!wake) return;
+    if (this.childGrading.has(ctx.sessionKey)) return;
+    if (!issued!.blocks.every((block) => prompt.includes(block.text))) return;
     this.tickets.delete(ticket!);
     this.onSubagentSpawned({ childSessionKey: ctx.sessionKey, runId: ctx.runId },
       { requesterSessionKey: wake.sessionKey, runId: this.runnerFor(wake.batchId) });
+    if (this.roots.get(ctx.sessionKey) === wake.batchId) this.childGrading.set(ctx.sessionKey, issued!.blocks);
   }
 
   private runnerFor(batchId: string): string | undefined {
@@ -267,6 +289,8 @@ export class WakeDecisionRouter {
     const result = spawnResult(event.result);
     if (result?.childSessionKey) {
       this.onSubagentSpawned(result, { requesterSessionKey: ctx.sessionKey, runId: ctx.runId });
+      this.correlateTicket(typeof event.params.task === "string" ? event.params.task : undefined,
+        { sessionKey: result.childSessionKey, runId: result.runId });
     }
   }
 
@@ -311,7 +335,8 @@ export class WakeDecisionRouter {
   }
 
   private removeBatchMappings(batchId: string): void {
-    for (const [ticket, value] of this.tickets) if (value === batchId) this.tickets.delete(ticket);
+    for (const [ticket, value] of this.tickets) if (value.batchId === batchId) this.tickets.delete(ticket);
+    for (const [sessionKey, id] of this.roots) if (id === batchId) this.childGrading.delete(sessionKey);
     for (const map of [this.roots, this.runners]) {
       for (const [key, value] of map) if (value === batchId) map.delete(key);
     }
@@ -322,6 +347,7 @@ export class WakeDecisionRouter {
     this.roots.clear();
     this.runners.clear();
     this.tickets.clear();
+    this.childGrading.clear();
     this.retired.clear();
     this.ignoredRuns.clear();
   }
