@@ -47,8 +47,8 @@ describe("packet wake path (#107)", () => {
     lookup = vi.fn(async () => { throw new Error("unexpected duplicate live read"); });
     horizon = { readOpenItems: vi.fn(async () => []), writeStepEvents: vi.fn(async () => {}) };
   });
-  afterEach(() => {
-    injector?.dispose();
+  afterEach(async () => {
+    await injector?.dispose();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
@@ -132,7 +132,7 @@ describe("packet wake path (#107)", () => {
     await injector.ready;
     await injector.inject(frame());
     await new Promise((resolve) => setTimeout(resolve, 30));
-    injector.dispose();
+    await injector.dispose();
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(posts).toEqual([]);
   });

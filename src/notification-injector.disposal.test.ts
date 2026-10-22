@@ -122,8 +122,14 @@ describe("notification injector disposal drain (#120)", () => {
     await expectWaiting(disposing);
     release.resolve();
     await disposing;
-    expect(JSON.parse(await readFile(join(directory, "pending-wakes.json"), "utf8")).wakes).toEqual({});
-    expect(await readFile(join(directory, "wake-bridge.json"), "utf8")).toContain("already MERGED");
+    // Main cancels dispatch after a lookup returns to an aborted injector.
+    // Drain that lookup, but retain the owed evidence for startup replay.
+    const wakes = JSON.parse(await readFile(join(directory, "pending-wakes.json"), "utf8")).wakes;
+    expect(Object.values(wakes)).toEqual([expect.objectContaining({ frames: [frame("queued")] })]);
+    const records = JSON.parse(await readFile(join(directory, "wake-bridge.json"), "utf8")).records;
+    expect(records).toContainEqual(expect.objectContaining({ runId: "queued", status: "open" }));
+    expect(await readFile(join(directory, "wake-bridge.json"), "utf8")).not.toContain("already MERGED");
+    expect(fetch).not.toHaveBeenCalled();
   });
   it("waits for startup state work when disposed before ready", async () => {
     const gate = gateWrite((file) => file.includes("wake-bridge.json."));

@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { beginRegistration } from "./registration-lifecycle.js";
 import { PluginServiceRuntime } from "./plugin-service-runtime.js";
 
-afterEach(() => {
-  beginRegistration().dispose();
+afterEach(async () => {
+  await beginRegistration().dispose();
 });
 
 describe("PluginServiceRuntime", () => {
