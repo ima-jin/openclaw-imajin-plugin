@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Fixed
+- **Decision-child grading safeguards (#101).** Resolve the epic yardstick in the plugin and fail closed on missing context or standing current-head change requests.
 - **Session inventory replay after restart (#109 / PR #110 send-back).**
   Persist per-native-session history points and archive flags in the existing
   private plugin state directory; resume after the saved output block, and
