@@ -157,6 +157,18 @@ describe("decision ticket grading authority (#101)", () => {
     expect(await task).toBeUndefined();
   });
 
+  it.each(["untrack", "disclose"])("refuses a live check finishing after %s", async (action) => {
+    const { source, router, spawn, approve, pr } = gradingRouter();
+    router.beforeModelResolve({ prompt: await spawn() }, child);
+    let finish!: (value: typeof pr) => void;
+    source.pullRequest.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    const pending = approve();
+    if (action === "untrack") router.untrack("batch");
+    else router.markDisclosed("batch");
+    finish(pr);
+    expect(await pending).toMatchObject({ block: true });
+  });
+
   it("refuses invalid tasks and bounds delegation capacity", async () => {
     const { router, spawn } = gradingRouter([]);
     expect(await router.beforeToolCall({ toolName: "sessions_spawn", params: { task: "" } }, parent)).toMatchObject({ block: true });

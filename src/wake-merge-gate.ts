@@ -1,5 +1,5 @@
 import type { WakeToolEvent } from "./wake-decision.js";
-import { gradingMarker, type WakeGradingBlock, type WakeGradingSource } from "./wake-grading.js";
+import { gradingMarker, withGradingDeadline, type WakeGradingBlock, type WakeGradingSource } from "./wake-grading.js";
 import { validatedWakePrUrl } from "./wake-live-state.js";
 
 interface Policy { block?: boolean; blockReason?: string; params?: Record<string, unknown> }
@@ -82,14 +82,16 @@ function graphqlMutation(query: unknown): Mutation {
 function cliMutation(event: WakeToolEvent, cliPath: string): Mutation | undefined {
   const command = event.params.command;
   if (typeof command !== "string") return;
-  const sensitive = /\bgh\b[\s\S]*\b(?:merge|review|api)\b/.test(command)
-    && /\bapi\b|--approve|\s-a\b|\bmerge\b|enqueuePullRequest|mergePullRequest|addPullRequestReview|\bAPPROVE\b|\/reviews\b/.test(command);
+  const sensitive = (/\bgh\b/.test(command) || command.includes(cliPath)) && /\b(?:merge|review|api)\b/.test(command);
   if (!sensitive) return;
   const args = words(command);
   if (!args || !["gh", cliPath].includes(args[0]) || event.params.env !== undefined) {
     return { approve: false, body: "" };
   }
   const approve = args[1] === "pr" && args[2] === "review" && args.some((arg) => arg === "--approve" || arg === "-a");
+  if (args[1] === "pr" && args[2] === "review" && !approve
+    && args.some((arg) => ["--request-changes", "--comment", "-r", "-c"].includes(arg))
+    && !args.some((arg) => /^-a/.test(arg))) return;
   if (args[1] === "pr" && (args[2] === "merge" || approve)) {
     const repository = flag(args, ["--repo", "-R"]);
     const directUrl = validatedWakePrUrl(args[3]);
@@ -152,7 +154,7 @@ export function gateDecisionMutation(
 
 async function checkLiveReview(block: WakeGradingBlock, mutation: Mutation, source: WakeGradingSource): Promise<Policy | undefined> {
   try {
-    const current = await source.pullRequest(block.url);
+    const current = await withGradingDeadline(source.pullRequest(block.url));
     if (current.id !== block.pr!.id || current.headSha !== block.pr!.headSha) {
       return refuse("head changed since grading; delegate a new decision ticket");
     }

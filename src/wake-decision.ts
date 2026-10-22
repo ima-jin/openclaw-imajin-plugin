@@ -236,8 +236,15 @@ export class WakeDecisionRouter {
       return this.delegateDecision(event, wake);
     }
     if (ctx.sessionKey === wake.sessionKey) return this.coordinatorTool(event, wake);
-    return gateDecisionMutation(event, this.childGrading.get(ctx.sessionKey!), this.gradingSource,
+    const policy = gateDecisionMutation(event, this.childGrading.get(ctx.sessionKey!), this.gradingSource,
       this.options.githubCliPath ?? "/usr/bin/gh");
+    if (!(policy instanceof Promise)) return policy;
+    return policy.then((result) => {
+      if (this.find(ctx) !== wake || wake.disclosed) {
+        return { block: true, blockReason: "Wake ended or disclosed during the live merge-side check; report blocked." };
+      }
+      return result;
+    });
   }
 
   onSubagentSpawned(

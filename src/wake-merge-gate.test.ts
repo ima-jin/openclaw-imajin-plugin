@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { gateDecisionMutation } from "./wake-merge-gate.js";
 import { resolveWakeGrading } from "./wake-grading.js";
 import { gradingFixture, GRADING_HEAD, GRADING_PR_URL as PR } from "./fixtures/wake-grading.js";
@@ -25,6 +25,7 @@ async function fixture() {
   return { pr, source, block, gate: (event: WakeToolEvent) => gateDecisionMutation(event, [block], source, "/usr/bin/gh") };
 }
 
+afterEach(() => vi.useRealTimers());
 describe("decision-child merge-side permission boundary (#101)", () => {
   it.each(actions)("blocks without a ticket grading block: $toolName $params", async (event) => {
     const { source } = gradingFixture();
@@ -76,6 +77,7 @@ describe("decision-child merge-side permission boundary (#101)", () => {
   it.each([
     `gh pr review 101 --approve`, `gh pr review ${PR} --approve --body-file /tmp/body`,
     `gh pr review ${PR} --approve --body=x -b y`, `gh pr review ${PR} --approve -bhidden`,
+    `gh pr review ${PR} -abhidden`,
     `gh pr review ${PR} --approve --repo other/repo`, `gh pr review 101 --approve -R fixture/repo -R other/repo`,
     `gh pr merge ${PR}; gh pr merge https://github.com/other/repo/pull/2`,
     `gh pr merge ${PR}\ngh pr merge https://github.com/other/repo/pull/2`,
@@ -96,6 +98,21 @@ describe("decision-child merge-side permission boundary (#101)", () => {
     expect(await gate(exec(`gh pr merge ${PR} --match-head-commit ${"b".repeat(40)}`))).toMatchObject({ block: true });
     expect((await gate(exec(`gh pr review 101 --repo=fixture/repo -a --body=checked`)))?.block).not.toBe(true);
     expect((await gate(exec(`/usr/bin/gh pr merge ${PR}`)))?.block).not.toBe(true);
+  });
+
+  it("bounds live review lookup failures rather than waiting forever", async () => {
+    const { source, gate } = await fixture();
+    vi.useFakeTimers();
+    source.pullRequest.mockReturnValue(new Promise(() => {}));
+    const pending = gate(approve);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(await pending).toMatchObject({ block: true });
+  });
+
+  it("gates a configured CLI whose basename is not gh", async () => {
+    const { source } = gradingFixture();
+    expect(await gateDecisionMutation(exec(`/opt/github pr review ${PR} --approve`), undefined, source, "/opt/github"))
+      .toMatchObject({ block: true });
   });
 
   it("leaves unrelated reads, non-approval reviews and non-wake tools alone", async () => {

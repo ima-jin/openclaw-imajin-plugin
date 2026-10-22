@@ -979,8 +979,11 @@ export function createNotificationInjector(
     before_agent_run: (event: unknown, ctx: WakeHookContext = {}) => decisionRouter.beforeAgentRun(event, ctx),
     before_prompt_build: (event: unknown, ctx: WakeHookContext = {}) => decisionRouter.beforePromptBuild(event, ctx),
     before_model_resolve: (event: { prompt?: string }, ctx: WakeHookContext = {}) => decisionRouter.beforeModelResolve(event, ctx),
-    before_tool_call: (event: WakeToolEvent, ctx: WakeHookContext = {}) =>
-      guards.beforeToolCall(event, ctx) ?? decisionRouter.beforeToolCall(event, ctx),
+    before_tool_call: (event: WakeToolEvent, ctx: WakeHookContext = {}) => {
+      const policy = guards.beforeToolCall(event, ctx) ?? decisionRouter.beforeToolCall(event, ctx);
+      return policy instanceof Promise
+        ? policy.then((result) => guards.beforeToolCall(event, ctx) ?? result) : policy;
+    },
     after_tool_call: async (event: WakeToolEvent, ctx: WakeHookContext = {}) => {
       decisionRouter.afterToolCall(event, ctx);
       await guards.afterToolCall(event, ctx);

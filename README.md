@@ -1201,6 +1201,38 @@ correlate children before their first model call, because the host can emit
 that differs from the configured model is stopped and alerted, not accepted
 as a cheaper fallback.
 
+**Plugin-owned decision yardstick (#101).** Each delegated task gets a
+plugin-resolved grading block for every subject PR, even with script-built
+packets. Authenticated, bounded GraphQL reads supply `closingIssuesReferences`,
+each issue's native `parent` chain through the epic (including cross-repository
+parents), verbatim OUTCOME and DECISION ruled lines from bodies/comments, and
+review history (reviewer, state, commit SHA). Comments follow the body so later
+rulings remain visible. Missing ancestry, an absent epic/OUTCOME, incomplete
+pagination or lookup failure is explicitly **UNRESOLVED**: report blocked,
+never substitute the coordinator's interpretation.
+
+Decision-child approve/merge/enqueue calls require that exact PR's resolved
+block on the child's one-use ticket. Immediately before acting, the plugin
+re-reads head/reviews: **any imajin-jin CHANGES_REQUESTED on the current head
+stands until a new head lands**, even after a subsequent approval. A changed
+head needs a new delegation/grading ticket; old-head change requests do not
+veto a freshly graded head. CLI approval bodies and GitHub MCP review bodies
+are prefixed with `Graded against: OUTCOME <repo>#<epic> · DECISION <refs> @ <headSha>`
+(`none` when there are no DECISION refs).
+
+Use a literal `gh pr review <PR-URL> --approve --body 'evidence'`, or an
+explicit PR number plus `--repo owner/repo`; merge has the same exact-target
+requirement. GitHub MCP approval/review, merge and enqueue tools use explicit
+owner/repo/PR fields. Opaque body files, environment overrides, shell programs
+and ambiguous targets fail closed. Raw GraphQL enqueue/merge accepts only one
+literal mutation with `input: {pullRequestId: "PR_..."}` (optionally
+`expectedHeadOid`) and a `clientMutationId` or `pullRequest { id }` selection,
+passed as `gh api graphql -f 'query=mutation { ... }'` or MCP `query`.
+Variables, aliases, compound mutations and opaque inputs are refused rather
+than guessed; use the direct CLI/MCP operation instead. Raw API approvals are
+refused in favor of the body-prefixed approval paths. These are wake tool-call
+guards, not a general-purpose shell sandbox.
+
 **Coordinator authority — option c (Ryan, 2026-10-18 11:08).** The wake
 model never approves or merges. `before_tool_call` denies direct review,
 approve, merge, enqueue and dispatch tools/actions, including shell commands
