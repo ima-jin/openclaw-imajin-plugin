@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+<!-- #106: kernel-picked default routing, session overrides, and observable break-glass fallback. -->
 
 ### Fixed
 - **Decision-child grading safeguards (#101).** Resolve the epic yardstick in the plugin and fail closed on missing context or standing current-head change requests.
