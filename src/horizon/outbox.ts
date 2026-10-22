@@ -23,7 +23,7 @@ function alreadyApplied(body: string): boolean {
   }
 }
 /** Bound untrusted receipt reads and discard them; never log or persist bodies. */
-async function receiptBody(response: Response): Promise<string> {
+export async function receiptBody(response: Response): Promise<string> {
   const reader = response.body?.getReader();
   if (!reader) return "";
   let size = 0;
@@ -76,7 +76,10 @@ export async function saveDeadLetter(path: string, request: StepRequest, httpSta
   await saveJson(path, file);
 }
 export function rejectedStepWarning(request: StepRequest, status: number): string {
-  const id = request.payload.stepId;
-  const safeId = /^horizon:[0-9a-f]{32}$/.test(id) ? id : "[invalid-step-id]";
+  const safeId = safeStepId(request);
   return `[imajin-horizon] stepId=${safeId} dead-lettered (HTTP ${status}); continuing outbox`;
+}
+export function safeStepId(request: StepRequest): string {
+  const id = request.payload.stepId;
+  return /^horizon:[0-9a-f]{32}$/.test(id) ? id : "[invalid-step-id]";
 }
