@@ -7,6 +7,7 @@ import { createNotificationInjector, type WsNotificationsConfig } from "./notifi
 import { sendDirectChannelMessage } from "./channel-notify.js";
 import { LIGHT_WAKE_BOOTSTRAP, MAX_WAKE_FIRST_TURN_BYTES } from "./wake-packet.js";
 import type { NotificationFrame } from "./ws-service.js";
+import { gradingFixture } from "./fixtures/wake-grading.js";
 
 vi.mock("./channel-notify.js", () => ({ sendDirectChannelMessage: vi.fn(async () => {}) }));
 const builder = fileURLToPath(new URL("./fixtures/wake-packet-builder.mjs", import.meta.url));
@@ -56,6 +57,7 @@ describe("packet wake path (#107)", () => {
   async function wake(overrides: Partial<WsNotificationsConfig> = {}) {
     injector = createNotificationInjector(api, { ...config, ...overrides }, {
       liveStateLookup: lookup, horizon, sessionTokens: async () => 0, abortWake: async () => {},
+      gradingSource: gradingFixture().source,
     });
     await injector.ready;
     await injector.inject(frame());
@@ -143,11 +145,13 @@ describe("packet wake path (#107)", () => {
       toolName: "exec", params: { command: "/usr/bin/gh pr view 107 --json state" },
     }, ctx) as { block: boolean };
     expect(duplicateRead.block).toBe(true);
-    const delegated = injector.runtimeHooks.before_tool_call({
+    const delegated = await injector.runtimeHooks.before_tool_call({
       toolName: "sessions_spawn", params: { task: "Review the supplied state" },
     }, ctx) as { params: { task: string } };
     expect(delegated.params.task).toContain(posts[0].message);
     expect(delegated.params.task).toContain("Do not re-fetch a supplied section");
+    expect(delegated.params.task).toContain("Plugin-resolved grading block: https://github.com/fixture/repo/pull/107");
+    expect(delegated.params.task).toContain("OUTCOME · the epic yardstick");
     injector.runtimeHooks.subagent_spawned({ childSessionKey: "agent:main:subagent:fixture", runId: "child" },
       { requesterSessionKey: ctx.sessionKey });
     const policy = injector.runtimeHooks.before_prompt_build({}, { sessionKey: "agent:main:subagent:fixture", runId: "child" }) as { appendSystemContext: string };
