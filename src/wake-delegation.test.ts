@@ -62,4 +62,46 @@ describe("wake delegation regression (#121)", () => {
     const router = setup();
     expect(await router.beforeToolCall(event, parent)).toEqual({ block: true, blockReason });
   });
+
+  it.each(forbidden)("still refuses nested $toolName after admitting the Code Mode bridge: $params", async (event) => {
+    const router = setup();
+    const code = "await call(params)";
+    expect(await router.beforeToolCall({
+      toolName: "exec", toolKind: "code_mode_exec", toolInputKind: "javascript",
+      params: { code, command: code },
+    }, parent)).toBeUndefined();
+    const call = vi.fn(async (params: Record<string, unknown>) =>
+      router.beforeToolCall({ toolName: event.toolName, params }, parent));
+    const result = await runInNewContext(`(async () => ${code})()`, { call, params: event.params });
+    expect(call).toHaveBeenCalledOnce();
+    expect(result).toEqual({ block: true, blockReason });
+  });
+
+  it.each([
+    { toolName: "exec" },
+    { toolName: "exec", toolKind: "code_mode_exec" },
+    { toolName: "exec", toolInputKind: "javascript" },
+    { toolName: "exec", toolKind: "shell", toolInputKind: "javascript" },
+    { toolName: "exec", toolKind: "code_mode_exec", toolInputKind: "shell" },
+    { toolName: "dispatch", toolKind: "code_mode_exec", toolInputKind: "javascript" },
+  ])("does not infer bridge authority from params or incomplete host identity: %j", async (identity) => {
+    const router = setup();
+    expect(await router.beforeToolCall({
+      ...identity,
+      params: {
+        command: "gh pr merge 121", code: "await sessions_spawn(params)",
+        toolKind: "code_mode_exec", toolInputKind: "javascript",
+      },
+    }, parent)).toEqual({ block: true, blockReason });
+  });
+
+  it("keeps delegation task validation and model/runtime pinning for nested calls", async () => {
+    const router = setup();
+    const call = (params: Record<string, unknown>) =>
+      router.beforeToolCall({ toolName: "sessions_spawn", params }, parent);
+    expect(await runInNewContext("(async () => await call({ task: '' }))()", { call }))
+      .toEqual({ block: true, blockReason: "Decision delegation requires a nonempty task." });
+    expect(await runInNewContext("(async () => await call({ task: 'Review', model: 'cheap', runtime: 'acp' }))()", { call }))
+      .toMatchObject({ params: { runtime: "subagent", model: "anthropic/claude-opus-5-5" } });
+  });
 });
