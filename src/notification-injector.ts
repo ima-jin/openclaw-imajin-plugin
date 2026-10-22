@@ -1016,13 +1016,15 @@ export function createNotificationInjector(
     if (!disclosureTargets.length) throw new Error("No disclosure destination configured");
     if (guards.isStopped(batchId)) throw new Error("Wake already stopped; directSend guard alert owns disclosure");
     if (guards.hasReported(batchId)) throw new Error("Wake already disclosed; no further posts");
+    const receipt = wakePacketReceipt(packets.get(batchId)?.metrics);
+    const prefix = receipt ? receipt + "\n" : "";
     await Promise.all(disclosureTargets.map(async (target) => {
       if (guards.isStopped(batchId)) throw new Error("Wake stopped before report delivery");
       const match = /^agent:[^:]+:([^:]+):(?:direct|dm|group|channel):(.+)$/.exec(target.sessionKey);
       if (!match) throw new Error("reportTo target has no channel destination");
       await sendDirectChannelMessage(
         { ...wsNotifications?.directSend, channel: match[1], target: match[2] },
-        `Warp wake ${disclosure.outcome} (${batchId}): ${wakePacketReceipt(packets.get(batchId)?.metrics)}\n${disclosure.message}`,
+        `Warp wake ${disclosure.outcome} (${batchId}): ${prefix}${disclosure.message}`,
         api,
       );
       guards.recordDisclosure(batchId, target.sessionKey);
@@ -1238,6 +1240,38 @@ export function createNotificationInjector(
     }
   }
 
+  async function prepareWakeInput(scope: string, frames: NotificationFrame[], batchId: string) {
+    const runIds = summarizeWakeRuns(frames).map((r) => r.runId);
+    const packet = wsNotifications?.wakePacket
+      ? await buildWakePacket(wsNotifications.wakePacket, runIds, lifecycle.signal) : undefined;
+    // The packet already contains live state and horizon. Do not re-read them.
+    const continuity = packet ? "" : await wakeContinuity(runIds);
+    const liveState = await buildWakeLiveState(packet ? [] : frames, bridge.listOpen(), {
+      lookup: deps.liveStateLookup, githubCliPath: wsNotifications?.githubCliPath,
+    });
+    if (packet && (typeof api.registerHook !== "function" || api.config?.hooks?.internal?.enabled === false)) {
+      Object.assign(packet, packetUnavailable("bootstrap hook unavailable"));
+    }
+    const message = packet
+      ? packetWakeMessage(batchId, buildWakeTurnMessage(scope, frames), packet)
+      : `Wake batch ID: ${batchId}\n\n${liveState.preamble}\n\n${buildWakeTurnMessage(scope, frames)}\n\n${continuity}`;
+    return { packet, liveState, message };
+  }
+
+  function bindWakeAdmission(batchId: string, result: WakeHookResult) {
+    supervisor.bindRun(batchId, result.runId);
+    guards.bindRun(batchId, result.runId);
+    allocatedFreshReuseKey = false;
+    if (!result.ok && !result.pending) {
+      wakeModelSources.delete(batchId);
+      supervisor.untrack(batchId);
+      guards.untrack(batchId);
+      decisionRouter.untrack(batchId);
+      packets.delete(batchId);
+    }
+    if (result.ok || result.pending) wakeReporter?.bindRun(batchId, result.runId);
+    else wakeReporter?.untrack(batchId);
+  }
   async function flushWakeTurn(
     scope: string,
     frames: NotificationFrame[],
@@ -1255,21 +1289,8 @@ export function createNotificationInjector(
     // imperative sentences — see `buildWakeTurnMessage`.
     await bridgeReady;
     const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
-    const runIds = summarizeWakeRuns(frames).map((r) => r.runId);
-    const packet = wsNotifications?.wakePacket
-      ? await buildWakePacket(wsNotifications.wakePacket, runIds, lifecycle.signal) : undefined;
+    const { packet, liveState, message } = await prepareWakeInput(scope, frames, idempotencyKey);
     if (lifecycle.signal.aborted) return;
-    // The packet already contains live state and horizon. Do not re-read them.
-    const continuity = packet ? "" : await wakeContinuity(runIds);
-    const liveState = await buildWakeLiveState(packet ? [] : frames, bridge.listOpen(), {
-      lookup: deps.liveStateLookup, githubCliPath: wsNotifications?.githubCliPath,
-    });
-    if (packet && (typeof api.registerHook !== "function" || api.config?.hooks?.internal?.enabled === false)) {
-      Object.assign(packet, packetUnavailable("bootstrap hook unavailable"));
-    }
-    const message = packet
-      ? packetWakeMessage(idempotencyKey, buildWakeTurnMessage(scope, frames), packet)
-      : `Wake batch ID: ${idempotencyKey}\n\n${liveState.preamble}\n\n${buildWakeTurnMessage(scope, frames)}\n\n${continuity}`;
     if (packet?.metrics.gap) await discloseWakeOutcome(packet.metrics.gap);
     if (await handleTerminalSubjects(liveState, frames, pendingKey)) return;
 
@@ -1326,24 +1347,7 @@ export function createNotificationInjector(
       idempotencyKey,
       model: selection.model,
     }, (reason) => { void supervisor.alert(idempotencyKey, reason); }, lifecycle.signal);
-    supervisor.bindRun(idempotencyKey, result.runId);
-    guards.bindRun(idempotencyKey, result.runId);
-    allocatedFreshReuseKey = false;
-    if (!result.ok && !result.pending) {
-      wakeModelSources.delete(idempotencyKey);
-      supervisor.untrack(idempotencyKey);
-      guards.untrack(idempotencyKey);
-      decisionRouter.untrack(idempotencyKey);
-      packets.delete(idempotencyKey);
-    }
-
-    if (wakeReporter) {
-      if (result.ok || result.pending) {
-        wakeReporter.bindRun(idempotencyKey, result.runId);
-      } else {
-        wakeReporter.untrack(idempotencyKey); // never admitted: no turn to report on
-      }
-    }
+    bindWakeAdmission(idempotencyKey, result);
 
     if (result.ok) {
       const admittedRun = result.runId ? " runId=" + result.runId : "";

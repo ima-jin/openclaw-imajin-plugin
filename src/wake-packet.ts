@@ -14,6 +14,16 @@ export interface WakePacketConfig {
   timeoutMs?: number;
   maxBytes?: number;
 }
+function validCommand(command: unknown): command is string[] {
+  return Array.isArray(command) && command.length > 0 && command.length <= 32
+    && command.every((part) => typeof part === "string" && part.length > 0 && part.length <= 4_096 && !part.includes("\0"))
+    && isAbsolute(command[0]);
+}
+
+function validRunIds(runIds: readonly string[]): boolean {
+  return Array.isArray(runIds) && runIds.length > 0 && runIds.length <= 50
+    && runIds.every((id) => typeof id === "string" && /^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(id));
+}
 /** Message-write runs per assistant message; llm_output.usage is attempt-cumulative. */
 export function recordPacketFirstAssistant(packet: WakePacketResult, message: any): void {
   if (packet.firstAssistantSeen || message?.role !== "assistant") return;
@@ -80,18 +90,13 @@ export function buildWakePacket(
   const command = config?.command;
   const timeoutMs = validBound(config?.timeoutMs, DEFAULT_PACKET_TIMEOUT_MS, MAX_PACKET_TIMEOUT_MS);
   const maxBytes = validBound(config?.maxBytes, DEFAULT_PACKET_MAX_BYTES, MAX_PACKET_BYTES);
-  if (!Array.isArray(command) || !command.length || command.length > 32
-    || command.some((part) => typeof part !== "string" || !part || part.length > 4_096 || part.includes("\0"))
-    || !isAbsolute(command[0]) || timeoutMs === undefined || maxBytes === undefined) {
+  if (!validCommand(command) || timeoutMs === undefined || maxBytes === undefined) {
     return Promise.resolve(packetUnavailable("invalid configuration"));
   }
-  if (!Array.isArray(runIds) || runIds.some((id) => typeof id !== "string")) {
+  if (!validRunIds(runIds)) {
     return Promise.resolve(packetUnavailable("invalid run IDs"));
   }
-  const ids = [...new Set(runIds)].sort();
-  if (!ids.length || ids.length > 50 || ids.some((id) => !/^[a-zA-Z0-9][a-zA-Z0-9._:-]{0,127}$/.test(id))) {
-    return Promise.resolve(packetUnavailable("invalid run IDs"));
-  }
+  const ids = [...new Set(runIds)].sort((a, b) => a.localeCompare(b, "en"));
   if (signal?.aborted) return Promise.resolve(packetUnavailable("cancelled"));
   return new Promise((resolve) => {
     const chunks: Buffer[] = [];

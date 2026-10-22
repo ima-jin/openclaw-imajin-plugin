@@ -89,6 +89,18 @@ describe("bounded wake packet builder", () => {
     expect(packet.metrics.firstTurnInputTokens).toBe(123);
   });
 
+  it("fails open when execution permission is denied", async () => {
+    const nonExecutable = fileURLToPath(new URL("./fixtures/wake-packet-state.json", import.meta.url));
+    expect(await buildWakePacket({ command: [nonExecutable] }, ["run-a"]))
+      .toEqual(packetUnavailable("execution failed"));
+  });
+
+  it("accepts exactly maxBytes and rejects one byte less without truncation", async () => {
+    const packet = await buildWakePacket({ command: command() }, ["run-a"]);
+    expect(await buildWakePacket({ command: command(), maxBytes: packet.metrics.packetBytes }, ["run-a"])).toEqual(packet);
+    expect(await buildWakePacket({ command: command(), maxBytes: packet.metrics.packetBytes - 1 }, ["run-a"]))
+      .toEqual(packetUnavailable("maxBytes exceeded"));
+  });
   it("prefers authoritative prompt tokens and never labels later usage as first when first is unavailable", () => {
     const packet = packetUnavailable("fixture");
     recordPacketFirstAssistant(packet, { role: "assistant", usage: {
@@ -99,6 +111,11 @@ describe("bounded wake packet builder", () => {
     recordPacketFirstAssistant(missing, { role: "assistant" });
     recordPacketFirstAssistant(missing, { role: "assistant", usage: { input: 999 } });
     expect(missing.metrics.firstTurnInputTokens).toBeUndefined();
+  });
+  it.each([Number.NaN, Infinity, -1, "123"])("does not invent usage from invalid first-call metrics (%s)", (input) => {
+    const packet = packetUnavailable("fixture");
+    recordPacketFirstAssistant(packet, { role: "assistant", usage: { input } });
+    expect(packet.metrics.firstTurnInputTokens).toBeUndefined();
   });
 
   it("keeps schema defaults and hard limits aligned with runtime", async () => {

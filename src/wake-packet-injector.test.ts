@@ -115,9 +115,33 @@ describe("packet wake path (#107)", () => {
     expect(horizon.writeStepEvents).toHaveBeenCalledOnce();
     expect(bootstrap(ctx.sessionKey)[0].content).toHaveLength(54_000);
   });
+  it("logs unavailable first-turn metrics on timeout rather than estimating them or suppressing disclosure", async () => {
+    await wake({ wakePacket: { command: command("fail") }, wakeTimeoutMs: 50 });
+    await vi.waitFor(() => expect(console.log).toHaveBeenCalledWith(expect.stringMatching(
+      /wake ended .*packetBytes=0 bootstrapBytes=unavailable firstTurnBytes=unavailable firstTurnInputTokens=unavailable packetSource=evidence-only.*reason=timeout/,
+    )));
+    expect(sendDirectChannelMessage).toHaveBeenCalledWith(expect.anything(),
+      expect.stringContaining("GAP: packet unavailable (nonzero exit)"), api);
+  });
+
+  it("cancels an active packet builder on disposal without posting a late wake", async () => {
+    injector = createNotificationInjector(api, {
+      ...config, wakePacket: { command: command("timeout"), timeoutMs: 5000 },
+    });
+    await injector.ready;
+    await injector.inject(frame());
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    injector.dispose();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(posts).toEqual([]);
+  });
 
   it("passes packet evidence and the no-refetch rule to delegated decision work", async () => {
-    const ctx = await wake();
+    const ctx = await wake({ wakeReadOnlyLookups: true });
+    const duplicateRead = injector.runtimeHooks.before_tool_call({
+      toolName: "exec", params: { command: "/usr/bin/gh pr view 107 --json state" },
+    }, ctx) as { block: boolean };
+    expect(duplicateRead.block).toBe(true);
     const delegated = injector.runtimeHooks.before_tool_call({
       toolName: "sessions_spawn", params: { task: "Review the supplied state" },
     }, ctx) as { params: { task: string } };

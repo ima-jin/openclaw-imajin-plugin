@@ -79,7 +79,8 @@ export class WakeDecisionRouter {
     if (this.wakes.size >= 100) this.untrack(this.wakes.keys().next().value!);
     this.wakes.set(batchId, {
       batchId, sessionKey, children: new Set(), failed: false, delegations: 0, disclosed: false, copyRequested: false,
-      lookupAllowed: this.options.wakeReadOnlyLookups === true && (subject.hasPr === false || subject.failedRun === true),
+      lookupAllowed: subject.packetContext === undefined && this.options.wakeReadOnlyLookups === true
+        && (subject.hasPr === false || subject.failedRun === true),
       packetContext: subject.packetContext,
     });
     if (!this.roots.has(sessionKey)) this.roots.set(sessionKey, batchId);
@@ -102,9 +103,10 @@ export class WakeDecisionRouter {
     const ticket = randomUUID();
     this.tickets.set(ticket, wake.batchId);
     wake.delegations++;
+    const packet = wake.packetContext ? "\n\n" + wake.packetContext : "";
     return { params: {
       ...event.params, runtime: "subagent", model: this.model,
-      task: `Wake decision ticket: ${ticket}\n${event.params.task}${wake.packetContext ? `\n\n${wake.packetContext}` : ""}`,
+      task: `Wake decision ticket: ${ticket}\n${event.params.task}${packet}`,
     } };
   }
 
