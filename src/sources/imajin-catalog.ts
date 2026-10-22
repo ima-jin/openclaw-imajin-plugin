@@ -21,17 +21,19 @@ export function buildImajinModelRef(modelId: string): string {
 }
 export type GatewayDefaultModel = string | { primary?: string; fallbacks?: string[] };
 export interface ImajinDefaultChange {
-  before: GatewayDefaultModel;
+  before: GatewayDefaultModel | null;
   after: { primary: "imajin/default"; fallbacks: [] };
   /** Existing direct ref only, never its credential. */
   breakGlassModel?: string;
 }
 
 function buildDefaultChange(current: Awaited<ReturnType<ImajinModelPolicyGatewayClient["getConfig"]>>): ImajinDefaultChange | undefined {
-  const before = current.defaultModel;
-  if (before === undefined) return;
-  const primary = typeof before === "string" ? before : before.primary;
-  const fallbacks = typeof before === "string" ? [] : before.fallbacks ?? [];
+  // Older injected adapters may expose only policy; the live adapter always
+  // reports this key, including an unset (host-implicit) default.
+  if (!("defaultModel" in current)) return;
+  const before = current.defaultModel ?? null;
+  const primary = typeof before === "string" ? before : before?.primary;
+  const fallbacks = typeof before === "string" ? [] : before?.fallbacks ?? [];
   if (primary === IMAJIN_DEFAULT_MODEL_REF && fallbacks.length === 0) return;
   const direct = current.breakGlassModel ?? (isDirectModelRef(primary) ? primary : undefined);
   return {
@@ -288,7 +290,7 @@ export function createLiveImajinModelPolicyGatewayClient(gatewayClient: {
       }
       return {
         hash: result.hash, allow: allow ?? [],
-        ...(defaultModel === undefined ? {} : { defaultModel }),
+        defaultModel,
         ...(breakGlassModel === undefined ? {} : { breakGlassModel }),
       };
     },

@@ -107,6 +107,14 @@ export interface ImajinCatalogRowMetadata {
   picked?: boolean;
 }
 
+function projectCatalogMetadata(metadata: ImajinCatalogRowMetadata | undefined) {
+  const connector = typeof metadata?.connector === "string" ? metadata.connector.trim() : "";
+  return {
+    ...(connector ? { connector } : {}),
+    ...(metadata?.picked === true ? { picked: true } : {}),
+  };
+}
+
 /** Exact provider/model only; excludes kernel routes, aliases, URLs and patterns. */
 export function isDirectModelRef(value: unknown): value is string {
   return typeof value === "string" && /^[a-z0-9][a-z0-9_-]*\/[^\s*?#:]+$/i.test(value)
@@ -174,8 +182,8 @@ export function projectImajinCatalogRows(
     const id = row.id.trim();
     if (!id || /[\s*]/.test(id) || seenIds.has(id)) continue;
     seenIds.add(id);
-    const connector =
-      typeof row.imajin?.connector === "string" ? row.imajin.connector.trim() : "";
+    const metadata = projectCatalogMetadata(row.imajin);
+    const connector = metadata.connector;
     models.push({
       id,
       name: connector ? `${id} (via ${connector})` : id,
@@ -184,8 +192,7 @@ export function projectImajinCatalogRows(
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow: DEFAULT_CONTEXT_WINDOW,
       maxTokens: DEFAULT_MAX_TOKENS,
-      ...(connector ? { connector } : {}),
-      ...(row.imajin?.picked === true ? { picked: true } : {}),
+      ...metadata,
     });
   }
   return models;

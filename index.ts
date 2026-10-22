@@ -240,19 +240,25 @@ async function startPluginRuntime(
   api: any,
   config: PluginConfig | undefined,
   client: ImajinClient | undefined,
-  imajinProvider: RegisteredImajinProvider,
-  defaultRouter: ReturnType<typeof createImajinDefaultRouter>,
+  models: { provider: RegisteredImajinProvider; defaults: ReturnType<typeof createImajinDefaultRouter> },
   lifecycle: RegistrationLifecycle,
   on: RuntimeHookRegister,
   setWakeSender: (sender: WakeDisclosureSender) => void,
 ): Promise<void> {
+  const { provider: imajinProvider, defaults: defaultRouter } = models;
   const discovery = imajinProvider.startDiscovery();
   lifecycle.add(() => discovery.stop());
   let wakeModelResolve: ((event: any, ctx?: any) => unknown) | undefined;
   on("before_model_resolve", async (event, ctx) => {
     const deliberate = await wakeModelResolve?.(event, ctx);
-    return deliberate ?? defaultRouter.beforeModelResolve(event, ctx);
+    if (deliberate) {
+      defaultRouter.preserveExplicitOverride(ctx);
+      return deliberate;
+    }
+    return defaultRouter.beforeModelResolve(event, ctx);
   }, { name: "imajin-default:model" });
+  on("before_agent_run", defaultRouter.beforeAgentRun, { name: "imajin-default:gate" });
+  on("agent_end", defaultRouter.onAgentEnd, { name: "imajin-default:end" });
   if (!config?.nodeUrl || !client) return;
   let startWs = async () => {};
   // Loop lifecycle → kernel loops rail (#46): signed loop.* events for
@@ -578,12 +584,14 @@ export default definePluginEntry({
       getConfig: () => api.runtime?.config?.current?.(),
     });
     const runtime = new PluginServiceRuntime(api.registrationMode, (lifecycle, on) =>
-      startPluginRuntime(api, config, client, imajinProvider, defaultRouter, lifecycle, on,
+      startPluginRuntime(api, config, client, { provider: imajinProvider, defaults: defaultRouter }, lifecycle, on,
         (sender) => runtime.setWakeSender(sender)),
     );
     runtime.defaultRoutingStatus = defaultRouter.status;
     // Lower priority than a deliberate wake/decision routing override.
     runtime.registerHook(api, "before_model_resolve", "imajin-default:model", -100);
+    runtime.registerHook(api, "before_agent_run", "imajin-default:gate");
+    runtime.registerHook(api, "agent_end", "imajin-default:end");
     api.registerTool(
       createImajinStatusTool({
         baseUrl: imajinProvider.baseUrl,

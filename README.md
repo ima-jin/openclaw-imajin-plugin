@@ -188,6 +188,7 @@ In `openclaw.json`:
 - **`modelDiscovery`** (optional, #55) — model discovery against the kernel; needs `nodeUrl` + `keypairPath`:
   - **`modelDiscovery.refreshIntervalMs`** — periodic re-discovery interval; default `300000` (5 min), floor `10000`, `0` = start-up discovery only
   - **`modelDiscovery.modelsPath`** — kernel route, default `/infer/v1/models/usable`
+  - **`modelDiscovery.breakGlassModel`** — optional existing direct `provider/model` ref, never a key; the approved default migration can retain the old direct default here. Used only for confirmed kernel/passthrough transport outages, subject to live model policy.
 - **`mcpUrl`** (optional, #50) — local passthrough `/mcp` endpoint `imajin_status` probes; defaults to the `inferProxyBaseUrl` root + `/mcp` (`http://127.0.0.1:8787/mcp`); see "Kernel MCP tools" below
 
 ### Turn-usage attestation
@@ -383,8 +384,9 @@ Dropped `imajin/*` refs require the same approval before removal. Static
 `imajin-openai/<id>` / `imajin-xai/<id>` refs are proposed for retirement only
 after the discovered `imajin/<id>` equivalent is already allowed (a separate
 card after enabling replacements). Wildcards, aliases, other providers,
-provider blocks, lane defaults and fallbacks are untouched. Repoint lanes
-before approving a legacy removal if they still use those refs.
+provider blocks and explicit agent/session models are untouched. The same card
+can now propose the inherited-default migration described below (#106). Repoint
+explicit lanes before approving a legacy removal if they still use those refs.
 
 Unchanged or reordered catalogs do not duplicate cards. Pending identities and
 Ignore decisions survive restarts in the existing private bridge state;
@@ -401,6 +403,47 @@ existing Gateway auth (or the existing override) must authorize that scope.
 Catalog decisions always require the operator's registered-key countersignature,
 even when the legacy `approvals.requireOperatorCountersignature` flag is false.
 Missing permission/signature fails closed; there is no file-edit fallback.
+### Follow the kernel connector pick (#106)
+
+Enable the existing `imajin-catalog` approval source, then approve its single
+card on **/jin → Operator approvals**. In addition to any allow-list delta,
+`detail.defaultChange` shows the old default and the proposed
+`agents.defaults.model = { primary: "imajin/default", fallbacks: [] }`.
+The old direct default, if it is an exact non-kernel provider/model ref, is
+retained as `modelDiscovery.breakGlassModel` (ref only; auth remains in the
+host's existing protected credential store). An existing explicit emergency
+ref takes precedence. No direct ref is invented for implicit host defaults.
+Ordinary fallback ladders are cleared in this same approved, base-hash-guarded
+patch: auth, billing and model errors must not automatically spend directly.
+Ignore leaves config unchanged; changed before-state requires fresh approval.
+
+After this one-time consent, **no gateway config edit** accompanies a picker
+change. At the next discovery refresh, `imajin/default` resolves to the first
+servable row with **boolean** `imajin.picked: true`, preserving the kernel's
+connector-resolution order (first sealed/granted connector wins when multiple
+cards are picked). It never guesses from an unmarked catalog row.
+Select `imajin/<id>` in a session to pin that exact model, even if it equals
+the current default; refreshes never rewrite that session. Explicit agent
+model settings and deliberate wake/decision pins also stay unchanged.
+
+For a floating-default turn, the pre-model hook probes the local passthrough's
+`/healthz`. A transport failure (connection/DNS/timeout or HTTP 502/503/504),
+or a discovery transport failure confirmed by a fresh retry, permits the
+optional direct ref. Auth/grant/policy failures, HTTP 402/429, route errors,
+malformed discovery, missing picks and stale `/healthz` history do **not**.
+Both the picked model and emergency ref must satisfy live model policy.
+The next turn rechecks reachability, so the emergency ref never becomes a
+persisted session override. There is no inference replay after partial output;
+an outage first observed during inference fails that attempt rather than
+replaying potentially billed work. Discovery working does not prove
+completions are healthy.
+
+`imajin_status.defaultRouting` reports `selector`, `pickedModel`,
+`fallbackCount`, `lastReason` (`passthrough_unreachable` or
+`kernel_unreachable`) and `lastFallbackAt`. These count routing decisions in
+the current service lifetime; recovery retains the count and last reason.
+The existing `healthz.body` separately exposes the passthrough's own counters.
+No credential or raw upstream error is included in the routing reason.
 
 **Doctor/status** (`imajin_status` tool): reports the discovered catalog as
 `imajin/<id>` refs, `lastDiscovery` `{ fetchedAt, outcome, modelCount, error?,

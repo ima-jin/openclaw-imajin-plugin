@@ -18,6 +18,9 @@ export interface ImajinDefaultRoutingStatus {
 }
 
 interface RoutingPolicy { allow?: string[]; breakGlassModel?: string }
+interface RoutingContext { runId?: string; modelProviderId?: string; modelId?: string }
+const followsDefault = (ctx: RoutingContext) =>
+  ctx.modelProviderId === IMAJIN_PROVIDER_ID && ctx.modelId === IMAJIN_DEFAULT_MODEL_ID;
 
 function readRoutingPolicy(getConfig: () => unknown): RoutingPolicy | undefined {
   const config = getConfig() as {
@@ -54,7 +57,19 @@ export function createImajinDefaultRouter(deps: {
   let fallbackCount = 0;
   let lastReason: string | null = null;
   let lastFallbackAt: string | null = null;
+  // A hook exception is swallowed by host model resolution. The later blocking
+  // gate must therefore remember failed admission, not let "default" reach a
+  // kernel that may itself resolve an unknown id to its first available brain.
+  const admissions = new Map<string, boolean>();
+  function admit(ctx: RoutingContext, allowed: boolean): void {
+    if (!ctx.runId) return;
+    admissions.set(ctx.runId, allowed);
+    if (admissions.size > 500) admissions.delete(admissions.keys().next().value!);
+  }
   return {
+    preserveExplicitOverride(ctx: RoutingContext = {}) {
+      if (followsDefault(ctx)) admit(ctx, true);
+    },
     status(): ImajinDefaultRoutingStatus {
       const picked = deps.cache.peek()?.models.find((model) => model.picked);
       return {
@@ -62,8 +77,19 @@ export function createImajinDefaultRouter(deps: {
         fallbackCount, lastReason, lastFallbackAt,
       };
     },
-    async beforeModelResolve(_event: unknown, ctx: { modelProviderId?: string; modelId?: string } = {}) {
-      if (ctx.modelProviderId !== IMAJIN_PROVIDER_ID || ctx.modelId !== IMAJIN_DEFAULT_MODEL_ID) return;
+    beforeAgentRun(_event: unknown, ctx: RoutingContext = {}) {
+      const allowed = ctx.runId ? admissions.get(ctx.runId) : undefined;
+      if (allowed === false || (followsDefault(ctx) && allowed !== true)) {
+        return { outcome: "block", reason: "Kernel default model unavailable or denied by live policy",
+          message: "Kernel default model unavailable or denied by live policy; check imajin_status and the catalog approval card." };
+      }
+    },
+    onAgentEnd(_event: unknown, ctx: RoutingContext = {}) {
+      if (ctx.runId) admissions.delete(ctx.runId);
+    },
+    async beforeModelResolve(_event: unknown, ctx: RoutingContext = {}) {
+      if (!followsDefault(ctx)) return;
+      admit(ctx, false);
       let state = await deps.cache.get();
       const health = await (deps.probe ?? fetchImajinProxyHealthz)(deps.baseUrl);
       // Discovery transport failures can outlive an outage; recheck before spending directly.
@@ -75,6 +101,7 @@ export function createImajinDefaultRouter(deps: {
       const reason = outageReason(health, state);
       const emergency = directOverride(policy, reason);
       if (emergency) {
+        admit(ctx, true);
         fallbackCount++;
         lastReason = reason;
         lastFallbackAt = new Date((deps.now ?? Date.now)()).toISOString();
@@ -82,6 +109,7 @@ export function createImajinDefaultRouter(deps: {
       }
       const model = state.models.find((entry) => entry.picked);
       if (!model || !isImajinModelAllowedByPolicy(policy.allow, model.id)) return;
+      admit(ctx, true);
       return { providerOverride: IMAJIN_PROVIDER_ID, modelOverride: model.id };
     },
   };

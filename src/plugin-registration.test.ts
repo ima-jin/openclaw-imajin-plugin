@@ -21,6 +21,7 @@ const mocks = vi.hoisted(() => ({
 vi.mock("./imajin-default-routing.js", () => ({
   createImajinDefaultRouter: () => ({
     beforeModelResolve: mocks.defaultModelResolve,
+    beforeAgentRun: vi.fn(), onAgentEnd: vi.fn(), preserveExplicitOverride: vi.fn(),
     status: () => ({ selector: "imajin/default", pickedModel: null, fallbackCount: 0, lastReason: null, lastFallbackAt: null }),
   }),
 }));

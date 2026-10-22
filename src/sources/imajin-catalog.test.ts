@@ -30,6 +30,19 @@ describe("isImajinModelAllowedByPolicy", () => {
     expect(isImajinModelAllowedByPolicy([], "grok-4")).toBe(true);
   });
 
+  it("proposes opting a host-implicit default into kernel routing without inventing a direct fallback", async () => {
+    const request = vi.fn().mockResolvedValue({ hash: "h", config: {} });
+    const source = createImajinCatalogSource({
+      listDiscoveredModels: () => [{ ...makeModel("a"), picked: true }],
+      isDiscoveryReady: () => true,
+      gateway: createLiveImajinModelPolicyGatewayClient({ request }),
+    });
+    expect((await source.list())[0].detail?.defaultChange).toEqual({
+      before: null, after: { primary: "imajin/default", fallbacks: [] },
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("allows an exact imajin/<model> ref", () => {
     expect(isImajinModelAllowedByPolicy(["imajin/grok-4"], "grok-4")).toBe(true);
     expect(isImajinModelAllowedByPolicy(["imajin/grok-4"], "gpt-6-astra")).toBe(false);
@@ -387,7 +400,7 @@ describe("live model policy RPC adapter", () => {
   it("omitted allow means allow-any, while patch replaces only the exact allow array with baseHash", async () => {
     const request = vi.fn().mockResolvedValue({ hash: "h", config: {} });
     const client = createLiveImajinModelPolicyGatewayClient({ request });
-    expect(await client.getConfig()).toEqual({ hash: "h", allow: [] });
+    expect(await client.getConfig()).toEqual({ hash: "h", allow: [], defaultModel: undefined });
     await client.patchModelPolicyAllow(["imajin/grok-4"], "h");
     expect(request).toHaveBeenLastCalledWith("config.patch", {
       raw: JSON.stringify({ agents: { defaults: { modelPolicy: { allow: ["imajin/grok-4"] } } } }),

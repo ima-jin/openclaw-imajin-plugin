@@ -39,6 +39,40 @@ describe("kernel-picked default (#106)", () => {
     expect(router.status()).toMatchObject({ pickedModel: "imajin/b", fallbackCount: 0, lastReason: null });
   });
 
+  it("blocks denied/missing picks even when the host swallows a model-hook failure", async () => {
+    const { router, config, probe, fetcher, cache } = await fixture();
+    const ctx = { ...following, runId: "blocked-run" };
+    config.agents.defaults.modelPolicy.allow = ["imajin/default"];
+    await router.beforeModelResolve({}, ctx);
+    expect(router.beforeAgentRun({}, ctx)).toMatchObject({ outcome: "block" });
+    config.agents.defaults.modelPolicy.allow = ["imajin/*", "direct/*"];
+    probe.mockRejectedValueOnce(new Error("probe failure"));
+    await expect(router.beforeModelResolve({}, ctx)).rejects.toThrow("probe failure");
+    expect(router.beforeAgentRun({}, ctx)).toMatchObject({ outcome: "block" });
+    await router.beforeModelResolve({}, ctx);
+    expect(router.beforeAgentRun({}, ctx)).toBeUndefined();
+    router.onAgentEnd({}, ctx);
+    expect(router.beforeAgentRun({}, ctx)).toMatchObject({ outcome: "block" });
+    fetcher.mockResolvedValue({ data: [] });
+    await cache.refresh();
+    await router.beforeModelResolve({}, ctx);
+    expect(router.beforeAgentRun({}, ctx)).toMatchObject({ outcome: "block" });
+    router.preserveExplicitOverride(ctx);
+    expect(router.beforeAgentRun({}, ctx)).toBeUndefined();
+    expect(router.beforeAgentRun({}, { modelProviderId: "imajin", modelId: "a" })).toBeUndefined();
+  });
+
+  it("uses the refreshed pick and live policy if they change during the health probe", async () => {
+    const { router, probe, fetcher, cache, config } = await fixture();
+    probe.mockImplementationOnce(async () => {
+      fetcher.mockResolvedValue(list("b"));
+      await cache.refresh();
+      config.agents.defaults.modelPolicy.allow = ["imajin/b"];
+      return { ok: true, status: 200 };
+    });
+    expect(await router.beforeModelResolve({}, following)).toEqual({ providerOverride: "imajin", modelOverride: "b" });
+  });
+
   it.each(["a", "b"])("explicit session imajin/%s survives refresh and outages, including a pin equal to the old pick", async (id) => {
     const { router, fetcher, cache, probe } = await fixture();
     const ctx = { modelProviderId: "imajin", modelId: id };
