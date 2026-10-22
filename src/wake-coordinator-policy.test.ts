@@ -196,4 +196,20 @@ describe("option c: enforced wake coordinator boundary", () => {
       .toMatchObject({ block: true }); // An ambiguous local-repo target is not ticket authority.
     expect(tool("exec", { command: "gh pr merge 84" })).toMatchObject({ block: true });
   });
+
+  it("admits only the host-identified Code Mode bridge and still gates its nested calls", async () => {
+    await start([frame("code-mode-delegation", true, "SUCCEEDED")]);
+    const code = 'await sessions_spawn({ task: "Review the PR" })';
+    expect(await injector.runtimeHooks.before_tool_call({
+      toolName: "exec", toolKind: "code_mode_exec", toolInputKind: "javascript",
+      params: { title: "Delegate review", code, command: code },
+    }, ctx())).toBeUndefined();
+    expect(await injector.runtimeHooks.before_tool_call({
+      toolName: "sessions_spawn", params: { task: "Review the PR" },
+    }, ctx())).toMatchObject({ params: { runtime: "subagent", model: "anthropic/claude-opus-5-5" } });
+    expect(tool("exec", { command: code, toolKind: "code_mode_exec", toolInputKind: "javascript" }))
+      .toMatchObject({ block: true });
+    expect(tool("exec", { command: "gh pr merge 84" })).toMatchObject({ block: true });
+    expect(tool("imajin_warp", { action: "dispatch" })).toMatchObject({ block: true });
+  });
 });

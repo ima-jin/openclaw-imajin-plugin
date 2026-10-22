@@ -35,6 +35,9 @@ interface WakeToolPolicy {
 
 export interface WakeToolEvent {
   toolName: string;
+  /** Host-owned tool identity, not model-supplied params. */
+  toolKind?: string;
+  toolInputKind?: string;
   params: Record<string, unknown>;
   result?: unknown;
   error?: string;
@@ -98,6 +101,11 @@ export class WakeDecisionRouter {
 
   private coordinatorTool(event: WakeToolEvent, wake: DecisionWake): WakeToolPolicy | undefined {
     if (WORKER_TOOLS.has(event.toolName)) return;
+    // Code Mode is a bridge, not shell exec. Each nested call re-enters this
+    // hook under its real tool name, so sessions_spawn still gets a pinned ticket
+    // and shell/merge/approve/enqueue/dispatch calls remain coordinator-blocked.
+    if (event.toolName === "exec" && event.toolKind === "code_mode_exec"
+      && event.toolInputKind === "javascript") return;
     if (wake.lookupAllowed) {
       const params = wakeReadOnlyLookup(event, this.options.githubCliPath ?? "/usr/bin/gh");
       if (params) return { params };
