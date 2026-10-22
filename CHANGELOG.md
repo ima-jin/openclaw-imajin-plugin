@@ -16,6 +16,7 @@
   agent session. Config-only; injector logic unchanged.
 
 ### Added
+- **Live catalog allow-list reconciliation (#105).** Operator-approved cut-over from static provider refs.
 - **Top-level session inventory and lifecycle/history commands (#109).** Boot,
   Gateway/kernel reconnect and `sessions.changed` publish signed session loops
   with labels/activity, child lineage, and bounded redacted #2406 history.
