@@ -1521,7 +1521,7 @@ export class GatewayApprovalsBridge {
       return { ok: false, error: `malformed operatorSignature: ${parsed.error}` };
     }
     if (!parsed.value) {
-      if (this.config.requireOperatorCountersignature) {
+      if (this.config.requireOperatorCountersignature || tracked.sourceId === "imajin-catalog") {
         return { ok: false, error: "operatorSignature is required on this bridge but was not supplied" };
       }
       return { ok: true };
@@ -1703,7 +1703,7 @@ export interface StartGatewayApprovalsBridgeDeps {
    */
   imajinCatalog?: {
     listDiscoveredModels: () => readonly ImajinRuntimeModel[];
-    isModelAllowed: (modelId: string) => boolean;
+    isDiscoveryReady: () => boolean;
   };
   /**
    * Resolves an operator DID to its registered Ed25519 public key (#44) —
@@ -1758,6 +1758,7 @@ interface LiveSourceOptions {
   resources: RegistrationLifecycle;
   gatewayToken?: string;
   notifySecret: string;
+  stateStore: ApprovalsStateStore;
   onExecReconnected: () => void;
 }
 
@@ -1817,8 +1818,11 @@ async function startCatalogSource(options: LiveSourceOptions): Promise<ApprovalS
   }));
   return createImajinCatalogSource({
     listDiscoveredModels: catalog.listDiscoveredModels,
-    isModelAllowed: catalog.isModelAllowed,
+    isDiscoveryReady: catalog.isDiscoveryReady,
     gateway: live.client,
+  }, {
+    state: options.stateStore.catalog,
+    persistState: () => options.stateStore.persist(),
   });
 }
 
@@ -1980,7 +1984,7 @@ async function startOwnedGatewayApprovalsBridge(
   // Late-bound: the Gateway connection opens before the bridge exists.
   let bridgeRef: GatewayApprovalsBridge | undefined;
   const sources = await startApprovalSources({
-    api, config: config!, deps, resources,
+    api, config: config!, deps, resources, stateStore,
     gatewayToken,
     notifySecret,
     onExecReconnected: () => {

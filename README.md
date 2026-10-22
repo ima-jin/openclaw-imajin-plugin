@@ -371,47 +371,56 @@ allowlist. If you omit `modelPolicy.allow` entirely (or leave it `[]`),
 OpenClaw's own default is "allow any configured model", so `imajin/*`
 models are already selectable with no allow-list edit at all.
 
-**Stricter alternative — per-model operator approval (`imajin-catalog`
-source, opt-in)**: for operators who set a restrictive `modelPolicy.allow`
-for other providers but never want a blanket `imajin/*` grant, add
-`"imajin-catalog"` to `approvals.sources` (see "Gateway approvals bridge"
-above for the shared `approvals.*` config). Each newly discovered
-`imajin/<model>` not yet covered by the allow list then publishes an
-`operator.approval.requested` ("Enable imajin/<model> for agents?") card on
-/jin; only a verified, signed `operator.approval.decided` approval ever
-appends that one `imajin/<model>` ref to `agents.defaults.modelPolicy.allow`
-(via the Gateway's `config.get`/`config.patch` RPCs) — a reject is
-remembered so the same model is never re-proposed. This plugin NEVER writes
-Gateway config on any other path. Off by default: an install with no
-`modelPolicy.allow` configured never needs this (see above), and an install
-that never lists `"imajin-catalog"` in `approvals.sources` never starts it.
+**Operator-approved live allow-list (`imajin-catalog`, opt-in, #105)**:
+add `"imajin-catalog"` to the existing `approvals.sources` bridge configuration.
+For restrictive policies, each catalog refresh is reconciled within the source's
+15-second poll. One card in **/jin → Operator approvals** lists exact `add` and
+`remove` refs. Approving applies exactly that delta through Gateway
+`config.get`/`config.patch`; no shell or manual per-model config edit is needed.
+Discovery, polling, rejection and failed discovery never write policy.
+
+Dropped `imajin/*` refs require the same approval before removal. Static
+`imajin-openai/<id>` / `imajin-xai/<id>` refs are proposed for retirement only
+after the discovered `imajin/<id>` equivalent is already allowed (a separate
+card after enabling replacements). Wildcards, aliases, other providers,
+provider blocks, lane defaults and fallbacks are untouched. Repoint lanes
+before approving a legacy removal if they still use those refs.
+
+Unchanged or reordered catalogs do not duplicate cards. Pending identities and
+Ignore decisions survive restarts in the existing private bridge state;
+changed deltas require fresh consent. Approval checks the current delta again
+and uses Gateway `baseHash` to reject concurrent config edits. If removing the
+last entry would produce `[]`, the card explicitly warns that OpenClaw treats
+that as **allow any configured model**, not deny-all; reject to keep the
+restriction. An omitted/empty policy or covering wildcard already allows the
+live models and needs no addition card.
+
+This opt-in source uses its own loopback **`operator.admin`** connection,
+required by Gateway config RPCs; no other connection is widened. The host's
+existing Gateway auth (or the existing override) must authorize that scope.
+Catalog decisions always require the operator's registered-key countersignature,
+even when the legacy `approvals.requireOperatorCountersignature` flag is false.
+Missing permission/signature fails closed; there is no file-edit fallback.
 
 **Doctor/status** (`imajin_status` tool): reports the discovered catalog as
 `imajin/<id>` refs, `lastDiscovery` `{ fetchedAt, outcome, modelCount, error?,
 httpStatus?, lastGoodAt }`, the kernel `discovery` URL + refresh interval, and a
-fresh probe of the proxy's `GET /healthz` body. Healthy looks like:
+fresh probe of the proxy's `GET /healthz` body. `allowList.configured` reports
+the configured refs (including legacy entries); `allowList.allowListed` and
+`allowList.discoveredButNotAllowed` partition the discovered catalog using
+OpenClaw's exact/wildcard/empty-policy semantics. All three are `null` if
+live config cannot be read, rather than implying permission. Healthy looks like:
 
 ```json
 { "lastDiscovery": { "outcome": "ok", "modelCount": 3, "fetchedAt": "..." },
   "catalog": [{ "ref": "imajin/grok-4", "connector": "xai" }, ...] }
 ```
 
-**Retiring the static provider blocks (operator step)**: once `imajin_status`
-shows `outcome: ok` with your brains listed as `imajin/<id>`, the hand-wired
-`models.providers.imajin-xai` / `imajin-openai` blocks are redundant. This
-plugin never edits Gateway config — do it yourself:
-
-1. Confirm `imajin_status` → `lastDiscovery.outcome: ok` and that every model
-   those blocks exposed (e.g. `grok-4`, `gpt-6-astra`) appears as `imajin/<id>`.
-2. Add `"imajin/*"` to `agents.defaults.modelPolicy.allow` if you keep a
-   restrictive allow list (see below), and repoint anything that referenced
-   `imajin-xai/grok-4` / `imajin-openai/gpt-6-astra` (sub-agent `model:`
-   values, fallbacks) at `imajin/grok-4` / `imajin/gpt-6-astra`.
-3. Delete the `imajin-xai` and `imajin-openai` entries from
-   `models.providers` (and their `modelPolicy.allow` refs) and restart or
-   reload the Gateway.
-4. Re-run `imajin_status` and spawn one sub-agent on an `imajin/*` model to
-   confirm. To roll back, re-add the blocks — nothing else changed.
+**Retiring static providers**: the approval source only retires their exact
+allow-list refs, never the `models.providers.imajin-xai` / `imajin-openai`
+blocks or lane configuration. After replacement `imajin/*` refs are allowed,
+repoint any lanes/fallbacks still using legacy refs before approving the
+retirement card. Provider-block cleanup is a separate operator choice.
 
 Note completions still depend on the kernel passthrough proxy being healthy
 (`imajin-ai#2453`); discovery working does not by itself prove completions do.
@@ -441,8 +450,7 @@ registration time: `google_gmail_send`, `google_calendar_create_event` and
 send tool, remove its glob or exact name from `exclude`** (e.g. drop
 `google_*_send*`). Equivalent config: `mcp.servers.imajin = { url:
 "http://127.0.0.1:8787/mcp", transport: "streamable-http", toolFilter: { exclude:
-[ … the globs above … ] } }`. The plugin does not write Gateway config (same
-posture as the model allow-list above); it only reads it, so `imajin_status` can
+[ … the globs above … ] } }`. The plugin does not write MCP Gateway config; that check is read-only, so `imajin_status` can
 tell you when the entry is missing. The passthrough also needs an `mcp` route
 in its `INFER_PROXY_ROUTES_CONFIG` (see its README); without one `/mcp` answers
 `422 no_route_configured`, which status reports as `outcome: not-configured`.

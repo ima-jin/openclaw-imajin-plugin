@@ -2,6 +2,7 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import type { ApprovalSourceRequest } from "./sources/types.js";
+import type { ImajinCatalogProposalState } from "./sources/imajin-catalog.js";
 
 export const APPROVALS_STATE_FILENAME = "approvals-bridge-state.json";
 
@@ -31,6 +32,7 @@ export class ApprovalsStateStore {
   readonly proposals = new Map<string, StoredApprovalProposal>();
   readonly warnings = new Set<string>();
   readonly outcomes = new Map<string, "applied" | "expired/superseded">();
+  readonly catalog: ImajinCatalogProposalState = { revision: null, proposalId: null, dismissed: false };
   private writes: Promise<void> = Promise.resolve();
 
   constructor(
@@ -53,6 +55,12 @@ export class ApprovalsStateStore {
       for (const [id, outcome] of Object.entries(state.outcomes ?? {})) {
         if (outcome === "applied" || outcome === "expired/superseded") this.outcomes.set(id, outcome);
       }
+      const catalog = state.catalog;
+      if (catalog && typeof catalog.revision === "string" && /^[0-9a-f]{64}$/.test(catalog.revision) &&
+          typeof catalog.proposalId === "string" && /^imajin-catalog:[0-9a-f-]{36}$/.test(catalog.proposalId) &&
+          typeof catalog.dismissed === "boolean") {
+        Object.assign(this.catalog, catalog);
+      }
     } catch {
       // First boot, foreign or corrupt state: live source reads remain authoritative.
     }
@@ -66,6 +74,7 @@ export class ApprovalsStateStore {
       proposals: Object.fromEntries(this.proposals),
       warnings: [...this.warnings],
       outcomes: Object.fromEntries(this.outcomes),
+      catalog: this.catalog,
     });
     this.writes = this.writes.then(async () => {
       try {

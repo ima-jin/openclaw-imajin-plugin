@@ -60,7 +60,6 @@ import {
   type RegisteredImajinProvider,
   type ImajinModelDiscoveryConfig,
 } from "./src/imajin-provider.js";
-import { isImajinModelAllowedByPolicy } from "./src/sources/imajin-catalog.js";
 import { registerLoopLifecycle, LOOP_LIFECYCLE_HOOKS, type LoopLifecycle, type LoopsConfig } from "./src/loop-hooks.js";
 import { registerHorizonSync, type HorizonConfig } from "./src/horizon/sync.js";
 import { resolveImajinMcpUrl } from "./src/kernel-mcp.js";
@@ -401,19 +400,13 @@ async function startPluginRuntime(
       },
       // Wires the opt-in "imajin-catalog" source (#36 item 3) so it can be
       // enabled via `approvals.sources` alongside system-agent/skill-
-      // workshop. Reads the config's live `modelPolicy.allow` on every
-      // check rather than a snapshot, so an operator edit takes effect
-      // without a plugin restart.
+      // workshop. The source reads live policy through config RPCs and
+      // only a successful discovery may propose changes.
       imajinCatalog: {
         listDiscoveredModels: () => imajinProvider.cache.peek()?.models ?? [],
-        isModelAllowed: (modelId: string) => {
-          const liveConfig = api.runtime?.config?.current?.() as
-            | { agents?: { defaults?: { modelPolicy?: { allow?: string[] } } } }
-            | undefined;
-          return isImajinModelAllowedByPolicy(
-            liveConfig?.agents?.defaults?.modelPolicy?.allow,
-            modelId,
-          );
+        isDiscoveryReady: () => {
+          const outcome = imajinProvider.cache.peek()?.outcome;
+          return outcome === "ok" || outcome === "empty";
         },
       },
     })

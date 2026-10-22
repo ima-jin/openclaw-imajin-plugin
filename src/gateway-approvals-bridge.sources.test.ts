@@ -349,92 +349,80 @@ function makeImajinModel(id: string, connector: string): ImajinRuntimeModel {
   };
 }
 
-describe("GatewayApprovalsBridge + imajin-catalog: publish on new row, config write only on decision", () => {
-  it("publishes operator.approval.requested for a newly discovered model, and only writes config.patch after a verified approve decision", async () => {
-    let discovered: ImajinRuntimeModel[] = [];
+describe("GatewayApprovalsBridge + imajin-catalog (#105)", () => {
+  async function fixture(allow = ["openai/*"], ids = ["grok-4", "gpt-6-astra"]) {
     const gateway: ImajinModelPolicyGatewayClient = {
-      getConfig: vi.fn().mockResolvedValue({ hash: "cfg-hash-1", allow: ["openai/*"] }),
-      patchModelPolicyAllow: vi.fn().mockResolvedValue(undefined),
+      getConfig: vi.fn(async () => ({ hash: "cfg-hash-1", allow: [...allow] })),
+      patchModelPolicyAllow: vi.fn(async (next) => { allow = next; }),
     };
     const source = createImajinCatalogSource({
-      listDiscoveredModels: () => discovered,
-      isModelAllowed: () => false,
-      gateway,
+      listDiscoveredModels: () => ids.map((id) => makeImajinModel(id, "kernel")),
+      isDiscoveryReady: () => true, gateway,
     });
     const kernel = makeKernel();
+    const operatorKey = ed.utils.randomPrivateKey();
+    const publicKey = bytesToHex(await ed.getPublicKeyAsync(operatorKey));
     const bridge = new GatewayApprovalsBridge(
       { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
-      new Map<string, ApprovalSource>([["imajin-catalog", source]]),
-      kernel as unknown as KernelNotifyClient,
+      new Map([[source.id, source]]), kernel,
+      undefined, { resolveOperatorPublicKey: async () => publicKey },
     );
-
-    // Nothing discovered yet — reconcile publishes nothing, and no config is
-    // ever read or written just from starting the bridge.
     await bridge.reconcile();
-    expect(kernel.publishApprovalRequested).not.toHaveBeenCalled();
-    expect(gateway.getConfig).not.toHaveBeenCalled();
-
-    // A new kernel brain appears (sealing a connector card on /jin).
-    discovered = [makeImajinModel("grok-4", "xai")];
-    await bridge.reconcile();
-    expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
     const published = kernel.publishApprovalRequested.mock.calls[0][0];
-    expect(published.source).toBe("imajin-catalog");
-    expect(published.kind).toBe("imajin-catalog:new-model");
-    expect(published.detail).toMatchObject({ modelId: "grok-4", ref: "imajin/grok-4" });
-    expect(bridge.isPublished("imajin-catalog:grok-4")).toBe(true);
+    const decide = async (change?: (frame: KernelBusEventFrame) => void) => {
+      const frame = makeDecidedFrame(published.proposalId, "approve", published.contentHash);
+      const fields = { contentHash: published.contentHash.replace(/^sha256:/, ""), decision: "approve", decidedAt: frame.payload!.decidedAt };
+      frame.payload!.operatorSignature = { keyId: publicKey, alg: "ed25519",
+        sig: bytesToHex(await ed.signAsync(new TextEncoder().encode(canonicalize(fields)), operatorKey)) };
+      change?.(frame);
+      return bridge.handleKernelDecision(frame);
+    };
+    return { gateway, kernel, bridge, published, decide };
+  }
 
-    // #36 hard requirement: no config write has happened yet — only a
-    // verified `operator.approval.decided` can trigger one.
-    expect(gateway.getConfig).not.toHaveBeenCalled();
-    expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
-
-    const stagedContentHash = lastPublishedContentHash(kernel);
-    await bridge.handleKernelDecision(makeDecidedFrame("imajin-catalog:grok-4", "approve", stagedContentHash));
-
-    expect(gateway.getConfig).toHaveBeenCalledTimes(1);
-    expect(gateway.patchModelPolicyAllow).toHaveBeenCalledWith(["openai/*", "imajin/grok-4"], "cfg-hash-1");
+  it("publishes exactly one card on unchanged refresh and applies exactly the signed additions once", async () => {
+    const { gateway, kernel, bridge, published, decide } = await fixture();
+    try {
+      expect(published).toMatchObject({ source: "imajin-catalog", kind: "imajin-catalog:reconcile",
+        detail: { add: ["imajin/gpt-6-astra", "imajin/grok-4"], remove: [] } });
+      await bridge.reconcile();
+      expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
+      expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
+      expect(await decide()).toBe("applied");
+      expect(gateway.patchModelPolicyAllow).toHaveBeenCalledWith([
+        "openai/*", "imajin/gpt-6-astra", "imajin/grok-4",
+      ], "cfg-hash-1");
+      await decide();
+      expect(gateway.patchModelPolicyAllow).toHaveBeenCalledTimes(1);
+      await bridge.reconcile();
+      expect(kernel.publishApprovalRequested).toHaveBeenCalledTimes(1);
+    } finally { bridge.dispose(); }
   });
 
-  it("never writes config for a decision from an unverified signer (not the configured operator)", async () => {
-    const gateway: ImajinModelPolicyGatewayClient = {
-      getConfig: vi.fn().mockResolvedValue({ hash: "cfg-hash-1", allow: [] }),
-      patchModelPolicyAllow: vi.fn().mockResolvedValue(undefined),
-    };
-    const source = createImajinCatalogSource({
-      listDiscoveredModels: () => [makeImajinModel("grok-4", "xai")],
-      isModelAllowed: () => false,
-      gateway,
+  it("removed catalog refs remain allowed until the signed removal card is approved", async () => {
+    const { gateway, published, bridge, decide } = await fixture(["openai/*", "imajin/grok-4"], []);
+    try {
+      expect(published.detail).toMatchObject({ add: [], remove: ["imajin/grok-4"] });
+      expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
+      expect(await decide()).toBe("applied");
+      expect(gateway.patchModelPolicyAllow).toHaveBeenCalledWith(["openai/*"], "cfg-hash-1");
+    } finally { bridge.dispose(); }
+  });
+
+  it.each(["issuer", "subject", "decidedBy", "contentHash", "missing signature", "invalid signature"])(
+    "refuses %s tampering without a config write", async (field) => {
+      const { gateway, bridge, decide } = await fixture();
+      try {
+        expect(await decide((frame) => {
+          if (field === "issuer" || field === "subject") frame[field] = "did:imajin:intruder";
+          if (field === "decidedBy") frame.payload!.decidedBy = "did:imajin:intruder";
+          if (field === "contentHash") frame.payload!.contentHash = "sha256:wrong";
+          if (field === "missing signature") delete frame.payload!.operatorSignature;
+          if (field === "invalid signature") frame.payload!.decidedAt = "changed-after-signing";
+        })).toBe("rejected");
+        expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
+      } finally { bridge.dispose(); }
     });
-    const kernel = makeKernel();
-    const bridge = new GatewayApprovalsBridge(
-      { operatorDid: OPERATOR_DID, agentDid: AGENT_DID, agentPrivateKeyHex: await generatePrivateKeyHex() },
-      new Map<string, ApprovalSource>([["imajin-catalog", source]]),
-      kernel as unknown as KernelNotifyClient,
-    );
-
-    await bridge.reconcile();
-    const stagedContentHash = lastPublishedContentHash(kernel);
-
-    const forgedFrame: KernelBusEventFrame = {
-      type: "bus_event",
-      eventType: "operator.approval.decided",
-      issuer: "did:imajin:not-the-operator",
-      subject: "did:imajin:not-the-operator",
-      scope: "operator",
-      payload: {
-        proposalId: "imajin-catalog:grok-4",
-        decision: "approve",
-        decidedBy: "did:imajin:not-the-operator",
-        contentHash: stagedContentHash,
-      },
-    };
-
-    await bridge.handleKernelDecision(forgedFrame);
-
-    expect(gateway.getConfig).not.toHaveBeenCalled();
-    expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
-  });
 });
 
 // --- gateway-exec (#38) end-to-end: resolve is only ever called after a

@@ -159,7 +159,7 @@ export function projectImajinCatalogRows(
     // The kernel only lists servable rows today; honour an explicit `false`.
     if (row.imajin?.servable === false) continue;
     const id = row.id.trim();
-    if (!id || seenIds.has(id)) continue;
+    if (!id || /[\s*]/.test(id) || seenIds.has(id)) continue;
     seenIds.add(id);
     const connector =
       typeof row.imajin?.connector === "string" ? row.imajin.connector.trim() : "";
