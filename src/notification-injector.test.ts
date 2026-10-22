@@ -1354,7 +1354,7 @@ describe("createNotificationInjector — persisted state across a simulated rest
     // Assert the hook-failure receipt, not the count of all wake-failure alerts.
     await vi.waitFor(() => expect(sendTextMock).toHaveBeenCalledWith(expect.objectContaining({
       to: "1",
-      text: expect.stringContaining("gateway returned 500 — automatic wake failed; Warp run 1 SUCCEEDED"),
+      text: expect.stringMatching(/gateway returned 500\s+— automatic wake failed; Warp run 1 SUCCEEDED/),
     })));
     await vi.waitFor(() => expect(console.error).toHaveBeenCalledWith(
       "[imajin-ws] wake hook FAILED for warp.run.completed: gateway returned 500 (leading, 1 notification(s) coalesced)",
