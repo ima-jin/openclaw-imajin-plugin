@@ -6,6 +6,8 @@ import {
   isImajinModelAllowedByPolicy,
   type ImajinCatalogSourceDeps,
   type ImajinCatalogProposalState,
+  type GatewayDefaultModel,
+  type ImajinDefaultChange,
 } from "./imajin-catalog.js";
 import type { ImajinRuntimeModel } from "../imajin-provider.js";
 
@@ -28,6 +30,19 @@ describe("isImajinModelAllowedByPolicy", () => {
     expect(isImajinModelAllowedByPolicy([], "grok-4")).toBe(true);
   });
 
+  it("proposes opting a host-implicit default into kernel routing without inventing a direct fallback", async () => {
+    const request = vi.fn().mockResolvedValue({ hash: "h", config: {} });
+    const source = createImajinCatalogSource({
+      listDiscoveredModels: () => [{ ...makeModel("a"), picked: true }],
+      isDiscoveryReady: () => true,
+      gateway: createLiveImajinModelPolicyGatewayClient({ request }),
+    });
+    expect((await source.list())[0].detail?.defaultChange).toEqual({
+      before: null, after: { primary: "imajin/default", fallbacks: [] },
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
   it("allows an exact imajin/<model> ref", () => {
     expect(isImajinModelAllowedByPolicy(["imajin/grok-4"], "grok-4")).toBe(true);
     expect(isImajinModelAllowedByPolicy(["imajin/grok-4"], "gpt-6-astra")).toBe(false);
@@ -44,6 +59,73 @@ describe("isImajinModelAllowedByPolicy", () => {
 
   it("buildImajinModelRef builds the imajin/<id> ref", () => {
     expect(buildImajinModelRef("grok-4")).toBe("imajin/grok-4");
+  });
+});
+
+describe("approved kernel-default migration (#106)", () => {
+  function fixture(model: GatewayDefaultModel = { primary: "direct/old", fallbacks: ["other/unsafe"] }) {
+    let defaultModel = model;
+    let models = [{ ...makeModel("a"), picked: true }, makeModel("b")];
+    let breakGlassModel: string | undefined;
+    const gateway = {
+      getConfig: vi.fn(async () => ({ hash: "latest", allow: ["imajin/*", "direct/*"], defaultModel, breakGlassModel })),
+      patchModelPolicyAllow: vi.fn(async (_allow: string[], _hash: string, change?: ImajinDefaultChange) => {
+        if (change) { defaultModel = change.after; breakGlassModel = change.breakGlassModel; }
+      }),
+    };
+    const source = createImajinCatalogSource({
+      listDiscoveredModels: () => models, isDiscoveryReady: () => true, gateway,
+    });
+    return { source, gateway, setModel: (next: GatewayDefaultModel) => { defaultModel = next; },
+      setModels: (next: typeof models) => { models = next; } };
+  }
+
+  it.each(["direct/old", { primary: "direct/old", fallbacks: ["other/unsafe"] }])(
+    "one card switches default %j only after approval; subsequent pick refreshes do not edit config", async (model) => {
+      const { source, gateway, setModels } = fixture(model);
+      const [card] = await source.list();
+      expect(card.kind).toBe("imajin-catalog:reconcile");
+      expect(card.detail).toMatchObject({ defaultChange: {
+        before: model, after: { primary: "imajin/default", fallbacks: [] }, breakGlassModel: "direct/old",
+      } });
+      expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
+      expect(await source.list()).toEqual([card]);
+      await source.resolve(card.proposalId, "approve", card.sourceRevision);
+      expect(gateway.patchModelPolicyAllow).toHaveBeenCalledTimes(1);
+      expect(gateway.patchModelPolicyAllow).toHaveBeenCalledWith(
+        ["imajin/*", "direct/*"], "latest", card.detail!.defaultChange);
+      setModels([makeModel("a"), { ...makeModel("b"), picked: true }]);
+      expect(await source.list()).toEqual([]);
+      expect(gateway.patchModelPolicyAllow).toHaveBeenCalledTimes(1);
+    });
+
+  it("Ignore preserves the old default and suppresses the same migration", async () => {
+    const { source, gateway } = fixture();
+    const [card] = await source.list();
+    await source.resolve(card.proposalId, "reject", card.sourceRevision);
+    expect(await source.list()).toEqual([]);
+    expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
+  });
+
+  it("a changed default invalidates staged approval, even with an unchanged allow-list", async () => {
+    const { source, gateway, setModel } = fixture();
+    const [card] = await source.list();
+    setModel("direct/new");
+    await expect(source.resolve(card.proposalId, "approve", card.sourceRevision)).rejects.toThrow("delta changed");
+    expect(gateway.patchModelPolicyAllow).not.toHaveBeenCalled();
+  });
+
+  it("does not propose a default migration without a kernel-picked marker", async () => {
+    const { source, setModels } = fixture();
+    setModels([makeModel("a")]);
+    expect(await source.list()).toEqual([]);
+  });
+
+  it("removes ordinary fallback ladders even if the primary already follows the kernel", async () => {
+    const { source } = fixture({ primary: "imajin/default", fallbacks: ["direct/unsafe"] });
+    expect((await source.list())[0].detail).toMatchObject({
+      defaultChange: { after: { primary: "imajin/default", fallbacks: [] } },
+    });
   });
 });
 
@@ -272,6 +354,41 @@ describe("createImajinCatalogSource reconciliation (#105)", () => {
 });
 
 describe("live model policy RPC adapter", () => {
+  it.each([null, [], 42, { primary: 42 }, { fallbacks: "direct/a" }, { fallbacks: [42] }])(
+    "rejects malformed default model snapshots %j", async (model) => {
+      const request = vi.fn().mockResolvedValue({ hash: "h", config: { agents: { defaults: { model } } } });
+      await expect(createLiveImajinModelPolicyGatewayClient({ request }).getConfig()).rejects.toThrow("invalid default");
+    });
+
+  it("reads the old default and atomically patches only the approved default, emergency ref and allow-list", async () => {
+    const request = vi.fn().mockResolvedValue({
+      hash: "h", config: { agents: { defaults: { model: "direct/old" } } },
+    });
+    const client = createLiveImajinModelPolicyGatewayClient({ request });
+    expect(await client.getConfig()).toEqual({ hash: "h", allow: [], defaultModel: "direct/old" });
+    const defaultChange: ImajinDefaultChange = {
+      before: "direct/old", after: { primary: "imajin/default", fallbacks: [] }, breakGlassModel: "direct/old",
+    };
+    await client.patchModelPolicyAllow(["imajin/*", "direct/old"], "h", defaultChange);
+    expect(request).toHaveBeenLastCalledWith("config.patch", {
+      raw: JSON.stringify({
+        agents: { defaults: {
+          modelPolicy: { allow: ["imajin/*", "direct/old"] }, model: defaultChange.after,
+        } },
+        plugins: { entries: { imajin: { config: { modelDiscovery: { breakGlassModel: "direct/old" } } } } },
+      }),
+      baseHash: "h", replacePaths: ["agents.defaults.modelPolicy.allow", "agents.defaults.model.fallbacks"],
+    });
+    // No provider blocks, agent list or session fields are in the patch.
+    expect(JSON.parse(request.mock.calls.at(-1)![1].raw)).not.toHaveProperty("models");
+  });
+
+  it("rejects non-direct emergency config instead of staging an unsafe default migration", async () => {
+    const request = vi.fn().mockResolvedValue({
+      hash: "h", config: { plugins: { entries: { imajin: { config: { modelDiscovery: { breakGlassModel: "imajin/a" } } } } } },
+    });
+    await expect(createLiveImajinModelPolicyGatewayClient({ request }).getConfig()).rejects.toThrow("invalid default");
+  });
   it.each([{}, { hash: "h" }, { config: {} }, { hash: "h", config: { agents: { defaults: { modelPolicy: { allow: [42] } } } } },
     { hash: "h", config: { agents: { defaults: { modelPolicy: { allow: "imajin/*" } } } } }])(
     "rejects malformed config snapshots %j", async (result) => {
@@ -283,7 +400,7 @@ describe("live model policy RPC adapter", () => {
   it("omitted allow means allow-any, while patch replaces only the exact allow array with baseHash", async () => {
     const request = vi.fn().mockResolvedValue({ hash: "h", config: {} });
     const client = createLiveImajinModelPolicyGatewayClient({ request });
-    expect(await client.getConfig()).toEqual({ hash: "h", allow: [] });
+    expect(await client.getConfig()).toEqual({ hash: "h", allow: [], defaultModel: undefined });
     await client.patchModelPolicyAllow(["imajin/grok-4"], "h");
     expect(request).toHaveBeenLastCalledWith("config.patch", {
       raw: JSON.stringify({ agents: { defaults: { modelPolicy: { allow: ["imajin/grok-4"] } } } }),

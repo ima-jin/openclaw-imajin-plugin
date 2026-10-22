@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+- **Kernel-picked default model (#106).** The catalog approval card can switch
+  inherited defaults to `imajin/default`, retaining the old direct ref as
+  transport-only break-glass and clearing ordinary fallback ladders. Discovery
+  refreshes move the floating selector; explicit `imajin/<id>` sessions stay
+  pinned. `imajin_status.defaultRouting` reports the pick, fallback count,
+  last reason and timestamp. No provider credentials are added.
+
 ### Fixed
 - **Decision-child grading safeguards (#101).** Resolve the epic yardstick in the plugin and fail closed on missing context or standing current-head change requests.
 - **Session inventory replay after restart (#109 / PR #110 send-back).**

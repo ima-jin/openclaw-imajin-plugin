@@ -1,9 +1,10 @@
 import { beginRegistration, type RegistrationLifecycle } from "./registration-lifecycle.js";
 import type { WakeDisclosureSender } from "./wake-report-tool.js";
+import type { ImajinDefaultRoutingStatus } from "./imajin-default-routing.js";
 
 type HookHandler = (...args: any[]) => unknown;
 export type RuntimeHookRegister = (
-  hook: string, handler: HookHandler, options?: { name?: string },
+  hook: string, handler: HookHandler, options?: { name?: string; priority?: number },
 ) => void;
 
 /**
@@ -39,6 +40,7 @@ function alreadyDispatched(event: unknown, name: string): boolean {
 
 /** Registry construction is metadata only; only a full service start owns IO. */
 export class PluginServiceRuntime {
+  defaultRoutingStatus?: () => ImajinDefaultRoutingStatus;
   private lifecycle?: RegistrationLifecycle;
   private started?: Promise<void>;
   private readonly handlers = new Map<string, HookHandler>();
@@ -58,14 +60,14 @@ export class PluginServiceRuntime {
     return owner?.lifecycle?.active ? owner : undefined;
   }
 
-  registerHook(api: { on: RuntimeHookRegister; registerHook?: RuntimeHookRegister }, hook: string, name: string): void {
+  registerHook(api: { on: RuntimeHookRegister; registerHook?: RuntimeHookRegister }, hook: string, name: string, priority?: number): void {
     if (!this.full) return;
     const register = hook.includes(":") ? api.registerHook?.bind(api) : api.on.bind(api);
     register?.(hook, (...args) => {
       const owner = PluginServiceRuntime.owner();
       if (!owner || alreadyDispatched(args[0], name)) return undefined;
       return owner.handlers.get(name)?.(...args);
-    }, { name });
+    }, { name, ...(priority === undefined ? {} : { priority }) });
   }
 
   readonly start = (): Promise<void> => {
