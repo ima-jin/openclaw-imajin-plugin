@@ -145,7 +145,7 @@
     },
     "approvals.sources": {
       "label": "Gateway Approvals Bridge: Sources",
-      "help": "Which approval sources to drive: \"system-agent\" (OpenClaw gateway restart / config-mutation proposals, #33) and/or \"skill-workshop\" (pending Skill Workshop skill proposals, #33) are on by default. \"imajin-catalog\" (opt-in per-model gating for newly discovered imajin/* models, #36 \u2014 an alternative to the one-time `imajin/*` modelPolicy.allow wildcard) and \"gateway-exec\" (OpenClaw host-exec approvals filed to the kernel as kind gateway-exec:command, #38) are opt-in ONLY \u2014 neither is ever enabled unless listed here explicitly, even when this array is otherwise omitted; gateway-exec grants remote-execution-grade operator.approvals authority over live host-exec approvals. ORDERING NOTE: land gateway-exec + ima-jin/imajin-ai#2221 before flipping the ssh exec policy from deny to ask (askFallback: deny) \u2014 flipping first routes prompts to the legacy Telegram /approve path this source replaces. A source left out of this list neither lists nor subscribes."
+      "help": "Which approval sources to drive: \"system-agent\" (OpenClaw gateway restart / config-mutation proposals, #33) and/or \"skill-workshop\" (pending Skill Workshop skill proposals, #33) are on by default. \"imajin-catalog\" (opt-in live imajin/* allow-list add/remove reconciliation via signed operator approval, #105; dedicated loopback operator.admin for config RPCs \u2014 an alternative to the one-time `imajin/*` modelPolicy.allow wildcard) and \"gateway-exec\" (OpenClaw host-exec approvals filed to the kernel as kind gateway-exec:command, #38) are opt-in ONLY \u2014 neither is ever enabled unless listed here explicitly, even when this array is otherwise omitted; gateway-exec grants remote-execution-grade operator.approvals authority over live host-exec approvals. ORDERING NOTE: land gateway-exec + ima-jin/imajin-ai#2221 before flipping the ssh exec policy from deny to ask (askFallback: deny) \u2014 flipping first routes prompts to the legacy Telegram /approve path this source replaces. A source left out of this list neither lists nor subscribes."
     },
     "approvals.gatewayToken": {
       "label": "Gateway Approvals Bridge: Gateway Token",
@@ -163,7 +163,7 @@
     },
     "approvals.requireOperatorCountersignature": {
       "label": "Gateway Approvals Bridge: Require Operator Countersignature",
-      "help": "Mirrors the kernel's OPERATOR_COUNTERSIGN_REQUIRED (#44, ima-jin/imajin-ai#2082). Default false: a decision missing operatorSignature is still applied (unchanged v1 behavior); any operatorSignature that IS supplied is ALWAYS verified directly against the operator DID's registered public key regardless of this flag. true: a decision (including a withdrawal) lacking a valid operatorSignature is rejected before it ever reaches a source. See README 'Operator countersignature' for the recommended rollout order."
+      "help": "Mirrors the kernel's OPERATOR_COUNTERSIGN_REQUIRED (#44, ima-jin/imajin-ai#2082). Catalog allow-list decisions always require operatorSignature (#105). For other sources, default false: a decision missing operatorSignature is still applied (unchanged v1 behavior); any operatorSignature that IS supplied is ALWAYS verified directly against the operator DID's registered public key regardless of this flag. true: a decision (including a withdrawal) lacking a valid operatorSignature is rejected before it ever reaches a source. See README 'Operator countersignature' for the recommended rollout order."
     },
     "approvals.loopBlockSweepIntervalMs": {
       "label": "Gateway Approvals Bridge: Stale Loop-Block Sweep Interval (ms)",
@@ -522,7 +522,7 @@
           "sources": {
             "type": "array",
             "items": { "type": "string", "enum": ["system-agent", "skill-workshop", "imajin-catalog", "gateway-exec"] },
-            "description": "Which approval sources to drive (#33, #36, #38). Defaults to [\"system-agent\", \"skill-workshop\"] when omitted \u2014 \"imajin-catalog\" (#36, per-model gating for newly discovered imajin/* models) and \"gateway-exec\" (#38, grants remote-execution-grade operator.approvals authority over live OpenClaw host-exec approvals) are opt-in ONLY and never included in that default; list either explicitly to enable it. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
+            "description": "Which approval sources to drive (#33, #36, #38). Defaults to [\"system-agent\", \"skill-workshop\"] when omitted \u2014 \"imajin-catalog\" (#105, live imajin/* allow-list add/remove reconciliation; dedicated operator.admin config connection) and \"gateway-exec\" (#38, grants remote-execution-grade operator.approvals authority over live OpenClaw host-exec approvals) are opt-in ONLY and never included in that default; list either explicitly to enable it. A source left out neither lists nor subscribes \u2014 no bridge-code changes are needed to add or remove a source."
           },
           "gatewayToken": {
             "description": "Optional bearer override for the plugin's own loopback Gateway operator connection. A plain string or a SecretRef object, resolved once via the plugin SDK. Optional: Gateway auth otherwise resolves automatically from the host's own gateway config.",
@@ -577,7 +577,7 @@
           },
           "requireOperatorCountersignature": {
             "type": "boolean",
-            "description": "Mirrors the kernel's OPERATOR_COUNTERSIGN_REQUIRED (#44, ima-jin/imajin-ai#2082). Default false: a decision missing operatorSignature is still applied (unchanged v1 behavior); a supplied operatorSignature is ALWAYS verified against the operator DID's registered public key regardless of this flag. true: a decision (including a withdrawal) lacking a valid operatorSignature is rejected before it ever reaches a source."
+            "description": "Mirrors the kernel's OPERATOR_COUNTERSIGN_REQUIRED (#44, ima-jin/imajin-ai#2082). Catalog allow-list decisions always require operatorSignature (#105). For other sources, default false: a decision missing operatorSignature is still applied (unchanged v1 behavior); a supplied operatorSignature is ALWAYS verified against the operator DID's registered public key regardless of this flag. true: a decision (including a withdrawal) lacking a valid operatorSignature is rejected before it ever reaches a source."
           }
         }
       }

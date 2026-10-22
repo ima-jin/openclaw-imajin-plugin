@@ -16,6 +16,14 @@
   agent session. Config-only; injector logic unchanged.
 
 ### Added
+- **Live catalog allow-list reconciliation (#105).** One /jin operator card
+  lists exact additions and removals; signed approval applies only that delta.
+  Legacy imajin-openai/* / imajin-xai/* exact refs retire only after their live
+  replacements are allowed. Pending/rejected cards survive restarts; unchanged
+  refreshes do not duplicate cards. Failed discovery never removes policy.
+  imajin_status now partitions discovered refs by live policy coverage.
+  The opt-in catalog source uses its own operator.admin config connection and
+  requires an operator countersignature; lane defaults/provider blocks stay put.
 - **Top-level session inventory and lifecycle/history commands (#109).** Boot,
   Gateway/kernel reconnect and `sessions.changed` publish signed session loops
   with labels/activity, child lineage, and bounded redacted #2406 history.

@@ -37,6 +37,12 @@ const TWO_ROW_KERNEL_RESPONSE: ImajinModelsListResponse = {
 };
 
 describe("projectImajinCatalogRows", () => {
+  it("drops wildcard and embedded-whitespace ids so discovery cannot grant a policy wildcard", () => {
+    expect(projectImajinCatalogRows({ data: [
+      { id: "*" }, { id: "grok*" }, { id: "bad model" }, { id: "bad\nmodel" },
+      { id: "vendor/model-1" },
+    ] }).map((model) => model.id)).toEqual(["vendor/model-1"]);
+  });
   it("projects the 2-row fixture (xai/grok-4, openai/gpt-6-astra) as text models named '<id> (via <connector>)'", () => {
     const models = projectImajinCatalogRows(TWO_ROW_KERNEL_RESPONSE);
 

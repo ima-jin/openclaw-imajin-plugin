@@ -573,6 +573,40 @@ describe("imajin_status tool (#55)", () => {
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: "ok" }) }));
   });
+  it("reports configured refs and partitions discovery into allow-listed and not-allowed without MCP", async () => {
+    const cache = new ImajinCatalogCache(async () => ({ data: [{ id: "grok-4" }, { id: "gpt-6-astra" }] }),
+      60_000, Date.now, quiet);
+    const getConfig = vi.fn(() => ({ agents: { defaults: { modelPolicy: {
+      allow: ["imajin/grok-4", "imajin-openai/gpt-6-astra"],
+    } } } }));
+    const tool = createImajinStatusTool({ baseUrl: "http://127.0.0.1:8787/openai/v1", cache, getConfig });
+    const body = JSON.parse((await tool.execute()).content[0].text);
+    expect(body.allowList).toEqual({
+      configured: ["imajin/grok-4", "imajin-openai/gpt-6-astra"],
+      allowListed: ["imajin/grok-4"], discoveredButNotAllowed: ["imajin/gpt-6-astra"],
+    });
+    expect(getConfig).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([{ allow: ["imajin/*"] }, { allow: [] }, {}])("respects wildcard and omitted/empty allow-any policies: %j", async (modelPolicy) => {
+    const cache = new ImajinCatalogCache(async () => ({ data: [{ id: "grok-4" }] }), 60_000, Date.now, quiet);
+    const tool = createImajinStatusTool({
+      baseUrl: "http://127.0.0.1:8787/openai/v1", cache,
+      getConfig: () => ({ agents: { defaults: { modelPolicy } } }),
+    });
+    expect(JSON.parse((await tool.execute()).content[0].text).allowList).toMatchObject({
+      allowListed: ["imajin/grok-4"], discoveredButNotAllowed: [],
+    });
+  });
+
+  it.each([undefined, { agents: { defaults: { modelPolicy: { allow: "bad" } } } }])(
+    "reports unknown rather than allow-any for unreadable/invalid policy: %j", async (config) => {
+      const cache = new ImajinCatalogCache(async () => ({ data: [{ id: "grok-4" }] }), 60_000, Date.now, quiet);
+      const tool = createImajinStatusTool({ baseUrl: "http://127.0.0.1:8787/openai/v1", cache, getConfig: () => config });
+      expect(JSON.parse((await tool.execute()).content[0].text).allowList).toEqual({
+        configured: null, allowListed: null, discoveredButNotAllowed: null,
+      });
+    });
 
   it("runs one discovery attempt when none has happened yet, and reports ok + imajin/<id> refs", async () => {
     const fetcher = vi.fn().mockResolvedValue({
