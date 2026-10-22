@@ -54,13 +54,14 @@ describe("RegistrationLifecycle", () => {
     expect(lifecycle.signal.aborted).toBe(true);
   });
 
-  it("disposes each resource once even when cleanup re-enters dispose", () => {
+  it("disposes each resource once even when cleanup re-enters dispose", async () => {
     const lifecycle = new RegistrationLifecycle();
     const cleanup = vi.fn(() => lifecycle.dispose());
     lifecycle.add(cleanup);
+    lifecycle.add(async () => {});
 
-    lifecycle.dispose();
-    lifecycle.dispose();
+    await lifecycle.dispose();
+    await lifecycle.dispose();
 
     expect(cleanup).toHaveBeenCalledTimes(1);
   });

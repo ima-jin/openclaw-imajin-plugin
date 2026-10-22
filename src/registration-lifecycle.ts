@@ -11,6 +11,7 @@ export class RegistrationLifecycle {
   private readonly controller = new AbortController();
   private readonly disposers: Dispose[] = [];
   private readonly pending = new Set<Promise<void>>();
+  private cleaning = false;
 
   get signal(): AbortSignal {
     return this.controller.signal;
@@ -26,14 +27,22 @@ export class RegistrationLifecycle {
   }
 
   async dispose(): Promise<void> {
+    // The outer disposal owns the drain when a synchronous disposer re-enters.
+    if (this.cleaning) return;
     if (this.active) {
-      this.controller.abort();
-      for (const dispose of this.disposers.splice(0).reverse()) this.cleanup(dispose);
+      this.cleaning = true;
+      try {
+        this.controller.abort();
+        for (const dispose of this.disposers.splice(0).reverse()) this.cleanup(dispose);
+      } finally {
+        this.cleaning = false;
+      }
     }
     await this.drain();
   }
 
   private async drain(): Promise<void> {
+    if (!this.pending.size) return;
     await Promise.all(this.pending);
     if (this.pending.size) await this.drain();
   }
