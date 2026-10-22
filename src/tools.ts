@@ -20,6 +20,7 @@ import {
 } from "./imajin-provider.js";
 import { buildMcpStatusBlock, probeKernelMcp, type McpProbeResult } from "./kernel-mcp.js";
 import { buildImajinAllowListStatus } from "./sources/imajin-catalog.js";
+import type { ImajinDefaultRoutingStatus } from "./imajin-default-routing.js";
 import { buildUsageReport, formatDay, parseDay, resolveUsageRange } from "./usage.js";
 import { ackGrant, fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
 import { containsLiveSecret, createSecretHandle } from "./vault/secret-handle-store.js";
@@ -1538,6 +1539,7 @@ export function createImajinStatusTool(deps: {
   mcpUrl?: string;
   /** Live config reader for model allow-list coverage and MCP registration. */
   getConfig?: () => unknown;
+  getDefaultRouting?: () => ImajinDefaultRoutingStatus | undefined;
   /** Probe override (tests). */
   probeMcp?: (url: string) => Promise<McpProbeResult>;
 }) {
@@ -1574,6 +1576,7 @@ export function createImajinStatusTool(deps: {
       }
       const status = {
         ...snapshot,
+        ...(deps.getDefaultRouting ? { defaultRouting: deps.getDefaultRouting() } : {}),
         allowList: buildImajinAllowListStatus(deps.cache.peek()?.models ?? [], config),
       };
       if (!deps.mcpUrl) return jsonResult(status);

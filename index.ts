@@ -77,6 +77,7 @@ import { ApprovalExecutionRegistry } from "./src/approval-execution.js";
 import { createWakeReportTool } from "./src/wake-report-tool.js";
 import type { RegistrationLifecycle } from "./src/registration-lifecycle.js";
 import { PluginServiceRuntime, type RuntimeHookRegister } from "./src/plugin-service-runtime.js";
+import { createImajinDefaultRouter } from "./src/imajin-default-routing.js";
 import type { WakeDisclosureSender } from "./src/wake-report-tool.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
@@ -240,12 +241,18 @@ async function startPluginRuntime(
   config: PluginConfig | undefined,
   client: ImajinClient | undefined,
   imajinProvider: RegisteredImajinProvider,
+  defaultRouter: ReturnType<typeof createImajinDefaultRouter>,
   lifecycle: RegistrationLifecycle,
   on: RuntimeHookRegister,
   setWakeSender: (sender: WakeDisclosureSender) => void,
 ): Promise<void> {
   const discovery = imajinProvider.startDiscovery();
   lifecycle.add(() => discovery.stop());
+  let wakeModelResolve: ((event: any, ctx?: any) => unknown) | undefined;
+  on("before_model_resolve", async (event, ctx) => {
+    const deliberate = await wakeModelResolve?.(event, ctx);
+    return deliberate ?? defaultRouter.beforeModelResolve(event, ctx);
+  }, { name: "imajin-default:model" });
   if (!config?.nodeUrl || !client) return;
   let startWs = async () => {};
   // Loop lifecycle → kernel loops rail (#46): signed loop.* events for
@@ -324,6 +331,10 @@ async function startPluginRuntime(
     });
     lifecycle.add(disposeInjector);
     for (const [hook, handler] of Object.entries(wakeRuntimeHooks)) {
+      if (hook === "before_model_resolve") {
+        wakeModelResolve = handler;
+        continue;
+      }
       on(hook, handler, { name: `imajin-wake:${hook}` });
     }
     setWakeSender(reportWake);
@@ -517,7 +528,9 @@ async function startPluginRuntime(
 
 function registerRuntimeHooks(api: any, runtime: PluginServiceRuntime): void {
   for (const hook of LOOP_LIFECYCLE_HOOKS) runtime.registerHook(api, hook, `imajin-loops:${hook}`);
-  for (const hook of WAKE_RUNTIME_HOOKS) runtime.registerHook(api, hook, `imajin-wake:${hook}`);
+  for (const hook of WAKE_RUNTIME_HOOKS) {
+    if (hook !== "before_model_resolve") runtime.registerHook(api, hook, `imajin-wake:${hook}`);
+  }
   runtime.registerHook(api, "agent_end", "wake-outcome");
   runtime.registerHook(api, "agent_end", "turn-usage-attestation");
 }
@@ -559,6 +572,18 @@ export default definePluginEntry({
         nodeUrl: config?.nodeUrl,
       },
     );
+    const defaultRouter = createImajinDefaultRouter({
+      cache: imajinProvider.cache,
+      baseUrl: imajinProvider.baseUrl,
+      getConfig: () => api.runtime?.config?.current?.(),
+    });
+    const runtime = new PluginServiceRuntime(api.registrationMode, (lifecycle, on) =>
+      startPluginRuntime(api, config, client, imajinProvider, defaultRouter, lifecycle, on,
+        (sender) => runtime.setWakeSender(sender)),
+    );
+    runtime.defaultRoutingStatus = defaultRouter.status;
+    // Lower priority than a deliberate wake/decision routing override.
+    runtime.registerHook(api, "before_model_resolve", "imajin-default:model", -100);
     api.registerTool(
       createImajinStatusTool({
         baseUrl: imajinProvider.baseUrl,
@@ -569,13 +594,10 @@ export default definePluginEntry({
         // the token). The plugin only probes it and reads (never writes) config.
         mcpUrl: resolveImajinMcpUrl(config, imajinProvider.baseUrl),
         getConfig: () => api.runtime?.config?.current?.(),
+        getDefaultRouting: () => (PluginServiceRuntime.owner() ?? runtime).defaultRoutingStatus?.(),
       }),
     );
 
-    const runtime = new PluginServiceRuntime(api.registrationMode, (lifecycle, on) =>
-      startPluginRuntime(api, config, client, imajinProvider, lifecycle, on,
-        (sender) => runtime.setWakeSender(sender)),
-    );
     // Both host service IDs share one idempotent full-mode runtime start.
     api.registerService({ id: "imajin-model-discovery", start: runtime.start, stop: runtime.stop });
 

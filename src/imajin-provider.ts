@@ -67,6 +67,8 @@
  */
 
 export const IMAJIN_PROVIDER_ID = "imajin";
+export const IMAJIN_DEFAULT_MODEL_ID = "default";
+export const IMAJIN_DEFAULT_MODEL_REF = "imajin/default";
 export const IMAJIN_PROVIDER_LABEL = "Imajin (kernel seat)";
 export const DEFAULT_INFER_PROXY_BASE_URL = "http://127.0.0.1:8787/openai/v1";
 export const IMAJIN_HEALTHZ_PATH = "/healthz";
@@ -102,6 +104,13 @@ export interface ImajinCatalogRowMetadata {
   connector?: string;
   credentialDid?: string;
   servable?: boolean;
+  picked?: boolean;
+}
+
+/** Exact provider/model only; excludes kernel routes, aliases, URLs and patterns. */
+export function isDirectModelRef(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z0-9][a-z0-9_-]*\/[^\s*?#:]+$/i.test(value)
+    && !value.toLowerCase().startsWith("imajin/") && !value.toLowerCase().startsWith("imajin-");
 }
 
 /** Discovery config (`plugins.entries.imajin.config.modelDiscovery`, #55). */
@@ -110,6 +119,8 @@ export interface ImajinModelDiscoveryConfig {
   refreshIntervalMs?: number;
   /** Kernel route to discover against. Default {@link DEFAULT_KERNEL_MODELS_PATH}. */
   modelsPath?: string;
+  /** Optional provider/model ref used only on a confirmed transport outage. Never a credential. */
+  breakGlassModel?: string;
 }
 
 export interface ImajinCatalogRow {
@@ -138,6 +149,8 @@ export interface ImajinRuntimeModel {
   maxTokens: number;
   /** The kernel-reported connector id, when present — used by policy/approval matching and status output. */
   connector?: string;
+  /** The connector card's current pick. Multiple cards retain kernel order. */
+  picked?: boolean;
 }
 
 /**
@@ -172,6 +185,7 @@ export function projectImajinCatalogRows(
       contextWindow: DEFAULT_CONTEXT_WINDOW,
       maxTokens: DEFAULT_MAX_TOKENS,
       ...(connector ? { connector } : {}),
+      ...(row.imajin?.picked === true ? { picked: true } : {}),
     });
   }
   return models;
@@ -211,8 +225,18 @@ export function buildImajinProviderConfig(params: {
     api: "openai-completions",
     baseUrl: params.baseUrl,
     apiKey: IMAJIN_SYNTHETIC_API_KEY,
-    models: params.models.map((model) => ({ ...model })),
+    models: [
+      ...params.models.map((model) => ({ ...model })),
+      ...buildImajinDefaultCatalogEntry(params.models),
+    ],
   };
+}
+
+/** A routing selector, not a second upstream model or a persisted session override. */
+export function buildImajinDefaultCatalogEntry(models: readonly ImajinRuntimeModel[]): ImajinRuntimeModel[] {
+  const picked = models.find((model) => model.picked);
+  if (!picked || models.some((model) => model.id === IMAJIN_DEFAULT_MODEL_ID)) return [];
+  return [{ ...picked, id: IMAJIN_DEFAULT_MODEL_ID, name: "Kernel connector pick (follows refresh)" }];
 }
 
 // --- Discovery outcomes + errors (#55) ---

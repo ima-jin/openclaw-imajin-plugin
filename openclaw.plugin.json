@@ -274,6 +274,11 @@
           "modelsPath": {
             "type": "string",
             "description": "Kernel route (relative to nodeUrl) to discover against. Default /infer/v1/models/usable."
+          },
+          "breakGlassModel": {
+            "type": "string",
+            "pattern": "^(?![Ii][Mm][Aa][Jj][Ii][Nn][/-])[a-zA-Z0-9][a-zA-Z0-9_-]*/[^\\s*?#:]+$",
+            "description": "Optional existing direct provider/model ref, never a key. The catalog approval card can retain the old default here when switching to imajin/default. Used only when the kernel/passthrough transport is unreachable, never for auth, policy, billing, or model errors. See imajin_status.defaultRouting."
           }
         }
       },

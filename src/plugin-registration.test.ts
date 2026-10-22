@@ -16,6 +16,13 @@ const mocks = vi.hoisted(() => ({
   sessionGateways: [] as Array<{ dispose: ReturnType<typeof vi.fn> }>,
   loopHook: vi.fn(), wakeHook: vi.fn(), usageHook: vi.fn(), wsStart: vi.fn(), inject: vi.fn(),
   getWarpRun: vi.fn(),
+  defaultModelResolve: vi.fn(), wakeModelResolve: vi.fn(),
+}));
+vi.mock("./imajin-default-routing.js", () => ({
+  createImajinDefaultRouter: () => ({
+    beforeModelResolve: mocks.defaultModelResolve,
+    status: () => ({ selector: "imajin/default", pickedModel: null, fallbackCount: 0, lastReason: null, lastFallbackAt: null }),
+  }),
 }));
 
 vi.mock("openclaw/plugin-sdk/plugin-entry", () => ({
@@ -72,7 +79,7 @@ vi.mock("./notification-injector.js", () => ({
     mocks.helpers.push({ dispose });
     return {
       inject: mocks.inject, dispose,
-      runtimeHooks: { before_agent_run: mocks.wakeHook },
+      runtimeHooks: { before_agent_run: mocks.wakeHook, before_model_resolve: mocks.wakeModelResolve },
       onAgentEnd: vi.fn(async () => {}), reportWake: vi.fn(),
     };
   },
@@ -178,6 +185,8 @@ describe("process-wide plugin registration (#86)", () => {
     });
     return {
       emit: (name: string, event?: object) => hooks.get(name)?.forEach((handler) => handler(event ?? {})),
+      resolveModel: async (event: object, ctx: object) =>
+        Promise.all((hooks.get("before_model_resolve") ?? []).map((handler) => handler(event, ctx))),
       ws: services.find((service) => service.id === "imajin-ws")!,
       discovery: services.find((service) => service.id === "imajin-model-discovery")!,
     };
@@ -223,6 +232,8 @@ describe("process-wide plugin registration (#86)", () => {
       return live;
     });
     mocks.wsStart.mockResolvedValue(undefined);
+    mocks.wakeModelResolve.mockReset();
+    mocks.defaultModelResolve.mockReset();
     mocks.inject.mockResolvedValue(undefined);
     mocks.preflight.mockResolvedValue({
       status: 200,
@@ -254,6 +265,28 @@ describe("process-wide plugin registration (#86)", () => {
     expect(output.requestUsage).toEqual({
       inferenceCost: 100, credits: 100, usdEst: 2, unit: "warp_credits",
     });
+  });
+
+  it("routes default selection through the started owner once, including unstarted full registries", async () => {
+    const active = await start();
+    await ready();
+    const metadata = register({}, "full");
+    mocks.defaultModelResolve.mockResolvedValue({ providerOverride: "imajin", modelOverride: "picked" });
+    const event = {};
+    const ctx = { modelProviderId: "imajin", modelId: "default" };
+    expect(await active.resolveModel(event, ctx)).toEqual([{ providerOverride: "imajin", modelOverride: "picked" }]);
+    expect(await metadata.resolveModel(event, ctx)).toEqual([undefined]);
+    expect(mocks.defaultModelResolve).toHaveBeenCalledTimes(1);
+    expect(mocks.defaultModelResolve).toHaveBeenCalledWith(event, ctx);
+  });
+
+  it("a deliberate wake/decision pin wins without performing or counting a default fallback", async () => {
+    const active = await start();
+    await ready();
+    mocks.wakeModelResolve.mockReturnValue({ providerOverride: "other", modelOverride: "pinned" });
+    expect(await active.resolveModel({}, { modelProviderId: "imajin", modelId: "default" }))
+      .toEqual([{ providerOverride: "other", modelOverride: "pinned" }]);
+    expect(mocks.defaultModelResolve).not.toHaveBeenCalled();
   });
 
   it("full/start stays live through three non-full register passes without any further starts", async () => {

@@ -1,12 +1,16 @@
 /**
  * Opt-in live catalog reconciliation (#105). One signed card lists exact
  * allow-list additions/removals. Only a verified operator decision writes
- * config; provider blocks and lane defaults are never changed.
+ * config. The same card can opt inherited defaults into the floating kernel
+ * selector (#106); explicit agent/session models and provider blocks stay put.
  */
 import { createHash, randomUUID } from "node:crypto";
 import { ApprovalContentDriftError, type ApprovalDecision, type ApprovalSource,
   type ApprovalSourceCurrentState, type ApprovalSourceRequest } from "./types.js";
-import { IMAJIN_PROVIDER_ID, type ImajinRuntimeModel } from "../imajin-provider.js";
+import {
+  IMAJIN_PROVIDER_ID, IMAJIN_DEFAULT_MODEL_REF, buildImajinDefaultCatalogEntry,
+  isDirectModelRef, type ImajinRuntimeModel,
+} from "../imajin-provider.js";
 import { createOperatorGatewayClient } from "../gateway-operator-client.js";
 
 const PROPOSAL_PREFIX = "imajin-catalog:";
@@ -14,6 +18,35 @@ const PROPOSAL_PREFIX = "imajin-catalog:";
 /** Builds the `imajin/<modelId>` ref this source proposes adding to the allow list. */
 export function buildImajinModelRef(modelId: string): string {
   return `${IMAJIN_PROVIDER_ID}/${modelId}`;
+}
+export type GatewayDefaultModel = string | { primary?: string; fallbacks?: string[] };
+export interface ImajinDefaultChange {
+  before: GatewayDefaultModel;
+  after: { primary: "imajin/default"; fallbacks: [] };
+  /** Existing direct ref only, never its credential. */
+  breakGlassModel?: string;
+}
+
+function buildDefaultChange(current: Awaited<ReturnType<ImajinModelPolicyGatewayClient["getConfig"]>>): ImajinDefaultChange | undefined {
+  const before = current.defaultModel;
+  if (before === undefined) return;
+  const primary = typeof before === "string" ? before : before.primary;
+  const fallbacks = typeof before === "string" ? [] : before.fallbacks ?? [];
+  if (primary === IMAJIN_DEFAULT_MODEL_REF && fallbacks.length === 0) return;
+  const direct = current.breakGlassModel ?? (isDirectModelRef(primary) ? primary : undefined);
+  return {
+    before, after: { primary: IMAJIN_DEFAULT_MODEL_REF, fallbacks: [] },
+    ...(direct ? { breakGlassModel: direct } : {}),
+  };
+}
+
+function isGatewayDefaultModel(value: unknown): boolean {
+  if (value === undefined || typeof value === "string") return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const model = value as { primary?: unknown; fallbacks?: unknown };
+  return (model.primary === undefined || typeof model.primary === "string") &&
+    (model.fallbacks === undefined || (Array.isArray(model.fallbacks) &&
+      model.fallbacks.every((ref) => typeof ref === "string")));
 }
 /** Read-only status; unknown config must never be reported as an allow-any policy. */
 export function buildImajinAllowListStatus(models: readonly ImajinRuntimeModel[], config: unknown) {
@@ -41,8 +74,13 @@ export function isImajinModelAllowedByPolicy(
   allow: readonly string[] | undefined,
   modelId: string,
 ): boolean {
+  return isModelRefAllowedByPolicy(allow, buildImajinModelRef(modelId));
+}
+
+export function isModelRefAllowedByPolicy(
+  allow: readonly string[] | undefined, ref: string,
+): boolean {
   if (!allow || allow.length === 0) return true;
-  const ref = buildImajinModelRef(modelId);
   for (const rawEntry of allow) {
     const entry = rawEntry.trim();
     if (!entry) continue;
@@ -78,8 +116,8 @@ export function buildImajinAllowListDelta(
 }
 
 export interface ImajinModelPolicyGatewayClient {
-  getConfig(): Promise<{ hash: string; allow: string[] }>;
-  patchModelPolicyAllow(nextAllow: string[], baseHash: string): Promise<void>;
+  getConfig(): Promise<{ hash: string; allow: string[]; defaultModel?: GatewayDefaultModel; breakGlassModel?: string }>;
+  patchModelPolicyAllow(nextAllow: string[], baseHash: string, defaultChange?: ImajinDefaultChange): Promise<void>;
 }
 
 export interface ImajinCatalogSourceDeps {
@@ -123,14 +161,18 @@ export function createImajinCatalogSource(
     const current = await deps.gateway.getConfig();
     // Discovery may have changed or failed while config.get was in flight.
     if (!deps.isDiscoveryReady()) return null;
-    const delta = buildImajinAllowListDelta(deps.listDiscoveredModels(), current.allow);
-    if (delta.add.length === 0 && delta.remove.length === 0) {
+    const models = deps.listDiscoveredModels();
+    const selectors = buildImajinDefaultCatalogEntry(models);
+    const delta = buildImajinAllowListDelta([...models, ...selectors], current.allow);
+    const defaultChange = selectors.length > 0 ? buildDefaultChange(current) : undefined;
+    if (delta.add.length === 0 && delta.remove.length === 0 && !defaultChange) {
       await identify(null);
       return null;
     }
     const emptiesPolicy = delta.add.length === 0 && current.allow.every((ref) => delta.remove.includes(ref));
     const detail = {
       ...delta, path: "agents.defaults.modelPolicy.allow",
+      ...(defaultChange ? { defaultChange } : {}),
       ...(emptiesPolicy ? {
         warning: "Removing every allow-list entry makes OpenClaw allow any configured model. Reject to retain the restriction.",
       } : {}),
@@ -145,9 +187,9 @@ export function createImajinCatalogSource(
     const request: ApprovalSourceRequest = {
       proposalId, sourceRevision, detail,
       kind: "imajin-catalog:reconcile",
-      summary: `Update Imajin allow-list: add ${delta.add.length}, remove ${delta.remove.length}?`,
+      summary: `Update Imajin allow-list: add ${delta.add.length}, remove ${delta.remove.length}${defaultChange ? "; follow kernel default (direct ref: break-glass only)" : ""}?`,
     };
-    return { ...current, request, delta };
+    return { ...current, request, delta, defaultChange };
   }
 
   return {
@@ -208,9 +250,12 @@ export function createImajinCatalogSource(
         await opts.persistState?.();
         return { applied: true };
       }
-      await deps.gateway.patchModelPolicyAllow(
-        [...state.allow.filter((ref) => !state.delta.remove.includes(ref)), ...state.delta.add], state.hash,
-      );
+      const nextAllow = [...state.allow.filter((ref) => !state.delta.remove.includes(ref)), ...state.delta.add];
+      if (state.defaultChange) {
+        await deps.gateway.patchModelPolicyAllow(nextAllow, state.hash, state.defaultChange);
+      } else {
+        await deps.gateway.patchModelPolicyAllow(nextAllow, state.hash);
+      }
       // A recurrence needs fresh consent, not a consumed replay-guard id.
       await identify(null);
       return { applied: true };
@@ -226,24 +271,45 @@ export function createLiveImajinModelPolicyGatewayClient(gatewayClient: {
     async getConfig() {
       const result = await gatewayClient.request<{
         hash?: string;
-        config?: { agents?: { defaults?: { modelPolicy?: { allow?: string[] } } } };
+        config?: {
+          agents?: { defaults?: { model?: GatewayDefaultModel; modelPolicy?: { allow?: string[] } } };
+          plugins?: { entries?: { imajin?: { config?: { modelDiscovery?: { breakGlassModel?: string } } } } };
+        };
       }>("config.get", {});
       const allow = result?.config?.agents?.defaults?.modelPolicy?.allow;
       if (!result?.hash || !result.config || (allow !== undefined &&
           (!Array.isArray(allow) || allow.some((ref) => typeof ref !== "string")))) {
         throw new Error("imajin-catalog received an invalid config snapshot");
       }
-      return { hash: result.hash, allow: allow ?? [] };
+      const defaultModel = result.config.agents?.defaults?.model;
+      const breakGlassModel = result.config.plugins?.entries?.imajin?.config?.modelDiscovery?.breakGlassModel;
+      if (!isGatewayDefaultModel(defaultModel) || (breakGlassModel !== undefined && !isDirectModelRef(breakGlassModel))) {
+        throw new Error("imajin-catalog received an invalid default model snapshot");
+      }
+      return {
+        hash: result.hash, allow: allow ?? [],
+        ...(defaultModel === undefined ? {} : { defaultModel }),
+        ...(breakGlassModel === undefined ? {} : { breakGlassModel }),
+      };
     },
-    async patchModelPolicyAllow(nextAllow, baseHash) {
+    async patchModelPolicyAllow(nextAllow, baseHash, defaultChange) {
       const raw = JSON.stringify({
-        agents: { defaults: { modelPolicy: { allow: nextAllow } } },
+        agents: { defaults: {
+          modelPolicy: { allow: nextAllow },
+          ...(defaultChange ? { model: defaultChange.after } : {}),
+        } },
+        ...(defaultChange?.breakGlassModel ? {
+          plugins: { entries: { imajin: { config: { modelDiscovery: { breakGlassModel: defaultChange.breakGlassModel } } } } },
+        } : {}),
       });
       await gatewayClient.request("config.patch", {
         raw,
         baseHash,
         // Replace exactly this array, preserving unrelated config.
-        replacePaths: ["agents.defaults.modelPolicy.allow"],
+        replacePaths: [
+          "agents.defaults.modelPolicy.allow",
+          ...(defaultChange ? ["agents.defaults.model.fallbacks"] : []),
+        ],
       });
     },
   };
