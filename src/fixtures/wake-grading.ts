@@ -10,8 +10,8 @@ export function gradingFixture() {
     reviews: [{ reviewer: "imajin-jin", state: "COMMENTED", commitSha: GRADING_HEAD }],
   };
   const source = {
-    pullRequest: vi.fn(async () => structuredClone(pr)),
-    issue: vi.fn<WakeGradingSource["issue"]>(async (ref) => ({
+    pullRequest: vi.fn(() => Promise.resolve(structuredClone(pr))),
+    issue: vi.fn<WakeGradingSource["issue"]>((ref) => Promise.resolve({
       ...ref, body: ref.number === 101 ? "OUTCOME (inherited) · child outcome" : "OUTCOME · the epic yardstick",
       comments: ["DECISION ruled 2026-10-20 · do not redefine middle", "ordinary comment"],
       parent: ref.number === 101 ? { repo: "fixture/epics", number: 82 } : null,

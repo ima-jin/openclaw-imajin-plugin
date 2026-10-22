@@ -48,7 +48,7 @@ async function connection(read: (cursor: string | null) => Promise<any>): Promis
   for (let page = 0; page < MAX_PAGES; page++) {
     const result = await read(cursor);
     if (!Array.isArray(result?.nodes) || typeof result.pageInfo?.hasNextPage !== "boolean") {
-      throw new Error("Incomplete GitHub connection");
+      throw new TypeError("Incomplete GitHub connection");
     }
     nodes.push(...result.nodes);
     if (!result.pageInfo.hasNextPage) return nodes;
@@ -179,7 +179,12 @@ export async function resolveWakeGrading(url: string, source: WakeGradingSource)
       lines.push(`Head: ${block.pr.headSha}`, `Review history: ${JSON.stringify(block.pr.reviews)}`,
         `closingIssuesReferences: ${block.pr.closingIssues.map(issueKey).join(", ") || "none"}`);
       if (!block.pr.closingIssues.length) throw new Error("No closing issues");
-      for (const issue of block.pr.closingIssues) await ancestry(source, issue, block, lines);
+      const chains = await Promise.all(block.pr.closingIssues.map(async (issue) => {
+        const chain: string[] = [];
+        await ancestry(source, issue, block, chain);
+        return chain;
+      }));
+      lines.push(...chains.flat());
     })());
     if (Buffer.byteLength(lines.join("\n")) > 128 * 1024) throw new Error("Grading evidence too large");
     block.resolved = true;
