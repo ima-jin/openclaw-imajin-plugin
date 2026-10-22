@@ -74,7 +74,7 @@ describe("packet wake path (#107)", () => {
   }
 
   it("starts from the packet with event evidence, avoids duplicate reads, and reports provenance", async () => {
-    const ctx = await wake({ sessionPerWake: false });
+    const ctx = await wake({ sessionPerWake: false, wakePacket: { command: command("sample-size") } });
     const message = posts[0].message;
     for (const evidence of ["runId: run-a", "state: SUCCEEDED", "title: Fixture", "runTime: 10s",
       "pull_request https://github.com/fixture/repo/pull/107 (feat/fixture)", "notificationId: notification-run-a"]) {
@@ -112,6 +112,7 @@ describe("packet wake path (#107)", () => {
     expect(console.log).toHaveBeenCalledWith(expect.stringContaining(
       `bootstrapBytes=${Buffer.byteLength(LIGHT_WAKE_BOOTSTRAP)} firstTurnBytes=${firstTurnBytes} firstTurnInputTokens=123 packetSource=packet`,
     ));
+    expect(console.log).toHaveBeenCalledWith(expect.stringContaining("packetBytes=12700"));
     expect(horizon.writeStepEvents).toHaveBeenCalledOnce();
     expect(bootstrap(ctx.sessionKey)[0].content).toHaveLength(54_000);
   });

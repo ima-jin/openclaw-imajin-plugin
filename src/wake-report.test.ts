@@ -7,6 +7,10 @@ import type { NotificationFrame } from "./ws-service.js";
 // The wake path's CLI ping is irrelevant here; keep it from spawning anything.
 vi.mock("node:child_process", () => ({ execFile: vi.fn() }));
 vi.mock("./wake-session-metadata.js", () => ({ readWakeSessionTokens: vi.fn(async () => 0) }));
+vi.mock("./channel-notify.js", () => ({ sendDirectChannelMessage: vi.fn(async () => {}) }));
+vi.mock("./session-command-gateway.js", () => ({
+  createLoopbackSessionGateway: () => ({ gateway: { abort: vi.fn(async () => {}) }, dispose: vi.fn() }),
+}));
 
 const WORKER = "agent:main:warp-events";
 const DM = "agent:main:telegram:direct:1";

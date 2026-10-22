@@ -19,9 +19,10 @@ if (mode === "fail") {
   spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: ["ignore", 1, "ignore"] });
 } else {
   const fixture = JSON.parse(readFileSync(new URL("./wake-packet-state.json", import.meta.url), "utf8"));
-  process.stdout.write([
+  const packet = [
     "# Wake packet",
     `Runs: ${runIds.join(", ")}`,
     ...Object.entries(fixture).map(([section, state]) => `${section}: ${JSON.stringify(state)}`),
-  ].join("\n"));
+  ].join("\n");
+  process.stdout.write(mode === "sample-size" ? packet.padEnd(12_700, " ") : packet);
 }
