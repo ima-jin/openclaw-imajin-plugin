@@ -84,15 +84,15 @@ export class PluginServiceRuntime {
       await this.setup(lifecycle, (_hook, handler, options) => {
         if (lifecycle.active) this.handlers.set(options?.name ?? _hook, handler);
       });
-    }).catch((err: unknown) => {
-      lifecycle.dispose();
+    }).catch(async (err: unknown) => {
+      await lifecycle.dispose();
       throw err;
     });
     return this.started;
   };
 
-  readonly stop = (): void => {
-    this.lifecycle?.dispose();
+  readonly stop = async (): Promise<void> => {
+    await this.lifecycle?.dispose();
   };
 
   setWakeSender(sender: WakeDisclosureSender): void {

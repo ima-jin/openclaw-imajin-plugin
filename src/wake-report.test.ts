@@ -116,7 +116,7 @@ describe("wsNotifications.reportTo (#47)", () => {
     }
     // The wake itself was never re-posted: reports are not wakes.
     expect(gw.wakes()).toHaveLength(1);
-    dispose();
+    await dispose();
   });
 
   it("does not double-send when agent_end fires twice for the same run", async () => {
@@ -127,7 +127,7 @@ describe("wsNotifications.reportTo (#47)", () => {
     await onAgentEnd!(turnEnd("done", { runId: "gw-run-1" }));
 
     expect(gw.reports()).toHaveLength(1);
-    dispose();
+    await dispose();
   });
 
   it("does not double-send for a duplicate batch id", async () => {
@@ -167,7 +167,7 @@ describe("wsNotifications.reportTo (#47)", () => {
     expect(message).toContain("no output");
     expect(message).toContain("FAILED");
     expect(message).toContain("Turn: ok");
-    injector.dispose();
+    await injector.dispose();
   });
 
   it("treats a NO_REPLY answer as no output, and surfaces an errored turn", async () => {
@@ -179,19 +179,19 @@ describe("wsNotifications.reportTo (#47)", () => {
     const { message } = gw.reports()[0];
     expect(message).toContain("no output");
     expect(message).toContain("Turn: error (model timeout)");
-    dispose();
+    await dispose();
   });
 
   it("forwards nothing but still monitors wake outcomes when reportTo is empty or omitted", async () => {
     const gw = mockGateway();
     const empty = await wake({ ...CONFIG, reportTo: [] });
     expect(empty.onAgentEnd).toBeTypeOf("function");
-    empty.dispose();
+    await empty.dispose();
 
     const { reportTo: _omit, ...omitted } = CONFIG;
     const none = createNotificationInjector(makeApi(), omitted);
     expect(none.onAgentEnd).toBeTypeOf("function");
-    none.dispose();
+    await none.dispose();
 
     expect(gw.reports()).toHaveLength(0);
   });
@@ -207,7 +207,7 @@ describe("wsNotifications.reportTo (#47)", () => {
     // …and the batch is still waiting for the worker's own turn.
     await onAgentEnd!(turnEnd("real", { runId: "gw-run-1" }));
     expect(gw.reports()).toHaveLength(1);
-    dispose();
+    await dispose();
   });
 
   it("logs a failing target once and never throws", async () => {

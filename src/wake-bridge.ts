@@ -121,6 +121,10 @@ export class WakeBridgeStore {
   private records: WakeBridgeRecord[] = [];
   private pending: Promise<void> = Promise.resolve();
   private readonly filePath: string | undefined;
+  /** Wait for this store's queued operations, including atomic file writes. */
+  async drain(): Promise<void> {
+    await this.pending;
+  }
 
   constructor(
     filePath?: string,

@@ -5,11 +5,12 @@
  * a full-mode service start, never while constructing a registry.
  */
 const registrationKey = Symbol.for("imajin.plugin.registration");
-type Dispose = () => void;
+type Dispose = () => unknown;
 
 export class RegistrationLifecycle {
   private readonly controller = new AbortController();
   private readonly disposers: Dispose[] = [];
+  private readonly pending = new Set<Promise<void>>();
 
   get signal(): AbortSignal {
     return this.controller.signal;
@@ -24,15 +25,23 @@ export class RegistrationLifecycle {
     else this.cleanup(dispose);
   }
 
-  dispose(): void {
-    if (!this.active) return;
-    this.controller.abort();
-    for (const dispose of this.disposers.splice(0).reverse()) this.cleanup(dispose);
+  async dispose(): Promise<void> {
+    if (this.active) {
+      this.controller.abort();
+      for (const dispose of this.disposers.splice(0).reverse()) this.cleanup(dispose);
+    }
+    while (this.pending.size) await Promise.all([...this.pending]);
   }
 
   private cleanup(dispose: Dispose): void {
     try {
-      dispose();
+      const result = dispose();
+      if (result instanceof Promise) {
+        const pending = result.catch((err: unknown) => {
+          console.error("[imajin-plugin] resource cleanup failed:", err);
+        }).finally(() => this.pending.delete(pending));
+        this.pending.add(pending);
+      }
     } catch (err) {
       console.error("[imajin-plugin] resource cleanup failed:", err);
     }

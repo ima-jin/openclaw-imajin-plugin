@@ -151,6 +151,10 @@ export class PendingWakeStore {
   private writes: Promise<boolean> = Promise.resolve(true);
 
   constructor(private readonly filePath: string | undefined) {}
+  /** Wait for all writes queued before shutdown. */
+  async drain(): Promise<void> {
+    await this.writes;
+  }
 
   async load(): Promise<void> {
     if (!this.filePath) {
