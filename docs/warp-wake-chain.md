@@ -493,3 +493,87 @@ into one wake).
   `never ran (no agent_end within` line means the Cron job itself never
   fired — escalate to openclaw core, since that is entirely host-side from
   this point on.
+
+## Script-built packet wakes (#107)
+
+Set `wsNotifications.wakePacket` to opt in. Omitting it preserves the existing
+live-state preamble/bridge path and workspace bootstrap.
+
+```json
+{
+  "wakePacket": {
+    "command": ["/absolute/path/to/node", "/absolute/path/to/tools/wake-packet.mjs"],
+    "timeoutMs": 5000,
+    "maxBytes": 16000
+  }
+}
+```
+
+These are operator-supplied paths, not plugin defaults. `command` is an argv
+array, never a shell string. The plugin appends sorted, unique run IDs as
+individual positional arguments (maximum 50, allowlisted scalar characters).
+The builder must accept the whole batch, read only GitHub/Warp/Sonar live state,
+and render deterministic UTF-8 stdout for a fixed batch and fixed live state.
+Keep its service credentials read-only, managed outside argv/configuration,
+and never print credentials to stdout. This is a trusted operator executable,
+not an OS sandbox: the plugin cannot make an arbitrary configured script
+read-only. Stdin is closed; stderr and raw execution errors are discarded.
+
+The packet should carry event, subject/parent/OUTCOME, tracked brief, PR
+state/draft/head/mergeable/review/checks/queue, exact-head Sonar, horizon slice,
+rules card and output contract. Missing sections must explicitly say `GAP:`.
+The operator's existing builder owns those reads; this plugin does not
+duplicate them or introduce a kernel-side gateway/session/transcript path.
+The fixture builder under `src/fixtures` exercises this contract without any
+network access or writes; it is not a production live-state collector.
+
+Packet wakes always use a fresh batch session, even if `sessionPerWake=false`.
+OpenClaw's public `api.registerHook("agent:bootstrap", ...)` hook replaces
+workspace bootstrap files **only for a tracked packet wake root** with a small
+identity/safety/report card. Ordinary sessions, report recipients and decision
+children are not changed. Evidence: OpenClaw **2026.10.4**,
+`src/agents/bootstrap-hooks.ts:applyBootstrapHookOverrides` and
+`docs/automation/hooks/event-types.md` (`agent:bootstrap` has mutable
+`context.bootstrapFiles`, selected by `sessionKey`). No workspace files are
+overwritten and no private host imports are used.
+
+Prerequisites: enable internal hooks (`hooks.internal.enabled` must not be
+`false`), permit the plugin's prompt/conversation hooks, configure
+`reportTo` and/or `directSend` for actual operator delivery, and permit the
+derived wake session prefix at the Gateway. Configure `wsNotifications.model`
+to the desired kimi-k3 provider/model ID; omission still respects the host's
+existing model choice.
+
+The existing event evidence remains the prompt header. The packet follows it.
+Coordinator lookups are disabled for packet wakes; delegated tasks receive the
+packet and the standing rule to consume supplied PR/checks/Sonar/brief/horizon
+sections without fetching them again, except for sections marked `GAP:`.
+Outcome reports identify packet provenance or name the packet failure gap.
+
+Builder timeout (default 5 seconds, maximum 15), nonzero exit, missing executable,
+invalid configuration/run IDs, empty/invalid UTF-8 output, or excess stdout all
+fail open: the wake still receives its evidence with one
+`GAP: packet unavailable (<reason>)` line. The operator also gets an immediate
+deterministic gap disclosure; existing completion/watchdog guards remain active.
+Timeout/overflow/disposal kills the builder's process group on POSIX, so
+inherited pipes or children cannot hold the wake lane open. Missing bootstrap
+hook support is a named gap, not a claim that the host loaded a light bootstrap.
+
+The stdout cap defaults to 16,000 bytes (maximum 20,000). Bootstrap + event
+header + packet must fit 25,000 bytes; otherwise the packet is discarded with
+a named budget gap, never silently truncated. Host wrappers, additional
+system context and tool schemas are outside that pre-dispatch budget.
+The **actual** first model input is measured separately:
+
+- `wake ended ... packetBytes=... bootstrapBytes=... firstTurnBytes=... firstTurnInputTokens=... packetSource=packet|evidence-only`
+- `firstTurnBytes` measures the first `llm_input` system prompt plus prompt,
+  including host-provided wrapper text. It is not a token estimate.
+- `firstTurnInputTokens` comes from the first assistant message's per-call
+  prompt usage (input plus cache read/write), never the cumulative
+  `llm_output.usage` or last assistant's context size.
+- Unobserved metrics say `unavailable`, never zero. Only scalar sizes are
+  retained; no prompt or transcript is added to logs.
+
+Use the `wake ended` measurement to check the operator's approximately-25KB
+first-turn target after deployment. The existing completion `sessionTokens`
+measurement is separate and unchanged.

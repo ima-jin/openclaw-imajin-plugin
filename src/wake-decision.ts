@@ -16,6 +16,7 @@ export interface WakeHookContext {
 export interface WakeSubjectPolicy {
   hasPr?: boolean;
   failedRun?: boolean;
+  packetContext?: string;
 }
 
 interface WakeDecisionOptions {
@@ -48,6 +49,7 @@ interface DecisionWake {
   disclosed: boolean;
   copyRequested: boolean;
   lookupAllowed: boolean;
+  packetContext?: string;
 }
 
 export interface SettledWake {
@@ -77,7 +79,9 @@ export class WakeDecisionRouter {
     if (this.wakes.size >= 100) this.untrack(this.wakes.keys().next().value!);
     this.wakes.set(batchId, {
       batchId, sessionKey, children: new Set(), failed: false, delegations: 0, disclosed: false, copyRequested: false,
-      lookupAllowed: this.options.wakeReadOnlyLookups === true && (subject.hasPr === false || subject.failedRun === true),
+      lookupAllowed: subject.packetContext === undefined && this.options.wakeReadOnlyLookups === true
+        && (subject.hasPr === false || subject.failedRun === true),
+      packetContext: subject.packetContext,
     });
     if (!this.roots.has(sessionKey)) this.roots.set(sessionKey, batchId);
   }
@@ -99,9 +103,10 @@ export class WakeDecisionRouter {
     const ticket = randomUUID();
     this.tickets.set(ticket, wake.batchId);
     wake.delegations++;
+    const packet = wake.packetContext ? "\n\n" + wake.packetContext : "";
     return { params: {
       ...event.params, runtime: "subagent", model: this.model,
-      task: `Wake decision ticket: ${ticket}\n${event.params.task}`,
+      task: `Wake decision ticket: ${ticket}\n${event.params.task}${packet}`,
     } };
   }
 
@@ -177,6 +182,7 @@ export class WakeDecisionRouter {
         : reporting;
       return { appendSystemContext: [
         "This is delegated Warp decision work. Review/approve/merge/enqueue/dispatch here, using live state before acting.",
+        ...(wake.packetContext ? ["Start from the supplied script-built packet. Do not re-fetch PR state, checks, Sonar, brief or horizon supplied there unless that section has a GAP:. Report packet provenance and every GAP:."] : []),
         childReporting,
         "Do not poll CI or mergeable in a loop: use one bounded `gh pr checks <n> --watch` call, or report blocked with CI pending; the next wake picks it up.",
         "An optional main-session copy uses sessions_send with timeoutSeconds 0, once only. After disclosure, do not acknowledge inter-session replies, including ANNOUNCE_SKIP.",

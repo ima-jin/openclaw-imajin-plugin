@@ -335,6 +335,34 @@
             "default": true,
             "description": "Use a fresh session per coalesced batch. False preserves fixed-key reuse only when wakeSessionKey has no {batchId}/{runId} tokens. Reused sessions rotate before injection when their size is unknown or the token reserve would exceed maxSessionTokens."
           },
+          "wakePacket": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["command"],
+            "description": "Opt in to a script-built wake packet and light bootstrap (#107). Forces fresh sessions. Requires OpenClaw agent:bootstrap internal hooks (hooks.internal.enabled must not be false). The operator owns the trusted read-only builder and credentials; no shell or workspace path is supplied by the plugin. Failures retain event evidence and disclose a GAP.",
+            "properties": {
+              "command": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 32,
+                "items": { "type": "string", "minLength": 1, "maxLength": 4096 },
+                "description": "Absolute executable path followed by fixed arguments; sorted unique validated run IDs are appended as individual positional arguments. Never put secrets here."
+              },
+              "timeoutMs": {
+                "type": "integer",
+                "default": 5000,
+                "minimum": 1,
+                "maximum": 15000
+              },
+              "maxBytes": {
+                "type": "integer",
+                "default": 16000,
+                "minimum": 1,
+                "maximum": 20000,
+                "description": "UTF-8 stdout cap; oversized packets fall back, never truncate. Bootstrap plus event evidence plus packet is additionally bounded to 25000 bytes before host prompt wrappers/tool schemas."
+              }
+            }
+          },
           "maxSessionTokens": {
             "type": "number",
             "default": 50000,

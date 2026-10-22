@@ -7,6 +7,31 @@ afterEach(() => {
 });
 
 describe("PluginServiceRuntime", () => {
+  it("registers session bootstrap through internal hooks, forwarding only to the active runtime", async () => {
+    const api = { on: vi.fn(), registerHook: vi.fn() };
+    const handler = vi.fn();
+    const runtime = new PluginServiceRuntime("full", async (_lifecycle, on) => {
+      on("agent:bootstrap", handler, { name: "bootstrap" });
+    });
+    runtime.registerHook(api, "agent:bootstrap", "bootstrap");
+    expect(api.on).not.toHaveBeenCalled();
+    expect(api.registerHook).toHaveBeenCalledWith("agent:bootstrap", expect.any(Function), { name: "bootstrap" });
+    const proxy = api.registerHook.mock.calls[0][1];
+    const event = { context: { bootstrapFiles: [] } };
+    proxy(event);
+    expect(handler).not.toHaveBeenCalled();
+    await runtime.start();
+    proxy(event);
+    proxy(event);
+    expect(handler).toHaveBeenCalledOnce();
+    runtime.stop();
+    proxy({});
+    expect(handler).toHaveBeenCalledOnce();
+    const metadata = new PluginServiceRuntime("discovery", async () => {});
+    api.registerHook.mockClear();
+    metadata.registerHook(api, "agent:bootstrap", "bootstrap");
+    expect(api.registerHook).not.toHaveBeenCalled();
+  });
   it("defers ownership and preserves hook return values from the started owner", async () => {
     const previous = beginRegistration();
     const api = { on: vi.fn() };
