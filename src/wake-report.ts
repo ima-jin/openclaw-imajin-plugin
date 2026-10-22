@@ -31,6 +31,7 @@
 
 import type { AgentEndEvent, AgentMessage } from "./turn-usage-attestation.js";
 import { findFinalAssistantMessage } from "./turn-usage-attestation.js";
+import { wakePacketReceipt, type WakePacketMetrics } from "./wake-packet.js";
 
 /** `agent:<agentId>:<rest>` — the shape every OpenClaw session key has. */
 const SESSION_KEY_RE = /^agent:([^:\s]+):\S+$/;
@@ -58,6 +59,8 @@ export interface WakeBatch {
   sessionKey?: string;
   /** Plugin-derived session dedicated to exactly this batch. */
   uniqueSession?: boolean;
+  /** Bounded scalar sizing/provenance, not a prompt or transcript. */
+  packet?: WakePacketMetrics;
 }
 
 /** Gateway admission UUID and harness runner UUID are distinct on current hosts. */
@@ -226,6 +229,7 @@ export function buildWakeReport(batch: WakeBatch, turn: TurnSummary): string {
     `Warp runs (${batch.runs.length}):`,
     ...formatRuns(batch.runs),
     turnLine,
+    ...(batch.packet ? [wakePacketReceipt(batch.packet)] : []),
     "",
     body,
   ].join("\n");

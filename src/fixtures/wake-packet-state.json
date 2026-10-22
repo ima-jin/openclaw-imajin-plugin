@@ -1,0 +1,10 @@
+{
+  "subject": { "issue": 107, "parent": 79, "OUTCOME": "Start with near-zero context and report signed step events" },
+  "brief": "Fixture tracked brief, no workspace path or credentials",
+  "PR state": { "state": "OPEN", "draft": true, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "mergeable": "MERGEABLE", "reviewDecision": "REVIEW_REQUIRED", "mergeQueue": null },
+  "checks": [{ "name": "test", "state": "SUCCESS" }],
+  "Sonar": { "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "OPEN": 0, "CONFIRMED": 0, "gate": "OK" },
+  "horizon": [{ "runId": "run-a", "status": "open" }],
+  "rules card": "Never merge or enqueue. Never disclose secrets.",
+  "output contract": "Report packet provenance, result, evidence and every GAP:"
+}

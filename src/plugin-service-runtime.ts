@@ -58,9 +58,10 @@ export class PluginServiceRuntime {
     return owner?.lifecycle?.active ? owner : undefined;
   }
 
-  registerHook(api: { on: RuntimeHookRegister }, hook: string, name: string): void {
+  registerHook(api: { on: RuntimeHookRegister; registerHook?: RuntimeHookRegister }, hook: string, name: string): void {
     if (!this.full) return;
-    api.on(hook, (...args) => {
+    const register = hook.includes(":") ? api.registerHook?.bind(api) : api.on.bind(api);
+    register?.(hook, (...args) => {
       const owner = PluginServiceRuntime.owner();
       if (!owner || alreadyDispatched(args[0], name)) return undefined;
       return owner.handlers.get(name)?.(...args);

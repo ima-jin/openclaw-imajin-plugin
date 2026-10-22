@@ -21,6 +21,11 @@ export function deriveWakeSessionKey(
   const key = base.replaceAll("{batchId}", batch).replaceAll("{runId}", `${hash(runIds.join("\n"))}-${batch}`);
   return sessionPerWake && !templated ? `${key}:${batch}` : key;
 }
+function packetSizing(batch: SupervisedWake): string {
+  const packet = batch.packet;
+  if (!packet) return "";
+  return ` packetBytes=${packet.packetBytes} bootstrapBytes=${packet.bootstrapBytes ?? "unavailable"} firstTurnBytes=${packet.firstTurnBytes ?? "unavailable"} firstTurnInputTokens=${packet.firstTurnInputTokens ?? "unavailable"} packetSource=${packet.source}`;
+}
 
 export function rotateWakeSessionKey(base: string): string {
   return `${base}:rotated-${randomUUID()}`;
@@ -135,7 +140,7 @@ export class WakeSupervisor {
       await this.options.alert(batch, reason);
     }
     const tokens = wakeEventTokens(event);
-    console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=${tokens ?? "unavailable"} source=final-assistant limit=${this.options.maxTokens ?? DEFAULT_WAKE_MAX_TOKENS}`);
+    console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=${tokens ?? "unavailable"}${packetSizing(batch)} source=final-assistant limit=${this.options.maxTokens ?? DEFAULT_WAKE_MAX_TOKENS}`);
     if (tokens !== undefined && tokens > (this.options.maxTokens ?? DEFAULT_WAKE_MAX_TOKENS) && !batch.alerted) {
       await this.options.alert(batch, `session size ${tokens} tokens exceeds wake limit`);
     }
@@ -199,6 +204,6 @@ export class WakeSupervisor {
     } catch {
       // Missing or unreadable metadata is the only unavailable-token fallback.
     }
-    console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=${tokens ?? "unavailable"} reason=timeout`);
+    console.log(`[imajin-ws] wake ended batch=${batch.batchId} sessionTokens=${tokens ?? "unavailable"}${packetSizing(batch)} reason=timeout`);
   }
 }
