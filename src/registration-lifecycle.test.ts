@@ -7,6 +7,36 @@ afterEach(() => {
 });
 
 describe("RegistrationLifecycle", () => {
+  it("awaits pending and late async disposers across repeated disposal calls", async () => {
+    const lifecycle = new RegistrationLifecycle();
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const cleanup = vi.fn(async () => { await pending; });
+    lifecycle.add(cleanup);
+    const first = lifecycle.dispose();
+    const lateCleanup = vi.fn(async () => { await pending; });
+    lifecycle.add(lateCleanup);
+    const finished = vi.fn();
+    const second = lifecycle.dispose().then(finished);
+    await Promise.resolve();
+    expect(finished).not.toHaveBeenCalled();
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(lateCleanup).toHaveBeenCalledOnce();
+    release();
+    await Promise.all([first, second]);
+    expect(finished).toHaveBeenCalledOnce();
+  });
+
+  it("contains async cleanup failures and still drains other resources", async () => {
+    const log = vi.spyOn(console, "error").mockImplementation(() => {});
+    const lifecycle = new RegistrationLifecycle();
+    const cleanup = vi.fn(async () => {});
+    lifecycle.add(cleanup);
+    lifecycle.add(async () => { throw new Error("async cleanup failed"); });
+    await expect(lifecycle.dispose()).resolves.toBeUndefined();
+    expect(cleanup).toHaveBeenCalledOnce();
+    expect(log).toHaveBeenCalledOnce();
+  });
   it("aborts before cleaning up resources in reverse ownership order", () => {
     const lifecycle = new RegistrationLifecycle();
     const order: string[] = [];
@@ -24,13 +54,14 @@ describe("RegistrationLifecycle", () => {
     expect(lifecycle.signal.aborted).toBe(true);
   });
 
-  it("disposes each resource once even when cleanup re-enters dispose", () => {
+  it("disposes each resource once even when cleanup re-enters dispose", async () => {
     const lifecycle = new RegistrationLifecycle();
     const cleanup = vi.fn(() => lifecycle.dispose());
     lifecycle.add(cleanup);
+    lifecycle.add(async () => {});
 
-    lifecycle.dispose();
-    lifecycle.dispose();
+    await lifecycle.dispose();
+    await lifecycle.dispose();
 
     expect(cleanup).toHaveBeenCalledTimes(1);
   });

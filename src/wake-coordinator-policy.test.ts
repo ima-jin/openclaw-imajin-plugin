@@ -39,7 +39,7 @@ describe("option c: enforced wake coordinator boundary", () => {
     for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation(() => {});
   });
   afterEach(async () => {
-    injector?.dispose();
+    await injector?.dispose();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
     await rm(directory, { recursive: true, force: true, maxRetries: 3, retryDelay: 10 });

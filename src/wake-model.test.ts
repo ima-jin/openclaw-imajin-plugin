@@ -57,7 +57,7 @@ describe("wakeModel (#117)", () => {
   });
 
   afterEach(async () => {
-    injector?.dispose();
+    await injector?.dispose();
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -134,7 +134,7 @@ describe("wakeModel (#117)", () => {
     const previousBody = bodies[0];
     input(0, { provider: "legacy", model: "coordinator" });
     expect(modelLogs()[0]).toContain('model="legacy/coordinator" source=model');
-    injector.dispose();
+    await injector.dispose();
     config.stateDir = undefined;
     config.wakeModel = "";
     create();

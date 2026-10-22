@@ -365,7 +365,7 @@ describe("signed reach events to Jin", () => {
     expect(fetchMock).not.toHaveBeenCalled();
     expect(sendDirectChannelMessage).not.toHaveBeenCalled();
     expect(JSON.parse(await readFile(join(stateDir, "pending-wakes.json"), "utf8")).wakes).toEqual({});
-    injector.dispose();
+    await injector.dispose();
   });
 
   it("documents an off-by-default escalation flag and a public-key-only pin in the schema", async () => {

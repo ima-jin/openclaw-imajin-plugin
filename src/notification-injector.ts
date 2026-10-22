@@ -792,7 +792,7 @@ export function createNotificationInjector(
   deps: NotificationInjectorDeps = {},
 ): {
   inject: (nf: NotificationFrame) => Promise<void>;
-  dispose: () => void;
+  dispose: () => Promise<void>;
   ready: Promise<void>;
   /**
    * Always installed for wake supervision; also forwards optional reportTo reports.
@@ -816,6 +816,16 @@ export function createNotificationInjector(
   const readTokens = deps.sessionTokens ?? ((sessionKey: string) => readWakeSessionTokens(api, sessionKey));
   const lifecycle = new AbortController();
   const packets = new Map<string, WakePacketResult>();
+  const activeOperations = new Set<Promise<unknown>>();
+  let disposing: Promise<void> | undefined;
+  function track<T>(task: Promise<T>): Promise<T> {
+    activeOperations.add(task);
+    void task.then(
+      () => activeOperations.delete(task),
+      () => activeOperations.delete(task),
+    );
+    return task;
+  }
   let reusedSessionKey = wakeSessionKey;
   let allocatedFreshReuseKey = false;
   const reservedTokens = new Map<string, number>();
@@ -907,7 +917,7 @@ export function createNotificationInjector(
         console.error("[imajin-ws] wake alert delivery failed; check directSend configuration");
       });
     },
-    complete: async (batch, event) => {
+    complete: (batch, event) => track((async () => {
       reservedTokens.delete(batch.sessionKey);
       const outcome = buildWakeOutcome(batch.runs.map((r) => r.runId), event);
       await bridge.recordOutcome(outcome);
@@ -920,7 +930,7 @@ export function createNotificationInjector(
         });
       }
       wakeReporter?.untrack(batch.batchId);
-    },
+    })()),
   });
   const abortGateway = createLoopbackSessionGateway({
     getConfig: () => api?.runtime?.config?.current?.() ?? api?.config ?? {},
@@ -1056,6 +1066,7 @@ export function createNotificationInjector(
     windowStart: number,
     phase: "leading" | "trailing",
   ): Promise<void> {
+    if (lifecycle.signal.aborted) return Promise.resolve();
     const sessionKey = freshSessions ? `${scope}:${windowStart}:${phase}` : wakeSessionKey;
     const prior = wakeQueueBySession.get(sessionKey) ?? Promise.resolve();
     const task = prior.then(
@@ -1066,7 +1077,7 @@ export function createNotificationInjector(
     // guard the queue chain anyway so one unexpected rejection can't wedge
     // every wake behind it forever.
     const guarded = task.catch(() => {
-      void escalateWakeFailure(scope, frames, "unexpected wake dispatch failure");
+      return escalateWakeFailure(scope, frames, "unexpected wake dispatch failure");
     }).finally(() => {
       if (wakeQueueBySession.get(sessionKey) === guarded) wakeQueueBySession.delete(sessionKey);
     });
@@ -1431,6 +1442,7 @@ export function createNotificationInjector(
   }
 
   function onLeadingFire(scope: string) {
+    if (lifecycle.signal.aborted) return;
     const state = coalesceByScope.get(scope);
     if (!state || state.phase !== "leading") {
       return;
@@ -1449,6 +1461,7 @@ export function createNotificationInjector(
    * (whenever it arrives) starts a brand-new leading window.
    */
   function onTrailingFire(scope: string) {
+    if (lifecycle.signal.aborted) return;
     const state = coalesceByScope.get(scope);
     if (!state || state.phase !== "trailing") {
       return;
@@ -1460,8 +1473,7 @@ export function createNotificationInjector(
     void scheduleWakeTurn(scope, state.frames, state.windowStart, "trailing");
   }
 
-  function dispose() {
-    lifecycle.abort();
+  function clearResources() {
     packets.clear();
     supervisor.dispose();
     guards.dispose();
@@ -1472,6 +1484,28 @@ export function createNotificationInjector(
       clearTimeout(buf.timeout);
       coalesceByScope.delete(scope);
     }
+  }
+  function dispose(): Promise<void> {
+    if (disposing) return disposing;
+    lifecycle.abort();
+    clearResources();
+    disposing = (async () => {
+      // Startup can enqueue replay work; injections/completions can append
+      // store writes after their first await. Drain producers before stores.
+      await stateReady;
+      await drainActiveOperations();
+      await Promise.allSettled(wakeQueueBySession.values());
+      // A wake may have started a completion while admission was settling.
+      await drainActiveOperations();
+      await Promise.all([pendingWakeStore.drain(), bridge.drain()]);
+      clearResources();
+    })();
+    return disposing;
+  }
+  async function drainActiveOperations(): Promise<void> {
+    if (!activeOperations.size) return;
+    await Promise.allSettled(activeOperations);
+    await drainActiveOperations();
   }
 
   async function inject(nf: NotificationFrame): Promise<void> {
@@ -1576,12 +1610,12 @@ export function createNotificationInjector(
   }
 
   return {
-    inject,
+    inject: (nf) => lifecycle.signal.aborted ? Promise.resolve() : track(inject(nf)),
     dispose,
     ready: stateReady,
     runtimeHooks,
     reportWake,
-    onAgentEnd: async (event, ctx = {}) => {
+    onAgentEnd: (event, ctx = {}) => lifecycle.signal.aborted ? Promise.resolve() : track((async () => {
       const settled = decisionRouter.end(event, ctx);
       if (!settled) return;
       const rootCtx = { sessionKey: settled.sessionKey, runId: settled.event.runId, batchId: settled.batchId };
@@ -1601,6 +1635,6 @@ export function createNotificationInjector(
       decisionRouter.untrack(settled.batchId);
       wakeModelSources.delete(settled.batchId);
       packets.delete(settled.batchId);
-    },
+    })()),
   };
 }

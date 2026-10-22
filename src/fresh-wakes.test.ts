@@ -200,7 +200,7 @@ describe("fresh wake bridge (#79)", () => {
     for (const method of ["log", "warn", "error", "info"] as const) vi.spyOn(console, method).mockImplementation(() => {});
   });
   afterEach(async () => {
-    for (const injector of injectors.splice(0)) injector.dispose();
+    for (const injector of injectors.splice(0)) await injector.dispose();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
     await rm(dir, { recursive: true, force: true });
@@ -337,7 +337,7 @@ describe("fresh wake bridge (#79)", () => {
     await first.inject(frame("watched"));
     await posted(1);
     await finish(first, 0);
-    first.dispose();
+    await first.dispose();
     const second = create();
     await second.inject(frame("next"));
     await posted(2);
@@ -362,7 +362,7 @@ describe("fresh wake bridge (#79)", () => {
     for (let registration = 0; registration < 5; registration++) {
       const injector = create({ ...config, wakeOwedMaxAgeMs: maxAge });
       await injector.ready;
-      injector.dispose();
+      await injector.dispose();
       expect(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes).toEqual({});
     }
     expect(posts).toHaveLength(0);
@@ -417,7 +417,7 @@ describe("fresh wake bridge (#79)", () => {
     await finish(off, 0);
     expect(horizon.readOpenItems).not.toHaveBeenCalled();
     expect(horizon.writeStepEvents).not.toHaveBeenCalled();
-    off.dispose();
+    await off.dispose();
     const on = create({ ...config, horizonEnabled: true }, { horizon });
     await on.inject(frame("on"));
     await posted(2);

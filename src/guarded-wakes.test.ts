@@ -73,8 +73,8 @@ describe("guarded wake acceptance (#82)", () => {
     for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation(() => {});
   });
   afterEach(async () => {
-    beginRegistration().dispose();
-    injector?.dispose();
+    await beginRegistration().dispose();
+    await injector?.dispose();
     vi.useRealTimers();
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
@@ -218,7 +218,7 @@ describe("guarded wake acceptance (#82)", () => {
       create();
       await injector.ready;
       await vi.waitFor(async () => expect(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes).toEqual({}));
-      injector.dispose();
+      await injector.dispose();
     }
     expect(sendDirectChannelMessage).toHaveBeenCalledTimes(1);
     expect(vi.mocked(sendDirectChannelMessage).mock.calls[0][1]).toContain("already MERGED");

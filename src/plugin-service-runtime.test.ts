@@ -2,8 +2,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { beginRegistration } from "./registration-lifecycle.js";
 import { PluginServiceRuntime } from "./plugin-service-runtime.js";
 
-afterEach(() => {
-  beginRegistration().dispose();
+afterEach(async () => {
+  await beginRegistration().dispose();
 });
 
 describe("PluginServiceRuntime", () => {
@@ -24,13 +24,29 @@ describe("PluginServiceRuntime", () => {
     proxy(event);
     proxy(event);
     expect(handler).toHaveBeenCalledOnce();
-    runtime.stop();
+    await runtime.stop();
     proxy({});
     expect(handler).toHaveBeenCalledOnce();
     const metadata = new PluginServiceRuntime("discovery", async () => {});
     api.registerHook.mockClear();
     metadata.registerHook(api, "agent:bootstrap", "bootstrap");
     expect(api.registerHook).not.toHaveBeenCalled();
+  });
+  it("awaits asynchronous resource cleanup from service stop", async () => {
+    let release!: () => void;
+    const pending = new Promise<void>((resolve) => { release = resolve; });
+    const runtime = new PluginServiceRuntime("full", async (lifecycle) => {
+      lifecycle.add(async () => { await pending; });
+    });
+    await runtime.start();
+    const stopped = vi.fn();
+    const stopping = runtime.stop().then(stopped);
+    await Promise.resolve();
+    expect(stopped).not.toHaveBeenCalled();
+    expect(PluginServiceRuntime.owner()).toBeUndefined();
+    release();
+    await stopping;
+    expect(stopped).toHaveBeenCalledOnce();
   });
   it("defers ownership and preserves hook return values from the started owner", async () => {
     const previous = beginRegistration();
@@ -51,7 +67,7 @@ describe("PluginServiceRuntime", () => {
     expect(previous.active).toBe(false);
     expect(proxy({})).toEqual({ modelOverride: "test-model" });
     expect(setup).toHaveBeenCalledOnce();
-    runtime.stop();
+    await runtime.stop();
     expect(proxy({})).toBeUndefined();
   });
 
@@ -62,7 +78,7 @@ describe("PluginServiceRuntime", () => {
       throw new Error("setup failed");
     });
     await expect(runtime.start()).rejects.toThrow("setup failed");
-    runtime.stop();
+    await runtime.stop();
     expect(cleanup).toHaveBeenCalledOnce();
   });
 
@@ -76,7 +92,7 @@ describe("PluginServiceRuntime", () => {
     await runtime.start();
     await runtime.reportWake({}, disclosure);
     expect(sender).toHaveBeenCalledWith({}, disclosure);
-    runtime.stop();
+    await runtime.stop();
     await expect(runtime.reportWake({}, disclosure)).rejects.toThrow("not started");
     expect(sender).toHaveBeenCalledOnce();
   });
@@ -106,7 +122,7 @@ describe("PluginServiceRuntime", () => {
     expect(reloads[0](event, {})).toBeUndefined();
     expect(handler).toHaveBeenCalledOnce();
 
-    owner.stop();
+    await owner.stop();
     expect(latest({ toolName: "exec", params: {} }, {})).toBeUndefined();
     expect(handler).toHaveBeenCalledOnce();
   });
@@ -122,7 +138,7 @@ describe("PluginServiceRuntime", () => {
     await owner.start();
     await reload.reportWake({ sessionKey: "agent:main:warp-events:abc" }, disclosure);
     expect(sender).toHaveBeenCalledWith({ sessionKey: "agent:main:warp-events:abc" }, disclosure);
-    owner.stop();
+    await owner.stop();
     await expect(reload.reportWake({}, disclosure)).rejects.toThrow("not started");
   });
 
@@ -133,11 +149,11 @@ describe("PluginServiceRuntime", () => {
     const second = new PluginServiceRuntime("full", async (lifecycle) => lifecycle.add(secondCleanup));
     await first.start();
     await second.start();
-    first.stop();
+    await first.stop();
     await first.start();
     expect(firstCleanup).toHaveBeenCalledOnce();
     expect(secondCleanup).not.toHaveBeenCalled();
-    second.stop();
+    await second.stop();
     expect(secondCleanup).toHaveBeenCalledOnce();
   });
 });
