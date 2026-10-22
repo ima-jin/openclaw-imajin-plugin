@@ -1,10 +1,10 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp, readFile, rename, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { canonicalize } from "../approval-bridge.js";
-import type { LoopIngestRequest, LoopReceiptPayload } from "../loop-publisher.js";
+import { createLoopTransport, type LoopIngestRequest, type LoopReceiptPayload } from "../loop-publisher.js";
 import { saveCursor, type Cursor } from "./cursor.js";
 import type { StepRequest } from "./model.js";
 import { envelopeHash, isStale, lookupReceipt } from "./receipts.js";
@@ -217,8 +217,7 @@ describe("stale durable outbox recovery", () => {
   it("resumes only unacknowledged receipt lookups after a mid-batch failure and restart", async () => {
     const test = await fixture();
     const cursor = JSON.parse(test.originalCursor) as Cursor;
-    const second = structuredClone(test.request);
-    second.type = "step.finished";
+    const second = await createLoopTransport(test.options).sign("step.finished", test.request.payload);
     cursor.pending!.requests.push(second);
     await saveCursor(test.first.cursorPath, cursor);
     test.respond(() => test.receipts.length === 1 ? accepted(test.request) : new Response(null, { status: 503 }));
@@ -237,7 +236,6 @@ describe("stale durable outbox recovery", () => {
     test.respond(async () => {
       await rename(test.first.cursorPath, `${test.first.cursorPath}.saved`);
       // Make the destination a directory so the atomic cursor rename fails.
-      const { mkdir } = await import("node:fs/promises");
       await mkdir(test.first.cursorPath);
       return accepted(test.request);
     });
@@ -249,6 +247,15 @@ describe("stale durable outbox recovery", () => {
     expect(test.receipts).toHaveLength(2);
     expect(test.ingest).toHaveLength(1);
     expect(JSON.parse(await readFile(test.first.cursorPath, "utf8"))).not.toHaveProperty("pending");
+  });
+  it("retains the stale outbox without any network request when the lookup signing key is unavailable", async () => {
+    const test = await fixture();
+    await rename(test.keypairPath, `${test.keypairPath}.unavailable`);
+    test.fetchImpl.mockClear();
+    await test.restart().sync();
+    expect(test.fetchImpl).not.toHaveBeenCalled();
+    expect(await readFile(test.first.cursorPath, "utf8")).toBe(test.originalCursor);
+    expect(test.logger.warn).toHaveBeenCalledWith(expect.stringContaining("receipt unavailable; exact envelope retained"));
   });
   it("reconciles when an ingest 400 crosses the age boundary during the request", async () => {
     const test = await fixture();
