@@ -28,7 +28,7 @@ function directFlags(args: string[], approve: boolean): boolean {
 
 function negativeReview(args: string[]): boolean {
   return args.some((arg) => ["--request-changes", "--comment", "-r", "-c"].includes(arg))
-    && !args.some((arg) => /^-a/.test(arg));
+    && !args.some((arg) => arg.startsWith("-a"));
 }
 
 function apiMutation(args: string[]): Mutation {
