@@ -17,6 +17,14 @@ export interface StoredApprovalProposal {
   expiresAtMs?: number;
 }
 
+function isCatalogProposalState(value: unknown): value is ImajinCatalogProposalState {
+  if (!value || typeof value !== "object") return false;
+  const catalog = value as Partial<ImajinCatalogProposalState>;
+  return typeof catalog.revision === "string" && /^[0-9a-f]{64}$/.test(catalog.revision) &&
+    typeof catalog.proposalId === "string" && /^imajin-catalog:[0-9a-f-]{36}$/.test(catalog.proposalId) &&
+    typeof catalog.dismissed === "boolean";
+}
+
 function isStoredProposal(value: unknown): value is StoredApprovalProposal {
   if (!value || typeof value !== "object") return false;
   const p = value as Partial<StoredApprovalProposal>;
@@ -56,10 +64,10 @@ export class ApprovalsStateStore {
         if (outcome === "applied" || outcome === "expired/superseded") this.outcomes.set(id, outcome);
       }
       const catalog = state.catalog;
-      if (catalog && typeof catalog.revision === "string" && /^[0-9a-f]{64}$/.test(catalog.revision) &&
-          typeof catalog.proposalId === "string" && /^imajin-catalog:[0-9a-f-]{36}$/.test(catalog.proposalId) &&
-          typeof catalog.dismissed === "boolean") {
-        Object.assign(this.catalog, catalog);
+      if (isCatalogProposalState(catalog)) {
+        this.catalog.revision = catalog.revision;
+        this.catalog.proposalId = catalog.proposalId;
+        this.catalog.dismissed = catalog.dismissed;
       }
     } catch {
       // First boot, foreign or corrupt state: live source reads remain authoritative.

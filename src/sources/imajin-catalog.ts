@@ -21,7 +21,7 @@ export function buildImajinAllowListStatus(models: readonly ImajinRuntimeModel[]
   const allow = root?.agents?.defaults?.modelPolicy?.allow;
   const readable = config !== null && typeof config === "object" &&
     (allow === undefined || (Array.isArray(allow) && allow.every((ref) => typeof ref === "string")));
-  const refs = [...new Set(models.map((model) => buildImajinModelRef(model.id)))].sort();
+  const refs = [...new Set(models.map((model) => buildImajinModelRef(model.id)))].sort((a, b) => a.localeCompare(b, "en"));
   const configured = readable ? (allow ?? []) as string[] : null;
   return {
     configured,
@@ -65,7 +65,7 @@ export function buildImajinAllowListDelta(
 ): { add: string[]; remove: string[] } {
   const discovered = new Set(models.map((model) => buildImajinModelRef(model.id)));
   const add = [...discovered].filter((ref) =>
-    !isImajinModelAllowedByPolicy(allow, ref.slice("imajin/".length))).sort();
+    !isImajinModelAllowedByPolicy(allow, ref.slice("imajin/".length))).sort((a, b) => a.localeCompare(b, "en"));
   const remove = [...new Set(allow)].filter((ref) => {
     if (isExactRef(ref, "imajin/")) return !discovered.has(ref);
     const prefix = ["imajin-openai/", "imajin-xai/"].find((p) => isExactRef(ref, p));
@@ -73,7 +73,7 @@ export function buildImajinAllowListDelta(
     const id = ref.slice(prefix.length);
     // First enable the replacement; only a subsequent card retires legacy.
     return discovered.has(buildImajinModelRef(id)) && isImajinModelAllowedByPolicy(allow, id);
-  }).sort();
+  }).sort((a, b) => a.localeCompare(b, "en"));
   return { add, remove };
 }
 
