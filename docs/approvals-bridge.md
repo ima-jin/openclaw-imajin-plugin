@@ -14,6 +14,13 @@ system-agent source concretely — they are still exactly accurate for it.
 directly; it is driven by a `Map<string, ApprovalSource>` built from
 `approvals.sources` (default: both `system-agent` and `skill-workshop`).
 
+Verified `withdrawn` decisions use each source's optional `withdrawalDecision`
+terminal non-apply action (#87): system-agent and gateway-exec map `reject`
+to Gateway `deny`; Skill Workshop rejects with the tracked revision pin.
+The usual pending/revision checks, execution deduplication, forgetting and
+loop unblock all apply. A source with no cancel analog omits this capability
+and retains a logged no-op after the hash and countersignature checks.
+
 ```
  approvals.sources: ["system-agent", "skill-workshop"]
                 │                        │
@@ -315,9 +322,9 @@ Kernel (/jin)                gateway-approvals-bridge.ts        OpenClaw Gateway
        |                              |  no -> reject, log, STOP ------+                       |
        |                              |                         |     |                       |
        |                              |--if decision == withdrawn:     |                       |
-       |                              |  no-op (no Gateway analog —    |                       |
-       |                              |  only reached once check 1 AND |                       |
-       |                              |  check 1.5 above both passed)  |                       |
+       |                              |  map to terminal reject, then |                       |
+       |                              |  continue pending/hash checks |                       |
+       |                              |  (no cancel analog: log no-op) |                       |
        |                              |                                |                       |
        |                              |--approval.get(proposalId)----->|                       |
        |                              |<--current snapshot-------------|                       |

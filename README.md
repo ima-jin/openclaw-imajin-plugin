@@ -1043,8 +1043,10 @@ same reason — the Gateway payload has no structured kind field either.
   contract). It reaches the operator via the standard notify channels
   (in-app/email) but will not render as a dedicated /jin card — that is
   kernel-side follow-up work, out of scope here.
-- A `withdrawn` decision is a documented no-op: `approval.resolve` has no
-  "withdraw" for a system-agent proposal already forwarded to it.
+- A verified `withdrawn` decision uses the source's terminal non-apply
+  action: `deny` for system-agent/gateway-exec, `reject` for Skill Workshop.
+  The bridge forgets the proposal and unblocks its loop. Sources without a
+  cancel analog retain a logged no-op.
 - The plugin's own Ed25519 request-*signature* is not yet verified by the
   kernel (see the trust-chain section above — the kernel does verify
   `contentHash` itself, per #2084) — signature verification lands with the

@@ -299,6 +299,7 @@ export function createGatewayExecSource(
 ): ApprovalSource {
   return {
     id: "gateway-exec",
+    withdrawalDecision: "reject",
     onDriftPolicy: "leave",
     // An ask-gated exec blocks on the Gateway until decided (#52): a card that
     // cannot be published must deny it, not leave it to time out (SIGTERM).

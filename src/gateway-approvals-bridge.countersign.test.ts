@@ -76,12 +76,13 @@ async function fixture() {
 }
 
 describe("#102 bare signed digest / prefixed wire countersignature contract", () => {
-  it.each(["approve", "deny"] as const)("applies bare-signed %s to a pending workshop proposal", async (decision) => {
+  it.each(["approve", "deny", "withdrawn"] as const)("applies bare-signed %s to a pending workshop proposal", async (decision) => {
     const { bridge, client, fields, frame } = await fixture();
     expect(await bridge.handleKernelDecision(await frame({ ...fields, decision }))).toBe("applied");
     expect(decision === "approve" ? client.apply : client.reject)
       .toHaveBeenCalledWith("workshop-pending", "native-revision");
     expect(decision === "approve" ? client.reject : client.apply).not.toHaveBeenCalled();
+    expect(bridge.isPublished("workshop-pending")).toBe(false);
   });
 
   it.each([
