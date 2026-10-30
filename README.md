@@ -1952,3 +1952,5 @@ mint, register, or seal a real key as part of testing this configuration.
   an absent/unresolvable agent receives **zero `imajin_*` tools**, including
   status. Move every participating identity into the map; merely retaining
   top-level credentials does not configure `main` in this mode.
+
+<!-- imajin-vault exec provider implementation in progress (#143). -->
