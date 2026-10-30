@@ -33,6 +33,8 @@ export interface ImajinClientConfig {
   keypairPath?: string;
   actAs?: string;
   signer?: ImajinSigner;
+  /** Optional restricted transport for non-tool secret resolution. */
+  transport?: typeof fetch;
 }
 export type CloudflareResource = "dns" | "settings" | "ssl" | "cache-rules" | "custom-hostnames" | "bulk" | "history" | "classification";
 
@@ -279,6 +281,7 @@ export interface WarpRunTranscript {
 }
 
 export class ImajinClient {
+  private readonly transport: typeof fetch;
   private baseUrl: string;
   private did?: string;
   private keypairPath?: string;
@@ -290,6 +293,7 @@ export class ImajinClient {
   private authenticating?: Promise<void>;
 
   constructor(config: ImajinClientConfig) {
+    this.transport = config.transport ?? ((...args) => fetch(...args));
     this.baseUrl = config.nodeUrl.replace(/\/$/, "");
     this.did = config.did;
     this.keypairPath = config.keypairPath;
@@ -395,7 +399,7 @@ export class ImajinClient {
     const did = this.signer?.did ?? keypair!.did;
 
     // Step 1: Request challenge
-    const challengeRes = await fetch(`${this.baseUrl}/auth/api/login/challenge`, {
+    const challengeRes = await this.transport(`${this.baseUrl}/auth/api/login/challenge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ did }),
@@ -418,7 +422,7 @@ export class ImajinClient {
       : await this.signChallenge(challenge, keypair!.privateKey);
 
     // Step 3: Verify signature
-    const verifyRes = await fetch(`${this.baseUrl}/auth/api/login/verify`, {
+    const verifyRes = await this.transport(`${this.baseUrl}/auth/api/login/verify`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ challengeId, signature }),
