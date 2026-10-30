@@ -1936,12 +1936,11 @@ mint, register, or seal a real key as part of testing this configuration.
   allowlists. Each entry gets a separate persisted state directory (the
   configured state root plus `<id>`, or `~/.openclaw/imajin-agents/<id>`) and
   agent-namespaced wake idempotency keys.
-- Gateway-wide approvals (`approvals` and `approvalBridge`), signed session
-  commands, loop/horizon publishers, turn-usage attestations and authenticated
-  model discovery are **not inherited or started in agent-map mode**. They
-  currently require the legacy Gateway file signer; reusing it for tenant
-  events would violate identity isolation. In particular, no tenant receives
-  the Gateway approval rail through its tool list. The global model-provider
+- Gateway approvals (`approvals` and `approvalBridge`) and signed session
+  commands require an explicit **`gatewayAgent`** selection (see below);
+  no tenant receives that authority through its tool list.
+  Loop/horizon publishers, turn-usage attestations and authenticated model
+  discovery remain **off in agent-map mode** pending #140/#141. The global model-provider
   registration remains available for health diagnostics but its catalog is
   unconfigured, never authenticated as main.
 - **Legacy zero-edit compatibility:** omit `agents` entirely to retain the
@@ -1952,3 +1951,36 @@ mint, register, or seal a real key as part of testing this configuration.
   an absent/unresolvable agent receives **zero `imajin_*` tools**, including
   status. Move every participating identity into the map; merely retaining
   top-level credentials does not configure `main` in this mode.
+
+### Map-mode gateway principal (#139)
+
+**Rollout hold:** keep the deployed Gateway on legacy config until epic #138
+lands. This change supplies approvals/session commands only; it is not a
+Gateway `openclaw.json` migration.
+
+Set `gatewayAgent: "main"` alongside `agents` to name the **exact valid map
+entry** that owns Gateway approvals and commands. There is no default, alias,
+or implicit choice of the first entry. The entry must resolve uniquely to its
+sealed `store` or vault-backed `exec` SecretRef. Missing, invalid, duplicate,
+or unresolved selection disables both features and emits a value-free warning;
+top-level `did`, `actAs`, `keypairPath`, or credentials are never a fallback.
+
+Keep the existing top-level feature settings (`approvals`, `approvalBridge`,
+`sessionCommands`), including their explicit opt-ins, operator DID and pinned
+public signing keys. Only the selected entry's DID, acting principal, signer,
+HTTP session and WebSocket are used. Approval preflight/catch-up uses that same
+client; durable approval state/cursors use its agent-scoped notification state
+directory. Approval requests retain their HTTP notify transport; decisions and
+signed command outcomes use the selected socket. Approval/session-command
+frames on tenant sockets are ignored, including frames addressed to main.
+The pinned kernel command signer and principal countersignature checks do not
+change.
+
+Commands targeting sessions or spawning agents are restricted to the selected
+agent's namespace in map mode; they cannot sign a tenant session's activity as
+main. Command-only loopback access does not start inventory or loop publishers;
+history publishing awaits #140. Legacy mode retains its existing loop/inventory
+requirements. `registerAgentPlugin` returns `getGatewayIdentity()`, exposing the
+active `GatewayAgentIdentity` (`client`, sealed `signer`, `ws`, config and agent
+id) for #140/#141; it returns `undefined` before startup, after stop/replacement,
+or on failed resolution. No private key material is exposed.
