@@ -13,12 +13,13 @@ const mcp = (toolName: string, params = {}): WakeToolEvent => ({
   toolName, params: { owner: "fixture", repo: "repo", pullNumber: 101, ...params },
 });
 const actions = [
-  approve, exec(`gh pr merge ${PR} --squash`), graph(), graph("mergePullRequest"),
+  approve,
   mcp("mcp__github__create_pull_request_review", { event: "APPROVE", body: "checked" }),
   mcp("mcp__github__pull_request_review_write", { method: "submit", event: "APPROVE" }),
-  mcp("mcp__github__merge_pull_request"), mcp("mcp__github__enqueue_pull_request"),
-  mcp("mcp__github__graphql", { query: query() }),
 ];
+const merges = [exec(`gh pr merge ${PR} --squash`), graph(), graph("mergePullRequest"),
+  mcp("mcp__github__merge_pull_request"), mcp("mcp__github__enqueue_pull_request"),
+  mcp("mcp__github__graphql", { query: query() })];
 async function fixture() {
   const { pr, source } = gradingFixture();
   const block = await resolveWakeGrading(PR, source);
@@ -30,6 +31,13 @@ describe("decision-child merge-side permission boundary (#101)", () => {
   it.each(actions)("blocks without a ticket grading block: $toolName $params", async (event) => {
     const { source } = gradingFixture();
     expect(await gateDecisionMutation(event, undefined, source, "/usr/bin/gh")).toMatchObject({ block: true });
+    expect(source.pullRequest).not.toHaveBeenCalled();
+  });
+
+  it.each(merges)("never authorizes wake merge/enqueue, even with a resolved block: $toolName", async (event) => {
+    const { gate, source } = await fixture();
+    source.pullRequest.mockClear();
+    expect(await gate(event)).toMatchObject({ block: true, blockReason: expect.stringContaining("wake paths never merge or enqueue") });
     expect(source.pullRequest).not.toHaveBeenCalled();
   });
 
@@ -97,7 +105,7 @@ describe("decision-child merge-side permission boundary (#101)", () => {
     expect(await gate({ ...approve, params: { ...approve.params, env: {} } })).toMatchObject({ block: true });
     expect(await gate(exec(`gh pr merge ${PR} --match-head-commit ${"b".repeat(40)}`))).toMatchObject({ block: true });
     expect((await gate(exec(`gh pr review 101 --repo=fixture/repo -a --body=checked`)))?.block).not.toBe(true);
-    expect((await gate(exec(`/usr/bin/gh pr merge ${PR}`)))?.block).not.toBe(true);
+    expect((await gate(exec(`/usr/bin/gh pr review ${PR} --approve`)))?.block).not.toBe(true);
   });
 
   it("bounds live review lookup failures rather than waiting forever", async () => {
