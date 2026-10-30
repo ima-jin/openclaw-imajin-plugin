@@ -106,7 +106,7 @@ function words(command: string): string[] | undefined {
 }
 
 function literalToken(value: string): string {
-  if (value === "\\'") return "'";
+  if (value === String.raw`\'`) return "'";
   return value.startsWith("'") || value.startsWith('"') ? value.slice(1, -1) : value;
 }
 
