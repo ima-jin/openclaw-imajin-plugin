@@ -54,15 +54,33 @@ function parseRequest(raw: string): string[] {
 }
 
 /** No redirects, ambient cookies, disk cache, or unbounded network requests. */
-const transport: typeof fetch = async (url, init) => {
-  const headers = new Headers(init?.headers);
-  headers.set("Cache-Control", "no-store");
-  const response = await fetch(url, {
-    ...init, headers, redirect: "error", credentials: "omit",
-    signal: AbortSignal.timeout(5000),
-  });
-  return new Response(await readBounded(response), { status: response.status, headers: response.headers });
-};
+function restrictedTransport(consumerDid: string): typeof fetch {
+  return async (url, init) => {
+    const headers = new Headers(init?.headers);
+    headers.set("Cache-Control", "no-store");
+    const response = await fetch(url, {
+      ...init, headers, redirect: "error", credentials: "omit",
+      signal: AbortSignal.timeout(5000),
+    });
+    const text = await readBounded(response);
+    if (response.ok) validateAuthResponse(String(url), text, consumerDid);
+    return new Response(text, { status: response.status, headers: response.headers });
+  };
+}
+
+function validateAuthResponse(url: string, text: string, consumerDid: string): void {
+  if (url.endsWith("/login/challenge")) {
+    const body: unknown = JSON.parse(text);
+    if (!record(body) || typeof body.challengeId !== "string" || !body.challengeId.length
+      || typeof body.challenge !== "string" || !/^(?:[a-f0-9]{2})+$/i.test(body.challenge)
+      || typeof body.expiresAt !== "string" || !Number.isFinite(Date.parse(body.expiresAt))
+      || Date.parse(body.expiresAt) <= Date.now()) throw new Error(FAILURE);
+  }
+  if (url.endsWith("/login/verify")) {
+    const body: unknown = JSON.parse(text);
+    if (!record(body) || body.did !== consumerDid || body.mfaRequired) throw new Error(FAILURE);
+  }
+}
 
 async function readBounded(response: Response): Promise<string> {
   if (!response.body) throw new Error(FAILURE);
@@ -100,8 +118,9 @@ async function loadBootstrap(config: VaultExecConfig) {
     publicKey: stored.publicKeyHex || stored.keypair?.publicKey || stored.publicKey,
     privateKey: stored.privateKey || stored.keypair?.privateKey,
   }, config.consumerDid);
+  const transport = restrictedTransport(config.consumerDid);
   const client = new ImajinClient({ nodeUrl: url.origin, did: config.consumerDid, signer, transport });
-  return { client, origin: url.origin };
+  return { client, origin: url.origin, transport };
 }
 
 function grantValue(raw: string): string {
@@ -130,7 +149,7 @@ export async function resolveVaultExec(raw: string, input: unknown): Promise<str
       try {
         if (!Object.hasOwn(config.grants, id)) throw new Error(FAILURE);
         bootstrap ??= loadBootstrap(config);
-        const { client, origin } = await bootstrap;
+        const { client, origin, transport } = await bootstrap;
         const cookie = await client.authenticatedCookie();
         const response = await transport(
           `${origin}/auth/api/vault/delegation/grants/${encodeURIComponent(config.grants[id])}/fetch`,

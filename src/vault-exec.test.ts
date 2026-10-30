@@ -44,6 +44,7 @@ beforeEach(async () => {
     if (path === "/provider.json") return JSON.stringify(config);
     throw new Error(target.privateKey);
   });
+
   mocks.resolve.mockReset();
   wire = [];
   status = 200;
@@ -54,13 +55,13 @@ beforeEach(async () => {
     if (url.endsWith("/challenge")) {
       const body = JSON.parse(init.body as string);
       expect(body.did).toBe(main.did);
-      return Response.json({ challengeId: "challenge-id", challenge: "challenge-text",
+      return Response.json({ challengeId: "challenge-id", challenge: main.publicKey,
         expiresAt: new Date(Date.now() + 300000).toISOString() });
     }
     if (url.endsWith("/verify")) {
       const { signature } = JSON.parse(init.body as string);
-      expect(await ed.verifyAsync(signature, new TextEncoder().encode("challenge-text"), main.publicKey)).toBe(true);
-      return Response.json({}, { headers: { "set-cookie": "session=throwaway; Path=/" } });
+      expect(await ed.verifyAsync(signature, new TextEncoder().encode(main.publicKey), main.publicKey)).toBe(true);
+      return Response.json({ did: main.did }, { headers: { "set-cookie": "session=throwaway; Path=/" } });
     }
     return Response.json(result, { status });
   });
@@ -70,6 +71,28 @@ beforeEach(async () => {
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe("imajin-vault exec provider", () => {
+  it.each([
+    {}, { challengeId: "" }, { challenge: "" }, { challenge: "not-hex" }, { challenge: "a" },
+    { expiresAt: "bad-date" }, { expiresAt: "2000-01-01T00:00:00Z" },
+  ])("refuses malformed or expired authentication challenges %#", async (patch) => {
+    const body = Object.keys(patch).length ? {
+      challengeId: "id", challenge: main.publicKey, expiresAt: new Date(Date.now() + 300000).toISOString(), ...patch,
+    } : patch;
+    fetchMock.mockResolvedValue(Response.json(body));
+    expect(JSON.parse(await resolveVaultExec(request(), config))).toEqual(failure);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([{}, { did: "did:imajin:wrong" }, { mfaRequired: true }])(
+    "refuses malformed, wrong-DID or MFA verification responses %#", async (patch) => {
+      fetchMock.mockImplementation(async (url: string) => url.endsWith("/challenge")
+        ? Response.json({ challengeId: "id", challenge: main.publicKey, expiresAt: new Date(Date.now() + 300000).toISOString() })
+        : Response.json(Object.keys(patch).length ? { did: main.did, ...patch } : patch,
+          { headers: { "set-cookie": "session=throwaway" } }));
+      expect(JSON.parse(await resolveVaultExec(request(), config))).toEqual(failure);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    },
+  );
   it.each([undefined, "did:imajin:org-artifact"])(
     "authenticates as the explicit main consumer, not the personal/org acting principal %#", async (actAs) => {
       gateway.plugins.entries.imajin.config.actAs = actAs;
@@ -110,15 +133,17 @@ describe("imajin-vault exec provider", () => {
   it.each(["challenge", "verify"])("redacts authentication failure at %s", async (step) => {
     fetchMock.mockImplementation(async (url: string) => url.endsWith(`/${step}`)
       ? Response.json({ error: target.privateKey }, { status: 401 })
-      : Response.json({ challengeId: "id", challenge: "text" }));
+      : Response.json({ challengeId: "id", challenge: main.publicKey,
+        expiresAt: new Date(Date.now() + 300000).toISOString() }));
     expect(JSON.parse(await resolveVaultExec(request(), config))).toEqual(failure);
     expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/fetch"))).toBe(false);
   });
 
   it.each([undefined, "", "session=", "bare"])("refuses absent/malformed auth cookie %#", async (cookie) => {
     fetchMock.mockImplementation(async (url: string) => url.endsWith("/challenge")
-      ? Response.json({ challengeId: "id", challenge: "text" })
-      : Response.json({}, cookie === undefined ? {} : { headers: { "set-cookie": cookie } }));
+      ? Response.json({ challengeId: "id", challenge: main.publicKey,
+        expiresAt: new Date(Date.now() + 300000).toISOString() })
+      : Response.json({ did: main.did }, cookie === undefined ? {} : { headers: { "set-cookie": cookie } }));
     expect(JSON.parse(await resolveVaultExec(request(), config))).toEqual(failure);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
