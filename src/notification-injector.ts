@@ -789,6 +789,10 @@ export const WAKE_RUNTIME_HOOKS = [
   "llm_output", "llm_input", "subagent_spawned",
 ] as const;
 
+function wakeIdentityPrefix(agentId: string | undefined): string {
+  return agentId ? `${agentId}:` : "";
+}
+
 export function createNotificationInjector(
   api: any,
   wsNotifications: WsNotificationsConfig | undefined,
@@ -808,7 +812,7 @@ export function createNotificationInjector(
   const targetSession = wsNotifications?.targetSession?.trim() || DEFAULT_WAKE_SESSION;
   const hookAgentId = wsNotifications?.hookAgentId?.trim() || DEFAULT_HOOK_AGENT_ID;
   const configuredWakeKey = wsNotifications?.wakeSessionKey?.trim() || targetSession;
-  const identityPrefix = deps.identityScope ? `${deps.identityScope}:` : "";
+  const identityPrefix = wakeIdentityPrefix(deps.identityScope);
   // The gateway re-scopes agent-prefixed hook keys to the selected target agent.
   const wakeSessionKey = configuredWakeKey.replace(/^agent:[^:]+:/, `agent:${hookAgentId}:`);
   const sessionPerWake = Boolean(wsNotifications?.wakePacket) || wsNotifications?.sessionPerWake !== false;
