@@ -94,7 +94,12 @@ async function loadBootstrap(config: VaultExecConfig) {
   if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash
     || url.pathname !== "/") throw new Error(FAILURE);
   // Reuse ONLY the already-configured bootstrap identity, never the target ref.
-  const signer = await signerFromValue(await readFile(main.keypairPath, "utf8"), config.consumerDid);
+  const stored = JSON.parse(await readFile(main.keypairPath, "utf8"));
+  const signer = await signerFromValue({
+    did: stored.did,
+    publicKey: stored.publicKeyHex || stored.keypair?.publicKey || stored.publicKey,
+    privateKey: stored.privateKey || stored.keypair?.privateKey,
+  }, config.consumerDid);
   const client = new ImajinClient({ nodeUrl: url.origin, did: config.consumerDid, signer, transport });
   return { client, origin: url.origin };
 }
@@ -120,14 +125,15 @@ export async function resolveVaultExec(raw: string, input: unknown): Promise<str
     const values: Record<string, string> = Object.create(null);
     const errors: Record<string, { code: string }> = Object.create(null);
     // Lazy bootstrap: an unmapped ref never authenticates or guesses a grant.
-    let bootstrap: Awaited<ReturnType<typeof loadBootstrap>> | undefined;
-    for (const id of ids) {
+    let bootstrap: ReturnType<typeof loadBootstrap> | undefined;
+    await Promise.all(ids.map(async (id) => {
       try {
         if (!Object.hasOwn(config.grants, id)) throw new Error(FAILURE);
-        bootstrap ??= await loadBootstrap(config);
-        const cookie = await bootstrap.client.authenticatedCookie();
+        bootstrap ??= loadBootstrap(config);
+        const { client, origin } = await bootstrap;
+        const cookie = await client.authenticatedCookie();
         const response = await transport(
-          `${bootstrap.origin}/auth/api/vault/delegation/grants/${encodeURIComponent(config.grants[id])}/fetch`,
+          `${origin}/auth/api/vault/delegation/grants/${encodeURIComponent(config.grants[id])}/fetch`,
           { method: "POST", headers: {
             Cookie: cookie, "X-Agent-DID": config.consumerDid,
             "Content-Type": "application/json", Accept: "application/json",
@@ -142,7 +148,7 @@ export async function resolveVaultExec(raw: string, input: unknown): Promise<str
         // Never return upstream messages, status text, cookies, or parser excerpts.
         errors[id] = { code: "UNAVAILABLE" };
       }
-    }
+    }));
     const output = JSON.stringify({ protocolVersion: 1, values, errors });
     if (Buffer.byteLength(output) > MAX_BYTES) throw new Error(FAILURE);
     return output;

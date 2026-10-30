@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as ed from "@noble/ed25519";
 import { AgentIdentities, publicKeyDid, resolveAgentSigner, signerFromValue } from "./agent-identities.js";
 import { parseVaultExecConfig, resolveVaultExec, runVaultExec } from "./vault-exec.js";
@@ -13,6 +13,8 @@ vi.mock("openclaw/plugin-sdk/secret-ref-runtime", () => ({ resolveSecretRefValue
 
 const request = (ids = ["artifact-identity"]) =>
   JSON.stringify({ protocolVersion: 1, provider: "imajin-vault", ids });
+// Compare digests so assertion diagnostics cannot print throwaway private material.
+const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 const failure = { protocolVersion: 1, values: {}, errors: { "artifact-identity": { code: "UNAVAILABLE" } } };
 const config = { gatewayConfigPath: "/gateway.json", consumerDid: "", grants: { "artifact-identity": "grant_artifact" } };
 let main: { did: string; publicKey: string; privateKey: string };
@@ -51,7 +53,7 @@ beforeEach(async () => {
     wire.push({ url, init });
     if (url.endsWith("/challenge")) {
       const body = JSON.parse(init.body as string);
-      expect(body.did === main.did).toBe(true);
+      expect(body.did).toBe(main.did);
       return Response.json({ challengeId: "challenge-id", challenge: "challenge-text",
         expiresAt: new Date(Date.now() + 300000).toISOString() });
     }
@@ -72,8 +74,7 @@ describe("imajin-vault exec provider", () => {
     "authenticates as the explicit main consumer, not the personal/org acting principal %#", async (actAs) => {
       gateway.plugins.entries.imajin.config.actAs = actAs;
       const response = JSON.parse(await resolveVaultExec(request(), config));
-      // Boolean comparisons avoid printing generated throwaway keys in assertion failures.
-      expect(response.values["artifact-identity"] === JSON.stringify(target)).toBe(true);
+      expect(digest(response.values["artifact-identity"])).toBe(digest(JSON.stringify(target)));
       expect(response.errors).toEqual({});
       const fetch = wire[2];
       expect(fetch.url).toBe("https://kernel.invalid/auth/api/vault/delegation/grants/grant_artifact/fetch");
@@ -167,6 +168,16 @@ describe("imajin-vault exec provider", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it.each(["nested", "publicKeyHex"])("supports the existing main keypair file format %s", async (format) => {
+    const stored = format === "nested"
+      ? { did: main.did, keypair: { publicKey: main.publicKey, privateKey: main.privateKey } }
+      : { ...main, publicKey: "public-base58-compat", publicKeyHex: main.publicKey };
+    mocks.read.mockImplementation(async (path: string) =>
+      JSON.stringify(path === "/gateway.json" ? gateway : stored));
+    const response = JSON.parse(await resolveVaultExec(request(), config));
+    expect(digest(response.values["artifact-identity"])).toBe(digest(JSON.stringify(target)));
+  });
+
   it.each([
     "", "not-json", "null", "[]", "{}", JSON.stringify({ protocolVersion: 2, provider: "imajin-vault", ids: ["a"] }),
     JSON.stringify({ protocolVersion: 1, provider: "other", ids: ["a"] }),
@@ -197,6 +208,27 @@ describe("imajin-vault exec provider", () => {
     expect(Object.keys(response.values)).toEqual(["artifact-identity"]);
     expect(response.errors).toEqual({ missing: { code: "UNAVAILABLE" } });
   });
+  it("coalesces bootstrap/auth across a batch but fetches every mapped grant", async () => {
+    const batch = { ...config, grants: { first: "grant_first", second: "grant_second" } };
+    const response = JSON.parse(await resolveVaultExec(request(["first", "second"]), batch));
+    expect(Object.keys(response.values).sort()).toEqual(["first", "second"]);
+    expect(wire.filter((row) => row.url.endsWith("/challenge"))).toHaveLength(1);
+    expect(wire.filter((row) => row.url.endsWith("/verify"))).toHaveLength(1);
+    expect(wire.filter((row) => row.url.endsWith("/fetch"))).toHaveLength(2);
+    expect(mocks.read.mock.calls.map(([path]) => path)).toEqual(["/gateway.json", "/existing-main.json"]);
+  });
+
+  it("rejects oversized aggregate output without emitting any partial values", async () => {
+    const batch = { ...config, grants: { first: "grant_first", second: "grant_second" } };
+    result = { ...(result as object), value: JSON.stringify(target).repeat(700) };
+    const out = vi.fn(), err = vi.fn();
+    mocks.read.mockImplementation(async (path: string) =>
+      JSON.stringify(path === "/provider.json" ? batch : path === "/gateway.json" ? gateway : main));
+    async function* stdin() { yield request(["first", "second"]); }
+    expect(await runVaultExec(["--config", "/provider.json"], stdin(), out, err)).toBe(1);
+    expect(out).not.toHaveBeenCalled();
+    expect(err).toHaveBeenCalledWith("imajin-vault: resolution unavailable\n");
+  });
 
   it("loads agents.<id>.keypair and removes it on the next refresh after revocation, with no value in tools or logs", async () => {
     const log = vi.spyOn(console, "log").mockImplementation(() => {});
@@ -212,7 +244,7 @@ describe("imajin-vault exec provider", () => {
     const identities = new AgentIdentities();
     await identities.prepare("https://kernel.invalid", agents, {}, resolveAgentSigner);
     const identity = identities.get("artifact");
-    expect(identity !== undefined).toBe(true);
+    expect(identity).toBeDefined();
     // A tool gets only public identity data, never the keypair/protocol payload.
     vi.spyOn(identity!.client, "lookupIdentity").mockResolvedValue({ did: target.did, scope: "actor", subtype: "agent" });
     const tool = createIdentityTool(identity!.client);
@@ -232,6 +264,15 @@ describe("imajin-vault exec provider", () => {
     let caught: unknown;
     try { await signerFromValue(`invalid${target.privateKey}`, target.did); } catch (error) { caught = error; }
     expect(String(caught)).toBe("Error: Identity keypair unavailable");
+  });
+  it("rejects public-DID and private/public mismatches using only generated throwaway keys", async () => {
+    const invalid = [
+      { ...target, publicKey: main.publicKey }, { ...target, privateKey: main.privateKey },
+      { ...target, privateKey: 1 }, null,
+    ];
+    await Promise.all(invalid.map(async (key) => {
+      await expect(signerFromValue(key, target.did)).rejects.toThrow("Identity keypair unavailable");
+    }));
   });
 
   it("CLI writes only the private protocol response, with no stderr or secret file writes", async () => {
