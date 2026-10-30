@@ -77,7 +77,8 @@
 import { readFile } from "node:fs/promises";
 import * as path from "node:path";
 import { RegistrationLifecycle } from "./registration-lifecycle.js";
-import { canonicalize, signMessage, type SignedMessage } from "./approval-bridge.js";
+import { canonicalize, signMessage, type SignedMessage, type MessageSigner } from "./approval-bridge.js";
+import type { ImajinSigner } from "./client.js";
 import { assertJsonStable } from "./approval-json.js";
 import { ApprovalExecutionRegistry, type ApprovalLoopBinding } from "./approval-execution.js";
 export type { ApprovalLoopBinding } from "./approval-execution.js";
@@ -259,7 +260,7 @@ export function buildDigestFields(params: {
 export async function buildApprovalRequestedPayload(
   sourceId: string,
   request: ApprovalSourceRequest,
-  signer: { did: string; privateKeyHex: string },
+  signer: MessageSigner,
 ): Promise<KernelApprovalRequestedPayload> {
   const digestFields = buildDigestFields({
     proposalId: request.proposalId,
@@ -271,7 +272,9 @@ export async function buildApprovalRequestedPayload(
   });
   const [contentHash, signature] = await Promise.all([
     computeContentHash(digestFields),
-    signCanonicalPayload(digestFields, signer.privateKeyHex),
+    "signer" in signer
+      ? signer.signer.signChallenge(canonicalize(digestFields))
+      : signCanonicalPayload(digestFields, signer.privateKeyHex),
   ]);
   return {
     ...digestFields,
@@ -508,7 +511,8 @@ export function resolveEnabledApprovalSourceIds(configured: string[] | undefined
 export interface GatewayApprovalsBridgeConfig {
   operatorDid: string;
   agentDid: string;
-  agentPrivateKeyHex: string;
+  agentPrivateKeyHex?: string;
+  agentSigner?: ImajinSigner;
   /**
    * Mirrors the kernel's `OPERATOR_COUNTERSIGN_REQUIRED` (#2082/#44): while
    * false (default), a decision missing `operatorSignature` is still
@@ -1054,10 +1058,7 @@ export class GatewayApprovalsBridge {
       } : {}),
     };
     try {
-      return await buildApprovalRequestedPayload(sourceId, { ...request, detail }, {
-        did: this.config.agentDid,
-        privateKeyHex: this.config.agentPrivateKeyHex,
-      });
+      return await buildApprovalRequestedPayload(sourceId, { ...request, detail }, this.messageSigner());
     } catch (err) {
       if (this.disposed) return;
       this.logger.error(`failed to sign operator.approval.requested for ${proposalId}: ${String(err)}`);
@@ -1144,6 +1145,15 @@ export class GatewayApprovalsBridge {
     if (!this.disposed) this.sources.get(sourceId)?.onPublishFailed?.(proposalId, failure);
   }
 
+  private messageSigner(): MessageSigner {
+    if (this.config.agentSigner) {
+      if (this.config.agentSigner.did !== this.config.agentDid) throw new Error("Signing identity mismatch");
+      return { did: this.config.agentDid, signer: this.config.agentSigner };
+    }
+    if (!this.config.agentPrivateKeyHex) throw new Error("Approval signing identity unavailable");
+    return { did: this.config.agentDid, privateKeyHex: this.config.agentPrivateKeyHex };
+  }
+
   /** Authenticated reconnect replay: closed sockets may have dropped startup bindings. */
   async republishApprovalBindings(): Promise<void> {
     if (this.disposed) return;
@@ -1174,11 +1184,7 @@ export class GatewayApprovalsBridge {
       };
       this.executionRegistry.bind(payload);
       if (!this.publishApprovalBinding) return;
-      const binding = await signMessage(payload, {
-        did: this.config.agentDid,
-        type: "agent",
-        privateKeyHex: this.config.agentPrivateKeyHex,
-      });
+      const binding = await signMessage(payload, { ...this.messageSigner(), type: "agent" });
       if (this.disposed) return;
       await this.publishApprovalBinding(binding);
     } catch (err) {
@@ -1645,11 +1651,9 @@ async function resolveApprovalsSecret(
         const trimmed = typeof value === "string" ? value.trim() : "";
         if (trimmed) return { value: trimmed, source: "secretRef" };
       }
-    } catch (err: unknown) {
+    } catch {
       console.warn(
-        `[imajin-approvals-bridge] SecretRef for ${envVar} failed to resolve: ${
-          err instanceof Error ? err.message : String(err)
-        } — falling back`,
+        `[imajin-approvals-bridge] SecretRef for ${envVar} failed to resolve — falling back`,
       );
     }
   } else if (typeof raw === "string" && raw.trim()) {
@@ -1694,6 +1698,7 @@ export interface StartGatewayApprovalsBridgeDeps {
   signal?: AbortSignal;
   did?: string;
   keypairPath?: string;
+  signer?: ImajinSigner;
   nodeUrl: string;
   /**
    * Wires the opt-in `"imajin-catalog"` source (#36 item 3). Omitted unless
@@ -1909,7 +1914,7 @@ async function prepareBridgeCredentials(
   config: ApprovalsBridgePluginConfig | undefined,
   deps: StartGatewayApprovalsBridgeDeps,
   resources: RegistrationLifecycle,
-): Promise<{ keypair: Keypair; gatewayToken?: string; notifySecret: string } | undefined> {
+): Promise<{ identity: { agentSigner: ImajinSigner } | { agentPrivateKeyHex: string }; gatewayToken?: string; notifySecret: string } | undefined> {
   if (!isApprovalsBridgeConfigured(config, deps.did)) {
     if (config?.enabled) {
       console.warn(
@@ -1932,16 +1937,21 @@ async function prepareBridgeCredentials(
     return undefined;
   }
 
-  let keypair: Keypair;
+  let identity: { agentSigner: ImajinSigner } | { agentPrivateKeyHex: string };
   try {
-    keypair = await loadAgentKeypair(deps.keypairPath!);
-  } catch (err) {
-    console.error(`[imajin-approvals-bridge] failed to load agent keypair: ${String(err)}`);
+    if (deps.signer) {
+      if (deps.signer.did !== deps.did) throw new Error("Signing identity mismatch");
+      identity = { agentSigner: deps.signer };
+    } else {
+      identity = { agentPrivateKeyHex: (await loadAgentKeypair(deps.keypairPath!)).privateKeyHex };
+    }
+  } catch {
+    console.error("[imajin-approvals-bridge] agent signing identity unavailable");
     return undefined;
   }
 
   if (!resources.active) return undefined;
-  return { keypair, gatewayToken: gatewayTokenResult.value, notifySecret: notifySecretResult.value };
+  return { identity, gatewayToken: gatewayTokenResult.value, notifySecret: notifySecretResult.value };
 }
 
 async function loadApprovalsState(deps: StartGatewayApprovalsBridgeDeps, operatorDid: string): Promise<ApprovalsStateStore> {
@@ -1972,7 +1982,7 @@ async function startOwnedGatewayApprovalsBridge(
 ): Promise<StartedGatewayApprovalsBridge | undefined> {
   const credentials = await prepareBridgeCredentials(api, config, deps, resources);
   if (!credentials) return undefined;
-  const { keypair, gatewayToken, notifySecret } = credentials;
+  const { identity, gatewayToken, notifySecret } = credentials;
   const stateStore = await loadApprovalsState(deps, config!.operatorDid!);
   const cursorStore = await loadApprovalsCursor(deps);
   const kernel = createHttpKernelNotifyClient({
@@ -2008,7 +2018,7 @@ async function startOwnedGatewayApprovalsBridge(
     {
       operatorDid: config!.operatorDid!,
       agentDid: deps.did!,
-      agentPrivateKeyHex: keypair.privateKeyHex,
+      ...identity,
       requireOperatorCountersignature: config!.requireOperatorCountersignature ?? false,
     },
     sources,

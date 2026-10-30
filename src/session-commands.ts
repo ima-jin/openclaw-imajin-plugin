@@ -52,6 +52,7 @@ import type { SessionGateway, SessionApprovalKind } from "./session-command-gate
 import { SessionGatewayFailure } from "./session-command-gateway.js";
 import { createLoopTracker, type LoopTracker, type LocalLoopTarget, isPrimarySessionKey } from "./loop-tracker.js";
 import { ApprovalExecutionRegistry } from "./approval-execution.js";
+import type { ImajinSigner } from "./client.js";
 
 export const SESSION_COMMAND_TYPES = [
   "session.send",
@@ -262,11 +263,13 @@ export type SessionCommandAttester = (
  */
 export function createSessionCommandAttester(opts: {
   did: string;
-  keypairPath: string;
+  keypairPath?: string;
+  signer?: ImajinSigner;
   send: (frame: unknown) => void;
 }): SessionCommandAttester {
   let key: Promise<string> | undefined;
   const loadKey = (): Promise<string> => {
+    if (!opts.keypairPath) return Promise.reject(new Error("Command signing identity unavailable"));
     key ??= readFile(opts.keypairPath, "utf-8")
       .then((raw) => {
         const parsed = JSON.parse(raw) as { privateKey?: string; keypair?: { privateKey?: string } };
@@ -282,10 +285,11 @@ export function createSessionCommandAttester(opts: {
   };
 
   return async (eventType, payload) => {
+    const identity = opts.signer ? { signer: opts.signer } : { privateKeyHex: await loadKey() };
     const attestation: SignedMessage<SessionCommandAttestationPayload> = await signMessage(payload, {
       did: opts.did,
       type: "agent",
-      privateKeyHex: await loadKey(),
+      ...identity,
     });
     opts.send({ type: eventType, attestation });
   };
@@ -300,6 +304,8 @@ export interface SessionCommandLogger {
 }
 
 export interface SessionCommandExecutorConfig {
+  /** Map mode: never attribute a tenant session or spawn to the gateway identity. */
+  localAgentId?: string;
   /** This agent's DID — commands must be addressed to exactly this. */
   agentDid: string;
   /** Pinned Ed25519 public key (hex) of the kernel's command-signing key. The only trusted grant signer. */
@@ -487,10 +493,12 @@ export function createSessionCommandExecutor(
     if (loopId !== undefined) {
       const target = loops.resolveLoop(loopId as string);
       if (target?.agentDid !== config.agentDid) throw new Rejection("loop_not_found");
+      assertLocalSession(target.sessionKey);
       if (sessionKey !== undefined && sessionKey !== target.sessionKey) throw new Rejection("loop_target_mismatch");
       return target;
     }
     if (!nonEmpty(sessionKey, 512)) invalid("loopId or local sessionKey is required");
+    assertLocalSession(sessionKey);
     // Compatibility for local key callers only. Never infer a key from a loop
     // id and never fall back to a supplied key after a failed loop lookup.
     let target = loops.lookupSession(sessionKey);
@@ -504,16 +512,29 @@ export function createSessionCommandExecutor(
   }
   type CommandPayload = Record<string, unknown>;
 
+  function assertLocalSession(sessionKey: string): void {
+    if (config.localAgentId && !sessionKey.startsWith(`agent:${config.localAgentId}:`)) {
+      throw new Rejection("loop_target_mismatch");
+    }
+  }
+
+  function assertLocalAgent(agentId: unknown): void {
+    if (config.localAgentId && agentId !== undefined && agentId !== config.localAgentId) {
+      throw new Rejection("loop_target_mismatch");
+    }
+  }
+
   async function send(command: SessionCommandFrame, p: CommandPayload, result: ExecutionResult): Promise<void> {
     if (!nonEmpty(p.message, MAX_TEXT_LENGTH)) invalid("message is required");
     if (!optional(p.agentId)) invalid("agentId must be a short string");
+    assertLocalAgent(p.agentId);
     const target = resolveTarget(p.loopId, p.sessionKey);
     address(result, target);
     claimConvertedApproval(command, p, result);
     const { runId } = await deps.gateway.send({
       sessionKey: target.sessionKey,
       message: p.message,
-      agentId: p.agentId as string | undefined,
+      agentId: config.localAgentId ?? p.agentId as string | undefined,
       idempotencyKey: command.commandId,
     });
     result.runId = runId;
@@ -578,6 +599,7 @@ export function createSessionCommandExecutor(
         !optional(p.label) || !optional(p.agentId) || !optional(p.group) || !optional(p.model)) {
       invalid("parentLoopId/parentSessionKey/label/agentId/group/model must be short strings");
     }
+    assertLocalAgent(p.agentId);
     const parent = p.parentLoopId !== undefined || p.parentSessionKey !== undefined
       ? resolveTarget(p.parentLoopId, p.parentSessionKey) : undefined;
     if (parent) address(result, parent);
@@ -586,12 +608,13 @@ export function createSessionCommandExecutor(
       task: p.task,
       parentSessionKey: parent?.sessionKey,
       label: p.label as string | undefined,
-      agentId: p.agentId as string | undefined,
+      agentId: config.localAgentId ?? p.agentId as string | undefined,
       group: p.group as string | undefined,
       model: p.model as string | undefined,
       idempotencyKey: command.commandId,
     });
     if (!nonEmpty(sessionKey, 512)) throw new Rejection("gateway_error", "spawn returned no child session");
+    assertLocalSession(sessionKey);
     const child = loops.registerSpawn({ sessionKey, parentLoopId: parent?.loopId });
     address(result, child);
     result.childLoopId = child.loopId;

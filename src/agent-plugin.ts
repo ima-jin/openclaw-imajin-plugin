@@ -1,5 +1,7 @@
 import { ImajinChat } from "./chat.js";
-import { AgentIdentities, AGENT_TOOL_NAMES, agentNotifications, resolveAgentSigner, type AgentIdentityConfig } from "./agent-identities.js";
+import { AgentIdentities, AGENT_TOOL_NAMES, agentNotifications, resolveAgentSigner, type AgentIdentityConfig, type AgentIdentity } from "./agent-identities.js";
+import { registerGatewayFeatures, type ApprovalBridgeSettings, type SessionCommandsSettings } from "./gateway-features.js";
+import type { ApprovalsBridgePluginConfig } from "./gateway-approvals-bridge.js";
 import { ImajinWsService, isNotificationFrame } from "./ws-service.js";
 import { createNotificationInjector, WAKE_RUNTIME_HOOKS } from "./notification-injector.js";
 import { createReachEventHandler, isReachFrame } from "./reach-events.js";
@@ -19,6 +21,16 @@ interface AgentToolContext {
   runId?: string;
 }
 
+export interface GatewayAgentIdentity extends AgentIdentity {
+  agentId: string;
+  ws: ImajinWsService;
+}
+
+export interface AgentPluginRegistration {
+  /** Active resolved gateway identity only; cleared on stop/replacement. */
+  getGatewayIdentity: () => GatewayAgentIdentity | undefined;
+}
+
 /** Match trusted host hook context, never a tool argument or kernel payload. */
 function ownsHook(agentId: string, event: any, ctx?: AgentToolContext): boolean {
   const sessionKey = ctx?.sessionKey ?? event?.sessionKey;
@@ -31,21 +43,33 @@ function ownsHook(agentId: string, event: any, ctx?: AgentToolContext): boolean 
 export function registerAgentPlugin(api: any, config: {
   nodeUrl?: string;
   agents?: Record<string, AgentIdentityConfig>;
+  gatewayAgent?: string;
+  approvals?: ApprovalsBridgePluginConfig;
+  approvalBridge?: ApprovalBridgeSettings;
+  sessionCommands?: SessionCommandsSettings;
   inferProxyBaseUrl?: string;
   mcpUrl?: string;
-}): void {
+}): AgentPluginRegistration {
   const identities = new AgentIdentities();
+  let gatewayIdentity: GatewayAgentIdentity | undefined;
   const senders = new Map<string, WakeDisclosureSender>();
   // A Gateway-wide provider cannot safely select an agent's catalog session.
   // Keep registration/health diagnostics, but never borrow main's credentials.
   const provider = registerImajinProvider(api, { inferProxyBaseUrl: config.inferProxyBaseUrl }, {});
   const runtime = new PluginServiceRuntime(api.registrationMode, async (lifecycle, on) => {
-    lifecycle.add(() => { identities.clear(); senders.clear(); });
-    if (!config.nodeUrl || !config.agents || typeof config.agents !== "object" || Array.isArray(config.agents)) return;
+    lifecycle.add(() => { identities.clear(); senders.clear(); gatewayIdentity = undefined; });
+    const warnGateway = () => console.warn("[imajin-plugin] gatewayAgent unavailable; approvals and session commands disabled");
+    if (!config.nodeUrl || !config.agents || typeof config.agents !== "object" || Array.isArray(config.agents)) {
+      warnGateway();
+      return;
+    }
     await identities.prepare(
       config.nodeUrl, config.agents, api.runtime?.config?.current?.() ?? api.config ?? {},
       resolveAgentSigner, () => lifecycle.active,
     );
+    if (!lifecycle.active) return;
+    const selected = typeof config.gatewayAgent === "string" ? identities.get(config.gatewayAgent) : undefined;
+    if (!selected) warnGateway();
     const starts: Promise<void>[] = [];
     for (const [agentId, identity] of identities.entries()) {
       if (!lifecycle.active) return;
@@ -56,6 +80,17 @@ export function registerAgentPlugin(api: any, config: {
         invalidateAuthentication: () => identity.client.invalidateAuthentication(),
       });
       lifecycle.add(() => ws.stop());
+      let gatewayFeatures: ReturnType<typeof registerGatewayFeatures> | undefined;
+      if (identity === selected) {
+        gatewayIdentity = { ...identity, agentId, ws };
+        gatewayFeatures = registerGatewayFeatures(api, {
+          nodeUrl: config.nodeUrl,
+          did: identity.config.did, actAs: identity.config.actAs, signer: identity.signer,
+          localAgentId: agentId, wsNotifications: notifications,
+          approvals: config.approvals, approvalBridge: config.approvalBridge,
+          sessionCommands: config.sessionCommands,
+        }, identity.client, ws, lifecycle);
+      }
       const injector = createNotificationInjector(api, notifications, {
         identityScope: agentId, sendFrame: (frame) => ws.send(frame),
       });
@@ -76,12 +111,13 @@ export function registerAgentPlugin(api: any, config: {
         { name: `imajin-agent:${agentId}:agent_end` });
       ws.onFrame((frame) => {
         if (!lifecycle.active) return;
+        if (gatewayFeatures?.handleFrame(frame)) return;
         if (isReachFrame(frame)) {
           void reach.handle(frame).catch(() => console.warn("[imajin-plugin] agent reach delivery failed"));
         } else if (isNotificationFrame(frame)) {
           void injector.inject(frame).catch(() => console.warn("[imajin-plugin] agent notification delivery failed"));
         }
-        // Gateway-wide approvals/session commands are deliberately not inherited.
+        // Tenant sockets never reach gateway handlers, including malformed frames.
       });
       starts.push(ws.start().then(() => { if (!lifecycle.active) ws.stop(); }));
     }
@@ -126,4 +162,5 @@ export function registerAgentPlugin(api: any, config: {
     }
   }
   api.registerService({ id: "imajin-ws", start: runtime.start, stop: runtime.stop });
+  return { getGatewayIdentity: () => gatewayIdentity };
 }

@@ -25,6 +25,7 @@ export interface AgentIdentityConfig {
 export interface AgentIdentity {
   config: AgentIdentityConfig;
   client: ImajinClient;
+  signer: ImajinSigner;
 }
 
 const AGENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
@@ -134,6 +135,7 @@ export class AgentIdentities {
         if (!active()) return;
         this.identities.set(id, {
           config: entry,
+          signer,
           client: new ImajinClient({ nodeUrl, did: entry.did, actAs: entry.actAs, signer }),
         });
       } catch {
