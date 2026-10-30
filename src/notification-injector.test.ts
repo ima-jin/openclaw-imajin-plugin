@@ -502,6 +502,31 @@ describe("createNotificationInjector — wake hook request shape", () => {
       delete process.env[HOOK_TOKEN_ENV];
     }
   });
+
+  it("completion clears an agent-namespaced pending admission without leaving a replay marker (#136)", async () => {
+    const { api } = makeApi();
+    const stateDir = await mkdtemp(join(tmpdir(), "agent-pending-wake-"));
+    setImpl(async () => jsonResponse(503, { runId: "pending-tenant" }));
+    const injector = createNotificationInjector(api, {
+      ...CONFIG, stateDir, targetSession: "agent:tenant:warp-events", hookAgentId: "tenant",
+    }, { identityScope: "tenant", abortWake: async () => {} });
+    try {
+      await injector.inject(frame("pending"));
+      await vi.advanceTimersByTimeAsync(COALESCE_MS);
+      const store = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+      await store.load();
+      expect(store.all()).toHaveLength(1);
+      await injector.onAgentEnd?.({
+        runId: "pending-tenant", sessionKey: "agent:tenant:warp-events", success: true,
+        messages: [{ role: "assistant", content: "Completed tenant work" }],
+      });
+      await store.load();
+      expect(store.all()).toHaveLength(0);
+    } finally {
+      await injector.dispose();
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("createNotificationInjector — wake hook outcomes (#18)", () => {
@@ -707,7 +732,7 @@ describe("createNotificationInjector — idempotency key (#18)", () => {
     const injectors = ["main", "tenant"].map((agentId) => createNotificationInjector(api, {
       ...CONFIG, targetSession: `agent:${agentId}:warp-events`, hookAgentId: agentId,
       reportTo: [`agent:${agentId}:operator`],
-    }, { identityScope: agentId }));
+    }, { identityScope: agentId, abortWake: async () => {} }));
     try {
       await Promise.all(injectors.map((injector) => injector.inject(frame("same-notification"))));
       await vi.advanceTimersByTimeAsync(COALESCE_MS);

@@ -14,6 +14,13 @@ export function validateDid(did: string): boolean {
   return DID_PATTERN.test(did);
 }
 
+function extractSessionCookie(header: string | null): string | undefined {
+  const cookie = header?.split(";", 1)[0];
+  if (!cookie) return undefined;
+  const separator = cookie.indexOf("=");
+  return separator > 0 && separator < cookie.length - 1 ? cookie : undefined;
+}
+
 /** Private material stays behind this capability, never in tool/config objects. */
 export interface ImajinSigner {
   did: string;
@@ -423,17 +430,11 @@ export class ImajinClient {
     }
 
     // Step 4: Extract session cookie
-    const setCookie = verifyRes.headers.get("set-cookie");
-    if (this.signer && !setCookie?.match(/([^=]+)=([^;]+)/)) {
+    const cookie = extractSessionCookie(verifyRes.headers.get("set-cookie"));
+    if (this.signer && !cookie) {
       throw new Error("Imajin auth returned no session cookie");
     }
-    if (setCookie) {
-      // Extract the session token from set-cookie header
-      const match = setCookie.match(/([^=]+)=([^;]+)/);
-      if (match) {
-        this.sessionCookie = `${match[1]}=${match[2]}`;
-      }
-    }
+    if (cookie) this.sessionCookie = cookie;
 
     // Session expires when the challenge would have expired (5 min),
     // but the JWT likely has a longer TTL. Refresh conservatively.

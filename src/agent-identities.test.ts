@@ -130,6 +130,10 @@ describe("sealed per-agent config", () => {
       hookAgentId: "tenant", stateDir: "/state/tenant", reportTo: ["agent:tenant:channel:operator"],
     });
     expect(agentNotifications("main", agent("main")).stateDir).not.toBe(agentNotifications("tenant", agent("tenant")).stateDir);
+    tenant.wsNotifications = { targetSession: "custom", wakeSessionKey: "wakes:{batchId}" };
+    expect(agentNotifications("tenant", tenant)).toMatchObject({
+      targetSession: "agent:tenant:custom", wakeSessionKey: "agent:tenant:wakes:{batchId}",
+    });
   });
 
   it("manifest only allows sealed refs and matches the runtime tool allowlist", async () => {
@@ -208,9 +212,11 @@ describe("two-agent challenge-response wire proof", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("never sends a tool request if verification returns no session cookie", async () => {
+  it.each([undefined, "", "=value", "session=", "bare", ";session=value"])(
+    "never sends a tool request if verification returns a missing or malformed session cookie %#", async (cookie) => {
     const fetch = vi.fn(async (url: string) => Response.json(url.endsWith("/challenge")
-      ? { challengeId: "tenant", challenge: "public-challenge" } : {}));
+      ? { challengeId: "tenant", challenge: "public-challenge" } : {},
+      cookie === undefined ? {} : { headers: { "set-cookie": cookie } }));
     vi.stubGlobal("fetch", fetch);
     const client = new ImajinClient({
       nodeUrl: "https://kernel.invalid", did: "did:imajin:tenant",

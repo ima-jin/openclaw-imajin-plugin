@@ -37,7 +37,7 @@ export function publicKeyDid(publicKey: string): string {
     encoded = alphabet[Number(number % 58n)] + encoded;
     number /= 58n;
   }
-  const leadingZeros = publicKey.match(/^(?:00)*/)?.[0].length ?? 0;
+  const leadingZeros = /^(?:00)*/.exec(publicKey)?.[0].length ?? 0;
   return `did:imajin:${"1".repeat(leadingZeros / 2)}${encoded}`;
 }
 
@@ -95,7 +95,7 @@ export async function resolveAgentSigner(
 /** Never merges top-level identity, targets, reports, approvals, or state into an agent. */
 export function agentNotifications(agentId: string, config: AgentIdentityConfig): WsNotificationsConfig {
   const notifications = config.wsNotifications;
-  const scope = (key: string) => key.replace(/^agent:[^:]+:/, `agent:${agentId}:`);
+  const scope = (key: string) => `agent:${agentId}:${key.replace(/^agent:[^:]*:/, "")}`;
   const targetSession = scope(notifications?.targetSession?.trim() || `agent:${agentId}:warp-events`);
   const stateRoot = notifications?.stateDir ?? join(homedir(), ".openclaw", "imajin-agents");
   return {

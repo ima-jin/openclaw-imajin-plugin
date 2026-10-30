@@ -808,6 +808,7 @@ export function createNotificationInjector(
   const targetSession = wsNotifications?.targetSession?.trim() || DEFAULT_WAKE_SESSION;
   const hookAgentId = wsNotifications?.hookAgentId?.trim() || DEFAULT_HOOK_AGENT_ID;
   const configuredWakeKey = wsNotifications?.wakeSessionKey?.trim() || targetSession;
+  const identityPrefix = deps.identityScope ? `${deps.identityScope}:` : "";
   // The gateway re-scopes agent-prefixed hook keys to the selected target agent.
   const wakeSessionKey = configuredWakeKey.replace(/^agent:[^:]+:/, `agent:${hookAgentId}:`);
   const sessionPerWake = Boolean(wsNotifications?.wakePacket) || wsNotifications?.sessionPerWake !== false;
@@ -925,7 +926,7 @@ export function createNotificationInjector(
       const outcome = buildWakeOutcome(batch.runs.map((r) => r.runId), event);
       await bridge.recordOutcome(outcome);
       if (event.wakeWatchdog !== true) {
-        await pendingWakeStore.delete(batch.batchId.replace(/^imajin-wake:/, ""));
+        await pendingWakeStore.delete(batch.batchId.slice(`imajin-wake:${identityPrefix}`.length));
       }
       if (horizon) {
         await withWakeDeadline(horizon.writeStepEvents(outcome)).catch(() => {
@@ -1306,7 +1307,6 @@ export function createNotificationInjector(
     // Evidence, not instructions (#22): one entry per run in the batch, no
     // imperative sentences — see `buildWakeTurnMessage`.
     await bridgeReady;
-    const identityPrefix = deps.identityScope ? `${deps.identityScope}:` : "";
     const idempotencyKey = `imajin-wake:${identityPrefix}${scope}:${windowStart}:${phase}`;
     const { packet, liveState, message } = await prepareWakeInput(scope, frames, idempotencyKey);
     if (lifecycle.signal.aborted) return;
