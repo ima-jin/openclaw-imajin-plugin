@@ -137,6 +137,11 @@ describe("map-mode gateway principal (#139)", () => {
     }));
     bridgeStart = vi.spyOn(approvals, "startGatewayApprovalsBridge");
   });
+  afterEach(async () => {
+    await beginRegistration().dispose();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+  });
 
   it("pins main for send/spawn and rejects an unexpected tenant spawn result without registering its loop", async () => {
     await ready(register());
@@ -181,11 +186,6 @@ describe("map-mode gateway principal (#139)", () => {
     expect(mocks.sockets[1].send).not.toHaveBeenCalled();
     await registration.stop();
     expect(exec.stop).toHaveBeenCalledOnce();
-  });
-  afterEach(async () => {
-    await beginRegistration().dispose();
-    vi.unstubAllGlobals();
-    vi.restoreAllMocks();
   });
 
   function register(overrides: Record<string, unknown> = {}) {
