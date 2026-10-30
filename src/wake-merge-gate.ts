@@ -173,9 +173,11 @@ function mcpMutation(event: WakeToolEvent): Mutation | undefined {
   const serialized = JSON.stringify(params);
   const approve = /approve.*pull.?request/.test(name)
     || (/review/.test(name) && String(params.event).toUpperCase() === "APPROVE");
-  const merge = /merge.*pull.?request|enqueue/.test(name);
+  const merge = /merge.*pull.?request|enqueue/.test(name)
+    || (/pull.?request/.test(name) && /^(?:merge|enqueue)$/i.test(String(params.method ?? params.action)));
   const graph = /enqueuePullRequest|mergePullRequest|addPullRequestReview/.test(serialized);
   if (!approve && !merge && !graph) return;
+  if (merge) return { approve: false, body: "" };
   if (graph) return graphqlMutation(params.query);
   const target = validatedWakePrUrl(params.pullRequestUrl ?? params.url)
     ?? url(`${params.owner}/${params.repo}`, params.pullNumber ?? params.pull_number ?? params.number);

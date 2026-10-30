@@ -180,7 +180,6 @@ describe("fresh wake bridge (#79)", () => {
   let config: WsNotificationsConfig;
   let api: any;
   const injectors: Array<ReturnType<typeof createNotificationInjector>> = [];
-  const configurations = new WeakMap<ReturnType<typeof createNotificationInjector>, WsNotificationsConfig>();
   const alerts = () => vi.mocked(sendDirectChannelMessage).mock.calls.filter(([, text]) => text.includes("automatic wake failed"));
   const posted = async (count: number) => vi.waitFor(() => expect(posts).toHaveLength(count), { interval: 5 });
 
@@ -208,22 +207,14 @@ describe("fresh wake bridge (#79)", () => {
 
   function create(settings = config, deps: Parameters<typeof createNotificationInjector>[2] = {}) {
     const injector = createNotificationInjector(api, settings, deps);
-    configurations.set(injector, settings);
     injectors.push(injector);
     return injector;
   }
 
   async function finish(injector: ReturnType<typeof create>, index: number, event: AgentEndEvent = {}) {
     if (!Object.keys(event).length) {
-      const settings = configurations.get(injector)!;
-      const key = settings.reportTo?.[0]?.split(":");
-      const channel = key?.[2] ?? settings.directSend?.channel ?? "telegram";
-      const target = key?.slice(4).join(":") ?? settings.directSend?.target;
-      await injector.runtimeHooks.after_tool_call({
-        toolName: "message", toolCallId: `report-${index}`,
-        params: { action: "send", channel, target, message: "Reviewed; PR awaiting review" },
-        result: { ok: true },
-      }, { sessionKey: posts[index].sessionKey, runId: `runner-${index + 1}` });
+      await injector.reportWake({ sessionKey: posts[index].sessionKey, runId: `runner-${index + 1}` },
+        { outcome: "completed", message: "Reviewed; PR awaiting review" });
     }
     await injector.onAgentEnd!({
       success: true, runId: `runner-${index + 1}`,
@@ -328,7 +319,7 @@ describe("fresh wake bridge (#79)", () => {
     await posted(1);
     await vi.waitFor(() => expect(alerts()).toHaveLength(1), { interval: 5 });
     expect(Object.keys(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes)).toHaveLength(1);
-    await finish(injector, 0);
+    await finish(injector, 0, { success: true });
     expect(JSON.parse(await readFile(join(dir, "pending-wakes.json"), "utf8")).wakes).toEqual({});
   });
 
@@ -475,7 +466,7 @@ describe("fresh wake bridge (#79)", () => {
     await injector.inject(frame("different-ids"));
     await posted(1);
     await finish(injector, 0);
-    await finish(injector, 0);
+    await finish(injector, 0, { success: true });
     expect(posts.filter((post) => post.name === "imajin-wake-report")).toHaveLength(1);
     expect(posts[1].message).toContain("Reviewed; PR awaiting review");
     expect(alerts()).toHaveLength(0);

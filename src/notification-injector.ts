@@ -939,6 +939,7 @@ export function createNotificationInjector(
   });
   const guards = new WakeGuards({
     maxTokens: maxWakeTokens,
+    outcomeReportsOnly: true,
     reportTo: disclosureTargets,
     alert: async (batch, reason) => {
       const evidence = [
@@ -960,7 +961,8 @@ export function createNotificationInjector(
       if (!guards.aliasSession(parent, child, runId, batchId)) void guards.stop(batchId, "decision child could not be supervised");
     },
     { wakeReadOnlyLookups: wsNotifications?.wakeReadOnlyLookups, githubCliPath: wsNotifications?.githubCliPath,
-      gradingSource: deps.gradingSource },
+      gradingSource: deps.gradingSource,
+      reportBlockedDelegation: (batchId, reason) => guards.stop(batchId, reason) },
   );
   const runtimeHooks: Record<(typeof WAKE_RUNTIME_HOOKS)[number], (event: any, ctx?: any) => unknown> = {
     "agent:bootstrap": (event: any) => {
@@ -1025,12 +1027,26 @@ export function createNotificationInjector(
     },
     subagent_spawned: (event: any, ctx: any = {}) => decisionRouter.onSubagentSpawned(event, ctx),
   };
+  const reportingBatches = new Set<string>();
   const reportWake: WakeDisclosureSender = async (ctx, disclosure) => {
+    if (!["completed", "blocked"].includes(disclosure?.outcome)
+      || typeof disclosure.message !== "string" || !disclosure.message.trim() || disclosure.message.length > 2_000) {
+      throw new Error("A bounded completed/blocked outcome disclosure is required");
+    }
     const batchId = decisionRouter.batch(ctx);
     if (!batchId) throw new Error("No active Warp wake owns this report");
     if (!disclosureTargets.length) throw new Error("No disclosure destination configured");
     if (guards.isStopped(batchId)) throw new Error("Wake already stopped; directSend guard alert owns disclosure");
     if (guards.hasReported(batchId)) throw new Error("Wake already disclosed; no further posts");
+    if (reportingBatches.has(batchId)) throw new Error("Wake outcome delivery already in progress");
+    reportingBatches.add(batchId);
+    try {
+      await deliverOutcomeDisclosure(batchId, disclosure);
+    } finally {
+      reportingBatches.delete(batchId);
+    }
+  };
+  async function deliverOutcomeDisclosure(batchId: string, disclosure: Parameters<WakeDisclosureSender>[1]) {
     const receipt = wakePacketReceipt(packets.get(batchId)?.metrics);
     const prefix = receipt ? receipt + "\n" : "";
     await Promise.all(disclosureTargets.map(async (target) => {
@@ -1045,7 +1061,7 @@ export function createNotificationInjector(
       guards.recordDisclosure(batchId, target.sessionKey);
     }));
     decisionRouter.markDisclosed(batchId);
-  };
+  }
 
   /**
    * Sends the kernel-facing `notification_ack` frame (#26). Never called

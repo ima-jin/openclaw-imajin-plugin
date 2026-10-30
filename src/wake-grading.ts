@@ -157,7 +157,7 @@ async function ancestry(source: WakeGradingSource, start: IssueRef, block: WakeG
     if (seen.has(key)) throw new GradingFailure(`${key}: native parent cycle`);
     if (seen.size >= 32) throw new GradingFailure(`${key}: native parent depth limit`);
     seen.add(key);
-    const issue = await source.issue(current).catch(() => {
+    const issue: GradingIssue = await source.issue(current).catch(() => {
       throw new GradingFailure(`${key}: ancestor lookup unavailable`);
     });
     if (issueKey(issue) !== key) throw new GradingFailure(`${key}: ancestor identity mismatch`);

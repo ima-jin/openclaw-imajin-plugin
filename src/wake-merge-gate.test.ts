@@ -19,6 +19,9 @@ const actions = [
 ];
 const merges = [exec(`gh pr merge ${PR} --squash`), graph(), graph("mergePullRequest"),
   mcp("mcp__github__merge_pull_request"), mcp("mcp__github__enqueue_pull_request"),
+  mcp("mcp__github__merge_pull_request_review", { event: "APPROVE" }),
+  mcp("mcp__github__pull_request_write", { method: "merge" }),
+  mcp("mcp__github__pull_request_write", { action: "enqueue" }),
   mcp("mcp__github__graphql", { query: query() })];
 async function fixture() {
   const { pr, source } = gradingFixture();

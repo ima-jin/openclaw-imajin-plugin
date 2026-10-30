@@ -56,6 +56,55 @@ describe("guarded wake acceptance (#82)", () => {
     return registries.at(-1)!;
   }
 
+  it.each(["events#78", "events#77", "imajin-ai#3160"])("%s blocked verdict survives an early review-started send", async (subject) => {
+    create();
+    await start();
+    const child = await spawnChild();
+    expect(injector.runtimeHooks.before_tool_call({
+      toolName: "message", params: { action: "send", channel: "telegram", target: "123", message: "review started" },
+    }, ctx())).toMatchObject({ block: true, blockReason: expect.stringContaining("concrete verdict") });
+    // A legacy/early receipt must not spend the final disclosure even if delivered before the hook upgrade.
+    await injector.runtimeHooks.after_tool_call({
+      toolName: "message", params: { action: "send", channel: "telegram", target: "123", message: "review started" },
+      result: { ok: true },
+    }, ctx());
+    expect(injector.runtimeHooks.before_tool_call({
+      toolName: "imajin_wake_report", params: { outcome: "blocked", message: `${subject}: grading unavailable` },
+    }, child)).toBeUndefined();
+    await createWakeReportTool(child, injector.reportWake).execute("blocked", {
+      outcome: "blocked", message: `${subject}: grading unavailable; did not approve.`,
+    });
+    expect(vi.mocked(sendDirectChannelMessage).mock.calls.filter(([, text]) =>
+      text.includes("Warp wake blocked"))).toHaveLength(1);
+    expect(vi.mocked(sendDirectChannelMessage).mock.calls.at(-1)![1]).toContain(`${subject}: grading unavailable`);
+    await expect(injector.reportWake(child, { outcome: "blocked", message: "duplicate" })).rejects.toThrow("already disclosed");
+    expect(alerts()).toHaveLength(0);
+  });
+
+  it("reports a spawn refused after disclosure through the deterministic safety alert", async () => {
+    create();
+    await start();
+    await injector.reportWake(ctx(), { outcome: "blocked", message: "Review could not finish" });
+    const refused = await injector.runtimeHooks.before_tool_call({
+      toolName: "sessions_spawn", params: { task: "retry review" },
+    }, ctx());
+    expect(refused).toMatchObject({ block: true, blockReason: expect.stringContaining("spawn refused") });
+    expect(alerts()).toHaveLength(1);
+    expect(alerts()[0][1]).toContain("Wake already disclosed; decision spawn refused");
+  });
+
+  it("does not duplicate a concurrent outcome send", async () => {
+    create();
+    await start();
+    let finish!: () => void;
+    vi.mocked(sendDirectChannelMessage).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = injector.reportWake(ctx(), { outcome: "blocked", message: "Missing evidence" });
+    await expect(injector.reportWake(ctx(), { outcome: "blocked", message: "second" })).rejects.toThrow("in progress");
+    finish();
+    await pending;
+    expect(vi.mocked(sendDirectChannelMessage).mock.calls.filter(([, text]) => text.includes("Warp wake blocked"))).toHaveLength(1);
+  });
+
   beforeEach(async () => {
     dir = await mkdtemp(join(tmpdir(), "guarded-wakes-"));
     posts = [];
@@ -174,6 +223,10 @@ describe("guarded wake acceptance (#82)", () => {
     }, ctx(index));
   }
   async function messageReceipt(target = "123", result: unknown = { ok: true }, index = 0) {
+    if (target === "123" && (result as { ok?: boolean })?.ok) {
+      await injector.reportWake(ctx(index), { outcome: "completed", message: "Reviewed live head" });
+      return;
+    }
     await injector.runtimeHooks.after_tool_call({
       toolName: "message", params: { action: "send", channel: "telegram", target }, result,
     }, ctx(index));
@@ -426,6 +479,9 @@ describe("guarded wake acceptance (#82)", () => {
       .execute("r", { outcome: "completed", message: "unrelated" })).rejects.toThrow("No active Warp wake");
     await expect(createWakeReportTool(ctx(), injector.reportWake)
       .execute("r", { outcome: "completed", message: "" })).rejects.toThrow("disclosure");
+    await expect(injector.reportWake(ctx(), { outcome: "blocked", message: " " })).rejects.toThrow("disclosure");
+    await expect(injector.reportWake(ctx(), { outcome: "blocked", message: "x".repeat(2_001) })).rejects.toThrow("disclosure");
+    await expect(injector.reportWake(ctx(), { outcome: "started" as "completed", message: "review started" })).rejects.toThrow("disclosure");
   });
 
   it("rechecks stopped state using factory context without runId before a report side effect", async () => {

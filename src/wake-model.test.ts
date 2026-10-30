@@ -192,11 +192,7 @@ describe("wakeModel (#117)", () => {
     await wake();
     expect(modelLogs()).toHaveLength(1);
     const ctx = { sessionKey: posts[0].sessionKey, runId: "runner-0" };
-    await injector.runtimeHooks.after_tool_call({
-      toolName: "message",
-      params: { action: "send", channel: "telegram", target: "123" },
-      result: { ok: true },
-    }, ctx);
+    await injector.reportWake(ctx, { outcome: "completed", message: "Reviewed live head" });
     await injector.onAgentEnd!({
       success: true, runId: ctx.runId,
       messages: [{ role: "user", content: posts[0].message }, { role: "assistant", content: "Reported." }],
