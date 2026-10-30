@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+<!-- #139: map-mode gateway principal implementation in progress. -->
 
 ### Added
 - **Kernel-picked default model (#106).** The catalog approval card can switch
