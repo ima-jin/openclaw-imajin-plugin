@@ -134,3 +134,65 @@ describe("decision-child merge-side permission boundary (#101)", () => {
     }
   });
 });
+
+describe("1. GraphQL endpoint goes through the strict GraphQL check only", () => {
+  const document = 'mutation{addPullRequestReview(input:{pullRequestId:"PR_fixture101",event:APPROVE}){clientMutationId}}';
+  const endpoints = ["graphql", "/graphql", "https://api.github.com/graphql"];
+  const methods = ["-X GET", "-XGET", "--method GET", "--method=GET", "-X POST", "--method=POST"];
+  const commands = endpoints.flatMap((endpoint) => methods.flatMap((method) => [
+    `gh api ${method} ${endpoint} -f 'query=${document}'`,
+    `gh api ${endpoint} ${method} -f 'query=${document}'`,
+    `gh api ${method} ${endpoint} -f 'query=query{viewer{login}}'`,
+    `gh api ${endpoint} ${method} -f 'query=query{viewer{login}}'`,
+  ]));
+
+  it.each(commands)("1. GraphQL endpoint goes through the strict GraphQL check only: %s", async (command) => {
+    const { gate } = await fixture();
+    expect(await gate(exec(command))).toMatchObject({ block: true });
+  });
+});
+
+describe("2. No headers or input file on the read-only path", () => {
+  const header = "X-HTTP-Method-Override: PUT";
+  const options = [
+    `-H '${header}'`, `'-H${header}'`, `'-H=${header}'`,
+    ...["header", "input"].flatMap((name) => {
+      const value = name === "header" ? header : "/tmp/body";
+      return Array.from({ length: name.length }, (_, index) => `--${name.slice(0, index + 1)}`)
+        .flatMap((flag) => [`${flag} '${value}'`, `${flag}='${value}'`]);
+    }),
+  ];
+  const commands = options.flatMap((option) => [
+    `gh api -X GET repos/o/r/pulls/101/merge ${option}`,
+    `gh api repos/o/r/pulls/101/merge ${option}`,
+    `gh api -XGET repos/o/r/pulls/101/merge ${option} -f state=closed`,
+    `gh api repos/o/r/pulls/101/merge --method=GET ${option}`,
+  ]);
+
+  it.each(commands)("2. No headers or input file on the read-only path: %s", async (command) => {
+    const { gate } = await fixture();
+    expect(await gate(exec(command))).toMatchObject({ block: true });
+  });
+});
+
+describe("3. Mutation words anywhere refuse", () => {
+  const documents = [
+    'query{viewer{login}} mutation{mergePullRequest(input:{pullRequestId:"PR_fixture101"}){clientMutationId}}',
+    '{viewer{login}} mutation M{enqueuePullRequest(input:{pullRequestId:"PR_fixture101"}){clientMutationId}}',
+    'query{viewer{login}} MUTATION{mergePullRequest(input:{pullRequestId:"PR_fixture101"}){clientMutationId}}',
+    '# comment\nmutation{mergePullRequest(input:{pullRequestId:"PR_fixture101"}){clientMutationId}}',
+    'query{viewer{login}}\n# comment\nmutation{mergePullRequest(input:{pullRequestId:"PR_fixture101"}){clientMutationId}}',
+    "query{viewer{...Rule}} fragment Rule on User { mutation { login } }",
+    "query{viewer{...Rule}} fragment Rule on User { MUTATION { login } }",
+    "query{viewer{login}}\n# mutation",
+    "subscription{viewer{login}}",
+    "query{viewer{login}} subscription S{viewer{login}}",
+    "{viewer{login}} SUBSCRIPTION S{viewer{login}}",
+    "query{viewer{...Rule}} fragment Rule on User { subscription { login } }",
+  ];
+
+  it.each(documents)("3. Mutation words anywhere refuse: %s", async (document) => {
+    const { gate } = await fixture();
+    expect(await gate(exec(`gh api graphql -f 'query=${document}'`))).toMatchObject({ block: true });
+  });
+});

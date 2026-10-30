@@ -37,17 +37,32 @@ const unparseable = (): Mutation => ({
 });
 
 function apiMutation(args: string[]): Mutation | undefined {
+  if (args.slice(2).some(isGraphqlEndpoint)) return graphqlApiMutation(args);
+  if (args.slice(2).some(headerOrInputFlag)) return unparseable();
   const method = flag(args, ["--method", "-X"]) ?? args.find((arg) => /^-X./.test(arg))?.slice(2);
   const fields = args.some((arg) => /^(?:--(?:raw-)?field|--input|-f|-F)/.test(arg));
   const methods = args.filter((arg) => /^(?:--method(?:=|$)|-X)/.test(arg));
-  if (args[1] === "api" && args[2] !== "graphql" && methods.length <= 1
+  if (args[1] === "api" && methods.length <= 1
     && (method === "GET" || (!method && !fields))) return;
-  if (args[1] === "api" && args[2] === "graphql" && args.length === 5 && ["-f", "--raw-field"].includes(args[3])) {
-    const query = args[4].startsWith("query=") ? args[4].slice(6) : undefined;
-    if (query && /^\s*(?:query\b|\{)/.test(query)) return;
-    return graphqlMutation(query);
-  }
   return unparseable();
+}
+
+function isGraphqlEndpoint(arg: string): boolean {
+  return /(?:^|\/)graphql$/.test(arg);
+}
+
+function headerOrInputFlag(arg: string): boolean {
+  if (arg.startsWith("-H")) return true;
+  const name = arg.split("=")[0];
+  return name.startsWith("--") && name.length > 2
+    && ["--header", "--input"].some((option) => option.startsWith(name));
+}
+
+function graphqlApiMutation(args: string[]): Mutation | undefined {
+  if (args.length !== 5 || !isGraphqlEndpoint(args[2]) || !["-f", "--raw-field"].includes(args[3])) return unparseable();
+  const query = args[4].startsWith("query=") ? args[4].slice(6) : undefined;
+  if (query && !/\b(?:mutation|subscription)\b/i.test(query) && /^\s*(?:query\b|\{)/.test(query)) return;
+  return graphqlMutation(query);
 }
 
 function cliMutation(event: WakeToolEvent, cliPath: string): Mutation | undefined {
