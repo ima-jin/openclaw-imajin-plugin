@@ -29,6 +29,8 @@ export interface WsServiceConfig {
   did?: string;
   keypairPath?: string;
   actAs?: string;
+  /** Identity-scoped HTTP session supplier for SecretRef-backed agents. */
+  authenticate?: () => Promise<string>;
 }
 
 export interface NotificationFrame {
@@ -258,6 +260,7 @@ export class ImajinWsService {
 
   /** Authenticate via HTTP challenge-response, extract session token. */
   private async authenticate(): Promise<string> {
+    if (this.config.authenticate) return this.config.authenticate();
     const keypair = await this.loadKeypair();
     const baseUrl = this.config.nodeUrl.replace(/\/$/, "");
 

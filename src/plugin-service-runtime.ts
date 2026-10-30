@@ -40,6 +40,7 @@ function alreadyDispatched(event: unknown, name: string): boolean {
 
 /** Registry construction is metadata only; only a full service start owns IO. */
 export class PluginServiceRuntime {
+  agentTools?: (ctx: { agentId?: string; sessionKey?: string; runId?: string }) => unknown;
   defaultRoutingStatus?: () => ImajinDefaultRoutingStatus;
   private lifecycle?: RegistrationLifecycle;
   private started?: Promise<void>;

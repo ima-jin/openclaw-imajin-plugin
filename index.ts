@@ -79,6 +79,8 @@ import type { RegistrationLifecycle } from "./src/registration-lifecycle.js";
 import { PluginServiceRuntime, type RuntimeHookRegister } from "./src/plugin-service-runtime.js";
 import { createImajinDefaultRouter } from "./src/imajin-default-routing.js";
 import type { WakeDisclosureSender } from "./src/wake-report-tool.js";
+import { registerAgentPlugin } from "./src/agent-plugin.js";
+import type { AgentIdentityConfig } from "./src/agent-identities.js";
 
 /** `plugins.entries.imajin.config.approvalBridge` (openclaw.json, #1816). */
 interface ApprovalBridgeSettings {
@@ -114,6 +116,7 @@ function toGatewayDecision(decision: GatewayApprovalDecision): "allow-once" | "d
 }
 
 interface PluginConfig {
+  agents?: Record<string, AgentIdentityConfig>;
   nodeUrl?: string;
   did?: string;
   keypairPath?: string;
@@ -551,6 +554,10 @@ export default definePluginEntry({
 
   register(api: any) {
     const config = api.pluginConfig as PluginConfig | undefined;
+    if (config && Object.hasOwn(config, "agents")) {
+      registerAgentPlugin(api, config);
+      return;
+    }
 
     // The one kernel client (agent DID challenge-response session) shared by
     // the primitive tools AND model discovery (#55). Built before the provider
