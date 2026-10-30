@@ -7,11 +7,14 @@ import { randomUUID } from "node:crypto";
 import { registerAgentPlugin } from "./agent-plugin.js";
 import { publicKeyDid, type AgentIdentityConfig } from "./agent-identities.js";
 import { ImajinClient } from "./client.js";
-import { canonicalize, verifyMessage } from "./approval-bridge.js";
+import { ApprovalBridge, canonicalize, verifyMessage } from "./approval-bridge.js";
+import { APPROVALS_STATE_FILENAME } from "./approvals-state.js";
+import { APPROVALS_CURSOR_FILENAME } from "./approvals-catchup.js";
 import { buildSessionCommandBody, signSessionCommandBody, SESSION_COMMAND_TYPES } from "./session-commands.js";
 import { beginRegistration } from "./registration-lifecycle.js";
 import * as approvals from "./gateway-approvals-bridge.js";
 import type { WsServiceConfig } from "./ws-service.js";
+import type { SystemAgentApprovalRequestRecord } from "./sources/system-agent.js";
 
 const mocks = vi.hoisted(() => ({
   resolve: vi.fn(), system: vi.fn(), exec: vi.fn(), loopback: vi.fn(),
@@ -70,7 +73,7 @@ function systemConnection() {
   return {
     start: vi.fn(async () => {}), stop: vi.fn(),
     client: {
-      list: vi.fn(async () => []),
+      list: vi.fn(async (): Promise<SystemAgentApprovalRequestRecord[]> => []),
       get: vi.fn(async () => ({
         status: "pending", expiresAtMs, presentation: { proposalHash: "revision" },
       })),
@@ -89,6 +92,7 @@ describe("map-mode gateway principal (#139)", () => {
   let gateway: { send: ReturnType<typeof vi.fn>; spawn: ReturnType<typeof vi.fn>; resolveApproval: ReturnType<typeof vi.fn> };
   let wire: Array<{ path: string; body: any; headers: Record<string, string> }>;
   let bridgeStart: MockInstance<typeof approvals.startGatewayApprovalsBridge>;
+  let caughtUp: object[];
 
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -115,6 +119,7 @@ describe("map-mode gateway principal (#139)", () => {
       did: "did:imajin:operator", scope: "actor", subtype: "human", publicKey: kernel.publicKey,
     });
     wire = [];
+    caughtUp = [];
     vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
       const path = new URL(url).pathname;
       const body = init?.body ? JSON.parse(init.body as string) : undefined;
@@ -126,9 +131,56 @@ describe("map-mode gateway principal (#139)", () => {
           Buffer.from(identity.publicKey, "hex"))).toBe(true);
         return Response.json({}, { headers: { "set-cookie": `session=${identity.did}` } });
       }
-      return Response.json({ events: [], nextCursor: "0", entitledEventTypes: ["operator.approval.decided"] });
+      const cursor = new URL(url).searchParams.get("cursor") ?? "0";
+      const events = cursor === "0" ? caughtUp : [];
+      return Response.json({ events, nextCursor: caughtUp.length ? "1" : "0", entitledEventTypes: ["operator.approval.decided"] });
     }));
     bridgeStart = vi.spyOn(approvals, "startGatewayApprovalsBridge");
+  });
+
+  it("pins main for send/spawn and rejects an unexpected tenant spawn result without registering its loop", async () => {
+    await ready(register());
+    mocks.sockets[0].frame?.(await command("session.send", { sessionKey: "agent:main:main", message: "test" }));
+    await vi.waitFor(() => expect(mocks.sockets[0].send).toHaveBeenCalledTimes(1));
+    expect(gateway.send).toHaveBeenCalledWith(expect.objectContaining({ agentId: "main" }));
+    mocks.sockets[0].frame?.(await command("session.spawn", { task: "test" }));
+    await vi.waitFor(() => expect(mocks.sockets[0].send).toHaveBeenCalledTimes(2));
+    expect(gateway.spawn).toHaveBeenCalledWith(expect.objectContaining({ agentId: "main" }));
+    expect(mocks.sockets[0].send.mock.calls[1][0].type).toBe("loop.session.spawn.completed");
+    gateway.spawn.mockResolvedValueOnce({ sessionKey: "agent:tenant:child" });
+    mocks.sockets[0].frame?.(await command("session.spawn", { task: "test" }));
+    await vi.waitFor(() => expect(mocks.sockets[0].send).toHaveBeenCalledTimes(3));
+    const failure = mocks.sockets[0].send.mock.calls[2][0].attestation.payload;
+    expect(failure.reason).toBe("loop_target_mismatch");
+    expect(failure.childLoopId).toBeUndefined();
+  });
+
+  it("runs gateway-exec preflight and publishes native approvals as the selected DID", async () => {
+    const record = {
+      id: "native-exec", createdAtMs: Date.now(), expiresAtMs: Date.now() + 60_000,
+      request: { command: "test", host: "gateway", cwd: "/workspace", agentId: "main", sessionKey: "agent:main:main" },
+    };
+    const exec = {
+      start: vi.fn(async () => {}), stop: vi.fn(),
+      client: {
+        list: vi.fn(async () => [record]), resolve: vi.fn(async () => ({ applied: true })),
+        onRequested: vi.fn(), onFinished: vi.fn(),
+      },
+    };
+    mocks.exec.mockResolvedValue(exec);
+    const registration = register({
+      approvals: { enabled: true, operatorDid: "did:imajin:operator", sources: ["gateway-exec"],
+        notifyWebhookSecret: randomUUID() },
+    });
+    await registration.start();
+    await vi.waitFor(() => expect(wire.some((row) => row.body?.scope === "operator.approval.requested")).toBe(true));
+    const data = wire.find((row) => row.body?.scope === "operator.approval.requested")!.body.data;
+    expect(data.signerDid).toBe(main.did);
+    expect(data.detail.requestedBy).toBe(main.did);
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("[imajin-approvals-bridge]"));
+    expect(mocks.sockets[1].send).not.toHaveBeenCalled();
+    await registration.stop();
+    expect(exec.stop).toHaveBeenCalledOnce();
   });
   afterEach(async () => {
     await beginRegistration().dispose();
@@ -168,7 +220,7 @@ describe("map-mode gateway principal (#139)", () => {
     return frame;
   }
 
-  it("resolves an approval only through main, signs its digest with the sealed key, and scopes state/catch-up", async () => {
+  it.each(["live", "catch-up"])("resolves an approval only through main via %s, signs its digest and scopes durable state", async (transport) => {
     const registration = register({ did: tenant.did, keypairPath: "/must-not-read", actAs: tenant.did });
     expect(registration.getGatewayIdentity()).toBeUndefined();
     await ready(registration);
@@ -185,10 +237,12 @@ describe("map-mode gateway principal (#139)", () => {
     expect(preflights.length).toBeGreaterThan(0);
     expect(preflights.every((row) => row.headers["X-Agent-DID"] === main.did)).toBe(true);
     const snapshot = await system.client.get();
-    system.client.onRequested.mock.calls[0][0]({
+    const record: SystemAgentApprovalRequestRecord = {
       id: "proposal", createdAtMs: Date.now(), expiresAtMs: snapshot.expiresAtMs,
-      request: { title: "Restart", command: "restart", proposalHash: "revision" },
-    });
+      request: { title: "Restart", description: "Restart", command: "restart", proposalHash: "revision", allowedDecisions: ["allow-once", "deny"] },
+    };
+    system.client.list.mockResolvedValue([record]);
+    system.client.onRequested.mock.calls[0][0](record);
     await vi.waitFor(() => expect(wire.some((row) => row.body?.scope === "operator.approval.requested")).toBe(true));
     const data = wire.find((row) => row.body?.scope === "operator.approval.requested")!.body.data;
     const { signature, signerDid, contentHash: _hash, ...digest } = data;
@@ -203,15 +257,34 @@ describe("map-mode gateway principal (#139)", () => {
     mocks.sockets[1].frame?.(decision);
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(system.client.resolve).not.toHaveBeenCalled();
-    mocks.sockets[0].frame?.(decision);
+    if (transport === "live") mocks.sockets[0].frame?.(decision);
+    else {
+      caughtUp = [{
+        ...decision, id: "event-1", cursor: "1", correlationId: null,
+        occurredAt: new Date().toISOString(), grantId: "grant",
+      }];
+      expect(mocks.sockets[1].connected).toBeUndefined();
+      await mocks.sockets[0].connected?.();
+    }
     await vi.waitFor(() => expect(system.client.resolve).toHaveBeenCalledOnce());
+    await vi.waitFor(async () => {
+      const state = JSON.parse(await readFile(join(dir, "main", APPROVALS_STATE_FILENAME), "utf8"));
+      expect(state.agentDid).toBe(main.did);
+      expect(state.outcomes.proposal).toBe("applied");
+    });
+    if (transport === "catch-up") {
+      const cursor = JSON.parse(await readFile(join(dir, "main", APPROVALS_CURSOR_FILENAME), "utf8"));
+      expect(cursor.agentDid).toBe(main.did);
+      expect(cursor.cursor).toBe("1");
+    }
     expect(mocks.sockets[1].send).not.toHaveBeenCalled();
     await registration.stop();
     expect(registration.getGatewayIdentity()).toBeUndefined();
   });
 
   it("ignores every command/approval frame on tenant sockets, including main-addressed valid commands", async () => {
-    await ready(register());
+    const handler = vi.spyOn(ApprovalBridge.prototype, "handleFrame");
+    await ready(register({ approvalBridge: { pinnedApproverPublicKeyHex: kernel.publicKey } }));
     for (const type of [...SESSION_COMMAND_TYPES, "approval.decision", "bus_event"]) {
       mocks.sockets[1].frame?.(await command(type, { sessionKey: "agent:main:main", message: "test" }));
     }
@@ -219,6 +292,7 @@ describe("map-mode gateway principal (#139)", () => {
     expect(gateway.resolveApproval).not.toHaveBeenCalled();
     expect(mocks.sockets[0].send).not.toHaveBeenCalled();
     expect(mocks.sockets[1].send).not.toHaveBeenCalled();
+    expect(handler).not.toHaveBeenCalled();
   });
 
   it("executes a verified session command on main and cryptographically attests only on main's socket", async () => {
@@ -233,6 +307,16 @@ describe("map-mode gateway principal (#139)", () => {
     expect(mocks.sockets[1].send).not.toHaveBeenCalled();
   });
 
+  it.each([undefined, { enabled: false, kernelPublicKeyHex: "unused" }, { enabled: true }])(
+    "does not accept session commands without explicit opt-in and a kernel pin %#", async (sessionCommands) => {
+      await ready(register({ sessionCommands }));
+      mocks.sockets[0].frame?.(await command("session.approve", { approvalId: "native" }));
+      expect(mocks.loopback).not.toHaveBeenCalled();
+      expect(gateway.resolveApproval).not.toHaveBeenCalled();
+      expect(mocks.sockets[0].send).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([undefined, "", "absent", " main", "__proto__", 1, null])(
     "missing or invalid gatewayAgent disables both features without legacy fallback %#", async (gatewayAgent) => {
       const registration = register({ gatewayAgent, did: main.did, keypairPath: "/must-not-read" });
@@ -241,6 +325,11 @@ describe("map-mode gateway principal (#139)", () => {
       expect(mocks.loopback).not.toHaveBeenCalled();
       expect(registration.getGatewayIdentity()).toBeUndefined();
       expect(console.warn).toHaveBeenCalledWith("[imajin-plugin] gatewayAgent unavailable; approvals and session commands disabled");
+      for (const socket of mocks.sockets) {
+        socket.frame?.(await command("session.approve", { approvalId: "native" }));
+        expect(socket.send).not.toHaveBeenCalled();
+      }
+      expect(gateway.resolveApproval).not.toHaveBeenCalled();
     },
   );
 

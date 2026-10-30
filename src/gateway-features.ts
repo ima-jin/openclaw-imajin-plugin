@@ -80,7 +80,7 @@ function createApprovalBridge(
     // anything expired, mismatched, or unsigned) — this is the one place
     // that actually resolves the OpenClaw gateway's pending approval.
     // No `reviewer` identity is passed: this bridge is not a registered
-    // channel route for the request (see the registerChannel TODO below),
+    // channel route for the request (see the channel integration notes in index.ts),
     // so custody checks that key off a channel/accountId/senderId triple
     // don't apply here; omitting all three is the documented no-reviewer form.
     approvalBridge.onResolved(async (requestId, decision, kind: GatewayApprovalKind) => {
@@ -171,7 +171,7 @@ export function registerGatewayFeatures(
     loopLifecycle?: LoopLifecycle;
     sessionGateway?: LoopbackSessionGateway;
     inventory?: SessionInventory;
-    imajinCatalog?: StartGatewayApprovalsBridgeDeps["imajinCatalog"];
+    imajinCatalog?: NonNullable<StartGatewayApprovalsBridgeDeps["imajinCatalog"]>;
   } = {},
 ): { approvalBridge?: ApprovalBridge; handleFrame: (frame: unknown) => boolean } {
   const { loopLifecycle, inventory, imajinCatalog } = options;
