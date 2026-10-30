@@ -1870,9 +1870,8 @@ checks the public key against both the private key and the kernel's
 `did:imajin:<base58(publicKey)>` DID. Only the runtime signer sees private
 material. Configure an actual encrypted OpenClaw `store` provider or a trusted
 vault-backed `exec` provider in the host's `secrets.providers` first.
-`imajin-vault` is an operator-configured provider name, **not a bundled
-provider or executable**. No new vault adapter is supplied here. Missing SDK
-secret-resolution support or an unavailable provider disables that agent;
+The plugin ships the **`imajin-vault` exec provider** described below.
+Missing SDK secret-resolution support or an unavailable provider disables that agent;
 do not substitute an inline value or a plaintext key file.
 
 Per-agent `keypair` rejects strings, inline key objects, `keypairPath`, and
@@ -1916,9 +1915,133 @@ mint, register, or seal a real key as part of testing this configuration.
    the agent itself. The kernel still adjudicates grants for every tool call.
 4. Store/seal the identity through the operator's protected provider flow,
    then configure only its SecretRef in the map. The published vault spec
-   documents vault-side minting and one-time grants, but not a general
-   OpenClaw identity-provider adapter; do not invent a plaintext export or
-   bypass to bridge that missing tooling.
+   documents vault-side minting and grants. Use the import/delegation flow
+   below for existing agent keys; never export them through chat or SSH.
+
+### Kernel vault exec provider (#143)
+
+`bin/imajin-vault.mjs` implements OpenClaw's
+[exec provider protocol v1](https://docs.openclaw.ai/gateway/secrets/secretref-contract).
+Run `npm ci --omit=peer --ignore-scripts` then `npm run build` in the plugin
+checkout before configuring it. Rebuild after updates. Use the **real,
+absolute, non-symlink Node binary** as `command`; `args` names the plugin-owned
+entrypoint and its non-secret config file. Do not run this resolver manually,
+from a model tool, or with stdout redirected to a terminal/log/file: successful
+stdout necessarily contains the secret protocol payload for the gateway's
+private pipe, **not tool output**.
+
+#### Seal and delegate
+
+In `/jin` → **Import credential**, a signed-in human approver selects the
+authorized **owner DID** (the org when acting as that org), pastes the keypair
+JSON once with no reveal, and explicitly selects the gateway's **main agent
+DID as consumer**. The panel uses `POST /api/vault/import`, requires human
+approval, and returns 409 on vault tier 1. `/admin/vault` and `/api/vault/set`
+are node-admin-only, not the org import path. Complete approval and obtain
+the resulting delegation `grantId` from the operator's metadata view.
+Use a reusable (`oneTime: false`), active grant: one-time grants are consumed
+by fetch and cannot support gateway refresh. The provider rejects them.
+
+Map the SecretRef id to that exact grant explicitly. No lookup by name,
+owner guessing, personal-session defaults, or inferred org ownership occurs.
+The kernel checks the grant's actual owner/consumer authority, revocation
+and expiry on every POST to
+`/auth/api/vault/delegation/grants/{grantId}/fetch`.
+The authenticated identity is always the consumer DID, with **no acting-as
+header**, even when main's usual `actAs` is a business/org DID.
+
+#### Bootstrap and config example
+
+The bootstrap identity must already work independently of this provider:
+`plugins.entries.imajin.config.did` is main's DID, with its existing absolute
+`keypairPath` and HTTPS `nodeUrl`. It must match `consumerDid` exactly. The
+provider validates that keypair's private/public/DID relationship and uses
+the plugin's Ed25519 challenge-response auth. It never authenticates as the
+target agent before fetching its key, nor borrows a human session.
+Moving **main's existing key off disk is out of scope**; no additional key
+file is created and fetched agent keys/cookies are never persisted or passed
+on argv/env. Keep main's existing file outside agent-readable sandboxes.
+
+Both files below are strict JSON, not JSON5, and must be operator-owned,
+protected against modification by agents. Includes and environment/template
+expansion are not supported by the standalone resolver. All DIDs/grant IDs
+shown here are public placeholders, not credentials.
+
+Non-secret `/etc/openclaw/imajin-vault.json`:
+
+```json
+{
+  "gatewayConfigPath": "/etc/openclaw/openclaw.json",
+  "consumerDid": "did:imajin:MAIN_AGENT_PUBLIC_DID",
+  "grants": {
+    "artifact-jin-identity": "GRANT_ID_FROM_APPROVED_IMPORT"
+  }
+}
+```
+
+Relevant portions of `/etc/openclaw/openclaw.json`:
+
+```json
+{
+  "secrets": {
+    "providers": {
+      "imajin-vault": {
+        "source": "exec",
+        "command": "/usr/bin/node",
+        "args": ["/opt/openclaw-imajin-plugin/bin/imajin-vault.mjs", "--config", "/etc/openclaw/imajin-vault.json"],
+        "jsonOnly": true,
+        "timeoutMs": 20000,
+        "maxOutputBytes": 262144
+      }
+    }
+  },
+  "plugins": {
+    "entries": {
+      "imajin": {
+        "enabled": true,
+        "config": {
+          "nodeUrl": "https://jin.imajin.ai",
+          "did": "did:imajin:MAIN_AGENT_PUBLIC_DID",
+          "keypairPath": "/protected/existing-main-identity.json",
+          "agents": {
+            "artifact-jin": {
+              "did": "did:imajin:ARTIFACT_AGENT_PUBLIC_DID",
+              "keypair": { "source": "exec", "provider": "imajin-vault", "id": "artifact-jin-identity" },
+              "actAs": "did:imajin:ARTIFACT_ORG",
+              "tools": ["imajin_identity", "imajin_discover", "imajin_chat"]
+            }
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+OpenClaw applies executable ownership/permission checks; adjust the real Node
+path to the gateway installation, without disabling those checks. The script,
+compiled `dist/`, config and main bootstrap file are trusted gateway assets.
+Do not give model tools host-exec/read access to them or to the resolver.
+SecretRefs are not an OS/process-isolation boundary.
+
+The command accepts only `--config <absolute non-secret path>` and a single
+stdin request `{protocolVersion: 1, provider: "imajin-vault", ids: [...]}`.
+It returns only protocol JSON, with requested values or fixed per-id
+`UNAVAILABLE` errors. It never logs upstream errors, response bodies or
+parser excerpts. Inputs/responses/output are bounded to 256 KiB and 64 ids;
+each HTTP request has a 5-second deadline, HTTPS only, redirects forbidden.
+There is no value cache between invocations, no fallback provider, no
+`keypairPath` fallback for a target agent, and no main-identity fallback.
+
+Cold boot resolves each `agents.<id>.keypair` through the existing SDK.
+An unavailable/missing/revoked/expired grant, auth error or malformed response
+leaves that agent without tools; healthy entries remain independent.
+**Refresh means a full plugin service restart/reload**, which clears existing
+identities before resolving again. Do not rely on a host secrets-only reload
+that retains a last-known-good snapshot: restart the plugin service after
+revocation. This provider does not poll or promise instant revocation of an
+already-running signer. On the next service refresh a revoked grant disables
+the entry, rather than keeping its old signer.
 
 ### Tool policy, notifications and compatibility
 
@@ -1952,3 +2075,4 @@ mint, register, or seal a real key as part of testing this configuration.
   an absent/unresolvable agent receives **zero `imajin_*` tools**, including
   status. Move every participating identity into the map; merely retaining
   top-level credentials does not configure `main` in this mode.
+

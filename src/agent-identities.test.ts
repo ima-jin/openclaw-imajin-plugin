@@ -160,7 +160,20 @@ describe("sealed per-agent config", () => {
     expect(chapter).toContain('"role": "agent"');
     expect(chapter).toContain("auth/api/spec");
     expect(chapter).toContain("vault/api/spec");
-    expect(chapter).toContain("not a bundled");
+    expect(chapter).toContain("ships the **`imajin-vault` exec provider**");
+    const providerChapter = chapter.split("### Kernel vault exec provider (#143)")[1];
+    const examples = [...providerChapter.matchAll(/```json\n([\s\S]+?)\n```/g)].map((match) => JSON.parse(match[1]));
+    const [mapping, host] = examples;
+    const provider = host.secrets.providers["imajin-vault"];
+    expect(provider.source).toBe("exec");
+    expect(provider.args).toContain("--config");
+    expect(provider.jsonOnly).toBe(true);
+    expect(mapping.consumerDid).toBe(host.plugins.entries.imajin.config.did);
+    const target = host.plugins.entries.imajin.config.agents["artifact-jin"];
+    expect(validAgentConfig("artifact-jin", target)).toBe(true);
+    expect(Object.hasOwn(mapping.grants, target.keypair.id)).toBe(true);
+    expect(providerChapter).toContain("no acting-as");
+    expect(providerChapter).toContain("main's existing key off disk is out of scope");
   });
 });
 

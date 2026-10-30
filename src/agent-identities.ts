@@ -72,6 +72,19 @@ export async function resolveAgentSigner(
   const resolved = await resolveSecretRefValues([ref], { config, env: process.env });
   if (resolved.size !== 1) throw new Error("Identity reference unavailable");
   const raw = resolved.values().next().value;
+  return signerFromValue(raw, did);
+}
+
+/** Validate private material without allowing parser/provider diagnostics to escape. */
+export async function signerFromValue(raw: unknown, did: string): Promise<ImajinSigner> {
+  try {
+    return await parseSigner(raw, did);
+  } catch {
+    throw new Error("Identity keypair unavailable");
+  }
+}
+
+async function parseSigner(raw: unknown, did: string): Promise<ImajinSigner> {
   const key = typeof raw === "string" ? JSON.parse(raw) : raw;
   if (key?.did !== did || !/^[a-f0-9]{64}$/i.test(key.privateKey)
     || !/^[a-f0-9]{64}$/i.test(key.publicKey)) {
