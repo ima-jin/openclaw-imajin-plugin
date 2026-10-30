@@ -1,3 +1,4 @@
+# Pending: #134 — resolved grading approvals and reliable wake verdict disclosure.
 # Changelog
 
 ## Unreleased
