@@ -37,10 +37,10 @@ const unparseable = (): Mutation => ({
 });
 
 function apiMutation(args: string[]): Mutation | undefined {
-  const method = flag(args, ["--method", "-X"]);
+  const method = flag(args, ["--method", "-X"]) ?? args.find((arg) => /^-X./.test(arg))?.slice(2);
   const fields = args.some((arg) => /^(?:--(?:raw-)?field|--input|-f|-F)/.test(arg));
-  const compactMethod = args.some((arg) => /^-X.+/.test(arg));
-  if (args[1] === "api" && args[2] !== "graphql" && !compactMethod
+  const methods = args.filter((arg) => /^(?:--method(?:=|$)|-X)/.test(arg));
+  if (args[1] === "api" && args[2] !== "graphql" && methods.length <= 1
     && (method === "GET" || (!method && !fields))) return;
   if (args[1] === "api" && args[2] === "graphql" && args.length === 5 && ["-f", "--raw-field"].includes(args[3])) {
     const query = args[4].startsWith("query=") ? args[4].slice(6) : undefined;
@@ -81,37 +81,33 @@ const quote = (text: string) => "'" + text.replaceAll("'", String.raw`'\''`) + "
 /** Literal shell words only. Single quotes may contain arbitrary Markdown. */
 function words(command: string): string[] | undefined {
   const result: string[] = [];
+  const token = /'[^']*'|"[^"$`\\]*"|\\'|[^\s'";&|<>()#$`\\*?~{}]+/y;
   let value = "";
   let started = false;
-  let quoteChar = "";
-  for (let i = 0; i < command.length; i++) {
-    const char = command[i];
-    if (quoteChar === "'") {
-      if (char === "'") quoteChar = "";
-      else value += char;
-    } else if (quoteChar === '"') {
-      if (char === '"') quoteChar = "";
-      else if (/[$`\\]/.test(char)) return;
-      else value += char;
-    } else if (char === "'" || char === '"') {
-      quoteChar = char;
-      started = true;
-    } else if (char === "\\" && command[i + 1] === "'") {
-      value += command[++i];
-      started = true;
-    } else if (/[\r\n;&|<>()#$`\\*?~{}]/.test(char)) return;
-    else if (/\s/.test(char)) {
+  let offset = 0;
+  while (offset < command.length) {
+    if (/[\r\n]/.test(command[offset])) return;
+    if (/\s/.test(command[offset])) {
       if (started) result.push(value);
       value = "";
       started = false;
-    } else {
-      value += char;
-      started = true;
+      offset++;
+      continue;
     }
+    token.lastIndex = offset;
+    const match = token.exec(command);
+    if (!match) return;
+    offset = token.lastIndex;
+    value += literalToken(match[0]);
+    started = true;
   }
-  if (quoteChar) return;
   if (started) result.push(value);
   return result;
+}
+
+function literalToken(value: string): string {
+  if (value === "\\'") return "'";
+  return value.startsWith("'") || value.startsWith('"') ? value.slice(1, -1) : value;
 }
 
 function flag(args: string[], names: string[]): string | undefined {

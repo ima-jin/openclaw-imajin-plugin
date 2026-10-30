@@ -149,32 +149,46 @@ export async function withGradingDeadline<T>(work: Promise<T>): Promise<T> {
   } finally { clearTimeout(timer); }
 }
 
-async function ancestry(source: WakeGradingSource, start: IssueRef, block: WakeGradingBlock, lines: string[]) {
-  const seen = new Set<string>();
-  let current: IssueRef | null = start;
-  while (current) {
-    const key = issueKey(current);
-    if (seen.has(key)) throw new GradingFailure(`${key}: native parent cycle`);
-    if (seen.size >= 32) throw new GradingFailure(`${key}: native parent depth limit`);
-    seen.add(key);
-    const issue: GradingIssue = await source.issue(current).catch(() => {
-      throw new GradingFailure(`${key}: ancestor lookup unavailable`);
-    });
-    if (issueKey(issue) !== key) throw new GradingFailure(`${key}: ancestor identity mismatch`);
-    const evidence = [issue.body, ...issue.comments].flatMap((text) => text.split(/\r?\n/))
-      .filter((line) => /\bOUTCOME(?:\s+\([^\r\n]*?\))?\s*·/.test(line) || /\bDECISION ruled\b/.test(line));
-    const hasOutcome = evidence.some((line) => /\bOUTCOME(?:\s+\([^\r\n]*?\))?\s*·/.test(line));
-    if (Buffer.byteLength([...lines, `Ancestor ${key}`, ...evidence].join("\n")) > 128 * 1024) {
-      throw new GradingFailure(`${key}: grading evidence too large`);
-    }
-    lines.push(`Ancestor ${key}`, ...evidence);
-    if (hasOutcome) block.outcomes!.push(key);
-    else lines.push(`${key}: no OUTCOME`);
-    if (evidence.some((line) => /\bDECISION ruled\b/.test(line))) block.decisions.push(key);
-    if (issue.epic) block.epics.push(key);
-    if (!issue.parent) lines.push(`chain ended at ${issue.state === "CLOSED" ? "closed " : ""}${key}: no native parent`);
-    current = issue.parent;
+const OUTCOME = /\bOUTCOME(?:\s+\([^\r\n]*?\))?\s*·/;
+const DECISION = /\bDECISION ruled\b/;
+
+function recordAncestor(issue: GradingIssue, block: WakeGradingBlock, lines: string[]) {
+  const key = issueKey(issue);
+  const evidence = [issue.body, ...issue.comments].flatMap((text) => text.split(/\r?\n/))
+    .filter((line) => OUTCOME.test(line) || DECISION.test(line));
+  if (Buffer.byteLength([...lines, `Ancestor ${key}`, ...evidence].join("\n")) > 128 * 1024) {
+    throw new GradingFailure(`${key}: grading evidence too large`);
   }
+  lines.push(`Ancestor ${key}`, ...evidence);
+  if (evidence.some((line) => OUTCOME.test(line))) block.outcomes!.push(key);
+  else lines.push(`${key}: no OUTCOME`);
+  if (evidence.some((line) => DECISION.test(line))) block.decisions.push(key);
+  if (issue.epic) block.epics.push(key);
+  if (!issue.parent) lines.push(`chain ended at ${issue.state === "CLOSED" ? "closed " : ""}${key}: no native parent`);
+}
+
+async function ancestry(
+  source: WakeGradingSource, current: IssueRef, block: WakeGradingBlock, lines: string[], seen = new Set<string>(),
+): Promise<void> {
+  const key = issueKey(current);
+  if (seen.has(key)) throw new GradingFailure(`${key}: native parent cycle`);
+  if (seen.size >= 32) throw new GradingFailure(`${key}: native parent depth limit`);
+  seen.add(key);
+  const issue = await source.issue(current).catch(() => {
+    throw new GradingFailure(`${key}: ancestor lookup unavailable`);
+  });
+  if (issueKey(issue) !== key) throw new GradingFailure(`${key}: ancestor identity mismatch`);
+  recordAncestor(issue, block, lines);
+  if (issue.parent) await ancestry(source, issue.parent, block, lines, seen);
+}
+
+async function closingChains(source: WakeGradingSource, block: WakeGradingBlock, lines: string[]) {
+  const evidence = block.pr!.closingIssues.map(() => [] as string[]);
+  const chains = await Promise.allSettled(block.pr!.closingIssues.map((issue, index) =>
+    ancestry(source, issue, block, evidence[index])));
+  lines.push(...evidence.flat());
+  const failed = chains.find((chain) => chain.status === "rejected");
+  if (failed?.status === "rejected") throw failed.reason;
 }
 
 /** Errors are deliberately value-free: CLI stderr and credentials never enter a task. */
@@ -187,7 +201,7 @@ export async function resolveWakeGrading(url: string, source: WakeGradingSource)
       lines.push(`Head: ${block.pr.headSha}`, `Review history: ${JSON.stringify(block.pr.reviews)}`,
         `closingIssuesReferences: ${block.pr.closingIssues.map(issueKey).join(", ") || "none"}`);
       if (!block.pr.closingIssues.length) throw new GradingFailure("no closing issues");
-      for (const issue of block.pr.closingIssues) await ancestry(source, issue, block, lines);
+      await closingChains(source, block, lines);
     })());
     if (Buffer.byteLength(lines.join("\n")) > 128 * 1024) throw new Error("Grading evidence too large");
     block.resolved = true;

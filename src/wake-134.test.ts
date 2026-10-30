@@ -88,6 +88,7 @@ describe("literal gh command boundary (#134)", () => {
     `gh pr view ${PR} --json reviews`, `gh pr diff ${PR}`, `gh pr checks ${PR}`,
     "gh issue view 1391 --repo ima-jin/imajin-ai",
     "gh api repos/fixture/repo/pulls/101", "gh api repos/fixture/repo/pulls/101 -X GET",
+    "gh api repos/fixture/repo/pulls/101 -XGET",
     "gh api repos/fixture/repo/issues -X GET -f state=closed",
     `gh api graphql -f 'query=query { viewer { login } }'`,
   ])("allows read-only gh without any ticket: %s", async (command) => {
@@ -104,6 +105,7 @@ describe("literal gh command boundary (#134)", () => {
     `gh --repo fixture/repo pr merge 101`,
     "gh api repos/fixture/repo/pulls/101/merge -XPUT",
     "gh api repos/fixture/repo/pulls/101/reviews -fevent=APPROVE",
+    "gh api repos/fixture/repo/pulls/101/merge -X GET --method PUT",
   ])("names unparseable commands rather than claiming grading is missing: %s", async (command) => {
     const { source } = gradingFixture();
     const block = await resolveWakeGrading(PR, source);
