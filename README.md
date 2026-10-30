@@ -1827,3 +1827,128 @@ Imajin (今人) is sovereign technology infrastructure — federated identity, .
 - **Network:** [jin.imajin.ai](https://jin.imajin.ai)
 - **Protocol:** [protocol.dfos.com](https://protocol.dfos.com)
 - **Code:** [github.com/ima-jin/imajin-ai](https://github.com/ima-jin/imajin-ai)
+
+## Per-agent Imajin identities (#136)
+
+On a multi-agent Gateway, set `plugins.entries.imajin.config.agents`, keyed by
+the **OpenClaw agent id** (`main`, `artifact-jin`, etc.). Each entry has its own
+`did`, sealed `keypair` SecretRef, optional `actAs` principal, exact `tools`
+allowlist, and `wsNotifications` settings. Each resolved entry owns one HTTP
+challenge-response session, reused by its own notification socket. No agent
+uses another agent's keypair, session cookie, or default acting principal.
+
+```json
+{
+  "nodeUrl": "https://jin.imajin.ai",
+  "agents": {
+    "main": {
+      "did": "did:imajin:MAIN_AGENT_PUBLIC_DID",
+      "keypair": { "source": "store", "provider": "default", "id": "imajin-main-identity" },
+      "actAs": "did:imajin:MAIN_PRINCIPAL"
+    },
+    "artifact-jin": {
+      "did": "did:imajin:ARTIFACT_AGENT_PUBLIC_DID",
+      "keypair": { "source": "exec", "provider": "imajin-vault", "id": "artifact-jin-identity" },
+      "actAs": "did:imajin:ARTIFACT_ORG",
+      "tools": ["imajin_identity", "imajin_discover", "imajin_chat"],
+      "wsNotifications": {
+        "injectScopes": ["warp.run.completed", "warp.run.failed", "warp.run.timeout"],
+        "hookToken": { "source": "store", "provider": "default", "id": "gateway-hook-token" },
+        "wakeSessionKey": "agent:artifact-jin:warp-events",
+        "reportTo": ["agent:artifact-jin:telegram:direct:OPERATOR_CHAT_ID"]
+      }
+    }
+  }
+}
+```
+
+The DIDs above are placeholders, not registered identities. Provision each
+keypair through your existing sealed store/vault tooling, outside chat,
+shell arguments and plugin config. The referenced value is a JSON object
+with `did`, `publicKey` and `privateKey` fields (Ed25519 hex); the plugin
+checks the public key against both the private key and the kernel's
+`did:imajin:<base58(publicKey)>` DID. Only the runtime signer sees private
+material. Configure an actual encrypted OpenClaw `store` provider or a trusted
+vault-backed `exec` provider in the host's `secrets.providers` first.
+`imajin-vault` is an operator-configured provider name, **not a bundled
+provider or executable**. No new vault adapter is supplied here. Missing SDK
+secret-resolution support or an unavailable provider disables that agent;
+do not substitute an inline value or a plaintext key file.
+
+Per-agent `keypair` rejects strings, inline key objects, `keypairPath`, and
+`env`/`file` refs. Duplicate DIDs or identical SecretRefs disable both entries.
+Resolution happens at full service startup, not during metadata discovery;
+before resolution, after stop, or on failure, the factory returns no tools.
+Restart/reload the plugin after provisioning or rotating an identity.
+
+### Register the agent and bind it to an org
+
+These are **operator steps**, not actions performed by this plugin. Do not
+mint, register, or seal a real key as part of testing this configuration.
+
+1. Read the deployed kernel's `/spec` catalogue first. Its auth contract is
+   available at `https://jin.imajin.ai/auth/api/spec`; its vault contract is
+   `https://jin.imajin.ai/vault/api/spec`. Auth spec paths are relative to
+   `/auth`, so the two existing operations below are served as
+   `/auth/api/register` and `/auth/api/groups/{groupDid}/controllers`.
+2. Use your protected signing/provisioning tool to submit **POST
+   `/api/register`**, with `type: "agent"`, the **public** `publicKey`, optional
+   `handle`/`name`, and a registration `signature`. No private key is sent to
+   register. The published spec requires `[publicKey, type, signature]`;
+   expect 201 for a new identity, or 200 for an already registered key.
+   Omit `Authorization` for signed self-registration. An app-service
+   Authorization header selects a separate, permission-gated path and never
+   falls back to self-registration.
+   **Version caveat:** the current kernel source still accepts
+   `scope: "actor", subtype: "agent"` rather than consuming `type`.
+   For that version, include those fields alongside `type: "agent"` and sign
+   the exact supported registration payload
+   `JSON.stringify({publicKey, handle, name, scope: "actor", subtype: "agent"})`
+   with the protected agent signer. Check your deployed version before
+   signing; do not register an unintended human identity by guessing fields.
+3. From the org owner's/admin's authenticated session, submit **POST
+   `/api/groups/{groupDid}/controllers`**, with public body
+   `{ "did": "<returned agent DID>", "role": "agent" }`. An owner can optionally
+   supply a finite `allowedServices` list to narrow authority; admins must
+   choose a finite subset of their own live services. The existing route
+   records `group.member.added` with the membership. No kernel change is
+   required. Use this org DID as that entry's `actAs`; omit `actAs` to act as
+   the agent itself. The kernel still adjudicates grants for every tool call.
+4. Store/seal the identity through the operator's protected provider flow,
+   then configure only its SecretRef in the map. The published vault spec
+   documents vault-side minting and one-time grants, but not a general
+   OpenClaw identity-provider adapter; do not invent a plaintext export or
+   bypass to bridge that missing tooling.
+
+### Tool policy, notifications and compatibility
+
+- `tools` omitted permits all existing primitive tools; `[]` permits none.
+  Entries are exact tool names, never wildcards. A tenant list can exclude
+  `imajin_warp`, `imajin_vault`, `imajin_cloudflare`, `imajin_status`, and
+  `imajin_wake_report`. Invalid or duplicate names fail closed. This plugin
+  list is an additional restriction; it does not grant kernel authority or
+  bypass OpenClaw tool policy.
+- Notifications use `agents.<id>.wsNotifications`: default wake/target is
+  `agent:<id>:warp-events`, and the hook agent is always `<id>`.
+  Agent-prefixed custom wake keys are scoped to that agent. `reportTo` and
+  `directSend` are explicit per-entry destinations, never inherited from main.
+  Permit that agent and its derived session-key prefix in the Gateway hook
+  allowlists. Each entry gets a separate persisted state directory (the
+  configured state root plus `<id>`, or `~/.openclaw/imajin-agents/<id>`) and
+  agent-namespaced wake idempotency keys.
+- Gateway-wide approvals (`approvals` and `approvalBridge`), signed session
+  commands, loop/horizon publishers, turn-usage attestations and authenticated
+  model discovery are **not inherited or started in agent-map mode**. They
+  currently require the legacy Gateway file signer; reusing it for tenant
+  events would violate identity isolation. In particular, no tenant receives
+  the Gateway approval rail through its tool list. The global model-provider
+  registration remains available for health diagnostics but its catalog is
+  unconfigured, never authenticated as main.
+- **Legacy zero-edit compatibility:** omit `agents` entirely to retain the
+  existing top-level `did`, `keypairPath`, `actAs`, `warp` and
+  `wsNotifications.wakeSessionKey` behavior, tools, provider and services.
+  (`wakeSessionKey` lives in `wsNotifications`, not `warp`, on current main.)
+  Adding even an empty `agents: {}` switches off legacy identity fallback:
+  an absent/unresolvable agent receives **zero `imajin_*` tools**, including
+  status. Move every participating identity into the map; merely retaining
+  top-level credentials does not configure `main` in this mode.

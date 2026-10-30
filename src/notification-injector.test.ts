@@ -502,6 +502,31 @@ describe("createNotificationInjector — wake hook request shape", () => {
       delete process.env[HOOK_TOKEN_ENV];
     }
   });
+
+  it("completion clears an agent-namespaced pending admission without leaving a replay marker (#136)", async () => {
+    const { api } = makeApi();
+    const stateDir = await mkdtemp(join(tmpdir(), "agent-pending-wake-"));
+    setImpl(async () => jsonResponse(503, { runId: "pending-tenant" }));
+    const injector = createNotificationInjector(api, {
+      ...CONFIG, stateDir, targetSession: "agent:tenant:warp-events", hookAgentId: "tenant",
+    }, { identityScope: "tenant", abortWake: async () => {} });
+    try {
+      await injector.inject(frame("pending"));
+      await vi.advanceTimersByTimeAsync(COALESCE_MS);
+      const store = new PendingWakeStore(join(stateDir, PENDING_WAKES_FILENAME));
+      await store.load();
+      expect(store.all()).toHaveLength(1);
+      await injector.onAgentEnd?.({
+        runId: "pending-tenant", sessionKey: "agent:tenant:warp-events", success: true,
+        messages: [{ role: "assistant", content: "Completed tenant work" }],
+      });
+      await store.load();
+      expect(store.all()).toHaveLength(0);
+    } finally {
+      await injector.dispose();
+      await rm(stateDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("createNotificationInjector — wake hook outcomes (#18)", () => {
@@ -698,6 +723,41 @@ describe("createNotificationInjector — idempotency key (#18)", () => {
 
     expect(secondKey).not.toBe(firstKey);
     await dispose();
+  });
+
+  it("two agents waking in the same millisecond get distinct admissions and report destinations (#136)", async () => {
+    const { api } = makeApi();
+    let admissions = 0;
+    setImpl(async () => jsonResponse(200, { runId: `admitted-${++admissions}` }));
+    const injectors = ["main", "tenant"].map((agentId) => createNotificationInjector(api, {
+      ...CONFIG, targetSession: `agent:${agentId}:warp-events`, hookAgentId: agentId,
+      reportTo: [`agent:${agentId}:operator`],
+    }, { identityScope: agentId, abortWake: async () => {} }));
+    try {
+      await Promise.all(injectors.map((injector) => injector.inject(frame("same-notification"))));
+      await vi.advanceTimersByTimeAsync(COALESCE_MS);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const keys = calls.map(([, init]) => init.headers["Idempotency-Key"]);
+      expect(new Set(keys).size).toBe(2);
+      const wakes = calls.map(([, init]) => JSON.parse(init.body));
+      expect(wakes.map((wake) => [wake.agentId, wake.sessionKey]).sort()).toEqual([
+        ["main", "agent:main:warp-events"], ["tenant", "agent:tenant:warp-events"],
+      ]);
+      for (const [index, injector] of injectors.entries()) {
+        const wake = wakes[index];
+        await injector.onAgentEnd?.({
+          runId: `admitted-${index + 1}`, sessionKey: wake.sessionKey, success: true,
+          messages: [{ role: "assistant", content: [{ type: "text", text: `Result for ${wake.agentId}` }] }],
+        });
+      }
+      const reports = calls.slice(2).map(([, init]) => JSON.parse(init.body));
+      expect(reports.map((report) => [report.agentId, report.sessionKey]).sort()).toEqual([
+        ["main", "agent:main:operator"], ["tenant", "agent:tenant:operator"],
+      ]);
+      for (const report of reports) expect(report.message).toContain(`Result for ${report.agentId}`);
+    } finally {
+      await Promise.all(injectors.map((injector) => injector.dispose()));
+    }
   });
 });
 

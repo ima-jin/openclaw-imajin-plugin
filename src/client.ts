@@ -14,11 +14,25 @@ export function validateDid(did: string): boolean {
   return DID_PATTERN.test(did);
 }
 
+function extractSessionCookie(header: string | null): string | undefined {
+  const cookie = header?.split(";", 1)[0];
+  if (!cookie) return undefined;
+  const separator = cookie.indexOf("=");
+  return separator > 0 && separator < cookie.length - 1 ? cookie : undefined;
+}
+
+/** Private material stays behind this capability, never in tool/config objects. */
+export interface ImajinSigner {
+  did: string;
+  signChallenge: (challenge: string) => Promise<string>;
+}
+
 export interface ImajinClientConfig {
   nodeUrl: string;
   did?: string;
   keypairPath?: string;
   actAs?: string;
+  signer?: ImajinSigner;
 }
 export type CloudflareResource = "dns" | "settings" | "ssl" | "cache-rules" | "custom-hostnames" | "bulk" | "history" | "classification";
 
@@ -272,12 +286,18 @@ export class ImajinClient {
   private keypair?: Keypair;
   private sessionCookie?: string;
   private sessionExpiresAt?: number;
+  private readonly signer?: ImajinSigner;
+  private authenticating?: Promise<void>;
 
   constructor(config: ImajinClientConfig) {
     this.baseUrl = config.nodeUrl.replace(/\/$/, "");
     this.did = config.did;
     this.keypairPath = config.keypairPath;
     this.actAs = config.actAs;
+    this.signer = config.signer;
+    if (this.signer && this.signer.did !== this.did) {
+      throw new Error("Imajin signer DID does not match configured identity");
+    }
   }
 
   // --- Auth ---
@@ -340,6 +360,25 @@ export class ImajinClient {
    * 4. Extract session cookie from response
    */
   async authenticate(): Promise<void> {
+    this.authenticating ??= this.authenticateSession().finally(() => {
+      this.authenticating = undefined;
+    });
+    await this.authenticating;
+  }
+
+  /** Reused by this identity's WS transport; never shared across agents. */
+  async authenticatedCookie(): Promise<string> {
+    await this.authenticate();
+    if (!this.sessionCookie) throw new Error("Imajin auth returned no session cookie");
+    return this.sessionCookie;
+  }
+
+  invalidateAuthentication(): void {
+    this.sessionCookie = undefined;
+    this.sessionExpiresAt = undefined;
+  }
+
+  private async authenticateSession(): Promise<void> {
     // Skip if session is still valid (with 5 min buffer)
     if (
       this.sessionCookie &&
@@ -349,13 +388,17 @@ export class ImajinClient {
       return;
     }
 
-    const keypair = await this.loadKeypair();
+    const keypair = this.signer ? undefined : await this.loadKeypair();
+    if (keypair && this.did && keypair.did !== this.did) {
+      throw new Error("Imajin keypair DID does not match configured identity");
+    }
+    const did = this.signer?.did ?? keypair!.did;
 
     // Step 1: Request challenge
     const challengeRes = await fetch(`${this.baseUrl}/auth/api/login/challenge`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ did: keypair.did }),
+      body: JSON.stringify({ did }),
     });
 
     if (!challengeRes.ok) {
@@ -370,7 +413,9 @@ export class ImajinClient {
     };
 
     // Step 2: Sign the challenge
-    const signature = await this.signChallenge(challenge, keypair.privateKey);
+    const signature = this.signer
+      ? await this.signer.signChallenge(challenge)
+      : await this.signChallenge(challenge, keypair!.privateKey);
 
     // Step 3: Verify signature
     const verifyRes = await fetch(`${this.baseUrl}/auth/api/login/verify`, {
@@ -385,14 +430,11 @@ export class ImajinClient {
     }
 
     // Step 4: Extract session cookie
-    const setCookie = verifyRes.headers.get("set-cookie");
-    if (setCookie) {
-      // Extract the session token from set-cookie header
-      const match = setCookie.match(/([^=]+)=([^;]+)/);
-      if (match) {
-        this.sessionCookie = `${match[1]}=${match[2]}`;
-      }
+    const cookie = extractSessionCookie(verifyRes.headers.get("set-cookie"));
+    if (this.signer && !cookie) {
+      throw new Error("Imajin auth returned no session cookie");
     }
+    if (cookie) this.sessionCookie = cookie;
 
     // Session expires when the challenge would have expired (5 min),
     // but the JWT likely has a longer TTL. Refresh conservatively.
@@ -406,7 +448,7 @@ export class ImajinClient {
     const headers: Record<string, string> = {
       Accept: "application/json",
     };
-    if (this.keypairPath) {
+    if (this.keypairPath || this.signer) {
       await this.authenticate();
       if (this.sessionCookie) {
         headers["Cookie"] = this.sessionCookie;

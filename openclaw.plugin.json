@@ -200,6 +200,42 @@
     "type": "object",
     "additionalProperties": false,
     "properties": {
+      "agents": {
+        "type": "object",
+        "description": "Explicit per-agent identity mode. Only listed, resolved agents get tools; top-level identity and Gateway-wide approvals are never inherited. Omit this map entirely for legacy mode.",
+        "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
+        "additionalProperties": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["did", "keypair"],
+          "properties": {
+            "did": { "type": "string", "pattern": "^did:imajin:[A-Za-z0-9:_-]+$" },
+            "actAs": { "type": "string", "pattern": "^did:imajin:[A-Za-z0-9:_-]+$" },
+            "keypair": {
+              "type": "object",
+              "description": "OpenClaw SecretRef to sealed JSON {did, publicKey, privateKey}. Configure a sealed store or vault-backed exec provider; never inline private material.",
+              "additionalProperties": false,
+              "required": ["source", "provider", "id"],
+              "properties": {
+                "source": { "type": "string", "enum": ["store", "exec"] },
+                "provider": { "type": "string", "minLength": 1, "pattern": "\\S" },
+                "id": { "type": "string", "minLength": 1, "pattern": "\\S" }
+              }
+            },
+            "tools": {
+              "type": "array",
+              "uniqueItems": true,
+              "description": "Exact plugin tool allowlist, including status and wake reports. Omitted permits all; [] permits none. Gateway-wide approval bridges are not started in this mode.",
+              "items": {
+                "type": "string",
+                "enum": ["imajin_status", "imajin_identity", "imajin_attest", "imajin_transact", "imajin_fair", "imajin_discover", "imajin_media", "imajin_warp", "imajin_infer", "imajin_usage", "imajin_vault", "imajin_cloudflare", "imajin_chat", "imajin_wake_report"]
+              }
+            },
+            "warp": { "$ref": "#/properties/warp" },
+            "wsNotifications": { "$ref": "#/properties/wsNotifications" }
+          }
+        }
+      },
       "nodeUrl": {
         "type": "string",
         "description": "Imajin node URL"

@@ -192,6 +192,28 @@ describe("isAuthFailureFrame", () => {
 });
 
 describe("computeReconnectDelayMs", () => {
+  it("SecretRef-backed sockets reuse and invalidate their own supplied session without reading a key file (#136)", async () => {
+    vi.useFakeTimers();
+    vi.mocked(readFile).mockClear();
+    const authenticate = vi.fn(async () => "session=opaque-test-session");
+    const invalidateAuthentication = vi.fn();
+    const service = new ImajinWsService({
+      nodeUrl: NODE_URL, did: "did:imajin:tenant", authenticate, invalidateAuthentication,
+    }, silentLogger());
+    try {
+      await service.start();
+      const socket = FakeSocket.instances[0];
+      socket.triggerOpen();
+      socket.triggerMessage(JSON.stringify({ type: "connected" }));
+      socket.triggerMessage(JSON.stringify({ type: "auth_required" }));
+      expect(invalidateAuthentication).toHaveBeenCalledOnce();
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(authenticate).toHaveBeenCalledTimes(2);
+      expect(readFile).not.toHaveBeenCalled();
+    } finally {
+      service.stop();
+    }
+  });
   it("doubles from the base delay on each attempt", () => {
     expect(computeReconnectDelayMs(0)).toBe(2_000);
     expect(computeReconnectDelayMs(1)).toBe(4_000);
