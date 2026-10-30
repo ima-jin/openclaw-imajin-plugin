@@ -164,7 +164,7 @@ In `openclaw.json`:
   - **`wsNotifications.maxWakeTokens`** — per-session context ceiling, default `80000`; applies independently to the wake and every decision child; never adds usage across turns or sessions
   - **`wsNotifications.model`** — optional coordinator model; omitted uses the host's configured wake-agent model
   - **`wsNotifications.wakeModel`** — optional string selecting the wake coordinator only (e.g. `"wakeModel": "imajin/kimi-k3"`); takes precedence over legacy `model`, never changes any gateway/agent default or `decisionModel`, and needs no provider keys. Unset, empty, or whitespace-only preserves the existing hook payload/routing (including legacy `model`, if configured). The host's read-only catalog and model policy resolve the override; unavailable/disallowed models or a failed/timed-out lookup warn and omit the override so the gateway uses its default. At the first root `llm_input`, each wake logs one `[imajin-ws] wake model="provider/model" source=wakeModel|default|model batch=…` line naming the actual model, not merely the requested one (`source=model` identifies the legacy option). Decision children and informational reports keep their existing routing.
-  - **`wsNotifications.decisionModel`** — decision subagent model, default `anthropic/claude-opus-5-5`; review/merge/enqueue/dispatch tools run only in pinned subagents, not the coordinator
+  - **`wsNotifications.decisionModel`** — decision subagent model, default `anthropic/claude-opus-5-5`; review/approve tools run only in pinned subagents, not the coordinator. No wake path may merge or enqueue.
   - **`wsNotifications.wakeReadOnlyLookups`** — defaults to `false` (option c: coordinate only); explicit `true` enables allowlisted reads only when no PR is known or every run in the batch is FAILED. It never permits coordinator review, approve, merge, enqueue or dispatch.
   - **`wsNotifications.githubCliPath`** — trusted absolute GitHub CLI path for live PR reads; default `/usr/bin/gh`; set the installed absolute path (e.g. `/opt/homebrew/bin/gh` on macOS), never a PATH-resolved command
   - **`wsNotifications.wakeTimeoutMs`** — completion watchdog; default `900000` (15 minutes), clamped to `1..3600000`ms, independent of `reportTo`
@@ -1232,8 +1232,8 @@ mergeable UNKNOWN/null**: terminal subjects receive a one-line directSend
 disclosure and are not re-reviewed. Mixed batches retain open or unavailable
 subjects; lookup failures are explicitly unavailable, never assumed merged.
 
-The coordinator's tools are restricted to `sessions_spawn`, `sessions_send`, `message` and
-`session_status`. Review/approve/merge/enqueue/dispatch work is delegated through
+The coordinator's tools are restricted to `sessions_spawn`, `sessions_send`, `imajin_wake_report` and
+`session_status` (native `message` calls are refused). Review/approve work is delegated through
 `sessions_spawn` with `runtime: "subagent"` and the configured `decisionModel`;
 the plugin overrides attempted model substitutions. The host must allow that
 model and the spawn tool. Missing permission/model availability is a blocker,
@@ -1247,33 +1247,38 @@ as a cheaper fallback.
 **Plugin-owned decision yardstick (#101).** Each delegated task gets a
 plugin-resolved grading block for every subject PR, even with script-built
 packets. Authenticated, bounded GraphQL reads supply `closingIssuesReferences`,
-each issue's native `parent` chain through the epic (including cross-repository
+each issue's whole native `parent` chain (including cross-repository
 parents), verbatim OUTCOME and DECISION ruled lines from bodies/comments, and
 review history (reviewer, state, commit SHA). Comments follow the body so later
-rulings remain visible. Missing ancestry, an absent epic/OUTCOME, incomplete
-pagination or lookup failure is explicitly **UNRESOLVED**: report blocked,
-never substitute the coordinator's interpretation.
+rulings remain visible. An ancestor without OUTCOME is recorded, not fatal;
+closed or epic-less terminal parents resolve with the evidence actually found.
+If no OUTCOME exists anywhere on the chain, both block and approval marker say
+`OUTCOME none on chain`. Ordinary decision reasoning is never invented as a
+`DECISION ruled` line. Cycles, depth overflow, incomplete pagination or lookup
+failure remain explicitly **UNRESOLVED**, with a safe failing-link reason:
+report blocked, never substitute the coordinator's interpretation.
 
-Decision-child approve/merge/enqueue calls require that exact PR's resolved
+Decision-child approval calls require that exact PR's resolved
 block on the child's one-use ticket. Immediately before acting, the plugin
 re-reads head/reviews: **any imajin-jin CHANGES_REQUESTED on the current head
 stands until a new head lands**, even after a subsequent approval. A changed
 head needs a new delegation/grading ticket; old-head change requests do not
 veto a freshly graded head. CLI approval bodies and GitHub MCP review bodies
 are prefixed with `Graded against: OUTCOME <repo>#<epic> · DECISION <refs> @ <headSha>`
-(`none` when there are no DECISION refs).
+(`none` when there are no DECISION refs; the available non-epic OUTCOME refs
+are used if no epic supplies an OUTCOME).
 
 Use a literal `gh pr review <PR-URL> --approve --body 'evidence'`, or an
-explicit PR number plus `--repo owner/repo`; merge has the same exact-target
-requirement. GitHub MCP approval/review, merge and enqueue tools use explicit
-owner/repo/PR fields. Opaque body files, environment overrides, shell programs
-and ambiguous targets fail closed. Raw GraphQL enqueue/merge accepts only one
-literal mutation with `input: {pullRequestId: "PR_..."}` (optionally
-`expectedHeadOid`) and a `clientMutationId` or `pullRequest { id }` selection,
-passed as `gh api graphql -f 'query=mutation { ... }'` or MCP `query`.
-Variables, aliases, compound mutations and opaque inputs are refused rather
-than guessed; use the direct CLI/MCP operation instead. Raw API approvals are
-refused in favor of the body-prefixed approval paths. These are wake tool-call
+explicit PR number plus `--repo owner/repo`. Single-quoted bodies support
+literal newlines, backticks and `$`; dynamic shell expansion is refused.
+GitHub MCP approval/review tools use explicit owner/repo/PR fields.
+Opaque body files, environment overrides, shell programs and ambiguous targets
+fail with `command not parseable for the merge gate: <hint>`, not a false
+missing-block diagnosis. Read-only `gh pr view/diff/checks`, `issue view`, REST
+GETs and literal GraphQL queries do not need a grading block. Raw API approvals
+are refused in favor of the body-prefixed approval paths.
+**No wake path may merge, enqueue or approve-and-merge**, including direct CLI,
+MCP and GraphQL mutations, even with a resolved block. These are wake tool-call
 guards, not a general-purpose shell sandbox.
 
 **Coordinator authority — option c (Ryan, 2026-10-18 11:08).** The wake
@@ -1323,12 +1328,12 @@ missing per-call usage is unknown, not cumulative billed usage.
 
 Configure **`directSend`**, and optionally `reportTo`. Explicit `reportTo`
 destinations take precedence; otherwise the directSend channel/target is the
-required destination. A successful `message` send to every required destination
-is the disclosure receipt. OpenClaw disables
-the native `message` tool in subagents, so decision children use the plugin's
+required destination. Progress notes such as “review started” do not spend the
+single disclosure: native `message` calls are refused and legacy message
+receipts do not close the wake. Coordinators and decision children use the plugin's
 **`imajin_wake_report`** tool with `outcome: "completed"` or `"blocked"` and a
 concrete evidence/blocker message. It performs deterministic
-`openclaw message send` calls to the explicit or fallback destinations and
+in-process channel sends to the explicit or fallback destinations and
 records receipts only after successful sends. Allow this plugin tool in
 decision-child tool policy. Final prose, spawn admission and the informational
 #47 report are not delivery evidence.
@@ -1357,6 +1362,9 @@ or reply to warp-events. The original message follows as report evidence,
 not as a task.
 After disclosure, inter-session reply turns (including `ANNOUNCE_SKIP`) are
 blocked without a reply, and further channel/report posts are refused.
+A spawn refused after disclosure (including a grading-resolution race) invokes
+the deterministic stop/alert path once, so the refusal cannot be lost behind
+the normal disclosure latch. This safety alert is not a second model-written verdict.
 Ended wakes stay fenced against late announcements, preventing acknowledgment
 ping-pong. A new admitted batch can still use an explicitly reused session.
 

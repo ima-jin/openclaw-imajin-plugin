@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Fixed
+- **Wake grading and disclosure (#134).** Native ancestry tolerates missing
+  OUTCOMEs and epic-less/closed terminals, retaining body/comment rulings and
+  specific lookup/cycle/depth/timeout blockers. Literal Markdown approvals pass
+  the resolved-block gate; reads bypass it, malformed commands name the parse
+  failure, and all wake merge/enqueue paths are refused. Final outcome reports
+  own disclosure; early status receipts cannot hide a child's blocked verdict.
+
 ### Added
 - **Kernel-picked default model (#106).** The catalog approval card can switch
   inherited defaults to `imajin/default`, retaining the old direct ref as

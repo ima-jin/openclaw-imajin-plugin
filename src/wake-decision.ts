@@ -6,7 +6,7 @@ import { createWakeGradingSource, resolveWakeGrading, type WakeGradingBlock, typ
 import { gateDecisionMutation } from "./wake-merge-gate.js";
 
 export const DEFAULT_WAKE_DECISION_MODEL = "anthropic/claude-opus-5-5";
-const WORKER_TOOLS = new Set(["message", "sessions_spawn", "sessions_send", "session_status"]);
+const WORKER_TOOLS = new Set(["message", "imajin_wake_report", "sessions_spawn", "sessions_send", "session_status"]);
 const MAX_CHILDREN = 32;
 const POSTING_TOOLS = new Set(["message", "imajin_wake_report"]);
 
@@ -26,6 +26,7 @@ interface WakeDecisionOptions {
   gradingSource?: WakeGradingSource;
   wakeReadOnlyLookups?: boolean;
   githubCliPath?: string;
+  reportBlockedDelegation?: (batchId: string, reason: string) => Promise<void>;
 }
 interface WakeToolPolicy {
   block?: boolean;
@@ -85,6 +86,10 @@ export class WakeDecisionRouter {
   ) {
     this.gradingSource = options.gradingSource ?? createWakeGradingSource(options.githubCliPath);
   }
+  private async refuseDelegation(wake: DecisionWake, reason: string): Promise<WakeToolPolicy> {
+    await this.options.reportBlockedDelegation?.(wake.batchId, reason);
+    return { block: true, blockReason: reason };
+  }
 
   track(sessionKey: string, batchId = sessionKey, subject: WakeSubjectPolicy = {}): void {
     if (this.wakes.has(batchId)) return;
@@ -114,6 +119,7 @@ export class WakeDecisionRouter {
   }
 
   private async delegateDecision(event: WakeToolEvent, wake: DecisionWake): Promise<WakeToolPolicy> {
+    if (wake.disclosed) return this.refuseDelegation(wake, "Wake already disclosed; decision spawn refused.");
     if (typeof event.params.task !== "string" || !event.params.task.trim()) {
       return { block: true, blockReason: "Decision delegation requires a nonempty task." };
     }
@@ -122,7 +128,7 @@ export class WakeDecisionRouter {
     wake.delegations++;
     const blocks = await Promise.all(wake.prUrls.map((url) => resolveWakeGrading(url, this.gradingSource)));
     if (this.wakes.get(wake.batchId) !== wake || wake.disclosed) {
-      return { block: true, blockReason: "Wake ended while resolving grading context; report blocked." };
+      return this.refuseDelegation(wake, "Wake ended while resolving grading context; decision spawn refused.");
     }
     this.tickets.set(ticket, { batchId: wake.batchId, blocks });
     const packet = wake.packetContext ? "\n\n" + wake.packetContext : "";
@@ -198,14 +204,14 @@ export class WakeDecisionRouter {
       return;
     }
     const reporting = this.reportTo.length
-      ? `Send a concrete outcome using message action=send to every disclosure target: ${JSON.stringify(this.reportTo)}. Final prose and NO_REPLY do not disclose an outcome. If blocked, disclose what did not finish.`
+      ? `Send a concrete outcome using imajin_wake_report with outcome=completed or blocked to every disclosure target: ${JSON.stringify(this.reportTo)}. Do not send "review started" or other progress notes: only a verdict spends the single disclosure. Final prose and NO_REPLY do not disclose an outcome. If blocked, disclose what did not finish.`
       : "No disclosure destination is configured; silent-ending monitoring is disabled. Do not invent a recipient.";
     if (wake.sessionKey !== ctx.sessionKey) {
       const childReporting = this.reportTo.length
         ? "Call imajin_wake_report with outcome=completed or blocked and concrete evidence before ending; it sends a real channel message to every configured disclosure target. Subagents do not have the normal message tool."
         : reporting;
       return { appendSystemContext: [
-        "This is delegated Warp decision work. Review/approve/merge/enqueue/dispatch here, using live state before acting.",
+        "This is delegated Warp decision work. Review/approve/report here, using live state before acting. Never merge, enqueue or approve-and-merge from any wake path.",
         "Grade only against the plugin-resolved OUTCOME and verbatim DECISION ruled lines on your ticket, not the coordinator's interpretation. If any grading chain is UNRESOLVED, report blocked instead of approving. Merge-side calls require an exact PR URL (or explicit --repo), and a fresh head/review check. A current-head imajin-jin CHANGES_REQUESTED stands until a new head lands. A changed head requires a new ticket. Approval bodies are prefixed by the plugin with the grading yardstick.",
         ...(wake.packetContext ? ["Start from the supplied script-built packet. Do not re-fetch PR state, checks, Sonar, brief or horizon supplied there unless that section has a GAP:. Report packet provenance and every GAP:."] : []),
         childReporting,
@@ -215,7 +221,7 @@ export class WakeDecisionRouter {
     }
     return {
       toolsAllow: [...WORKER_TOOLS, ...(wake.lookupAllowed ? WAKE_LOOKUP_TOOLS : [])],
-      appendSystemContext: `Warp wake coordinator (option c): delegate review, approve, merge, enqueue and dispatch work with sessions_spawn, runtime=subagent, model=${this.model}. Pass the entire live-state preamble and relevant horizon/bridge evidence in the task. Never approve or merge yourself, regardless of lookup settings. Read-only lookups allowed for this batch: ${wake.lookupAllowed}. ${reporting} An optional main-session copy uses sessions_send with timeoutSeconds 0, once only. After disclosure, do not acknowledge inter-session replies, including ANNOUNCE_SKIP.`,
+      appendSystemContext: `Warp wake coordinator (option c): delegate review and approve/report work with sessions_spawn, runtime=subagent, model=${this.model}. Pass the entire live-state preamble and relevant horizon/bridge evidence in the task. Never approve yourself. No wake path may merge, enqueue or approve-and-merge, regardless of lookup settings. Read-only lookups allowed for this batch: ${wake.lookupAllowed}. ${reporting} An optional main-session copy uses sessions_send with timeoutSeconds 0, once only. After disclosure, do not acknowledge inter-session replies, including ANNOUNCE_SKIP.`,
     };
   }
 
@@ -237,11 +243,12 @@ export class WakeDecisionRouter {
       return;
     }
     if (event.toolName === "sessions_send") return this.mainSessionCopy(event, wake, ctx.sessionKey === wake.sessionKey);
+    if (event.toolName === "sessions_spawn") return this.delegateDecision(event, wake);
     if (wake.disclosed && POSTING_TOOLS.has(event.toolName)) {
       return { block: true, blockReason: "Warp wake already disclosed; do not post or act on inter-session replies." };
     }
-    if (event.toolName === "sessions_spawn") {
-      return this.delegateDecision(event, wake);
+    if (event.toolName === "message") {
+      return { block: true, blockReason: "Reserve the single disclosure for a concrete verdict or blocker via imajin_wake_report; progress messages do not disclose an outcome." };
     }
     if (ctx.sessionKey === wake.sessionKey) return this.coordinatorTool(event, wake);
     const policy = gateDecisionMutation(event, this.childGrading.get(ctx.sessionKey!), this.gradingSource,

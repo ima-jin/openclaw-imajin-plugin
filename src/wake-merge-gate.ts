@@ -4,6 +4,7 @@ import { validatedWakePrUrl } from "./wake-live-state.js";
 
 interface Policy { block?: boolean; blockReason?: string; params?: Record<string, unknown> }
 interface Mutation {
+  parseError?: string;
   target?: string;
   nodeId?: string;
   approve: boolean;
@@ -31,17 +32,46 @@ function negativeReview(args: string[]): boolean {
     && !args.some((arg) => arg.startsWith("-a"));
 }
 
-function apiMutation(args: string[]): Mutation {
-  if (args[1] === "api" && args[2] === "graphql" && args.length === 5 && ["-f", "--raw-field"].includes(args[3])) {
-    return graphqlMutation(args[4].startsWith("query=") ? args[4].slice(6) : undefined);
-  }
-  return { approve: false, body: "" };
+const unparseable = (): Mutation => ({
+  approve: false, body: "", parseError: "use one literal gh command with an exact PR URL or --repo; single-quote Markdown bodies",
+});
+
+function apiMutation(args: string[]): Mutation | undefined {
+  if (args.slice(2).some(isGraphqlEndpoint)) return graphqlApiMutation(args);
+  if (args.slice(2).some(headerOrInputFlag)) return unparseable();
+  const method = flag(args, ["--method", "-X"]) ?? args.find((arg) => /^-X./.test(arg))?.slice(2);
+  const fields = args.some((arg) => /^(?:--(?:raw-)?field|--input|-f|-F)/.test(arg));
+  const methods = args.filter((arg) => /^(?:--method(?:=|$)|-X)/.test(arg));
+  if (args[1] === "api" && methods.length <= 1
+    && (method === "GET" || (!method && !fields))) return;
+  return unparseable();
+}
+
+function isGraphqlEndpoint(arg: string): boolean {
+  return /(?:^|\/)graphql$/.test(arg);
+}
+
+function headerOrInputFlag(arg: string): boolean {
+  if (arg.startsWith("-H")) return true;
+  const name = arg.split("=")[0];
+  return name.startsWith("--") && name.length > 2
+    && ["--header", "--input"].some((option) => option.startsWith(name));
+}
+
+function graphqlApiMutation(args: string[]): Mutation | undefined {
+  if (args.length !== 5 || !isGraphqlEndpoint(args[2]) || !["-f", "--raw-field"].includes(args[3])) return unparseable();
+  const query = args[4].startsWith("query=") ? args[4].slice(6) : undefined;
+  if (query && !/\b(?:mutation|subscription)\b/i.test(query) && /^\s*(?:query\b|\{)/.test(query)) return;
+  return graphqlMutation(query);
 }
 
 function cliMutation(event: WakeToolEvent, cliPath: string): Mutation | undefined {
   const args = mutationWords(event, cliPath);
   if (args === undefined) return;
-  if (args === null) return { approve: false, body: "" };
+  if (args === null) return unparseable();
+  if ((args[1] === "pr" && ["view", "diff", "checks"].includes(args[2]))
+    || (args[1] === "issue" && args[2] === "view")) return;
+  if (args[1] !== "api" && !(args[1] === "pr" && ["merge", "review"].includes(args[2]))) return unparseable();
   const review = args[1] === "pr" && args[2] === "review";
   const approve = review && args.some((arg) => arg === "--approve" || arg === "-a");
   if (review && !approve && negativeReview(args)) return;
@@ -63,24 +93,36 @@ function mutationWords(event: WakeToolEvent, cliPath: string): string[] | null |
 const refuse = (reason: string): Policy => ({ block: true, blockReason: `Decision merge-side call blocked: ${reason}. Report blocked.` });
 const quote = (text: string) => "'" + text.replaceAll("'", String.raw`'\''`) + "'";
 
-/** A single literal command, never a shell program or a body-file/editor indirection. */
+/** Literal shell words only. Single quotes may contain arbitrary Markdown. */
 function words(command: string): string[] | undefined {
   const result: string[] = [];
-  if (/[$`\\]/.test(command)) return;
-  const token = /'[^']*'|"[^"]*"|[^\s'";&|<>()#$`\\]+/y;
+  const token = /'[^']*'|"[^"$`\\]*"|\\'|[^\s'";&|<>()#$`\\*?~{}]+/y;
+  let value = "";
+  let started = false;
   let offset = 0;
   while (offset < command.length) {
     if (/[\r\n]/.test(command[offset])) return;
-    if (/\s/.test(command[offset])) { offset++; continue; }
+    if (/\s/.test(command[offset])) {
+      if (started) result.push(value);
+      value = "";
+      started = false;
+      offset++;
+      continue;
+    }
     token.lastIndex = offset;
     const match = token.exec(command);
     if (!match) return;
     offset = token.lastIndex;
-    if (offset < command.length && !/\s/.test(command[offset])) return;
-    const value = match[0];
-    result.push(value.startsWith("'") || value.startsWith('"') ? value.slice(1, -1) : value);
+    value += literalToken(match[0]);
+    started = true;
   }
+  if (started) result.push(value);
   return result;
+}
+
+function literalToken(value: string): string {
+  if (value === String.raw`\'`) return "'";
+  return value.startsWith("'") || value.startsWith('"') ? value.slice(1, -1) : value;
 }
 
 function flag(args: string[], names: string[]): string | undefined {
@@ -98,7 +140,7 @@ function url(repo: unknown, number: unknown): string | undefined {
 function graphqlMutation(query: unknown): Mutation {
   // Deliberately bounded grammar: no aliases, extra mutations, fragments, variables,
   // opaque input files or unrelated node IDs used as supposed target evidence.
-  const invalid = { approve: false, body: "" };
+  const invalid = unparseable();
   if (typeof query !== "string" || /\\/.test(query)) return invalid;
   const compact = query.split(/("[^"]*")/).map((part, index) => index % 2 ? part : part.replaceAll(/\s/g, "")).join("");
   const prefix = /^mutation\{(enqueuePullRequest|mergePullRequest)\(input:\{pullRequestId:"(PR_[\w-]+)"/.exec(compact);
@@ -129,8 +171,9 @@ function directMutation(event: WakeToolEvent, args: string[], approve: boolean):
   const ambiguous = !directFlags(args, approve)
     || (directUrl && repository && !directUrl.includes(`/${repository}/pull/`))
     || duplicateFlag(args, ["--repo", "-R"]) || duplicateFlag(args, ["--body", "-b"]);
+  if (ambiguous || !target) return unparseable();
   return {
-    target: ambiguous ? undefined : target, approve, body, expectedHeadSha: flag(args, ["--match-head-commit"]),
+    target, approve, body, expectedHeadSha: flag(args, ["--match-head-commit"]),
     withBody: approve ? (value) => approvalBody(event, args, value) : undefined,
   };
 }
@@ -141,9 +184,11 @@ function mcpMutation(event: WakeToolEvent): Mutation | undefined {
   const serialized = JSON.stringify(params);
   const approve = /approve.*pull.?request/.test(name)
     || (/review/.test(name) && String(params.event).toUpperCase() === "APPROVE");
-  const merge = /merge.*pull.?request|enqueue/.test(name);
+  const merge = /merge.*pull.?request|enqueue/.test(name)
+    || (/pull.?request/.test(name) && /^(?:merge|enqueue)$/i.test(String(params.method ?? params.action)));
   const graph = /enqueuePullRequest|mergePullRequest|addPullRequestReview/.test(serialized);
   if (!approve && !merge && !graph) return;
+  if (merge) return { approve: false, body: "" };
   if (graph) return graphqlMutation(params.query);
   const target = validatedWakePrUrl(params.pullRequestUrl ?? params.url)
     ?? url(`${params.owner}/${params.repo}`, params.pullNumber ?? params.pull_number ?? params.number);
@@ -160,6 +205,8 @@ export function gateDecisionMutation(
 ): Policy | Promise<Policy | undefined> | undefined {
   const mutation = event.toolName === "exec" ? cliMutation(event, cliPath) : mcpMutation(event);
   if (!mutation) return;
+  if (mutation.parseError) return refuse(`command not parseable for the merge gate: ${mutation.parseError}`);
+  if (!mutation.approve) return refuse("wake paths never merge or enqueue; report the verdict instead");
   const block = blocks?.find((entry) => mutation.target
     ? entry.url.toLowerCase() === mutation.target.toLowerCase() : mutation.nodeId && entry.pr?.id === mutation.nodeId);
   if (!block?.resolved || !block.pr) return refuse("no resolved grading block on this child's ticket for the exact PR");
