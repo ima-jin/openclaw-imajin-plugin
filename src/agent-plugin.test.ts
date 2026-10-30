@@ -46,6 +46,7 @@ vi.mock("./ws-service.js", async (original) => ({
     start = vi.fn(async () => {});
     stop() { this.socket.stop(); }
     send = vi.fn();
+    onConnected = vi.fn();
     onFrame(handler: (frame: any) => void) { this.socket.frame = handler; }
   },
 }));
@@ -171,6 +172,8 @@ describe("per-agent plugin registration", () => {
     registry.emit("before_agent_run", {}, { agentId: "tenant", sessionKey: "agent:tenant:custom" });
     expect(mocks.injectors[1].hook).toHaveBeenCalledOnce();
     expect(mocks.injectors[0].hook).not.toHaveBeenCalled();
+    registry.emit("before_agent_run", {}, { agentId: "tenant", sessionKey: "agent:main:custom" });
+    expect(mocks.injectors[1].hook).toHaveBeenCalledOnce();
     await Promise.all(registry.emit("agent_end", { sessionKey: "agent:tenant:custom" }));
     expect(mocks.injectors[1].end).toHaveBeenCalledOnce();
     expect(mocks.injectors[0].end).not.toHaveBeenCalled();
@@ -250,6 +253,7 @@ describe("per-agent plugin registration", () => {
       nodeUrl: "https://kernel.invalid", did: "did:imajin:legacy",
       keypairPath: "/legacy-public-only.json", actAs: "did:imajin:legacy-org",
       warp: { usdPerCredit: 0.02 },
+      loops: { enabled: false },
       wsNotifications: { wakeSessionKey: "agent:main:custom", reportTo: ["agent:main:operator"] },
     };
     const registry = register(config);
@@ -260,8 +264,11 @@ describe("per-agent plugin registration", () => {
     expect(wire[0].body).toEqual({ did: "did:imajin:legacy" });
     expect(wire[1].body.signature).toBe("fake-legacy-signature");
     expect(wire[2].headers).toMatchObject({ "X-Agent-DID": config.did, "X-Acting-For": config.actAs });
-    // Existing registration-runtime tests exercise legacy startup, including notification config.
     expect(mocks.signer).not.toHaveBeenCalled();
-    expect(config.wsNotifications.wakeSessionKey).toBe("agent:main:custom");
+    await registry.start();
+    expect(mocks.injectors[0].config).toEqual(config.wsNotifications);
+    expect(mocks.sockets[0].config).toMatchObject({
+      did: config.did, keypairPath: config.keypairPath, actAs: config.actAs,
+    });
   });
 });

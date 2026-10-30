@@ -31,6 +31,7 @@ export interface WsServiceConfig {
   actAs?: string;
   /** Identity-scoped HTTP session supplier for SecretRef-backed agents. */
   authenticate?: () => Promise<string>;
+  invalidateAuthentication?: () => void;
 }
 
 export interface NotificationFrame {
@@ -260,7 +261,10 @@ export class ImajinWsService {
 
   /** Authenticate via HTTP challenge-response, extract session token. */
   private async authenticate(): Promise<string> {
-    if (this.config.authenticate) return this.config.authenticate();
+    if (this.config.authenticate) {
+      this.sessionCookie = await this.config.authenticate();
+      return this.sessionCookie;
+    }
     const keypair = await this.loadKeypair();
     const baseUrl = this.config.nodeUrl.replace(/\/$/, "");
 
@@ -417,7 +421,7 @@ export class ImajinWsService {
           this.logger.warn(`auth rejected by kernel (${reason}) — refreshing session and reconnecting`);
           // Force a fresh challenge-response on the next connect() rather than
           // retrying with a cookie the kernel just told us is no longer valid.
-          this.sessionCookie = null;
+          this.invalidateSession();
           ws.close(4001, "auth refresh");
           return;
         }
@@ -443,7 +447,7 @@ export class ImajinWsService {
       this.ws = ws;
     } catch (err) {
       this.logger.error(`connect failed: ${err}`);
-      this.sessionCookie = null; // Force re-auth on next attempt
+      this.invalidateSession(); // Force re-auth on next attempt
       this.scheduleReconnect();
     }
   }
@@ -529,9 +533,14 @@ export class ImajinWsService {
     }
     this.authRefreshTimer = setTimeout(() => {
       this.logger.info("refreshing session ahead of expiry");
-      this.sessionCookie = null;
+      this.invalidateSession();
       this.ws?.close(4000, "auth refresh");
     }, AUTH_REFRESH_INTERVAL_MS);
+  }
+
+  private invalidateSession(): void {
+    this.sessionCookie = null;
+    this.config.invalidateAuthentication?.();
   }
 
   private clearTimers(): void {

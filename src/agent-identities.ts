@@ -28,6 +28,18 @@ export interface AgentIdentity {
 }
 
 const AGENT_ID = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+/** Kernel key-backed DIDs are did:imajin:base58(publicKey), not config labels. */
+export function publicKeyDid(publicKey: string): string {
+  const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  let number = BigInt(`0x${publicKey}`);
+  let encoded = "";
+  while (number > 0n) {
+    encoded = alphabet[Number(number % 58n)] + encoded;
+    number /= 58n;
+  }
+  const leadingZeros = publicKey.match(/^(?:00)*/)?.[0].length ?? 0;
+  return `did:imajin:${"1".repeat(leadingZeros / 2)}${encoded}`;
+}
 
 /** Only sealed store / vault-backed exec providers, never inline/env/file keys. */
 export function isSealedKeyRef(value: unknown): value is SecretRef {
@@ -61,14 +73,16 @@ export async function resolveAgentSigner(
   if (resolved.size !== 1) throw new Error("Identity reference unavailable");
   const raw = resolved.values().next().value;
   const key = typeof raw === "string" ? JSON.parse(raw) : raw;
-  if (!key || key.did !== did || !/^[a-f0-9]{64}$/i.test(key.privateKey)
+  if (key?.did !== did || !/^[a-f0-9]{64}$/i.test(key.privateKey)
     || !/^[a-f0-9]{64}$/i.test(key.publicKey)) {
     throw new Error("Identity reference does not match configured DID/keypair");
   }
+  if (publicKeyDid(key.publicKey) !== did) throw new Error("Identity public key does not match DID");
   const ed = await import("@noble/ed25519");
   const privateBytes = Buffer.from(key.privateKey, "hex");
   const publicBytes = await ed.getPublicKeyAsync(privateBytes);
   if (Buffer.from(publicBytes).toString("hex") !== key.publicKey.toLowerCase()) {
+    privateBytes.fill(0);
     throw new Error("Identity reference public key mismatch");
   }
   return {

@@ -699,6 +699,41 @@ describe("createNotificationInjector — idempotency key (#18)", () => {
     expect(secondKey).not.toBe(firstKey);
     await dispose();
   });
+
+  it("two agents waking in the same millisecond get distinct admissions and report destinations (#136)", async () => {
+    const { api } = makeApi();
+    let admissions = 0;
+    setImpl(async () => jsonResponse(200, { runId: `admitted-${++admissions}` }));
+    const injectors = ["main", "tenant"].map((agentId) => createNotificationInjector(api, {
+      ...CONFIG, targetSession: `agent:${agentId}:warp-events`, hookAgentId: agentId,
+      reportTo: [`agent:${agentId}:operator`],
+    }, { identityScope: agentId }));
+    try {
+      await Promise.all(injectors.map((injector) => injector.inject(frame("same-notification"))));
+      await vi.advanceTimersByTimeAsync(COALESCE_MS);
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      const keys = calls.map(([, init]) => init.headers["Idempotency-Key"]);
+      expect(new Set(keys).size).toBe(2);
+      const wakes = calls.map(([, init]) => JSON.parse(init.body));
+      expect(wakes.map((wake) => [wake.agentId, wake.sessionKey]).sort()).toEqual([
+        ["main", "agent:main:warp-events"], ["tenant", "agent:tenant:warp-events"],
+      ]);
+      for (const [index, injector] of injectors.entries()) {
+        const wake = wakes[index];
+        await injector.onAgentEnd?.({
+          runId: `admitted-${index + 1}`, sessionKey: wake.sessionKey, success: true,
+          messages: [{ role: "assistant", content: [{ type: "text", text: `Result for ${wake.agentId}` }] }],
+        });
+      }
+      const reports = calls.slice(2).map(([, init]) => JSON.parse(init.body));
+      expect(reports.map((report) => [report.agentId, report.sessionKey]).sort()).toEqual([
+        ["main", "agent:main:operator"], ["tenant", "agent:tenant:operator"],
+      ]);
+      for (const report of reports) expect(report.message).toContain(`Result for ${report.agentId}`);
+    } finally {
+      await Promise.all(injectors.map((injector) => injector.dispose()));
+    }
+  });
 });
 
 describe("createNotificationInjector — hook token is never logged (#18)", () => {

@@ -366,6 +366,11 @@ export class ImajinClient {
     return this.sessionCookie;
   }
 
+  invalidateAuthentication(): void {
+    this.sessionCookie = undefined;
+    this.sessionExpiresAt = undefined;
+  }
+
   private async authenticateSession(): Promise<void> {
     // Skip if session is still valid (with 5 min buffer)
     if (
@@ -419,6 +424,9 @@ export class ImajinClient {
 
     // Step 4: Extract session cookie
     const setCookie = verifyRes.headers.get("set-cookie");
+    if (this.signer && !setCookie?.match(/([^=]+)=([^;]+)/)) {
+      throw new Error("Imajin auth returned no session cookie");
+    }
     if (setCookie) {
       // Extract the session token from set-cookie header
       const match = setCookie.match(/([^=]+)=([^;]+)/);

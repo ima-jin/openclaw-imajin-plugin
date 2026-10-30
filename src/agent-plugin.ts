@@ -21,8 +21,9 @@ interface AgentToolContext {
 
 /** Match trusted host hook context, never a tool argument or kernel payload. */
 function ownsHook(agentId: string, event: any, ctx?: AgentToolContext): boolean {
-  if (ctx?.agentId) return ctx.agentId === agentId;
   const sessionKey = ctx?.sessionKey ?? event?.sessionKey;
+  if (ctx?.agentId && ctx.agentId !== agentId) return false;
+  if (ctx?.agentId && sessionKey === undefined) return true;
   return typeof sessionKey === "string" && sessionKey.startsWith(`agent:${agentId}:`);
 }
 
@@ -45,15 +46,19 @@ export function registerAgentPlugin(api: any, config: {
       config.nodeUrl, config.agents, api.runtime?.config?.current?.() ?? api.config ?? {},
       resolveAgentSigner, () => lifecycle.active,
     );
+    const starts: Promise<void>[] = [];
     for (const [agentId, identity] of identities.entries()) {
       if (!lifecycle.active) return;
       const notifications = agentNotifications(agentId, identity.config);
       const ws = new ImajinWsService({
         nodeUrl: config.nodeUrl, did: identity.config.did, actAs: identity.config.actAs,
         authenticate: () => identity.client.authenticatedCookie(),
+        invalidateAuthentication: () => identity.client.invalidateAuthentication(),
       });
       lifecycle.add(() => ws.stop());
-      const injector = createNotificationInjector(api, notifications, { sendFrame: (frame) => ws.send(frame) });
+      const injector = createNotificationInjector(api, notifications, {
+        identityScope: agentId, sendFrame: (frame) => ws.send(frame),
+      });
       lifecycle.add(injector.dispose);
       senders.set(agentId, injector.reportWake);
       const reach = createReachEventHandler(api, notifications.reach, {
@@ -78,9 +83,9 @@ export function registerAgentPlugin(api: any, config: {
         }
         // Gateway-wide approvals/session commands are deliberately not inherited.
       });
-      await ws.start();
-      if (!lifecycle.active) ws.stop();
+      starts.push(ws.start().then(() => { if (!lifecycle.active) ws.stop(); }));
     }
+    await Promise.all(starts);
   });
   runtime.agentTools = (ctx: AgentToolContext) => {
     const identity = identities.get(ctx.agentId);

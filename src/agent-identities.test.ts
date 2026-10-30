@@ -2,14 +2,14 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { readFile } from "node:fs/promises";
 import {
   AgentIdentities, AGENT_TOOL_NAMES, agentNotifications, isSealedKeyRef,
-  resolveAgentSigner, validAgentConfig, type AgentIdentityConfig,
+  resolveAgentSigner, validAgentConfig, publicKeyDid, type AgentIdentityConfig,
 } from "./agent-identities.js";
 import { ImajinClient } from "./client.js";
 
 const sdk = vi.hoisted(() => ({ resolve: vi.fn() }));
 vi.mock("openclaw/plugin-sdk/secret-ref-runtime", () => ({ resolveSecretRefValues: sdk.resolve }));
 
-export function agent(id: string): AgentIdentityConfig {
+function agent(id: string): AgentIdentityConfig {
   return {
     did: `did:imajin:${id}`,
     keypair: { source: "store", provider: "sealed", id: `agents/${id}` },
@@ -24,6 +24,10 @@ const fakeSigner = async (_config: unknown, _ref: unknown, did: string) => ({
 afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe("sealed per-agent config", () => {
+  it("derives public-only kernel DIDs including leading zero bytes", () => {
+    expect(publicKeyDid("00".repeat(32))).toBe(`did:imajin:${"1".repeat(32)}`);
+    expect(publicKeyDid("00".repeat(31) + "01")).toBe(`did:imajin:${"1".repeat(31)}2`);
+  });
   it("accepts distinct sealed identities and rejects absent/unknown agent IDs", async () => {
     const identities = new AgentIdentities();
     await identities.prepare("https://kernel.invalid", { main: agent("main"), tenant: agent("tenant") }, {}, fakeSigner);
@@ -140,6 +144,20 @@ describe("sealed per-agent config", () => {
     expect(entry.properties.wsNotifications.$ref).toBe("#/properties/wsNotifications");
     expect(manifest.configSchema.properties.keypairPath.type).toBe("string");
   });
+
+  it("README documents valid ref-only config and both existing registration/binding routes", async () => {
+    const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+    const chapter = readme.split("## Per-agent Imajin identities (#136)")[1];
+    const example = JSON.parse(chapter.match(/```json\n([\s\S]+?)\n```/)![1]);
+    for (const [id, config] of Object.entries(example.agents)) expect(validAgentConfig(id, config)).toBe(true);
+    expect(chapter).toContain("/api/register");
+    expect(chapter).toContain('type: "agent"');
+    expect(chapter).toContain("/api/groups/{groupDid}/controllers");
+    expect(chapter).toContain('"role": "agent"');
+    expect(chapter).toContain("auth/api/spec");
+    expect(chapter).toContain("vault/api/spec");
+    expect(chapter).toContain("not a bundled");
+  });
 });
 
 describe("two-agent challenge-response wire proof", () => {
@@ -174,6 +192,10 @@ describe("two-agent challenge-response wire proof", () => {
     expect(await main.authenticatedCookie()).toBe("session=did:imajin:main");
     expect(await tenant.authenticatedCookie()).toBe("session=did:imajin:tenant");
     expect(wire.filter((row) => row.path.endsWith("/challenge"))).toHaveLength(2);
+    tenant.invalidateAuthentication();
+    await tenant.getRaw("/probe");
+    expect(wire.filter((row) => row.path.endsWith("/challenge")).map((row) => row.body.did))
+      .toEqual(["did:imajin:main", "did:imajin:tenant", "did:imajin:tenant"]);
   });
 
   it("refuses a signer belonging to another DID before any network call", () => {
@@ -184,5 +206,17 @@ describe("two-agent challenge-response wire proof", () => {
       signer: { did: "did:imajin:main", signChallenge: vi.fn() },
     })).toThrow("does not match");
     expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it("never sends a tool request if verification returns no session cookie", async () => {
+    const fetch = vi.fn(async (url: string) => Response.json(url.endsWith("/challenge")
+      ? { challengeId: "tenant", challenge: "public-challenge" } : {}));
+    vi.stubGlobal("fetch", fetch);
+    const client = new ImajinClient({
+      nodeUrl: "https://kernel.invalid", did: "did:imajin:tenant",
+      signer: await fakeSigner({}, {}, "did:imajin:tenant"),
+    });
+    await expect(client.getRaw("/must-not-call")).rejects.toThrow("no session cookie");
+    expect(fetch).toHaveBeenCalledTimes(2);
   });
 });

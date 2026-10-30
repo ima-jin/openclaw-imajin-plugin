@@ -758,6 +758,8 @@ export async function postWakeHookWithRetries(
  *   were the previous approach (#11-#17); #18 replaces all of it.
  */
 export interface NotificationInjectorDeps {
+  /** Agent-map mode only: prevent cross-agent Gateway idempotency collisions. */
+  identityScope?: string;
   gradingSource?: import("./wake-grading.js").WakeGradingSource;
   /**
    * Sends a frame over the authenticated WS connection — pass
@@ -1304,7 +1306,8 @@ export function createNotificationInjector(
     // Evidence, not instructions (#22): one entry per run in the batch, no
     // imperative sentences — see `buildWakeTurnMessage`.
     await bridgeReady;
-    const idempotencyKey = `imajin-wake:${scope}:${windowStart}:${phase}`;
+    const identityPrefix = deps.identityScope ? `${deps.identityScope}:` : "";
+    const idempotencyKey = `imajin-wake:${identityPrefix}${scope}:${windowStart}:${phase}`;
     const { packet, liveState, message } = await prepareWakeInput(scope, frames, idempotencyKey);
     if (lifecycle.signal.aborted) return;
     if (packet?.metrics.gap) await discloseWakeOutcome(packet.metrics.gap);
