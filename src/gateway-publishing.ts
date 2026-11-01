@@ -38,6 +38,7 @@ function scopeLoopHook(agentId: string, hook: string, event: any, ctx: any, owne
   const subagent = hook.startsWith("subagent_");
   const key = subagent ? ctx?.childSessionKey ?? ctx?.sessionKey : ctx?.sessionKey;
   if (!ownsSession(agentId, key)) return undefined;
+  if (ctx?.sessionKey !== undefined && !ownsSession(agentId, ctx.sessionKey)) return undefined;
   if (ctx?.requesterSessionKey !== undefined && !ownsSession(agentId, ctx.requesterSessionKey)) return undefined;
   if (hook === "cron_reconciled") {
     return { event: { ...event, reason: "scoped" }, ctx: scopedCronContext(ctx, ownedJobs) };

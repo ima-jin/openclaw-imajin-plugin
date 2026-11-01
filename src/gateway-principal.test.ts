@@ -267,6 +267,7 @@ describe("map-mode gateway principal (#139)", () => {
     { agentId: "tenant", sessionKey: "agent:main:main" },
     { childSessionKey: "agent:tenant:subagent:child", requesterSessionKey: "agent:main:main" },
     { childSessionKey: "agent:main:subagent:child", requesterSessionKey: "agent:tenant:main" },
+    { childSessionKey: "agent:main:subagent:child", sessionKey: "agent:tenant:main" },
   ])("refuses missing, tenant or conflicting trusted publishing context %#", async (ctx) => {
     const registration = register({ approvals: undefined, sessionCommands: undefined });
     await registration.start();
@@ -294,6 +295,35 @@ describe("map-mode gateway principal (#139)", () => {
     }
     expect(registration.getGatewayIdentity()).toBeUndefined();
     expect(publishes()).toEqual([]);
+  });
+
+  it("uses only the explicitly selected gateway, even when it is not named main", async () => {
+    const registration = register({ gatewayAgent: "tenant", approvals: undefined, sessionCommands: undefined });
+    await registration.start();
+    await registration.emit("session_start", { sessionId: "main" }, { sessionKey: "agent:main:main" });
+    await registration.emit("agent_end", {}, { sessionKey: "agent:main:main" });
+    expect(publishes()).toEqual([]);
+    await registration.emit("session_start", { sessionId: "selected" }, { sessionKey: "agent:tenant:main" });
+    await registration.emit("agent_end", {}, { sessionKey: "agent:tenant:main" });
+    await vi.waitFor(() => expect(publishes()).toHaveLength(3));
+    for (const { body, headers } of publishes()) {
+      expect(body.publisherDid ?? body.issuer_did).toBe(tenant.did);
+      expect(headers.Cookie).toBe(`session=${tenant.did}`);
+    }
+  });
+
+  it.each(["loops", "usage"])("respects the independent %s opt-out", async (feature) => {
+    const registration = register({
+      approvals: undefined, sessionCommands: undefined,
+      loops: { enabled: feature !== "loops" }, attestation: { enabled: feature !== "usage" },
+    });
+    await registration.start();
+    const ctx = { sessionKey: "agent:main:main" };
+    await registration.emit("session_start", { sessionId: "session" }, ctx);
+    await registration.emit("agent_end", {}, ctx);
+    await vi.waitFor(() => expect(publishes()).toHaveLength(feature === "loops" ? 1 : 2));
+    expect(publishes().every(row => feature === "loops"
+      ? row.body.type === "agent.turn.usage" : row.body.type.startsWith("loop."))).toBe(true);
   });
 
   it("respects publisher opt-outs and drops late hooks after stop", async () => {
