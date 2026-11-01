@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi, type MockInstance } from "vitest";
 import * as ed from "@noble/ed25519";
-import { mkdtemp, readFile } from "node:fs/promises";
+import { mkdtemp, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
@@ -15,6 +15,7 @@ import { beginRegistration } from "./registration-lifecycle.js";
 import * as approvals from "./gateway-approvals-bridge.js";
 import type { WsServiceConfig } from "./ws-service.js";
 import type { SystemAgentApprovalRequestRecord } from "./sources/system-agent.js";
+import { deriveLoopId } from "./loop-publisher.js";
 
 const mocks = vi.hoisted(() => ({
   resolve: vi.fn(), system: vi.fn(), exec: vi.fn(), loopback: vi.fn(),
@@ -190,6 +191,7 @@ describe("map-mode gateway principal (#139)", () => {
 
   function register(overrides: Record<string, unknown> = {}) {
     const services: any[] = [];
+    const hooks = new Map<string, Array<(...args: any[]) => unknown>>();
     const config = {
       nodeUrl: "https://kernel.invalid", agents, gatewayAgent: "main",
       approvals: { enabled: true, operatorDid: "did:imajin:operator", sources: ["system-agent"],
@@ -198,11 +200,222 @@ describe("map-mode gateway principal (#139)", () => {
       ...overrides,
     };
     const registration = registerAgentPlugin({
-      registrationMode: "full", config: {}, registerProvider: vi.fn(), registerTool: vi.fn(), on: vi.fn(),
+      registrationMode: "full", config: {}, registerProvider: vi.fn(), registerTool: vi.fn(),
+      on: (name: string, handler: (...args: any[]) => unknown) => {
+        hooks.set(name, [...hooks.get(name) ?? [], handler]);
+      },
       registerService: (service: any) => services.push(service),
     }, config);
-    return { ...registration, start: () => services[0].start(), stop: () => services[0].stop() };
+    return {
+      ...registration, start: () => services[0].start(), stop: () => services[0].stop(),
+      emit: (hook: string, event: object, ctx?: object) =>
+        Promise.all((hooks.get(hook) ?? []).map(handler => handler(event, ctx))),
+    };
   }
+
+  function publishes() {
+    return wire.filter(row => row.path === "/api/loops" || row.path === "/auth/api/attestations");
+  }
+
+  async function verifyPublished() {
+    for (const row of publishes()) {
+      const { body, headers } = row;
+      expect(headers.Cookie).toBe(`session=${main.did}`);
+      expect(headers.Authorization).toBeUndefined();
+      const isLoop = row.path === "/api/loops";
+      expect(isLoop ? body.publisherDid : body.issuer_did).toBe(main.did);
+      const signed = isLoop ? { type: body.type, payload: body.payload } : {
+        subject_did: body.subject_did, type: body.type, context_id: body.context_id,
+        context_type: body.context_type, payload: body.payload, issued_at: body.issued_at,
+      };
+      const signature = Buffer.from(isLoop ? body.signature.sig : body.signature, "hex");
+      const message = new TextEncoder().encode(canonicalize(signed));
+      expect(await ed.verifyAsync(signature, message, Buffer.from(main.publicKey, "hex"))).toBe(true);
+      expect(await ed.verifyAsync(signature, message, Buffer.from(tenant.publicKey, "hex"))).toBe(false);
+    }
+  }
+
+  it("publishes gateway sessions, subagents, cron and zero-cost usage with the existing sealed client", async () => {
+    const registration = register({ approvals: undefined, sessionCommands: undefined });
+    await registration.start();
+    const ctx = { agentId: "main", sessionKey: "agent:main:main" };
+    await registration.emit("session_start", { sessionId: "session", sessionKey: "agent:tenant:spoof" }, ctx);
+    await registration.emit("agent_end", {
+      sessionKey: "agent:tenant:spoof", messages: [{ role: "assistant", usage: { input: 0 } }],
+    }, ctx);
+    const child = { childSessionKey: "agent:main:subagent:child", requesterSessionKey: ctx.sessionKey };
+    await registration.emit("subagent_spawned", { childSessionKey: "agent:tenant:spoof" }, child);
+    await registration.emit("subagent_progress", { phase: "started" }, child);
+    await registration.emit("subagent_ended", { targetSessionKey: "agent:tenant:spoof", outcome: "ok" }, child);
+    await registration.emit("cron_changed", { action: "started", jobId: "owned", runAtMs: 1 }, ctx);
+    await registration.emit("cron_changed", { action: "finished", jobId: "owned", status: "ok" }, ctx);
+    await registration.emit("session_end", { sessionId: "session" }, ctx);
+    await vi.waitFor(() => expect(publishes()).toHaveLength(9));
+    const usage = publishes().find(row => row.body.type === "agent.turn.usage")!.body;
+    expect(usage.subject_did).toBe(main.did);
+    expect(usage.context_id).toBe(ctx.sessionKey);
+    expect(usage.payload.cost.total).toBe(0);
+    expect(usage.payload.usage.input).toBe(0);
+    expect(JSON.stringify(publishes())).not.toContain("agent:tenant:spoof");
+    expect(mocks.resolve).toHaveBeenCalledTimes(2);
+    await verifyPublished();
+  });
+
+  it.each([
+    undefined, {}, { agentId: "main" }, { sessionKey: "agent:tenant:main" },
+    { sessionKey: "agent:mainish:main" }, { sessionKey: "agent:main:" },
+    { agentId: "tenant", sessionKey: "agent:main:main" },
+    { childSessionKey: "agent:tenant:subagent:child", requesterSessionKey: "agent:main:main" },
+    { childSessionKey: "agent:main:subagent:child", requesterSessionKey: "agent:tenant:main" },
+    { childSessionKey: "agent:main:subagent:child", sessionKey: "agent:tenant:main" },
+  ])("refuses missing, tenant or conflicting trusted publishing context %#", async (ctx) => {
+    const registration = register({ approvals: undefined, sessionCommands: undefined });
+    await registration.start();
+    for (const hook of ["session_start", "agent_end", "session_end", "subagent_spawned",
+      "subagent_progress", "subagent_ended", "cron_changed", "cron_reconciled"]) {
+      await registration.emit(hook, {
+        sessionKey: "agent:main:main", sessionId: "spoof", childSessionKey: "agent:main:subagent:spoof",
+        targetSessionKey: "agent:main:subagent:spoof", action: "started", jobId: "spoof",
+      }, ctx);
+    }
+    expect(publishes()).toEqual([]);
+  });
+
+  it.each([undefined, "absent", "invalid-signer"])("publishing stays off without a resolved gateway: %s", async (gatewayAgent) => {
+    if (gatewayAgent === "invalid-signer") mocks.resolve.mockRejectedValueOnce(new Error(randomUUID()));
+    const registration = register({
+      gatewayAgent: gatewayAgent === "invalid-signer" ? "main" : gatewayAgent,
+      did: main.did, keypairPath: "/must-not-read",
+      attestation: { enabled: true, serviceUrl: "https://must-not-call.invalid", internalApiKey: randomUUID() },
+      horizon: { enabled: true, loopId: "spoof", filePath: "/must-not-read" },
+    });
+    await registration.start();
+    for (const hook of ["session_start", "agent_end"]) {
+      await registration.emit(hook, { sessionId: "session" }, { sessionKey: "agent:main:main" });
+    }
+    expect(registration.getGatewayIdentity()).toBeUndefined();
+    expect(publishes()).toEqual([]);
+  });
+
+  it("uses only the explicitly selected gateway, even when it is not named main", async () => {
+    const registration = register({ gatewayAgent: "tenant", approvals: undefined, sessionCommands: undefined });
+    await registration.start();
+    await registration.emit("session_start", { sessionId: "main" }, { sessionKey: "agent:main:main" });
+    await registration.emit("agent_end", {}, { sessionKey: "agent:main:main" });
+    expect(publishes()).toEqual([]);
+    await registration.emit("session_start", { sessionId: "selected" }, { sessionKey: "agent:tenant:main" });
+    await registration.emit("agent_end", {}, { sessionKey: "agent:tenant:main" });
+    await vi.waitFor(() => expect(publishes()).toHaveLength(3));
+    for (const { body, headers } of publishes()) {
+      expect(body.publisherDid ?? body.issuer_did).toBe(tenant.did);
+      expect(headers.Cookie).toBe(`session=${tenant.did}`);
+    }
+  });
+
+  it.each(["loops", "usage"])("respects the independent %s opt-out", async (feature) => {
+    const registration = register({
+      approvals: undefined, sessionCommands: undefined,
+      loops: { enabled: feature !== "loops" }, attestation: { enabled: feature !== "usage" },
+    });
+    await registration.start();
+    const ctx = { sessionKey: "agent:main:main" };
+    await registration.emit("session_start", { sessionId: "session" }, ctx);
+    await registration.emit("agent_end", {}, ctx);
+    await vi.waitFor(() => expect(publishes()).toHaveLength(feature === "loops" ? 1 : 2));
+    expect(publishes().every(row => feature === "loops"
+      ? row.body.type === "agent.turn.usage" : row.body.type.startsWith("loop."))).toBe(true);
+  });
+
+  it("respects publisher opt-outs and drops late hooks after stop", async () => {
+    const registration = register({
+      approvals: undefined, sessionCommands: undefined,
+      loops: { enabled: false }, attestation: { enabled: false },
+    });
+    await registration.start();
+    const ctx = { sessionKey: "agent:main:main" };
+    await registration.emit("session_start", {}, ctx);
+    await registration.emit("agent_end", {}, ctx);
+    expect(publishes()).toEqual([]);
+    await registration.stop();
+    await registration.emit("agent_end", {}, ctx);
+    expect(publishes()).toEqual([]);
+  });
+
+  it("does not attribute global cron snapshots or tenant orphan jobs to the gateway", async () => {
+    const registration = register({ approvals: undefined, sessionCommands: undefined, attestation: { enabled: false } });
+    await registration.start();
+    const list = vi.fn(async () => [{ id: "tenant-job", state: { runningAtMs: 10 } }]);
+    await registration.emit("cron_reconciled", { reason: "startup" }, { getCron: () => ({ list }) });
+    expect(list).not.toHaveBeenCalled();
+    await registration.emit("cron_reconciled", { reason: "startup" }, {
+      sessionKey: "agent:main:cron:owned", getCron: () => ({ list }),
+    });
+    expect(list).toHaveBeenCalledOnce();
+    expect(publishes()).toEqual([]);
+  });
+
+  it.each([true, false])("warns once only when horizon is enabled (%s) but loops are disabled", async (enabled) => {
+    const registration = register({
+      approvals: undefined, sessionCommands: undefined, loops: { enabled: false },
+      attestation: { enabled: false },
+      horizon: { enabled, loopId: "unbound", filePath: join(dir, "must-not-read.json") },
+    });
+    await registration.start();
+    const warning = "[imajin-horizon] disabled: horizon requires loop lifecycle tracking";
+    const ctx = { sessionKey: "agent:main:main" };
+    await registration.emit("session_start", { sessionId: "first" }, ctx);
+    await registration.emit("session_start", { sessionId: "second" }, ctx);
+    const warnings = vi.mocked(console.warn).mock.calls.filter(([message]) => message === warning);
+    expect(warnings).toEqual(enabled ? [[warning]] : []);
+    expect(publishes()).toEqual([]);
+  });
+
+  async function horizonConfig() {
+    const filePath = join(dir, "gateway-horizon.json");
+    await writeFile(filePath, JSON.stringify({
+      depthTarget: 1,
+      items: [{ id: "140", title: "Gateway publishing", zone: "head", refs: ["#140"], addedAt: new Date().toISOString() }],
+    }));
+    return {
+      enabled: true, repository: "ima-jin/openclaw-imajin-plugin", filePath,
+      loopId: deriveLoopId(main.did, "openclaw.session", "session"),
+    };
+  }
+
+  it("binds horizon to a trusted gateway-owned loop, signs with main and stops on replacement", async () => {
+    const registration = register({ approvals: undefined, sessionCommands: undefined, horizon: await horizonConfig() });
+    await registration.start();
+    await registration.emit("session_start", { sessionId: "session" }, { sessionKey: "agent:tenant:main" });
+    expect(publishes()).toEqual([]);
+    await registration.emit("session_start", { sessionId: "session" }, { sessionKey: "agent:main:main" });
+    await vi.waitFor(() => expect(publishes().some(row => row.body.type === "step.queued")).toBe(true));
+    await verifyPublished();
+    const files = await readFile(join(dir, "main", "horizon-sync",
+      (await import("./horizon/model.js")).digest([
+        "https://kernel.invalid", deriveLoopId(main.did, "openclaw.session", "session"), main.did, "did:imajin:operator",
+      ]) + ".json"), "utf8");
+    expect(JSON.parse(files).steps).toHaveProperty(
+      publishes().find(row => row.body.type === "step.queued")!.body.payload.stepId,
+    );
+    await register({ gatewayAgent: undefined }).start();
+    const count = publishes().length;
+    await registration.emit("agent_end", {}, { sessionKey: "agent:main:main" });
+    expect(publishes()).toHaveLength(count);
+  });
+
+  it.each(["wrong-loop", "missing-file", "disabled"])("horizon refuses %s configuration", async (failure) => {
+    const horizon = await horizonConfig();
+    if (failure === "wrong-loop") horizon.loopId = "unowned-loop";
+    if (failure === "missing-file") horizon.filePath = "";
+    if (failure === "disabled") horizon.enabled = false;
+    const registration = register({
+      approvals: undefined, sessionCommands: undefined, horizon, attestation: { enabled: false },
+    });
+    await registration.start();
+    await registration.emit("session_start", { sessionId: "session" }, { sessionKey: "agent:main:main" });
+    await vi.waitFor(() => expect(publishes()).toHaveLength(1));
+    expect(publishes().some(row => row.body.type.startsWith("step."))).toBe(false);
+  });
 
   async function ready(registration: ReturnType<typeof register>) {
     await registration.start();

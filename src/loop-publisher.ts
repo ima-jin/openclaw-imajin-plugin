@@ -40,6 +40,7 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { canonicalize } from "./approval-bridge.js";
+import type { ImajinClient, ImajinSigner } from "./client.js";
 
 export const LOOP_LIFECYCLE_TYPES = [
   "loop.started",
@@ -265,7 +266,10 @@ export interface LoopSenderOptions {
   did: string;
   /** Principal the loops belong to (onBehalfOf). Defaults to `did`. */
   principal?: string;
-  keypairPath: string;
+  keypairPath?: string;
+  signer?: ImajinSigner;
+  client?: Pick<ImajinClient, "authenticatedCookie">;
+  signal?: AbortSignal;
   logger?: LoopSenderLogger;
   fetchImpl?: typeof fetch;
   now?: () => number;
@@ -285,32 +289,49 @@ export interface LoopSender {
 export function createLoopTransport(options: LoopSenderOptions) {
   let key: Promise<SigningKey> | undefined;
   const getKey = (): Promise<SigningKey> => {
+    if (!options.keypairPath) return Promise.reject(new Error("Loop signing identity unavailable"));
     key ??= loadSigningKey(options.keypairPath).catch((err: unknown) => {
       key = undefined;
       throw err;
     });
     return key;
   };
-  function post(path: string, request: object): Promise<Response> {
+  async function sign<T extends string, P extends object>(type: T, payload: P): Promise<LoopIngestRequest<T, P>> {
+    options.signal?.throwIfAborted();
+    if (!options.signer) return signLoopEvent(type, payload, options.did, await getKey());
+    const { signer } = options;
+    if (signer.did !== options.did || !signer.publicKey) throw new Error("Loop signing identity mismatch");
+    return {
+      type, payload, publisherDid: options.did,
+      signature: {
+        keyId: signer.publicKey, alg: "ed25519",
+        sig: await signer.signChallenge(canonicalize({ type, payload })),
+      },
+    };
+  }
+  async function post(path: string, request: object): Promise<Response> {
+    options.signal?.throwIfAborted();
+    const cookie = await options.client?.authenticatedCookie();
+    options.signal?.throwIfAborted();
     return (options.fetchImpl ?? fetch)(
       `${options.nodeUrl.replace(/\/$/, "")}${path}`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
         body: JSON.stringify(request),
-        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+        signal: AbortSignal.any([AbortSignal.timeout(POST_TIMEOUT_MS), ...options.signal ? [options.signal] : []]),
       },
     );
   }
   return {
     async sign<T extends string, P extends LoopEnvelope>(type: T, payload: P) {
-      return signLoopEvent(type, payload, options.did, await getKey());
+      return sign(type, payload);
     },
     post(request: LoopIngestRequest<string>): Promise<Response> {
       return post(LOOPS_INGEST_PATH, request);
     },
     async receipt(payload: LoopReceiptPayload): Promise<Response> {
-      const request = await signLoopEvent("loop.receipt", payload, options.did, await getKey());
+      const request = await sign("loop.receipt", payload);
       return post(LOOPS_RECEIPTS_PATH, request);
     },
   };
