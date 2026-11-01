@@ -1,8 +1,13 @@
 import { writeFileSync, unlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ImajinChat } from "./chat.js";
 import type { ImajinClient } from "./client.js";
-import { ImajinCatalogCache, ImajinDiscoveryError } from "./imajin-provider.js";
+import { buildImajinStatusSnapshot, ImajinCatalogCache, ImajinDiscoveryError } from "./imajin-provider.js";
+import { buildMcpStatusBlock } from "./kernel-mcp.js";
+import { buildImajinAllowListStatus } from "./sources/imajin-catalog.js";
+import { buildStatusIdentity } from "./status-identity.js";
 import {
   createMediaTool,
   createAttestTool,
@@ -180,7 +185,7 @@ describe("imajin_media tool", () => {
 
   it("media upload with onBehalfOf passes to client", async () => {
     // Create a temporary file for readFile to succeed
-    const tmpPath = "/tmp/imajin-test-upload.txt";
+    const tmpPath = join(tmpdir(), "imajin-test-upload.txt").replaceAll("\\", "/");
     writeFileSync(tmpPath, "test-content");
 
     vi.mocked(client.uploadMedia).mockResolvedValue({
@@ -573,6 +578,31 @@ describe("imajin_status tool (#55)", () => {
   beforeEach(() => {
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ status: "ok" }) }));
   });
+  it("leaves every pre-existing status field unchanged when adding identity and sources", async () => {
+    const baseUrl = "http://proxy.invalid/openai/v1";
+    const nodeUrl = "https://kernel.invalid";
+    const mcpUrl = "http://proxy.invalid/mcp";
+    const probe = { url: mcpUrl, ok: true, outcome: "ok" as const, toolCount: 0, tools: [] };
+    const cache = new ImajinCatalogCache(async () => ({ data: [{ id: "test-model" }] }), 60_000, Date.now, quiet);
+    await cache.refresh();
+    const identity = buildStatusIdentity({ mode: "legacy", did: "did:imajin:caller", isGatewayAgent: true });
+    const tool = createImajinStatusTool({
+      baseUrl, cache, discovery, nodeUrl, mcpUrl, getIdentity: () => identity,
+      probeMcp: async () => probe,
+    });
+    const result = JSON.parse((await tool.execute()).content[0].text);
+    const { identity: actualIdentity, sources, ...existing } = result;
+    expect(actualIdentity).toEqual(identity);
+    expect(sources.kernelNode).toEqual({ url: nodeUrl });
+    expect(sources.discovery).toEqual({ url: discovery.modelsUrl, outcome: "ok" });
+    expect(existing).toEqual({
+      ...buildImajinStatusSnapshot({
+        baseUrl, discovery, cacheState: cache.peek(), healthz: { ok: true, status: 200, body: { status: "ok" } },
+      }),
+      allowList: buildImajinAllowListStatus(cache.peek()!.models, undefined),
+      mcp: buildMcpStatusBlock({ mcpUrl, probe }),
+    });
+  });
   it("reports configured refs and partitions discovery into allow-listed and not-allowed without MCP", async () => {
     const cache = new ImajinCatalogCache(async () => ({ data: [{ id: "grok-4" }, { id: "gpt-6-astra" }] }),
       60_000, Date.now, quiet);
@@ -666,6 +696,14 @@ describe("imajin_status tool (#55)", () => {
       });
       const body = JSON.parse((await tool.execute()).content[0].text);
       expect(probeMcp).toHaveBeenCalledWith(mcpUrl);
+      expect(probeMcp).toHaveBeenCalledOnce();
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(body.sources).toEqual({
+        passthrough: { url: "http://127.0.0.1:8787/healthz", reachable: true },
+        discovery: { url: null, outcome: "empty" },
+        kernelNode: { url: null },
+        kernelMcp: { url: mcpUrl, reachable: true, outcome: "ok" },
+      });
       expect(body.lastDiscovery).toBeDefined();
       expect(body.mcp).toMatchObject({
         url: mcpUrl,

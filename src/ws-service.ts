@@ -177,6 +177,14 @@ export class ImajinWsService {
     };
   }
 
+  /** Current socket state only; no connection or authentication side effects. */
+  status(): { state: string } {
+    if (this.stopped) return { state: "stopped" };
+    if (this.reconnectTimer) return { state: "reconnecting" };
+    const states = ["connecting", "open", "closing", "closed"];
+    return { state: this.ws ? states[this.ws.readyState] ?? "closed" : "idle" };
+  }
+
   /** Register a handler for inbound frames. */
   onFrame(handler: FrameHandler): void {
     this.handlers.push(handler);

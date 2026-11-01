@@ -6,6 +6,7 @@
  */
 
 import { readFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
 import type { UsageRollupAttestation, UsageSummary } from "./usage.js";
 
 const DID_PATTERN = /^did:imajin:[A-Za-z0-9:_-]+$/;
@@ -281,6 +282,12 @@ export interface WarpRunTranscript {
   truncated: boolean;
 }
 
+export interface ImajinAuthStatus {
+  ok: boolean;
+  at: string;
+  error?: string;
+}
+
 export class ImajinClient {
   private readonly transport: typeof fetch;
   private baseUrl: string;
@@ -292,6 +299,7 @@ export class ImajinClient {
   private sessionExpiresAt?: number;
   private readonly signer?: ImajinSigner;
   private authenticating?: Promise<void>;
+  private lastAuth?: ImajinAuthStatus;
 
   constructor(config: ImajinClientConfig) {
     this.transport = config.transport ?? ((...args) => fetch(...args));
@@ -306,6 +314,19 @@ export class ImajinClient {
   }
 
   // --- Auth ---
+
+  /** In-memory metadata only: never loads a key or authenticates for status. */
+  identityStatus() {
+    const publicKey = this.signer?.publicKey || this.keypair?.publicKey || this.keypair?.publicKeyHex;
+    return {
+      did: this.did,
+      actAs: this.actAs,
+      publicKey: publicKey
+        ? createHash("sha256").update(Buffer.from(publicKey, "hex")).digest("hex").slice(0, 12)
+        : null,
+      auth: this.lastAuth ? { ...this.lastAuth } : null,
+    };
+  }
 
   /**
    * Load the Ed25519 keypair from the configured path.
@@ -393,6 +414,17 @@ export class ImajinClient {
       return;
     }
 
+    try {
+      await this.authenticateAttempt();
+      this.lastAuth = { ok: true, at: new Date().toISOString() };
+    } catch (err) {
+      // Neither response bodies nor signer/parser errors are safe to expose.
+      this.lastAuth = { ok: false, at: new Date().toISOString(), error: "Authentication failed" };
+      throw err;
+    }
+  }
+
+  private async authenticateAttempt(): Promise<void> {
     const keypair = this.signer ? undefined : await this.loadKeypair();
     if (keypair && this.did && keypair.did !== this.did) {
       throw new Error("Imajin keypair DID does not match configured identity");

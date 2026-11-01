@@ -64,6 +64,7 @@ import { registerAgentPlugin } from "./src/agent-plugin.js";
 import { registerGatewayFeatures, type ApprovalBridgeSettings, type SessionCommandsSettings } from "./src/gateway-features.js";
 import type { ApprovalsBridgePluginConfig } from "./src/gateway-approvals-bridge.js";
 import type { AgentIdentityConfig } from "./src/agent-identities.js";
+import { buildStatusIdentity } from "./src/status-identity.js";
 
 interface PluginConfig {
   agents?: Record<string, AgentIdentityConfig>;
@@ -93,6 +94,7 @@ async function startPluginRuntime(
   lifecycle: RegistrationLifecycle,
   on: RuntimeHookRegister,
   setWakeSender: (sender: WakeDisclosureSender) => void,
+  setStatusWs: (ws: ImajinWsService) => void,
 ): Promise<void> {
   const { provider: imajinProvider, defaults: defaultRouter } = models;
   const discovery = imajinProvider.startDiscovery();
@@ -169,6 +171,7 @@ async function startPluginRuntime(
         actAs: config.actAs,
       },
     );
+    setStatusWs(wsService);
 
     lifecycle.add(() => wsService.stop());
 
@@ -355,17 +358,24 @@ export default definePluginEntry({
       baseUrl: imajinProvider.baseUrl,
       getConfig: () => api.runtime?.config?.current?.(),
     });
+    let statusWs: ImajinWsService | undefined;
     const runtime = new PluginServiceRuntime(api.registrationMode, (lifecycle, on) =>
       startPluginRuntime(api, config, client, { provider: imajinProvider, defaults: defaultRouter }, lifecycle, on,
-        (sender) => runtime.setWakeSender(sender)),
+        (sender) => runtime.setWakeSender(sender), (ws) => { statusWs = ws; }),
     );
     runtime.defaultRoutingStatus = defaultRouter.status;
+    runtime.statusIdentity = (agentId) => buildStatusIdentity({
+      agentId, mode: "legacy", did: config?.did, actAs: config?.actAs, client,
+      isGatewayAgent: true, keypairSource: config?.keypairPath ? "file" : undefined,
+      ws: statusWs?.status(),
+      warnings: client?.identityStatus().auth?.ok === false ? ["Identity authentication unavailable"] : [],
+    });
     // Lower priority than a deliberate wake/decision routing override.
     runtime.registerHook(api, "before_model_resolve", "imajin-default:model", -100);
     runtime.registerHook(api, "before_agent_run", "imajin-default:gate");
     runtime.registerHook(api, "agent_end", "imajin-default:end");
     api.registerTool(
-      createImajinStatusTool({
+      (ctx: { agentId?: string }) => createImajinStatusTool({
         baseUrl: imajinProvider.baseUrl,
         cache: imajinProvider.cache,
         discovery: imajinProvider.discovery,
@@ -375,7 +385,10 @@ export default definePluginEntry({
         mcpUrl: resolveImajinMcpUrl(config, imajinProvider.baseUrl),
         getConfig: () => api.runtime?.config?.current?.(),
         getDefaultRouting: () => (PluginServiceRuntime.owner() ?? runtime).defaultRoutingStatus?.(),
+        getIdentity: () => (PluginServiceRuntime.owner() ?? runtime).statusIdentity?.(ctx.agentId),
+        nodeUrl: config?.nodeUrl,
       }),
+      { names: ["imajin_status"] },
     );
 
     // Both host service IDs share one idempotent full-mode runtime start.

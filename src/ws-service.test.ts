@@ -192,6 +192,23 @@ describe("isAuthFailureFrame", () => {
 });
 
 describe("computeReconnectDelayMs", () => {
+  it("reports socket lifecycle from held state without extra authentication", async () => {
+    vi.useFakeTimers();
+    const authenticate = vi.fn(async () => `session=${crypto.randomUUID()}`);
+    const service = new ImajinWsService({ nodeUrl: NODE_URL, authenticate }, silentLogger());
+    expect(service.status()).toEqual({ state: "idle" });
+    expect(authenticate).not.toHaveBeenCalled();
+    await service.start();
+    expect(service.status()).toEqual({ state: "connecting" });
+    const socket = FakeSocket.instances[0];
+    socket.triggerOpen();
+    expect(service.status()).toEqual({ state: "open" });
+    socket.close(1006);
+    expect(service.status()).toEqual({ state: "reconnecting" });
+    service.stop();
+    expect(service.status()).toEqual({ state: "stopped" });
+    expect(authenticate).toHaveBeenCalledOnce();
+  });
   it("SecretRef-backed sockets reuse and invalidate their own supplied session without reading a key file (#136)", async () => {
     vi.useFakeTimers();
     vi.mocked(readFile).mockClear();
