@@ -1,6 +1,7 @@
 # @openclaw/imajin-plugin
 
 OpenClaw plugin for the [Imajin](https://jin.imajin.ai) sovereign identity and settlement network.
+Map-mode gateway-only loop publishing and turn-usage attestations are tracked in #140.
 
 ## What it does
 
