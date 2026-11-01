@@ -317,6 +317,27 @@ describe("map-mode gateway principal (#139)", () => {
     },
   );
 
+  it.each([
+    ["missing nodeUrl", { nodeUrl: undefined }],
+    ["missing nodeUrl", { nodeUrl: "" }],
+    ["missing or invalid agents", { agents: undefined }],
+    ["missing or invalid agents", { agents: null }],
+    ["missing or invalid agents", { agents: [] }],
+    ["missing or invalid agents", { agents: "private invalid configuration" }],
+  ])("reports %s without blaming gatewayAgent %#", async (cause, overrides) => {
+    const registration = register(overrides);
+    await registration.start();
+    expect(console.warn).toHaveBeenCalledTimes(1);
+    expect(console.warn).toHaveBeenCalledWith(
+      `[imajin-plugin] ${cause}; approvals and session commands disabled`,
+    );
+    expect(mocks.resolve).not.toHaveBeenCalled();
+    expect(mocks.sockets).toHaveLength(0);
+    expect(bridgeStart).not.toHaveBeenCalled();
+    expect(mocks.loopback).not.toHaveBeenCalled();
+    expect(registration.getGatewayIdentity()).toBeUndefined();
+  });
+
   it.each([undefined, "", "absent", " main", "__proto__", 1, null])(
     "missing or invalid gatewayAgent disables both features without legacy fallback %#", async (gatewayAgent) => {
       const registration = register({ gatewayAgent, did: main.did, keypairPath: "/must-not-read" });
@@ -324,7 +345,8 @@ describe("map-mode gateway principal (#139)", () => {
       expect(bridgeStart).not.toHaveBeenCalled();
       expect(mocks.loopback).not.toHaveBeenCalled();
       expect(registration.getGatewayIdentity()).toBeUndefined();
-      expect(console.warn).toHaveBeenCalledWith("[imajin-plugin] gatewayAgent unavailable; approvals and session commands disabled");
+      expect(console.warn).toHaveBeenCalledTimes(1);
+      expect(console.warn).toHaveBeenCalledWith("[imajin-plugin] missing or unresolvable gatewayAgent; approvals and session commands disabled");
       for (const socket of mocks.sockets) {
         socket.frame?.(await command("session.approve", { approvalId: "native" }));
         expect(socket.send).not.toHaveBeenCalled();
@@ -343,7 +365,7 @@ describe("map-mode gateway principal (#139)", () => {
     expect(registration.getGatewayIdentity()).toBeUndefined();
     expect(bridgeStart).not.toHaveBeenCalled();
     expect(mocks.loopback).not.toHaveBeenCalled();
-    expect(console.warn).toHaveBeenCalledWith("[imajin-plugin] gatewayAgent unavailable; approvals and session commands disabled");
+    expect(console.warn).toHaveBeenCalledWith("[imajin-plugin] missing or unresolvable gatewayAgent; approvals and session commands disabled");
     expect(vi.mocked(console.warn).mock.calls.flat().join(" ")).not.toContain("provider detail");
   });
 

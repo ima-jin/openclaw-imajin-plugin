@@ -58,9 +58,14 @@ export function registerAgentPlugin(api: any, config: {
   const provider = registerImajinProvider(api, { inferProxyBaseUrl: config.inferProxyBaseUrl }, {});
   const runtime = new PluginServiceRuntime(api.registrationMode, async (lifecycle, on) => {
     lifecycle.add(() => { identities.clear(); senders.clear(); gatewayIdentity = undefined; });
-    const warnGateway = () => console.warn("[imajin-plugin] gatewayAgent unavailable; approvals and session commands disabled");
-    if (!config.nodeUrl || !config.agents || typeof config.agents !== "object" || Array.isArray(config.agents)) {
-      warnGateway();
+    const warnGateway = (cause: "missing nodeUrl" | "missing or invalid agents" | "missing or unresolvable gatewayAgent") =>
+      console.warn(`[imajin-plugin] ${cause}; approvals and session commands disabled`);
+    if (!config.nodeUrl) {
+      warnGateway("missing nodeUrl");
+      return;
+    }
+    if (!config.agents || typeof config.agents !== "object" || Array.isArray(config.agents)) {
+      warnGateway("missing or invalid agents");
       return;
     }
     await identities.prepare(
@@ -69,7 +74,7 @@ export function registerAgentPlugin(api: any, config: {
     );
     if (!lifecycle.active) return;
     const selected = typeof config.gatewayAgent === "string" ? identities.get(config.gatewayAgent) : undefined;
-    if (!selected) warnGateway();
+    if (!selected) warnGateway("missing or unresolvable gatewayAgent");
     const starts: Promise<void>[] = [];
     for (const [agentId, identity] of identities.entries()) {
       if (!lifecycle.active) return;
