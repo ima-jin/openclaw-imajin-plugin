@@ -4,7 +4,11 @@
   "private": true,
   "description": "OpenClaw plugin for Imajin network — identity, attestation, attribution, settlement, discovery",
   "type": "module",
+  "bin": {
+    "imajin-vault": "./bin/imajin-vault.mjs"
+  },
   "scripts": {
+    "build": "tsc -p .",
     "test": "vitest run",
     "typecheck": "tsc --noEmit -p ."
   },
