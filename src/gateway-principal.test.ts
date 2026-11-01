@@ -34,8 +34,12 @@ vi.mock("./sources/gateway-exec.js", async (original) => ({
 vi.mock("./session-command-gateway.js", async (original) => ({
   ...await original<object>(), createLoopbackSessionGateway: mocks.loopback,
 }));
-vi.mock("./imajin-provider.js", () => ({
-  registerImajinProvider: () => ({ baseUrl: "http://proxy.invalid", cache: {}, discovery: {} }),
+vi.mock("./imajin-provider.js", async (original) => ({
+  ...await original<object>(),
+  registerImajinProvider: () => ({
+    baseUrl: "http://proxy.invalid", cache: {}, discovery: {},
+    startDiscovery: () => ({ stop: vi.fn() }),
+  }),
 }));
 vi.mock("./notification-injector.js", () => ({
   WAKE_RUNTIME_HOOKS: [],

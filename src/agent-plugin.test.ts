@@ -72,17 +72,18 @@ function agent(id: string, tools?: string[]): AgentIdentityConfig {
 function register(config: any, registrationMode = "full") {
   const tools: any[] = [];
   const services: any[] = [];
+  const providers: any[] = [];
   const hooks: Array<{ name: string; handler: (...args: any[]) => unknown }> = [];
   plugin.register({
     pluginConfig: config, registrationMode, config: { secrets: {} },
-    registerProvider: vi.fn(),
+    registerProvider: (provider: any) => providers.push(provider),
     registerTool: (tool: any) => tools.push(tool),
     registerService: (service: any) => services.push(service),
     on: (name: string, handler: any) => hooks.push({ name, handler }),
     registerHook: (name: string, handler: any) => hooks.push({ name, handler }),
   });
   return {
-    tools, services,
+    tools, services, providers,
     agentTools: (ctx: any) => tools.flatMap((tool) => typeof tool === "function" ? tool(ctx) ?? [] : [tool]),
     emit: (name: string, event: object, ctx?: object) => hooks.filter((hook) => hook.name === name)
       .map((hook) => hook.handler(event, ctx)),
@@ -99,10 +100,148 @@ beforeEach(() => {
 });
 afterEach(async () => {
   await beginRegistration().dispose();
+  vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
 });
 
+describe("gateway model discovery (#141)", () => {
+  const models = { data: [{ id: "picked-model", imajin: { connector: "test", picked: true } }] };
+
+  beforeEach(() => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+  });
+
+  it.each(["store", "exec"] as const)("uses only the selected %s-backed gateway session; tenant tools keep their own session", async (source) => {
+    const main = agent("main");
+    main.keypair.source = source;
+    const wire: Array<{ path: string; body: any; headers: any }> = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init?: RequestInit) => {
+      const path = new URL(url).pathname;
+      const body = init?.body ? JSON.parse(init.body as string) : undefined;
+      wire.push({ path, body, headers: init?.headers });
+      if (path.endsWith("/challenge")) return Response.json({ challengeId: body.did, challenge: body.did });
+      if (path.endsWith("/verify")) {
+        expect(body.signature).toBe(`fake:${body.challengeId}:${body.challengeId}`);
+        return Response.json({}, { headers: { "set-cookie": `session=${body.challengeId}` } });
+      }
+      return Response.json(path === "/custom/models" ? models : { did: "did:imajin:lookup" });
+    }));
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { tenant: agent("tenant"), main },
+      did: "did:imajin:legacy", keypairPath: "/must-not-read", actAs: "did:imajin:legacy-org",
+      modelDiscovery: { refreshIntervalMs: 0, modelsPath: "/custom/models" },
+      inferProxyBaseUrl: "http://proxy.invalid/openai/v1",
+    });
+    const catalog = registry.providers[0].catalog;
+    expect((await catalog.run()).provider.models).toEqual([]);
+    expect(wire).toEqual([]);
+    await registry.start();
+    await vi.waitFor(() => expect(wire.some((row) => row.path === "/custom/models")).toBe(true));
+    const discovered = (await catalog.run()).provider;
+    expect(discovered.models.map((model: any) => `imajin/${model.id}`)).toEqual(["imajin/picked-model", "imajin/default"]);
+    expect(discovered.baseUrl).toBe("http://proxy.invalid/openai/v1");
+    const discovery = wire.find((row) => row.path === "/custom/models")!;
+    expect(discovery.headers).toMatchObject({
+      Cookie: "session=did:imajin:main", "X-Agent-DID": main.did, "X-Acting-For": main.actAs,
+    });
+    expect(wire.filter((row) => row.path.endsWith("/challenge")).map((row) => row.body.did)).toEqual([main.did]);
+    const tenantTool = registry.agentTools({ agentId: "tenant" }).find((tool) => tool.name === "imajin_identity");
+    await tenantTool.execute("lookup", { action: "lookup", query: "did:imajin:lookup" });
+    expect(wire.find((row) => row.path.includes("/lookup/"))!.headers).toMatchObject({
+      Cookie: "session=did:imajin:tenant", "X-Agent-DID": "did:imajin:tenant",
+      "X-Acting-For": "did:imajin:org-tenant",
+    });
+    expect(wire.filter((row) => row.path === "/custom/models")).toHaveLength(1);
+    expect(mocks.signer).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([undefined, "", "absent", " main", "__proto__"])("never falls back to tenants or legacy credentials for gatewayAgent %s", async (gatewayAgent) => {
+    const request = vi.spyOn(ImajinClient.prototype, "requestRaw");
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent,
+      agents: { main: agent("main"), tenant: agent("tenant") },
+      did: "did:imajin:legacy", keypairPath: "/must-not-read",
+      modelDiscovery: { refreshIntervalMs: 0 },
+    });
+    await registry.start();
+    expect((await registry.providers[0].catalog.run()).provider.models).toEqual([]);
+    expect(request).not.toHaveBeenCalled();
+    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("(unconfigured)"));
+  });
+
+  it("does not borrow a healthy tenant client when the selected gateway signer fails", async () => {
+    mocks.signer.mockImplementation(async (_config, _ref, did) => {
+      if (did === "did:imajin:main") throw new Error("protected provider detail");
+      return { did, signChallenge: vi.fn() };
+    });
+    const request = vi.spyOn(ImajinClient.prototype, "requestRaw");
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { main: agent("main"), tenant: agent("tenant") }, modelDiscovery: { refreshIntervalMs: 0 },
+    });
+    await registry.start();
+    expect(registry.agentTools({ agentId: "tenant" })).toHaveLength(AGENT_TOOL_NAMES.length);
+    expect((await registry.providers[0].catalog.run()).provider.models).toEqual([]);
+    expect(request).not.toHaveBeenCalled();
+    expect(vi.mocked(console.warn).mock.calls.flat().join(" ")).not.toContain("protected provider detail");
+  });
+
+  it.each([401, 403, 500])("does not retry HTTP %s as a tenant or log upstream response data", async (status) => {
+    const request = vi.spyOn(ImajinClient.prototype, "requestRaw").mockResolvedValue({
+      status, contentType: "application/json", text: "protected upstream detail",
+    });
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { main: agent("main"), tenant: agent("tenant") }, modelDiscovery: { refreshIntervalMs: 0 },
+    });
+    await registry.start();
+    expect((await registry.providers[0].catalog.run()).provider.models).toEqual([]);
+    expect(request).toHaveBeenCalledOnce();
+    expect(vi.mocked(console.warn).mock.calls.flat().join(" ")).not.toContain("protected upstream detail");
+  });
+
+  it("refreshes once globally, accepts invalidation only from the gateway, and retires discovery on replacement/stop", async () => {
+    vi.useFakeTimers();
+    const request = vi.spyOn(ImajinClient.prototype, "requestRaw").mockResolvedValue({
+      status: 200, contentType: "application/json", text: JSON.stringify(models),
+    });
+    const config = {
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { main: agent("main"), tenant: agent("tenant") }, modelDiscovery: { refreshIntervalMs: 10_000 },
+    };
+    const registry = register(config);
+    await registry.start();
+    await registry.providers[0].catalog.run();
+    expect(request).toHaveBeenCalledOnce();
+    const frame = { type: "notification", id: "catalog", scope: "connector.models.changed", title: "Changed" };
+    mocks.sockets[1].frame?.(frame);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request).toHaveBeenCalledOnce();
+    mocks.sockets[0].frame?.(frame);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(request).toHaveBeenCalledTimes(3);
+    const metadata = register(config, "tool-discovery");
+    await metadata.start();
+    await metadata.providers[0].catalog.run();
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(mocks.signer).toHaveBeenCalledTimes(2);
+    const replacement = register({ ...config, gatewayAgent: undefined });
+    await replacement.start();
+    await vi.advanceTimersByTimeAsync(60_001);
+    await registry.providers[0].catalog.run();
+    expect(request).toHaveBeenCalledTimes(3);
+    await replacement.stop();
+    await vi.advanceTimersByTimeAsync(60_001);
+    await replacement.providers[0].catalog.run();
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(mocks.signer).toHaveBeenCalledTimes(4);
+  });
+});
 describe("per-agent plugin registration", () => {
   it("fails closed for unknown agents even with a complete main identity configured", async () => {
     const registry = register({
