@@ -83,12 +83,16 @@ export function registerGatewayPublishing(
   let horizon: ReturnType<typeof registerHorizonSync>;
   lifecycle.add(() => horizon?.stop());
   if (config.horizon?.enabled !== true) return;
+  if (!loops) {
+    console.warn("[imajin-horizon] disabled: horizon requires loop lifecycle tracking");
+    return;
+  }
   // A configured loop id alone is not ownership evidence. Bind the file publisher
   // only after a trusted gateway session establishes that exact local loop.
   on("session_start", (_event, ctx) => {
     if (!lifecycle.active || horizon || !ownsSession(agentId, ctx?.sessionKey)) return;
     if (ctx?.agentId && ctx.agentId !== agentId) return;
-    const target = loops?.tracker.lookupSession(ctx.sessionKey);
+    const target = loops.tracker.lookupSession(ctx.sessionKey);
     if (!target || target.loopId !== config.horizon?.loopId) return;
     if (!config.horizon.filePath) {
       console.warn("[imajin-horizon] disabled: map mode requires an explicit gateway horizon file");

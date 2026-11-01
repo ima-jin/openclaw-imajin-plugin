@@ -354,6 +354,22 @@ describe("map-mode gateway principal (#139)", () => {
     expect(publishes()).toEqual([]);
   });
 
+  it.each([true, false])("warns once only when horizon is enabled (%s) but loops are disabled", async (enabled) => {
+    const registration = register({
+      approvals: undefined, sessionCommands: undefined, loops: { enabled: false },
+      attestation: { enabled: false },
+      horizon: { enabled, loopId: "unbound", filePath: join(dir, "must-not-read.json") },
+    });
+    await registration.start();
+    const warning = "[imajin-horizon] disabled: horizon requires loop lifecycle tracking";
+    const ctx = { sessionKey: "agent:main:main" };
+    await registration.emit("session_start", { sessionId: "first" }, ctx);
+    await registration.emit("session_start", { sessionId: "second" }, ctx);
+    const warnings = vi.mocked(console.warn).mock.calls.filter(([message]) => message === warning);
+    expect(warnings).toEqual(enabled ? [[warning]] : []);
+    expect(publishes()).toEqual([]);
+  });
+
   async function horizonConfig() {
     const filePath = join(dir, "gateway-horizon.json");
     await writeFile(filePath, JSON.stringify({
