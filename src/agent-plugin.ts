@@ -6,7 +6,10 @@ import { ImajinWsService, isNotificationFrame } from "./ws-service.js";
 import { createNotificationInjector, WAKE_RUNTIME_HOOKS } from "./notification-injector.js";
 import { createReachEventHandler, isReachFrame } from "./reach-events.js";
 import { PluginServiceRuntime } from "./plugin-service-runtime.js";
-import { registerImajinProvider } from "./imajin-provider.js";
+import {
+  registerImajinProvider, createImajinKernelModelsFetcher, resolveImajinKernelModelsPath,
+  isImajinCatalogInvalidationScope, ImajinDiscoveryError, type ImajinModelDiscoveryConfig,
+} from "./imajin-provider.js";
 import { resolveImajinMcpUrl } from "./kernel-mcp.js";
 import { createWakeReportTool, type WakeDisclosureSender } from "./wake-report-tool.js";
 import { registerGatewayPublishing } from "./gateway-publishing.js";
@@ -52,6 +55,7 @@ export function registerAgentPlugin(api: any, config: {
   approvalBridge?: ApprovalBridgeSettings;
   sessionCommands?: SessionCommandsSettings;
   inferProxyBaseUrl?: string;
+  modelDiscovery?: ImajinModelDiscoveryConfig;
   mcpUrl?: string;
   loops?: LoopsConfig;
   horizon?: HorizonConfig;
@@ -61,19 +65,39 @@ export function registerAgentPlugin(api: any, config: {
   let gatewayIdentity: GatewayAgentIdentity | undefined;
   const getGatewayIdentity = () => gatewayIdentity;
   const senders = new Map<string, WakeDisclosureSender>();
-  // A Gateway-wide provider cannot safely select an agent's catalog session.
-  // Keep registration/health diagnostics, but never borrow main's credentials.
-  const provider = registerImajinProvider(api, { inferProxyBaseUrl: config.inferProxyBaseUrl }, {});
+  // One global catalog, using only the already-resolved gateway identity.
+  const provider = registerImajinProvider(api, config, {
+    nodeUrl: config.nodeUrl,
+    fetcher: async () => {
+      try {
+        return await createImajinKernelModelsFetcher(getGatewayIdentity()?.client, {
+          modelsPath: resolveImajinKernelModelsPath(config.modelDiscovery),
+        })();
+      } catch (err) {
+        // Auth/provider failures may contain protected upstream response data.
+        const failure = err instanceof ImajinDiscoveryError ? err : undefined;
+        throw new ImajinDiscoveryError(
+          failure?.kind ?? "unreachable", "Gateway model discovery unavailable", failure?.httpStatus,
+        );
+      }
+    },
+  });
   const runtime = new PluginServiceRuntime(api.registrationMode, async (lifecycle, on) => {
     lifecycle.add(() => { identities.clear(); senders.clear(); gatewayIdentity = undefined; });
+    const startDiscovery = () => {
+      const discovery = provider.startDiscovery();
+      lifecycle.add(() => discovery.stop());
+    };
     const warnGateway = (cause: "missing nodeUrl" | "missing or invalid agents" | "missing or unresolvable gatewayAgent") =>
       console.warn(`[imajin-plugin] ${cause}; approvals and session commands disabled`);
     if (!config.nodeUrl) {
       warnGateway("missing nodeUrl");
+      startDiscovery();
       return;
     }
     if (!config.agents || typeof config.agents !== "object" || Array.isArray(config.agents)) {
       warnGateway("missing or invalid agents");
+      startDiscovery();
       return;
     }
     await identities.prepare(
@@ -129,12 +153,17 @@ export function registerAgentPlugin(api: any, config: {
         if (isReachFrame(frame)) {
           void reach.handle(frame).catch(() => console.warn("[imajin-plugin] agent reach delivery failed"));
         } else if (isNotificationFrame(frame)) {
+          if (identity === selected && isImajinCatalogInvalidationScope(frame.scope)) {
+            provider.cache.invalidate();
+            void provider.cache.refresh();
+          }
           void injector.inject(frame).catch(() => console.warn("[imajin-plugin] agent notification delivery failed"));
         }
         // Tenant sockets never reach gateway handlers, including malformed frames.
       });
       starts.push(ws.start().then(() => { if (!lifecycle.active) ws.stop(); }));
     }
+    startDiscovery();
     await Promise.all(starts);
   });
   runtime.agentTools = (ctx: AgentToolContext) => {

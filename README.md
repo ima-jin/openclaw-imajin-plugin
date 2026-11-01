@@ -2063,10 +2063,8 @@ the entry, rather than keeping its old signer.
   commands require an explicit **`gatewayAgent`** selection (see below);
   no tenant receives that authority through its tool list.
   Loop/horizon publishers and turn-usage attestations use only that gateway
-  principal (#140, below). Authenticated model discovery remains **off in
-  agent-map mode** pending #141. The global model-provider
-  registration remains available for health diagnostics but its catalog is
-  unconfigured, never authenticated as main.
+  principal (#140, below). Global model discovery uses only the resolved
+  `gatewayAgent` client (#141), never a tenant's session.
 - **Legacy zero-edit compatibility:** omit `agents` entirely to retain the
   existing top-level `did`, `keypairPath`, `actAs`, `warp` and
   `wsNotifications.wakeSessionKey` behavior, tools, provider and services.
@@ -2141,3 +2139,21 @@ internal-key environment fallback; it never borrows a top-level bearer.
 Zero-cost turns remain visible. Failed publishes are dropped with value-free
 warnings, without retries or failing the turn. Legacy mode keeps its original
 internal endpoint and publisher behavior unchanged.
+
+### Map-mode model discovery (#141)
+
+The global `imajin/*` catalog uses the existing `getGatewayIdentity()` client:
+the selected entry's sealed signer, DID session and `actAs`, resolved once at
+service startup, never re-resolved per catalog fetch or tenant. Top-level
+`modelDiscovery` settings (route and refresh interval) and `inferProxyBaseUrl`
+keep their existing meaning. Discovery starts after identity resolution,
+refreshes periodically and lazily, and responds to catalog invalidation
+notifications only on the selected gateway socket. Stop/replacement retires
+the scheduler and the client reference.
+
+Without a valid resolved `gatewayAgent`, discovery remains `unconfigured`
+and makes no authenticated request, even if tenant identities or legacy
+top-level credentials exist. Tenant tools and sockets keep their own sessions;
+they cannot supply, borrow, or trigger refresh with the gateway discovery
+session. Publishing the global catalog grants no tenant approvals or session
+command authority. Legacy configuration without `agents` is unchanged.
