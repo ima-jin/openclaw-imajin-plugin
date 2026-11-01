@@ -3,6 +3,10 @@
 ## Unreleased
 
 ### Added
+- **Map-mode gateway principal (#139).** Explicit `gatewayAgent` selects a
+  resolved sealed map identity for approvals and session commands. Tenant
+  sockets have no gateway authority; missing selection fails closed without
+  legacy fallback. Gateway rollout remains held on epic #138.
 - **Kernel-picked default model (#106).** The catalog approval card can switch
   inherited defaults to `imajin/default`, retaining the old direct ref as
   transport-only break-glass and clearing ordinary fallback ladders. Discovery

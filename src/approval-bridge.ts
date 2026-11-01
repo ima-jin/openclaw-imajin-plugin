@@ -1,4 +1,9 @@
 import { readFile } from "node:fs/promises";
+import type { ImajinSigner } from "./client.js";
+
+export type MessageSigner = { did: string } & (
+  { privateKeyHex: string } | { signer: ImajinSigner }
+);
 
 export type SignerType = "human" | "agent";
 export type GatewayApprovalKind = "exec" | "plugin";
@@ -65,7 +70,8 @@ interface Logger {
 
 export interface ApprovalBridgeConfig {
   did: string;
-  keypairPath: string;
+  keypairPath?: string;
+  signer?: ImajinSigner;
   pinnedApproverPublicKeyHex: string;
 }
 
@@ -149,9 +155,13 @@ function isSignedMessage(value: unknown): value is SignedMessage<unknown> {
 
 export async function signMessage<T>(
   payload: T,
-  signer: { did: string; type: SignerType; privateKeyHex: string },
+  signer: MessageSigner & { type: SignerType },
 ): Promise<SignedMessage<T>> {
   const unsigned = { from: signer.did, type: signer.type, timestamp: Date.now(), payload };
+  if ("signer" in signer) {
+    if (signer.signer.did !== signer.did) throw new Error("Signing identity mismatch");
+    return { ...unsigned, signature: await signer.signer.signChallenge(canonicalize(unsigned)) };
+  }
   const ed = await loadEd25519();
   const signature = await ed.signAsync(
     new TextEncoder().encode(canonicalize(unsigned)),
@@ -192,12 +202,11 @@ export function isApprovalDecisionFrame(frame: unknown): frame is ApprovalDecisi
 
 export async function buildApprovalRequestedFrame(
   request: GatewayApprovalRequest,
-  signer: { did: string; privateKeyHex: string },
+  signer: MessageSigner,
 ): Promise<ApprovalRequestedFrame> {
   const attestation = await signMessage(request, {
-    did: signer.did,
+    ...signer,
     type: "agent",
-    privateKeyHex: signer.privateKeyHex,
   });
   return { type: APPROVAL_REQUESTED_FRAME_TYPE, attestation };
 }
@@ -267,7 +276,10 @@ export class ApprovalBridge {
     if (!request.requestId || !Number.isFinite(expiresAtMs)) {
       throw new Error("approval bridge: requestId and a valid expiresAt are required");
     }
-    const frame = await buildApprovalRequestedFrame(request, await this.loadKeypair());
+    const signer = this.config.signer
+      ? { did: this.config.did, signer: this.config.signer }
+      : await this.loadKeypair();
+    const frame = await buildApprovalRequestedFrame(request, signer);
     this.pending.set(request.requestId, {
       requestId: request.requestId,
       expiresAtMs,
@@ -327,6 +339,7 @@ export class ApprovalBridge {
 
   private async loadKeypair(): Promise<RequesterKeypair> {
     if (this.keypair) return this.keypair;
+    if (!this.config.keypairPath) throw new Error("Approval signing identity unavailable");
     const parsed = JSON.parse(await readFile(this.config.keypairPath, "utf-8")) as {
       did?: string;
       privateKey?: string;

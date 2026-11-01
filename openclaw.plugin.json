@@ -37,6 +37,10 @@
       "help": "The agent's decentralized identifier on the Imajin network",
       "placeholder": "did:imajin:..."
     },
+    "gatewayAgent": {
+      "label": "Gateway Agent",
+      "help": "Map mode only: exact agents entry owning Gateway approvals and session commands. Must resolve its sealed keypair; missing/invalid selection disables both without legacy fallback."
+    },
     "keypairPath": {
       "label": "Keypair Path",
       "help": "Path to the Ed25519 keypair JSON file for signing",
@@ -202,7 +206,7 @@
     "properties": {
       "agents": {
         "type": "object",
-        "description": "Explicit per-agent identity mode. Only listed, resolved agents get tools; top-level identity and Gateway-wide approvals are never inherited. Omit this map entirely for legacy mode.",
+        "description": "Explicit per-agent identity mode. Only listed, resolved agents get tools; top-level identity is never inherited. gatewayAgent selects the sole Gateway approvals/session-command identity. Omit this map entirely for legacy mode.",
         "propertyNames": { "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$" },
         "additionalProperties": {
           "type": "object",
@@ -225,7 +229,7 @@
             "tools": {
               "type": "array",
               "uniqueItems": true,
-              "description": "Exact plugin tool allowlist, including status and wake reports. Omitted permits all; [] permits none. Gateway-wide approval bridges are not started in this mode.",
+              "description": "Exact plugin tool allowlist, including status and wake reports. Omitted permits all; [] permits none. Gateway authority is separately selected by gatewayAgent, never granted by this list.",
               "items": {
                 "type": "string",
                 "enum": ["imajin_status", "imajin_identity", "imajin_attest", "imajin_transact", "imajin_fair", "imajin_discover", "imajin_media", "imajin_warp", "imajin_infer", "imajin_usage", "imajin_vault", "imajin_cloudflare", "imajin_chat", "imajin_wake_report"]
@@ -234,6 +238,21 @@
             "warp": { "$ref": "#/properties/warp" },
             "wsNotifications": { "$ref": "#/properties/wsNotifications" }
           }
+        }
+      },
+      "gatewayAgent": {
+        "type": "string",
+        "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+        "description": "Map mode only. Must name a valid, uniquely resolved agents entry. Gateway approvals/session commands use only its sealed signer and WS. Missing/unresolvable selection disables both with no legacy fallback."
+      },
+      "sessionCommands": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false },
+          "kernelPublicKeyHex": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" },
+          "kernelDid": { "type": "string" },
+          "requirePrincipalCountersignature": { "type": "boolean", "default": true }
         }
       },
       "nodeUrl": {
