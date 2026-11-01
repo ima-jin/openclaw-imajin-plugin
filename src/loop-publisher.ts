@@ -269,6 +269,7 @@ export interface LoopSenderOptions {
   keypairPath?: string;
   signer?: ImajinSigner;
   client?: Pick<ImajinClient, "authenticatedCookie">;
+  signal?: AbortSignal;
   logger?: LoopSenderLogger;
   fetchImpl?: typeof fetch;
   now?: () => number;
@@ -296,6 +297,7 @@ export function createLoopTransport(options: LoopSenderOptions) {
     return key;
   };
   async function sign<T extends string, P extends object>(type: T, payload: P): Promise<LoopIngestRequest<T, P>> {
+    options.signal?.throwIfAborted();
     if (!options.signer) return signLoopEvent(type, payload, options.did, await getKey());
     const { signer } = options;
     if (signer.did !== options.did || !signer.publicKey) throw new Error("Loop signing identity mismatch");
@@ -308,14 +310,16 @@ export function createLoopTransport(options: LoopSenderOptions) {
     };
   }
   async function post(path: string, request: object): Promise<Response> {
+    options.signal?.throwIfAborted();
     const cookie = await options.client?.authenticatedCookie();
+    options.signal?.throwIfAborted();
     return (options.fetchImpl ?? fetch)(
       `${options.nodeUrl.replace(/\/$/, "")}${path}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}) },
         body: JSON.stringify(request),
-        signal: AbortSignal.timeout(POST_TIMEOUT_MS),
+        signal: AbortSignal.any([AbortSignal.timeout(POST_TIMEOUT_MS), ...options.signal ? [options.signal] : []]),
       },
     );
   }

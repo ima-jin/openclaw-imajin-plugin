@@ -54,6 +54,12 @@ const AGENT_RUN_CONTEXT_TYPE = "agent_run";
 const RETENTION_MS = 90 * 24 * 60 * 60 * 1000; // 90-day rolling retention window
 const DEFAULT_INTERNAL_API_KEY_ENV = "ATTESTATION_INTERNAL_API_KEY";
 const INTERNAL_ATTESTATION_PATH = "/auth/api/attestations/internal";
+interface TurnUsageIdentity {
+  client: Pick<ImajinClient, "authenticatedCookie">;
+  signer: ImajinSigner;
+  nodeUrl: string;
+  signal?: AbortSignal;
+}
 
 export interface AgentTokenUsage {
   input?: number;
@@ -68,12 +74,14 @@ export interface AgentTokenUsage {
 async function postSignedTurnUsage(
   did: string,
   event: AgentEndEvent,
-  identity: { client: Pick<ImajinClient, "authenticatedCookie">; signer: ImajinSigner; nodeUrl: string },
+  identity: TurnUsageIdentity,
 ): Promise<void> {
   try {
+    identity.signal?.throwIfAborted();
     // Sign the JSON wire representation: omit undefined fields before canonicalizing.
     const finalMessage = findFinalAssistantMessage(event?.messages);
-    const payload = JSON.parse(JSON.stringify(buildTurnUsagePayload(event ?? {}, finalMessage)));
+    const wirePayload = JSON.stringify(buildTurnUsagePayload(event ?? {}, finalMessage));
+    const payload: TurnUsagePayload = JSON.parse(wirePayload);
     const claim = buildTurnUsageClaim(did, payload);
     const body = {
       subject_did: did, type: claim.type, context_id: claim.context_id,
@@ -81,11 +89,12 @@ async function postSignedTurnUsage(
     };
     const signature = await identity.signer.signChallenge(canonicalize(body));
     const cookie = await identity.client.authenticatedCookie();
+    identity.signal?.throwIfAborted();
     const response = await fetch(`${identity.nodeUrl.replaceAll(/\/$/g, "")}/auth/api/attestations`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: cookie },
       body: JSON.stringify({ ...body, issuer_did: did, signature, expires_at: claim.expires_at }),
-      signal: AbortSignal.timeout(10_000),
+      signal: AbortSignal.any([AbortSignal.timeout(10_000), ...identity.signal ? [identity.signal] : []]),
     });
     if (!response.ok) console.warn("[imajin-plugin] agent.turn.usage publish dropped");
   } catch {
@@ -412,7 +421,7 @@ function resolveSettings(
 export function createTurnUsageAttestationHandler(
   did: string | undefined,
   config: TurnUsageAttestationConfig,
-  identity?: { client: Pick<ImajinClient, "authenticatedCookie">; signer: ImajinSigner; nodeUrl: string },
+  identity?: TurnUsageIdentity,
 ): ((event: AgentEndEvent) => void) | undefined {
   if (identity) {
     if (config.enabled === false || !did || identity.signer.did !== did) return undefined;

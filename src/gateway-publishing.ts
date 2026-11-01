@@ -68,10 +68,10 @@ export function registerGatewayPublishing(
       const scoped = scopeLoopHook(agentId, hook, event, ctx, ownedCronJobs);
       return scoped ? handler(scoped.event, scoped.ctx) : undefined;
     }, options),
-  }, { nodeUrl: config.nodeUrl, did, actAs, signer, client, config: config.loops });
+  }, { nodeUrl: config.nodeUrl, did, actAs, signer, client, signal: lifecycle.signal, config: config.loops });
 
   const usage = createTurnUsageAttestationHandler(did, { enabled: config.attestation?.enabled }, {
-    nodeUrl: config.nodeUrl, signer, client,
+    nodeUrl: config.nodeUrl, signer, client, signal: lifecycle.signal,
   });
   if (usage) on("agent_end", (event, ctx) => {
     if (!lifecycle.active || !ownsSession(agentId, ctx?.sessionKey)) return;
@@ -96,7 +96,7 @@ export function registerGatewayPublishing(
     horizon = registerHorizonSync({
       registerService: (service) => service.start(),
     }, {
-      nodeUrl: config.nodeUrl, did, principal: actAs, signer, client,
+      nodeUrl: config.nodeUrl, did, principal: actAs, signer, client, signal: lifecycle.signal,
       config: {
         ...config.horizon,
         stateDir: join(agentNotifications(agentId, identity.config).stateDir!, "horizon-sync"),

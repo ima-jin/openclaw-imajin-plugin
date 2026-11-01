@@ -26,6 +26,69 @@ function mockFetch(response: unknown, status = 201) {
   } as unknown as Response);
 }
 
+describe("gateway signed turn usage", () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const identity = () => ({
+    nodeUrl: "https://kernel.test",
+    signer: { did: DID, signChallenge: vi.fn(async () => "signature") },
+    client: { authenticatedCookie: vi.fn(async () => "session=test") },
+  });
+
+  it.each(["missing-did", "wrong-signer", "disabled"])("refuses %s without legacy fallback", (failure) => {
+    const gateway = identity();
+    if (failure === "wrong-signer") gateway.signer.did = "did:imajin:tenant";
+    expect(createTurnUsageAttestationHandler(failure === "missing-did" ? undefined : DID, {
+      enabled: failure !== "disabled", serviceUrl: "https://must-not-use.test", internalApiKey: "unused",
+    }, gateway)).toBeUndefined();
+    expect(gateway.signer.signChallenge).not.toHaveBeenCalled();
+    expect(gateway.client.authenticatedCookie).not.toHaveBeenCalled();
+  });
+
+  it.each(["sign", "auth", "http", "network", "retired", "retired-during-auth", "malformed"])(
+    "drops %s errors with one value-free warning and no retry", async (failure) => {
+      const gateway = identity();
+      const controller = new AbortController();
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      const fetchImpl = mockFetch({ detail: "private provider detail" }, failure === "http" ? 403 : 201);
+      vi.stubGlobal("fetch", fetchImpl);
+      if (failure === "sign") gateway.signer.signChallenge.mockRejectedValue(new Error("private provider detail"));
+      if (failure === "auth") gateway.client.authenticatedCookie.mockRejectedValue(new Error("private provider detail"));
+      if (failure === "network") fetchImpl.mockRejectedValue(new Error("private provider detail"));
+      if (failure === "retired") controller.abort();
+      if (failure === "retired-during-auth") gateway.client.authenticatedCookie.mockImplementation(async () => {
+        controller.abort();
+        return "session=test";
+      });
+      const handler = createTurnUsageAttestationHandler(DID, {}, { ...gateway, signal: controller.signal })!;
+      const event: AgentEndEvent = { messages: [] };
+      if (failure === "malformed") Object.defineProperty(event, "messages", { get() { throw new Error("private provider detail"); } });
+      expect(handler(event)).toBeUndefined();
+      await vi.waitFor(() => expect(warn).toHaveBeenCalledOnce());
+      expect(warn).toHaveBeenCalledWith("[imajin-plugin] agent.turn.usage publish dropped");
+      expect(fetchImpl).toHaveBeenCalledTimes(["http", "network"].includes(failure) ? 1 : 0);
+    },
+  );
+
+  it("ignores top-level internal credentials and service URL in map mode", async () => {
+    const gateway = identity();
+    const fetchImpl = mockFetch({});
+    vi.stubGlobal("fetch", fetchImpl);
+    const handler = createTurnUsageAttestationHandler(DID, {
+      internalApiKey: "unused", serviceUrl: "https://must-not-use.test",
+    }, gateway)!;
+    expect(handler({ sessionKey: "agent:main:main" })).toBeUndefined();
+    await vi.waitFor(() => expect(fetchImpl).toHaveBeenCalledOnce());
+    expect(fetchImpl.mock.calls[0][0]).toBe("https://kernel.test/auth/api/attestations");
+    const init = fetchImpl.mock.calls[0][1] as RequestInit;
+    expect(init.headers).toEqual({ "Content-Type": "application/json", Cookie: "session=test" });
+    expect(JSON.parse(init.body as string)).toMatchObject({ issuer_did: DID, subject_did: DID });
+  });
+});
+
 describe("findFinalAssistantMessage", () => {
   it("returns the last assistant-role message", () => {
     const messages: AgentMessage[] = [

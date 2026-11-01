@@ -4,6 +4,7 @@ import { canonicalize } from "./approval-bridge.js";
 import {
   MAX_SUMMARY_LENGTH,
   createLoopSender,
+  createLoopTransport,
   deriveLoopId,
   sanitizeRefs,
   sanitizeSummary,
@@ -58,6 +59,44 @@ function bodies(fetchMock: ReturnType<typeof okFetch>): LoopIngestRequest[] {
 beforeEach(() => {
   vi.mocked(readFile).mockReset();
   vi.mocked(readFile).mockResolvedValue(KEYPAIR);
+});
+
+describe("sealed loop transport", () => {
+  it.each(["mismatch", "missing-public-key", "signing", "authentication", "retired"])(
+    "drops %s failures without reading the legacy key or leaking provider errors", async (failure) => {
+      const fetchImpl = okFetch();
+      const logger = { info: vi.fn(), warn: vi.fn() };
+      const controller = new AbortController();
+      const signer = { did: DID, publicKey: "public", signChallenge: vi.fn(async () => "signature") };
+      const client = { authenticatedCookie: vi.fn(async () => "session=test") };
+      if (failure === "mismatch") signer.did = "did:imajin:other";
+      if (failure === "missing-public-key") signer.publicKey = "";
+      if (failure === "signing") signer.signChallenge.mockRejectedValue(new Error("private provider detail"));
+      if (failure === "authentication") client.authenticatedCookie.mockRejectedValue(new Error("private provider detail"));
+      if (failure === "retired") controller.abort();
+      const sender = createLoopSender({
+        nodeUrl: NODE_URL, did: DID, signer, client, signal: controller.signal,
+        keypairPath: "/must-not-read", logger, fetchImpl,
+      });
+      sender.publish(transition());
+      await sender.idle();
+      expect(fetchImpl).not.toHaveBeenCalled();
+      expect(readFile).not.toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledOnce();
+      expect(JSON.stringify(logger.warn.mock.calls)).not.toContain("private provider detail");
+    },
+  );
+
+  it("does not POST when retired while authentication is pending", async () => {
+    const controller = new AbortController();
+    const fetchImpl = okFetch();
+    const transport = createLoopTransport({
+      nodeUrl: NODE_URL, did: DID, signal: controller.signal, fetchImpl,
+      client: { authenticatedCookie: async () => { controller.abort(); return "session=test"; } },
+    });
+    await expect(transport.post({} as LoopIngestRequest)).rejects.toThrow();
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
 });
 
 describe("deriveLoopId", () => {

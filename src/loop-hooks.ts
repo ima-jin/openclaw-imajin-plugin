@@ -39,8 +39,9 @@ export interface LoopHooksDeps {
   nodeUrl?: string;
   did?: string;
   keypairPath?: string;
-  signer?: LoopSenderOptions["signer"];
-  client?: LoopSenderOptions["client"];
+  signer?: NonNullable<LoopSenderOptions["signer"]>;
+  client?: NonNullable<LoopSenderOptions["client"]>;
+  signal?: AbortSignal;
   /** Principal the loops belong to (the plugin's `actAs`); defaults to `did`. */
   actAs?: string;
   config?: LoopsConfig;
@@ -80,6 +81,7 @@ export function registerLoopLifecycle(api: HookApi, deps: LoopHooksDeps): LoopLi
     keypairPath: deps.keypairPath,
     signer: deps.signer,
     client: deps.client,
+    signal: deps.signal,
     logger: deps.logger,
     fetchImpl: deps.fetchImpl,
     now: deps.now,
