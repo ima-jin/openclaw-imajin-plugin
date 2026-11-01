@@ -1,7 +1,6 @@
 # @openclaw/imajin-plugin
 
 OpenClaw plugin for the [Imajin](https://jin.imajin.ai) sovereign identity and settlement network.
-Map-mode gateway-only loop publishing and turn-usage attestations are tracked in #140.
 
 ## What it does
 
@@ -2063,8 +2062,9 @@ the entry, rather than keeping its old signer.
 - Gateway approvals (`approvals` and `approvalBridge`) and signed session
   commands require an explicit **`gatewayAgent`** selection (see below);
   no tenant receives that authority through its tool list.
-  Loop/horizon publishers, turn-usage attestations and authenticated model
-  discovery remain **off in agent-map mode** pending #140/#141. The global model-provider
+  Loop/horizon publishers and turn-usage attestations use only that gateway
+  principal (#140, below). Authenticated model discovery remains **off in
+  agent-map mode** pending #141. The global model-provider
   registration remains available for health diagnostics but its catalog is
   unconfigured, never authenticated as main.
 - **Legacy zero-edit compatibility:** omit `agents` entirely to retain the
@@ -2079,7 +2079,7 @@ the entry, rather than keeping its old signer.
 ### Map-mode gateway principal (#139)
 
 **Rollout hold:** keep the deployed Gateway on legacy config until epic #138
-lands. This change supplies approvals/session commands only; it is not a
+lands. These changes supply gateway-principal runtime wiring; this is not a
 Gateway `openclaw.json` migration.
 
 Set `gatewayAgent: "main"` alongside `agents` to name the **exact valid map
@@ -2102,9 +2102,42 @@ change.
 
 Commands targeting sessions or spawning agents are restricted to the selected
 agent's namespace in map mode; they cannot sign a tenant session's activity as
-main. Command-only loopback access does not start inventory or loop publishers;
-history publishing awaits #140. Legacy mode retains its existing loop/inventory
+main. Command-only loopback access does not start inventory; gateway-only loop
+hooks are independent. History inventory remains legacy-only. Legacy mode retains its existing loop/inventory
 requirements. `registerAgentPlugin` returns `getGatewayIdentity()`, exposing the
 active `GatewayAgentIdentity` (`client`, sealed `signer`, `ws`, config and agent
 id) for #140/#141; it returns `undefined` before startup, after stop/replacement,
 or on failed resolution. No private key material is exposed.
+
+### Map-mode loop/horizon publishing and turn usage (#140)
+
+The same `getGatewayIdentity()` supplies the selected agent's existing client
+and sealed signer; neither a new identity resolver nor a file signer is used.
+`loops.enabled: false` and `attestation.enabled: false` retain their opt-outs.
+No gateway selection or failed identity resolution means both publishers and
+attestations are off, even when legacy top-level credentials remain present.
+
+Only trusted host hook context in `agent:<gatewayAgent>:*` can authorize a
+publication. Event payload session keys cannot grant ownership or override that
+context. Tenant, missing-context, conflicting-agent and cross-agent subagent
+hooks publish nothing under the gateway DID. Global cron snapshots cannot
+establish ownership; reconciliation is limited to jobs already observed on
+the gateway's own sessions. Gateway-wide session inventory is not enabled in
+map mode because it includes tenant sessions.
+
+Map-mode horizon sync is opt-in (`horizon.enabled: true`), uses an explicit
+gateway-owned `horizon.filePath` (never the shared default workspace file),
+and starts only when a trusted `session_start` establishes the exact configured
+`horizon.loopId` in the gateway tracker. Until then it emits nothing. Its cursor
+and outbox live in the selected agent's notification state directory under
+`horizon-sync`, not a legacy keypair directory or shared top-level state path.
+Reload/stop retires the publisher. Operator configuration must point to that
+gateway's file and loop; this plugin never edits Gateway configuration.
+
+Turn usage uses the existing authenticated gateway client and Ed25519 signer
+to POST self-issued/self-subject `agent.turn.usage` to `/auth/api/attestations`.
+Map mode ignores the legacy `attestation.serviceUrl`, `internalApiKey` and
+internal-key environment fallback; it never borrows a top-level bearer.
+Zero-cost turns remain visible. Failed publishes are dropped with value-free
+warnings, without retries or failing the turn. Legacy mode keeps its original
+internal endpoint and publisher behavior unchanged.

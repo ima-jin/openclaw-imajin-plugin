@@ -47,12 +47,15 @@ export function createHorizonSync(options: HorizonSyncOptions) {
     throw new Error("invalid kernel URL");
   }
   const filePath = expandPath(options.config.filePath ?? "~/.openclaw/workspace/horizon/horizon.json");
-  const stateDir = expandPath(options.config.stateDir ?? join(dirname(expandPath(options.keypairPath)), "horizon-sync"));
+  const defaultStateDir = options.keypairPath ? join(dirname(expandPath(options.keypairPath)), "horizon-sync") : undefined;
+  const stateDir = expandPath(text(options.config.stateDir ?? defaultStateDir));
   const scope = digest([options.nodeUrl.replace(/\/$/, ""), loopId, options.did, principal]);
   const cursorPath = join(stateDir, `${scope}.json`);
   const deadLetterPath = `${cursorPath}.dead-letter.json`;
   if (filePath === cursorPath) throw new Error("horizon must not be its own cursor");
-  const transport = createLoopTransport({ ...options, keypairPath: expandPath(options.keypairPath) });
+  const transport = createLoopTransport({
+    ...options, keypairPath: options.keypairPath ? expandPath(options.keypairPath) : undefined,
+  });
   const log = options.logger ?? { info: console.log, warn: console.warn };
   const now = options.now ?? Date.now;
   const interval = options.config.syncIntervalMs ?? 30_000;
@@ -199,7 +202,8 @@ export function registerHorizonSync(
 ) {
   if (options.config?.enabled !== true) return undefined;
   try {
-    const sync = createHorizonSync({ ...options, did: text(options.did), keypairPath: text(options.keypairPath), config: options.config });
+    if (!options.signer) text(options.keypairPath);
+    const sync = createHorizonSync({ ...options, did: text(options.did), config: options.config });
     api.registerService({ id: "imajin-horizon-sync", start: sync.start, stop: sync.stop });
     return sync;
   } catch {

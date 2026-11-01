@@ -9,6 +9,10 @@ import { PluginServiceRuntime } from "./plugin-service-runtime.js";
 import { registerImajinProvider } from "./imajin-provider.js";
 import { resolveImajinMcpUrl } from "./kernel-mcp.js";
 import { createWakeReportTool, type WakeDisclosureSender } from "./wake-report-tool.js";
+import { registerGatewayPublishing } from "./gateway-publishing.js";
+import { LOOP_LIFECYCLE_HOOKS, type LoopsConfig } from "./loop-hooks.js";
+import type { HorizonConfig } from "./horizon/sync.js";
+import type { TurnUsageAttestationConfig } from "./turn-usage-attestation.js";
 import {
   createIdentityTool, createAttestTool, createTransactTool, createFairTool,
   createDiscoverTool, createMediaTool, createWarpTool, createInferTool,
@@ -49,9 +53,13 @@ export function registerAgentPlugin(api: any, config: {
   sessionCommands?: SessionCommandsSettings;
   inferProxyBaseUrl?: string;
   mcpUrl?: string;
+  loops?: LoopsConfig;
+  horizon?: HorizonConfig;
+  attestation?: TurnUsageAttestationConfig;
 }): AgentPluginRegistration {
   const identities = new AgentIdentities();
   let gatewayIdentity: GatewayAgentIdentity | undefined;
+  const getGatewayIdentity = () => gatewayIdentity;
   const senders = new Map<string, WakeDisclosureSender>();
   // A Gateway-wide provider cannot safely select an agent's catalog session.
   // Keep registration/health diagnostics, but never borrow main's credentials.
@@ -88,6 +96,7 @@ export function registerAgentPlugin(api: any, config: {
       let gatewayFeatures: ReturnType<typeof registerGatewayFeatures> | undefined;
       if (identity === selected) {
         gatewayIdentity = { ...identity, agentId, ws };
+        registerGatewayPublishing(getGatewayIdentity()!, { ...config, nodeUrl: config.nodeUrl }, lifecycle, on);
         gatewayFeatures = registerGatewayFeatures(api, {
           nodeUrl: config.nodeUrl,
           did: identity.config.did, actAs: identity.config.actAs, signer: identity.signer,
@@ -166,6 +175,9 @@ export function registerAgentPlugin(api: any, config: {
       runtime.registerHook(api, hook, `imajin-agent:${agentId}:${hook}`);
     }
   }
+  for (const hook of LOOP_LIFECYCLE_HOOKS) runtime.registerHook(api, hook, `imajin-loops:${hook}`);
+  runtime.registerHook(api, "session_start", "imajin-gateway:horizon");
+  runtime.registerHook(api, "agent_end", "turn-usage-attestation");
   api.registerService({ id: "imajin-ws", start: runtime.start, stop: runtime.stop });
-  return { getGatewayIdentity: () => gatewayIdentity };
+  return { getGatewayIdentity };
 }

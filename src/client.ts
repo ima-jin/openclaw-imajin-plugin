@@ -24,6 +24,7 @@ function extractSessionCookie(header: string | null): string | undefined {
 /** Private material stays behind this capability, never in tool/config objects. */
 export interface ImajinSigner {
   did: string;
+  publicKey?: string;
   signChallenge: (challenge: string) => Promise<string>;
 }
 

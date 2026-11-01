@@ -39,6 +39,8 @@ export interface LoopHooksDeps {
   nodeUrl?: string;
   did?: string;
   keypairPath?: string;
+  signer?: LoopSenderOptions["signer"];
+  client?: LoopSenderOptions["client"];
   /** Principal the loops belong to (the plugin's `actAs`); defaults to `did`. */
   actAs?: string;
   config?: LoopsConfig;
@@ -66,7 +68,7 @@ export function registerLoopLifecycle(api: HookApi, deps: LoopHooksDeps): LoopLi
   if (deps.config?.enabled === false) return undefined;
   const log = deps.logger ?? { info: console.log, warn: console.warn };
 
-  if (!deps.nodeUrl || !deps.did || !deps.keypairPath) {
+  if (!deps.nodeUrl || !deps.did || (!deps.keypairPath && !deps.signer)) {
     log.info("[imajin-loops] disabled — needs nodeUrl, did and keypairPath to sign loop events");
     return undefined;
   }
@@ -76,6 +78,8 @@ export function registerLoopLifecycle(api: HookApi, deps: LoopHooksDeps): LoopLi
     did: deps.did,
     principal: deps.actAs,
     keypairPath: deps.keypairPath,
+    signer: deps.signer,
+    client: deps.client,
     logger: deps.logger,
     fetchImpl: deps.fetchImpl,
     now: deps.now,

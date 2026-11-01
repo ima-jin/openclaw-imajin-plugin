@@ -46,6 +46,8 @@
  */
 
 import { createHash } from "node:crypto";
+import { canonicalize } from "./approval-bridge.js";
+import type { ImajinClient, ImajinSigner } from "./client.js";
 
 const AGENT_TURN_USAGE_TYPE = "agent.turn.usage";
 const AGENT_RUN_CONTEXT_TYPE = "agent_run";
@@ -60,6 +62,35 @@ export interface AgentTokenUsage {
   cacheWrite?: number;
   totalTokens?: number;
   contextUsage?: { state: "available"; promptTokens: number; totalTokens: number } | { state: "unavailable" };
+}
+
+/** Map mode authors as the gateway DID, never through an internal/top-level credential. */
+async function postSignedTurnUsage(
+  did: string,
+  event: AgentEndEvent,
+  identity: { client: Pick<ImajinClient, "authenticatedCookie">; signer: ImajinSigner; nodeUrl: string },
+): Promise<void> {
+  try {
+    // Sign the JSON wire representation: omit undefined fields before canonicalizing.
+    const finalMessage = findFinalAssistantMessage(event?.messages);
+    const payload = JSON.parse(JSON.stringify(buildTurnUsagePayload(event ?? {}, finalMessage)));
+    const claim = buildTurnUsageClaim(did, payload);
+    const body = {
+      subject_did: did, type: claim.type, context_id: claim.context_id,
+      context_type: claim.context_type, payload, issued_at: Date.now(),
+    };
+    const signature = await identity.signer.signChallenge(canonicalize(body));
+    const cookie = await identity.client.authenticatedCookie();
+    const response = await fetch(`${identity.nodeUrl.replaceAll(/\/$/g, "")}/auth/api/attestations`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ ...body, issuer_did: did, signature, expires_at: claim.expires_at }),
+      signal: AbortSignal.timeout(10_000),
+    });
+    if (!response.ok) console.warn("[imajin-plugin] agent.turn.usage publish dropped");
+  } catch {
+    console.warn("[imajin-plugin] agent.turn.usage publish dropped");
+  }
 }
 
 export interface AgentTurnCost {
@@ -381,7 +412,14 @@ function resolveSettings(
 export function createTurnUsageAttestationHandler(
   did: string | undefined,
   config: TurnUsageAttestationConfig,
+  identity?: { client: Pick<ImajinClient, "authenticatedCookie">; signer: ImajinSigner; nodeUrl: string },
 ): ((event: AgentEndEvent) => void) | undefined {
+  if (identity) {
+    if (config.enabled === false || !did || identity.signer.did !== did) return undefined;
+    return (event) => {
+      void postSignedTurnUsage(did, event, identity);
+    };
+  }
   const settings = resolveSettings(did, config);
   if (!settings) return undefined;
   const { did: issuerDid, serviceUrl, internalApiKey } = settings;

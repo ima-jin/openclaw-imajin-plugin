@@ -101,6 +101,7 @@ async function parseSigner(raw: unknown, did: string): Promise<ImajinSigner> {
   }
   return {
     did,
+    publicKey: key.publicKey.toLowerCase(),
     signChallenge: async (challenge) =>
       Buffer.from(await ed.signAsync(new TextEncoder().encode(challenge), privateBytes)).toString("hex"),
   };
