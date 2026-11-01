@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Calling-agent identity and source diagnostics in `imajin_status` (#147).
 
 ### Added
 - **Map-mode gateway principal (#139).** Explicit `gatewayAgent` selects a

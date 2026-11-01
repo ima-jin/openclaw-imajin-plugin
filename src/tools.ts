@@ -16,6 +16,7 @@ import type { ImajinClient, WarpAgentRun } from "./client.js";
 import {
   buildImajinStatusSnapshot,
   fetchImajinProxyHealthz,
+  resolveImajinHealthzUrl,
   type ImajinCatalogCache,
 } from "./imajin-provider.js";
 import { buildMcpStatusBlock, probeKernelMcp, type McpProbeResult } from "./kernel-mcp.js";
@@ -24,6 +25,7 @@ import type { ImajinDefaultRoutingStatus } from "./imajin-default-routing.js";
 import { buildUsageReport, formatDay, parseDay, resolveUsageRange } from "./usage.js";
 import { ackGrant, fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
 import { containsLiveSecret, createSecretHandle } from "./vault/secret-handle-store.js";
+import type { StatusIdentity } from "./status-identity.js";
 
 export { createCloudflareTool } from "./cloudflare-tool.js";
 
@@ -1540,6 +1542,8 @@ export function createImajinStatusTool(deps: {
   /** Live config reader for model allow-list coverage and MCP registration. */
   getConfig?: () => unknown;
   getDefaultRouting?: () => ImajinDefaultRoutingStatus | undefined;
+  getIdentity?: () => StatusIdentity | undefined;
+  nodeUrl?: string;
   /** Probe override (tests). */
   probeMcp?: (url: string) => Promise<McpProbeResult>;
 }) {
@@ -1552,7 +1556,8 @@ export function createImajinStatusTool(deps: {
       "route-error | auth-error | malformed | unconfigured), a fresh probe of the " +
       "kernel inference proxy's GET /healthz, and (#50) the kernel MCP passthrough: " +
       "reachability, tool count, whether the `imajin` MCP server is registered, and which " +
-      "google_* send/write tools need an explicit operator enable.",
+      "google_* send/write tools need an explicit operator enable. Includes the calling " +
+      "agent's identity, last authentication and socket state, and a sources summary.",
     parameters: {
       type: "object" as const,
       properties: {},
@@ -1578,12 +1583,31 @@ export function createImajinStatusTool(deps: {
         ...snapshot,
         ...(deps.getDefaultRouting ? { defaultRouting: deps.getDefaultRouting() } : {}),
         allowList: buildImajinAllowListStatus(deps.cache.peek()?.models ?? [], config),
+        ...(deps.getIdentity ? { identity: deps.getIdentity() } : {}),
       };
-      if (!deps.mcpUrl) return jsonResult(status);
+      const sources = {
+        passthrough: { url: resolveImajinHealthzUrl(deps.baseUrl), reachable: healthz.ok },
+        discovery: {
+          url: deps.discovery?.modelsUrl ?? null,
+          outcome: deps.cache.peek()?.outcome ?? "never",
+        },
+        kernelNode: { url: deps.nodeUrl ?? null },
+      };
+      if (!deps.mcpUrl) return jsonResult({
+        ...status, sources: { ...sources, kernelMcp: { reachable: null, outcome: "unconfigured" } },
+      });
       const probe = await (deps.probeMcp ?? probeKernelMcp)(deps.mcpUrl);
       return jsonResult({
         ...status,
         mcp: buildMcpStatusBlock({ mcpUrl: deps.mcpUrl, probe, config }),
+        sources: {
+          ...sources,
+          kernelMcp: {
+            url: deps.mcpUrl, reachable: probe.ok, outcome: probe.outcome,
+            ...(probe.httpStatus === undefined ? {} : { httpStatus: probe.httpStatus }),
+            ...(probe.errorCode ? { errorCode: probe.errorCode } : {}),
+          },
+        },
       });
     },
   };

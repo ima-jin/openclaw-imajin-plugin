@@ -4,6 +4,7 @@ import type { WsNotificationsConfig } from "./notification-injector.js";
 import { AGENT_TOOL_NAMES, type AgentIdentityConfig } from "./agent-identities.js";
 import { beginRegistration } from "./registration-lifecycle.js";
 import { ImajinClient } from "./client.js";
+import { randomUUID } from "node:crypto";
 
 const mocks = vi.hoisted(() => ({
   signer: vi.fn(),
@@ -46,6 +47,7 @@ vi.mock("./ws-service.js", async (original) => ({
     start = vi.fn(async () => {});
     stop() { this.socket.stop(); }
     send = vi.fn();
+    status = () => ({ state: "open" });
     onConnected = vi.fn();
     onFrame(handler: (frame: any) => void) { this.socket.frame = handler; }
   },
@@ -243,6 +245,127 @@ describe("gateway model discovery (#141)", () => {
   });
 });
 describe("per-agent plugin registration", () => {
+  function statusTransport() {
+    vi.spyOn(ImajinClient.prototype, "requestRaw").mockResolvedValue({
+      status: 200, contentType: "application/json", text: JSON.stringify({ data: [] }),
+    });
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => url.endsWith("/mcp")
+      ? Response.json({ error: "no_route_configured" }, { status: 422 })
+      : Response.json({ status: "ok" })));
+  }
+
+  it.each([undefined, "did:imajin:business"])("reports only the caller's map identity with acting principal %s", async (actAs) => {
+    statusTransport();
+    const protectedValue = randomUUID();
+    const main = { ...agent("main"), actAs };
+    const artifact = {
+      ...agent("artifact"), actAs,
+      keypair: { source: "exec" as const, provider: "imajin-vault", id: "artifact-identity" },
+    };
+    mocks.signer.mockImplementation(async (_config, _ref, did) => ({
+      did, publicKey: (did === main.did ? "ab" : "cd").repeat(32), signChallenge: vi.fn(),
+      privateKey: protectedValue, seed: protectedValue, token: protectedValue,
+    }));
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main", agents: { main, artifact },
+      did: "did:imajin:must-not-borrow", keypairPath: "/must-not-read",
+      modelDiscovery: { refreshIntervalMs: 0 }, loops: { enabled: false }, attestation: { enabled: false },
+    });
+    await registry.start();
+    for (const [id, own, other] of [["main", main, artifact], ["artifact", artifact, main]] as const) {
+      const tool = registry.agentTools({ agentId: id }).find((entry) => entry.name === "imajin_status");
+      const report = await tool.execute("status", { agentId: other.did });
+      const body = report.details;
+      expect(body.identity).toMatchObject({
+        agentId: id, mode: "map", did: own.did, isGatewayAgent: id === "main",
+        keypairSource: `${own.keypair.source}:${own.keypair.id}`,
+        auth: null, ws: { state: "open" }, warnings: [],
+      });
+      expect(body.identity.actAs).toBe(actAs);
+      expect(body.identity.publicKey).toMatch(/^[a-f0-9]{12}$/);
+      expect(JSON.stringify(body.identity)).not.toContain(other.did);
+      expect(report.content[0].text).not.toContain("must-not-borrow");
+      expect(body.sources.kernelMcp).toEqual({
+        url: "http://127.0.0.1:8787/mcp", reachable: false, outcome: "not-configured",
+        httpStatus: 422, errorCode: "no_route_configured",
+      });
+      expect(JSON.parse(report.content[0].text)).toEqual(body);
+      expect(JSON.stringify(body)).not.toMatch(/"(privateKey|seed|token|sessionCookie)"\s*:/);
+      expect(JSON.stringify(report)).not.toContain(protectedValue);
+    }
+    expect(mocks.signer).toHaveBeenCalledTimes(2);
+    expect(ImajinClient.prototype.requestRaw).toHaveBeenCalledTimes(1); // startup discovery only
+    expect(fetch).toHaveBeenCalledTimes(4); // one existing health + MCP probe per call
+    await registry.stop();
+  });
+
+  it("keeps unresolved status value-free, allowlisted and retired with its runtime", async () => {
+    statusTransport();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    mocks.signer.mockRejectedValue(new Error("protected-provider-output"));
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { main: agent("main"), denied: agent("denied", []), noStatus: agent("no-status", ["imajin_identity"]) },
+      modelDiscovery: { refreshIntervalMs: 0 },
+    });
+    await registry.start();
+    const tools = registry.agentTools({ agentId: "main" });
+    expect(tools.map((tool) => tool.name)).toEqual(["imajin_status"]);
+    for (const agentId of ["denied", "noStatus", "missing", "__proto__"]) {
+      expect(registry.agentTools({ agentId })).toEqual([]);
+    }
+    const report = await tools[0].execute();
+    expect(report.details.identity).toMatchObject({
+      did: "did:imajin:main", mode: "map", isGatewayAgent: false,
+      keypairSource: "store:main", publicKey: null, auth: null, ws: { state: "disabled" },
+      warnings: [
+        "Identity keypair unavailable; authenticated tools disabled",
+        "Gateway agent unavailable; gateway features disabled",
+      ],
+    });
+    expect(JSON.stringify(report)).not.toContain("protected-provider-output");
+    expect(JSON.stringify(report.details)).not.toMatch(/"(privateKey|seed|token|sessionCookie)"\s*:/);
+    expect(vi.mocked(console.warn).mock.calls.flat().join(" ")).not.toContain("protected-provider-output");
+    expect(ImajinClient.prototype.requestRaw).not.toHaveBeenCalled();
+    await registry.stop();
+    expect(() => tools[0].execute()).toThrow("no longer active");
+    expect(registry.agentTools({ agentId: "main" })).toEqual([]);
+  });
+
+  it.each([undefined, "did:imajin:business"])("reports legacy top-level identity with acting principal %s", async (actAs) => {
+    statusTransport();
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", did: "did:imajin:legacy", keypairPath: "/must-not-read",
+      actAs, modelDiscovery: { refreshIntervalMs: 0 },
+    });
+    const tool = registry.agentTools({ agentId: "main" }).find((entry) => entry.name === "imajin_status");
+    const report = await tool.execute();
+    expect(report.details.identity).toEqual({
+      agentId: "main", mode: "legacy", did: "did:imajin:legacy",
+      ...(actAs === undefined ? {} : { actAs }),
+      isGatewayAgent: true, keypairSource: "file", publicKey: null, auth: null,
+      ws: { state: "not-started" }, warnings: [],
+    });
+    expect(JSON.stringify(report)).not.toContain("/must-not-read");
+    expect(mocks.signer).not.toHaveBeenCalled();
+  });
+
+  it("reports a missing legacy keypair as a warning rather than failing status", async () => {
+    statusTransport();
+    vi.mocked(ImajinClient.prototype.requestRaw).mockRestore();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", did: "did:imajin:legacy",
+      keypairPath: "/missing-status-identity.json", modelDiscovery: { refreshIntervalMs: 0 },
+    });
+    const tool = registry.agentTools({ agentId: "main" }).find((entry) => entry.name === "imajin_status");
+    const report = await tool.execute();
+    expect(report.details.identity).toMatchObject({
+      mode: "legacy", did: "did:imajin:legacy",
+      auth: { ok: false, error: "Authentication failed" },
+      warnings: ["Identity authentication unavailable"],
+    });
+  });
   it("fails closed for unknown agents even with a complete main identity configured", async () => {
     const registry = register({
       nodeUrl: "https://kernel.invalid", did: "did:imajin:legacy", keypairPath: "/must-not-read",
@@ -270,7 +393,7 @@ describe("per-agent plugin registration", () => {
     mocks.signer.mockRejectedValueOnce(new Error("unavailable"));
     const registry = register({ nodeUrl: "https://kernel.invalid", agents: { main: agent("main"), tenant: agent("tenant") } });
     await registry.start();
-    expect(registry.agentTools({ agentId: "main" })).toEqual([]);
+    expect(registry.agentTools({ agentId: "main" }).map((tool) => tool.name)).toEqual(["imajin_status"]);
     expect(registry.agentTools({ agentId: "tenant" })).toHaveLength(AGENT_TOOL_NAMES.length);
     expect(mocks.sockets.map((socket) => socket.config.did)).toEqual(["did:imajin:tenant"]);
   });
@@ -343,6 +466,12 @@ describe("per-agent plugin registration", () => {
       const tool = registry.agentTools({ agentId: id }).find((entry) => entry.name === "imajin_identity");
       await tool.execute("call", { action: "lookup", query: "did:imajin:lookup" });
       expect(await mocks.sockets[index].config.authenticate?.()).toBe(`session=did:imajin:${id}`);
+      const status = registry.agentTools({ agentId: id }).find((entry) => entry.name === "imajin_status");
+      const report = await status.execute();
+      expect(report.details.identity).toMatchObject({
+        did: `did:imajin:${id}`, auth: { ok: true, at: expect.any(String) },
+      });
+      expect(JSON.stringify(report.details.identity)).not.toContain(`session=did:imajin:${id}`);
     }
     expect(wire.filter((row) => row.path.endsWith("/challenge")).map((row) => row.body.did))
       .toEqual(["did:imajin:main", "did:imajin:tenant"]);
@@ -396,8 +525,8 @@ describe("per-agent plugin registration", () => {
       wsNotifications: { wakeSessionKey: "agent:main:custom", reportTo: ["agent:main:operator"] },
     };
     const registry = register(config);
-    expect(registry.tools.filter((tool) => typeof tool !== "function").map((tool) => tool.name).sort())
-      .toEqual(AGENT_TOOL_NAMES.filter((name) => name !== "imajin_wake_report").sort());
+    expect(registry.agentTools({ agentId: "main" }).map((tool) => tool.name).sort())
+      .toEqual([...AGENT_TOOL_NAMES].sort());
     await registry.tools.find((tool) => tool.name === "imajin_identity")
       .execute("legacy", { action: "lookup", query: "did:imajin:lookup" });
     expect(wire[0].body).toEqual({ did: "did:imajin:legacy" });

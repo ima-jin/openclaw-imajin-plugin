@@ -65,6 +65,7 @@ export function registerAgentPlugin(api: any, config: {
   let gatewayIdentity: GatewayAgentIdentity | undefined;
   const getGatewayIdentity = () => gatewayIdentity;
   const senders = new Map<string, WakeDisclosureSender>();
+  const sockets = new Map<string, ImajinWsService>();
   // One global catalog, using only the already-resolved gateway identity.
   const provider = registerImajinProvider(api, config, {
     nodeUrl: config.nodeUrl,
@@ -83,7 +84,7 @@ export function registerAgentPlugin(api: any, config: {
     },
   });
   const runtime = new PluginServiceRuntime(api.registrationMode, async (lifecycle, on) => {
-    lifecycle.add(() => { identities.clear(); senders.clear(); gatewayIdentity = undefined; });
+    lifecycle.add(() => { identities.clear(); senders.clear(); sockets.clear(); gatewayIdentity = undefined; });
     const startDiscovery = () => {
       const discovery = provider.startDiscovery();
       lifecycle.add(() => discovery.stop());
@@ -116,6 +117,7 @@ export function registerAgentPlugin(api: any, config: {
         authenticate: () => identity.client.authenticatedCookie(),
         invalidateAuthentication: () => identity.client.invalidateAuthentication(),
       });
+      sockets.set(agentId, ws);
       lifecycle.add(() => ws.stop());
       let gatewayFeatures: ReturnType<typeof registerGatewayFeatures> | undefined;
       if (identity === selected) {
@@ -167,8 +169,32 @@ export function registerAgentPlugin(api: any, config: {
     await Promise.all(starts);
   });
   runtime.agentTools = (ctx: AgentToolContext) => {
+    const diagnostic = identities.diagnostic(ctx.agentId);
+    if (!diagnostic) return null;
     const identity = identities.get(ctx.agentId);
-    if (!identity) return null;
+    const status = createImajinStatusTool({
+      baseUrl: provider.baseUrl, cache: provider.cache, discovery: provider.discovery,
+      mcpUrl: resolveImajinMcpUrl(config, provider.baseUrl), nodeUrl: config.nodeUrl,
+      getConfig: () => api.runtime?.config?.current?.(),
+      getIdentity: () => identities.status(
+        ctx.agentId!, gatewayIdentity?.agentId === ctx.agentId,
+        sockets.get(ctx.agentId!)?.status() ?? { state: "disabled" },
+        gatewayIdentity ? [] : ["Gateway agent unavailable; gateway features disabled"],
+      ),
+    });
+    const guard = (tool: any) => ({
+      ...tool,
+      execute: (...args: any[]) => {
+        if (PluginServiceRuntime.owner() !== runtime || identities.diagnostic(ctx.agentId) !== diagnostic) {
+          throw new Error("Agent identity runtime is no longer active");
+        }
+        return tool.execute(...args);
+      },
+    });
+    if (!identity) {
+      return diagnostic.config.tools === undefined || diagnostic.config.tools.includes(status.name)
+        ? [guard(status)] : [];
+    }
     const { client, config: agent } = identity;
     const tools = [
       createIdentityTool(client), createAttestTool(client), createTransactTool(client),
@@ -176,26 +202,14 @@ export function registerAgentPlugin(api: any, config: {
       createWarpTool(client, agent.warp), createInferTool(client), createUsageTool(client),
       createVaultTool(client), createCloudflareTool(client),
       createChatTool(new ImajinChat(client, agent.did)),
-      createImajinStatusTool({
-        baseUrl: provider.baseUrl, cache: provider.cache, discovery: provider.discovery,
-        mcpUrl: resolveImajinMcpUrl(config, provider.baseUrl),
-        getConfig: () => api.runtime?.config?.current?.(),
-      }),
+      status,
       createWakeReportTool(ctx, async (context, disclosure) => {
         const sender = senders.get(ctx.agentId!);
         if (!sender) throw new Error("Agent notification runtime unavailable");
         await sender(context, disclosure);
       }),
     ].filter((tool) => agent.tools === undefined || agent.tools.includes(tool.name));
-    return tools.map((tool) => ({
-      ...tool,
-      execute: (...args: any[]) => {
-        if (PluginServiceRuntime.owner() !== runtime || identities.get(ctx.agentId) !== identity) {
-          throw new Error("Agent identity runtime is no longer active");
-        }
-        return (tool.execute as (...params: any[]) => unknown)(...args);
-      },
-    }));
+    return tools.map(guard);
   };
   api.registerTool((ctx: AgentToolContext) => PluginServiceRuntime.owner()?.agentTools?.(ctx) ?? null,
     { names: [...AGENT_TOOL_NAMES] });

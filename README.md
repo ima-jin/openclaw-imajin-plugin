@@ -2035,7 +2035,8 @@ There is no value cache between invocations, no fallback provider, no
 
 Cold boot resolves each `agents.<id>.keypair` through the existing SDK.
 An unavailable/missing/revoked/expired grant, auth error or malformed response
-leaves that agent without tools; healthy entries remain independent.
+leaves that agent without authenticated tools; only allowlisted `imajin_status`
+diagnostics remain available (#147). Healthy entries remain independent.
 **Refresh means a full plugin service restart/reload**, which clears existing
 identities before resolving again. Do not rely on a host secrets-only reload
 that retains a last-known-good snapshot: restart the plugin service after
@@ -2070,9 +2071,36 @@ the entry, rather than keeping its old signer.
   `wsNotifications.wakeSessionKey` behavior, tools, provider and services.
   (`wakeSessionKey` lives in `wsNotifications`, not `warp`, on current main.)
   Adding even an empty `agents: {}` switches off legacy identity fallback:
-  an absent/unresolvable agent receives **zero `imajin_*` tools**, including
-  status. Move every participating identity into the map; merely retaining
-  top-level credentials does not configure `main` in this mode.
+  an absent or invalid agent receives **zero `imajin_*` tools**, including
+  status. A valid entry with an unresolved or duplicate key receives only
+  `imajin_status`, if its tool allowlist permits it. Move every participating
+  identity into the map; merely retaining top-level credentials does not
+  configure `main` in this mode.
+### Calling-agent status (#147)
+
+`imajin_status` adds `identity` and `sources`; all existing result fields retain
+their shapes. The host's calling `agentId` selects the map entry, never a tool
+argument, another agent, or a top-level legacy fallback. Legacy mode reports
+the top-level identity and `mode: "legacy"`.
+
+`identity` contains `agentId`, `mode`, `did`, optional `actAs`, `isGatewayAgent`,
+`keypairSource` (`store:<id>`, `exec:<id>`, or legacy `file`), `publicKey` (the
+first 12 hex characters of SHA-256 over public-key bytes), `auth` (last HTTP
+challenge-response `{ ok, at, error? }`), `ws: { state }`, and `warnings`.
+Unknown DID, key source, fingerprint, or not-yet-attempted auth is `null`.
+Status does not read a key file or resolve a SecretRef to obtain a fingerprint.
+Auth timestamps describe actual attempts, not cached session reuse; failure
+details are deliberately value-free. No private key, seed, cookie, or token
+is projected. An unresolved keypair appears in warnings without enabling any
+authenticated tool. Missing/unresolvable gateway selection also warns, without
+revealing another agent's configuration.
+
+`sources` summarizes `passthrough` (health URL/reachability), `discovery`
+(URL/last outcome), `kernelMcp` (URL/reachability/outcome and any HTTP status
+or error code), and `kernelNode` (configured node URL). It reuses status's
+existing health and MCP probes and the discovery cache, not additional
+requests. For example, a 422 `no_route_configured` remains
+`kernelMcp.outcome: "not-configured"`; status does not repair the route.
 
 ### Map-mode gateway principal (#139)
 

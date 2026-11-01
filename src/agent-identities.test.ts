@@ -5,6 +5,7 @@ import {
   resolveAgentSigner, validAgentConfig, publicKeyDid, type AgentIdentityConfig,
 } from "./agent-identities.js";
 import { ImajinClient } from "./client.js";
+import { join } from "node:path";
 
 const sdk = vi.hoisted(() => ({ resolve: vi.fn() }));
 vi.mock("openclaw/plugin-sdk/secret-ref-runtime", () => ({ resolveSecretRefValues: sdk.resolve }));
@@ -35,6 +36,7 @@ describe("sealed per-agent config", () => {
     for (const id of [undefined, "", "missing", "__proto__", "constructor"]) expect(identities.get(id)).toBeUndefined();
     identities.clear();
     expect([...identities.entries()]).toEqual([]);
+    expect(identities.status("main", false)).toBeUndefined();
   });
 
   it.each([
@@ -82,6 +84,12 @@ describe("sealed per-agent config", () => {
     await identities.prepare("https://kernel.invalid", { main, tenant }, {}, resolver);
     expect([...identities.entries()]).toEqual([]);
     expect(resolver).not.toHaveBeenCalled();
+    for (const id of ["main", "tenant"]) {
+      expect(identities.status(id, false)).toMatchObject({
+        did: id === "main" ? main.did : tenant.did, auth: null,
+        warnings: ["Identity DID or key reference is shared; authenticated tools disabled"],
+      });
+    }
   });
 
   it("never falls back when resolution fails or returns another agent's signer", async () => {
@@ -127,7 +135,7 @@ describe("sealed per-agent config", () => {
     };
     expect(agentNotifications("tenant", tenant)).toMatchObject({
       targetSession: "agent:tenant:custom", wakeSessionKey: "agent:tenant:wakes:{batchId}",
-      hookAgentId: "tenant", stateDir: "/state/tenant", reportTo: ["agent:tenant:channel:operator"],
+      hookAgentId: "tenant", stateDir: join("/state", "tenant"), reportTo: ["agent:tenant:channel:operator"],
     });
     expect(agentNotifications("main", agent("main")).stateDir).not.toBe(agentNotifications("tenant", agent("tenant")).stateDir);
     tenant.wsNotifications = { targetSession: "custom", wakeSessionKey: "wakes:{batchId}" };
@@ -152,7 +160,7 @@ describe("sealed per-agent config", () => {
   it("README documents valid ref-only config and both existing registration/binding routes", async () => {
     const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
     const chapter = readme.split("## Per-agent Imajin identities (#136)")[1];
-    const example = JSON.parse(chapter.match(/```json\n([\s\S]+?)\n```/)![1]);
+    const example = JSON.parse(chapter.match(/```json\r?\n([\s\S]+?)\r?\n```/)![1]);
     for (const [id, config] of Object.entries(example.agents)) expect(validAgentConfig(id, config)).toBe(true);
     expect(chapter).toContain("/api/register");
     expect(chapter).toContain('type: "agent"');
@@ -162,7 +170,7 @@ describe("sealed per-agent config", () => {
     expect(chapter).toContain("vault/api/spec");
     expect(chapter).toContain("ships the **`imajin-vault` exec provider**");
     const providerChapter = chapter.split("### Kernel vault exec provider (#143)")[1];
-    const examples = [...providerChapter.matchAll(/```json\n([\s\S]+?)\n```/g)].map((match) => JSON.parse(match[1]));
+    const examples = [...providerChapter.matchAll(/```json\r?\n([\s\S]+?)\r?\n```/g)].map((match) => JSON.parse(match[1]));
     const [mapping, host] = examples;
     const provider = host.secrets.providers["imajin-vault"];
     expect(provider.source).toBe("exec");

@@ -4,6 +4,7 @@ import type { SecretRef } from "openclaw/plugin-sdk/secret-input-runtime";
 import { ImajinClient, validateDid, type ImajinSigner } from "./client.js";
 import type { WsNotificationsConfig } from "./notification-injector.js";
 import type { WarpToolConfig } from "./tools.js";
+import { buildStatusIdentity } from "./status-identity.js";
 
 export const AGENT_TOOL_NAMES = [
   "imajin_status", "imajin_identity", "imajin_attest", "imajin_transact",
@@ -124,6 +125,7 @@ export function agentNotifications(agentId: string, config: AgentIdentityConfig)
 
 export class AgentIdentities {
   private readonly identities = new Map<string, AgentIdentity>();
+  private readonly diagnostics = new Map<string, { config: AgentIdentityConfig; warnings: string[] }>();
 
   async prepare(
     nodeUrl: string,
@@ -132,7 +134,7 @@ export class AgentIdentities {
     resolveSigner = resolveAgentSigner,
     active = () => true,
   ): Promise<void> {
-    this.identities.clear();
+    this.clear();
     // Do not let two configured agents share a DID or reference accidentally.
     const didCounts = new Map<string, number>();
     const refCounts = new Map<string, number>();
@@ -143,7 +145,13 @@ export class AgentIdentities {
       refCounts.set(refKey(entry), (refCounts.get(refKey(entry)) ?? 0) + 1);
     }
     for (const [id, entry] of entries) {
-      if (didCounts.get(entry.did) !== 1 || refCounts.get(refKey(entry)) !== 1) continue;
+      if (!active()) return;
+      const diagnostic = { config: entry, warnings: [] as string[] };
+      this.diagnostics.set(id, diagnostic);
+      if (didCounts.get(entry.did) !== 1 || refCounts.get(refKey(entry)) !== 1) {
+        diagnostic.warnings.push("Identity DID or key reference is shared; authenticated tools disabled");
+        continue;
+      }
       try {
         const signer = await resolveSigner(hostConfig, entry.keypair, entry.did);
         if (!active()) return;
@@ -154,6 +162,8 @@ export class AgentIdentities {
         });
       } catch {
         // Provider errors can contain secret values. Deliberately value-free.
+        if (!active()) return;
+        diagnostic.warnings.push("Identity keypair unavailable; authenticated tools disabled");
         console.warn("[imajin-plugin] agent identity unavailable; tools disabled");
       }
     }
@@ -167,7 +177,24 @@ export class AgentIdentities {
     return this.identities.entries();
   }
 
+  diagnostic(agentId: string | undefined) {
+    return agentId ? this.diagnostics.get(agentId) : undefined;
+  }
+
+  status(agentId: string, isGatewayAgent: boolean, ws?: { state: string }, warnings: string[] = []) {
+    const diagnostic = this.diagnostics.get(agentId);
+    if (!diagnostic) return undefined;
+    const { config } = diagnostic;
+    return buildStatusIdentity({
+      agentId, mode: "map", did: config.did, actAs: config.actAs, isGatewayAgent,
+      keypairSource: `${config.keypair.source}:${config.keypair.id}`,
+      client: this.get(agentId)?.client, ws,
+      warnings: [...diagnostic.warnings, ...warnings],
+    });
+  }
+
   clear(): void {
     this.identities.clear();
+    this.diagnostics.clear();
   }
 }

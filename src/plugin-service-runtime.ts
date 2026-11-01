@@ -1,6 +1,7 @@
 import { beginRegistration, type RegistrationLifecycle } from "./registration-lifecycle.js";
 import type { WakeDisclosureSender } from "./wake-report-tool.js";
 import type { ImajinDefaultRoutingStatus } from "./imajin-default-routing.js";
+import type { StatusIdentity } from "./status-identity.js";
 
 type HookHandler = (...args: any[]) => unknown;
 export type RuntimeHookRegister = (
@@ -42,6 +43,7 @@ function alreadyDispatched(event: unknown, name: string): boolean {
 export class PluginServiceRuntime {
   agentTools?: (ctx: { agentId?: string; sessionKey?: string; runId?: string }) => unknown;
   defaultRoutingStatus?: () => ImajinDefaultRoutingStatus;
+  statusIdentity?: (agentId?: string) => StatusIdentity;
   private lifecycle?: RegistrationLifecycle;
   private started?: Promise<void>;
   private readonly handlers = new Map<string, HookHandler>();
