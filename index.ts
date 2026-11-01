@@ -93,8 +93,10 @@ async function startPluginRuntime(
   models: { provider: RegisteredImajinProvider; defaults: ReturnType<typeof createImajinDefaultRouter> },
   lifecycle: RegistrationLifecycle,
   on: RuntimeHookRegister,
-  setWakeSender: (sender: WakeDisclosureSender) => void,
-  setStatusWs: (ws: ImajinWsService) => void,
+  bindings: {
+    setWakeSender: (sender: WakeDisclosureSender) => void;
+    setStatusWs: (ws: ImajinWsService) => void;
+  },
 ): Promise<void> {
   const { provider: imajinProvider, defaults: defaultRouter } = models;
   const discovery = imajinProvider.startDiscovery();
@@ -171,7 +173,7 @@ async function startPluginRuntime(
         actAs: config.actAs,
       },
     );
-    setStatusWs(wsService);
+    bindings.setStatusWs(wsService);
 
     lifecycle.add(() => wsService.stop());
 
@@ -195,7 +197,7 @@ async function startPluginRuntime(
       }
       on(hook, handler, { name: `imajin-wake:${hook}` });
     }
-    setWakeSender(reportWake);
+    bindings.setWakeSender(reportWake);
     const reachEvents = createReachEventHandler(api, config.wsNotifications?.reach, {
       principalDid: config.actAs ?? config.did,
       targetSession: config.wsNotifications?.targetSession,
@@ -361,7 +363,7 @@ export default definePluginEntry({
     let statusWs: ImajinWsService | undefined;
     const runtime = new PluginServiceRuntime(api.registrationMode, (lifecycle, on) =>
       startPluginRuntime(api, config, client, { provider: imajinProvider, defaults: defaultRouter }, lifecycle, on,
-        (sender) => runtime.setWakeSender(sender), (ws) => { statusWs = ws; }),
+        { setWakeSender: (sender) => runtime.setWakeSender(sender), setStatusWs: (ws) => { statusWs = ws; } }),
     );
     runtime.defaultRoutingStatus = defaultRouter.status;
     runtime.statusIdentity = (agentId) => buildStatusIdentity({
