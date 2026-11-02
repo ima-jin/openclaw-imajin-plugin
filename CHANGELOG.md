@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Per-agent inference authentication (#150): implementation in progress.
 - Calling-agent identity and source diagnostics in `imajin_status` (#147).
 
 ### Fixed
