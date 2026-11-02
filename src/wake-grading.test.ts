@@ -21,21 +21,24 @@ describe("plugin-owned grading resolution (#101)", () => {
     expect(gradingMarker(block)).toBe(`Graded against: OUTCOME fixture/epics#82 · DECISION fixture/repo#101, fixture/epics#82 @ ${GRADING_HEAD}`);
   });
 
-  it.each(["no-closing", "missing-parent", "no-outcome", "cycle", "lookup", "identity", "too-large"])(
+  it.each(["no-closing", "cycle", "lookup", "identity", "too-large", "depth"])(
     "marks %s unresolved, without exposing diagnostics", async (failure) => {
       const { source, pr } = gradingFixture();
       if (failure === "no-closing") pr.closingIssues = [];
       if (failure === "lookup") source.issue.mockRejectedValue(new Error("private diagnostics"));
       else if (failure !== "no-closing") source.issue.mockImplementation(async (ref) => ({
         ...ref, number: failure === "identity" ? 999 : ref.number,
-        body: failure === "no-outcome" ? "" : "OUTCOME · " + (failure === "too-large" ? "x".repeat(140_000) : "child"),
-        comments: [], epic: failure === "too-large", parent: failure === "cycle" ? ref : null,
+        body: "OUTCOME · " + (failure === "too-large" ? "x".repeat(140_000) : "child"),
+        comments: [], epic: failure === "too-large",
+        parent: failure === "cycle" ? ref : failure === "depth" ? { ...ref, number: ref.number + 1 } : null,
       }));
       const block = await resolveWakeGrading(GRADING_PR_URL, source);
       expect(block.resolved).toBe(false);
       expect(block.text).toContain("UNRESOLVED:");
       expect(block.text).toContain("Report blocked");
       expect(block.text).not.toContain("private diagnostics");
+      if (["cycle", "depth"].includes(failure)) expect(block.text).toContain(failure);
+      if (failure === "lookup") expect(block.text).toContain("fixture/repo#101: ancestor lookup unavailable");
     },
   );
 
@@ -45,7 +48,7 @@ describe("plugin-owned grading resolution (#101)", () => {
     source.pullRequest.mockReturnValue(new Promise(() => {}));
     const pending = resolveWakeGrading(GRADING_PR_URL, source);
     await vi.advanceTimersByTimeAsync(15_000);
-    expect((await pending).resolved).toBe(false);
+    expect(await pending).toMatchObject({ resolved: false, text: expect.stringContaining("timeout") });
   });
 
   it("marks no DECISION as none rather than inventing parent rulings", async () => {

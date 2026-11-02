@@ -38,6 +38,8 @@ export interface WakeGuardToolEvent extends WakeGuardContext {
 
 export interface WakeGuardOptions {
   maxTokens?: number;
+  /** Wake verdicts use the validated report tool; native progress receipts are not outcomes. */
+  outcomeReportsOnly?: boolean;
   reportTo?: readonly { sessionKey: string }[];
   alert: (batch: WakeGuardAlert, reason: string) => Promise<void>;
   abort: (sessionKey: string, runId?: string) => Promise<void>;
@@ -460,6 +462,7 @@ export class WakeGuards {
   }
 
   private disclosure(pending: Pending, event: WakeGuardToolEvent): void {
+    if (this.options.outcomeReportsOnly) return;
     if (event.toolName !== "message" || event.params.action !== "send" || !successful(event)) return;
     const matches = this.targets.filter((target) =>
       target.destination && sentDestination(event.params, target.destination));

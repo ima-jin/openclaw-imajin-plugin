@@ -15,12 +15,27 @@ function setup(model = DEFAULT_WAKE_DECISION_MODEL) {
 describe("wake decision delegation", () => {
   it("narrows only coordinator tools and preserves unrelated session policy", async () => {
     const { router } = setup();
-    expect(router.beforePromptBuild({}, parent)).toMatchObject({ toolsAllow: ["message", "sessions_spawn", "sessions_send", "session_status"] });
+    expect(router.beforePromptBuild({}, parent)).toMatchObject({ toolsAllow: ["message", "imajin_wake_report", "sessions_spawn", "sessions_send", "session_status"] });
     expect(router.beforePromptBuild({}, parent)?.appendSystemContext).toContain("anthropic/claude-opus-5-5");
     expect(router.beforePromptBuild({}, {})).toBeUndefined();
     expect((await router.beforeToolCall({ toolName: "exec", params: { command: "gh pr merge" } }, parent))?.block).toBe(true);
     expect(router.beforeToolCall({ toolName: "exec", params: {} }, {})).toBeUndefined();
-    expect(router.beforeToolCall({ toolName: "message", params: {} }, parent)).toBeUndefined();
+    expect(router.beforeToolCall({ toolName: "message", params: {} }, parent)).toMatchObject({ block: true });
+    expect(router.beforeToolCall({ toolName: "imajin_wake_report", params: { outcome: "blocked", message: "Missing evidence" } }, parent)).toBeUndefined();
+  });
+
+  it("reports a delegation refused when disclosure wins the grading-resolution race", async () => {
+    const { source, pr } = gradingFixture();
+    const reportBlockedDelegation = vi.fn(async () => {});
+    const router = new WakeDecisionRouter("fixture/decision", [], vi.fn(), { gradingSource: source, reportBlockedDelegation });
+    router.track(parent.sessionKey, "batch", { prUrls: [GRADING_PR_URL] });
+    let finish!: (value: typeof pr) => void;
+    source.pullRequest.mockReturnValue(new Promise((resolve) => { finish = resolve; }));
+    const pending = router.beforeToolCall({ toolName: "sessions_spawn", params: { task: "review" } }, parent);
+    router.markDisclosed("batch");
+    finish(pr);
+    expect(await pending).toMatchObject({ block: true, blockReason: expect.stringContaining("resolving grading context") });
+    expect(reportBlockedDelegation).toHaveBeenCalledWith("batch", expect.stringContaining("spawn refused"));
   });
 
   it("pins every delegated action and descendant spawn to the configured decision model", async () => {
