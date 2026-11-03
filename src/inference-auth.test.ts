@@ -2,7 +2,7 @@ import { generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AssistantMessage, AssistantMessageEvent, StreamFn, StreamModel } from "openclaw/plugin-sdk/llm";
+import type { AssistantMessage, AssistantMessageEvent, AssistantMessageEventStream, StreamFn, StreamModel } from "openclaw/plugin-sdk/llm";
 import { AgentInferenceAuth } from "./inference-auth.js";
 import { createAgentInferenceWrapper } from "./inference-stream.js";
 import { ImajinClient } from "./client.js";
@@ -198,6 +198,11 @@ describe("calling-agent provider wire contract", () => {
     expect(new Set(requests.map((req) => req.headers.authorization)).size).toBe(1);
   });
 
+  it("settles result() without requiring the caller to drain the event iterator", async () => {
+    const stream = await call("main") as AssistantMessageEventStream;
+    expect((await stream.result()).stopReason).toBe("stop");
+    expect((await events(stream)).map((event) => event.type)).toEqual(["start", "done"]);
+  });
   it.each(["absent", "unlisted"])("missing agents.%s fails before any request", async (id) => {
     expect(() => call(id)).toThrow(`agents.${id}`);
     expect(mints).toEqual([]); expect(requests).toEqual([]);
@@ -362,6 +367,16 @@ describe("mint validation and expiration", () => {
   });
   it.each([null, {}, { token: "bad" }, { expiresIn: -1 }, { scopes: [] }])("refuses malformed mint response %#", async (body) => {
     const auth = new AgentInferenceAuth("https://kernel.invalid", () => identity, async () => Response.json(body));
+    await expect(auth.credential("main")).rejects.toThrow("invalid response");
+  });
+  it.each([
+    { expiresIn: -1 }, { expiresIn: 0 }, { expiresIn: "600" }, { scopes: [] },
+    { scopes: ["infer:completions", 1] }, { scopes: "infer:completions" },
+  ])("rejects invalid TTL/scopes even with an otherwise valid token case %#", async (override) => {
+    const auth = new AgentInferenceAuth("https://kernel.invalid", () => identity, async () => Response.json({
+      token: mintJwt(identity.config.did, identity.config.actAs!), expiresIn: 600,
+      scopes: ["infer:completions"], ...override,
+    }));
     await expect(auth.credential("main")).rejects.toThrow("invalid response");
   });
   it("hides provider exception values and causes", async () => {

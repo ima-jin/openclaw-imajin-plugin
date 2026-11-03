@@ -56,7 +56,7 @@ export class AgentInferenceAuth {
     const { did, actAs } = identity.config;
     const key = JSON.stringify([did, actAs ?? null, AUDIENCE]);
     let entry = this.entries.get(key);
-    if (!entry || entry.identity !== identity) {
+    if (entry?.identity !== identity) {
       entry = { identity };
       this.entries.set(key, entry);
     }
@@ -120,7 +120,8 @@ function validateMintedCredential(
 ): InferenceCredential {
   if (typeof minted?.token !== "string" || !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(minted.token)
     || typeof minted.expiresIn !== "number" || !Number.isFinite(minted.expiresIn) || minted.expiresIn <= 0
-    || !Array.isArray(minted.scopes) || !minted.scopes.includes("infer:completions")) {
+    || !Array.isArray(minted.scopes) || !minted.scopes.every((scope) => typeof scope === "string")
+    || !minted.scopes.includes("infer:completions")) {
     throw new Error("Invalid mint response");
   }
   const [head, payload] = minted.token.split(".");
