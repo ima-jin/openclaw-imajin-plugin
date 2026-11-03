@@ -182,6 +182,9 @@ function catalogRowId(row: ImajinCatalogRow | null): string | undefined {
   const id = row.id.trim();
   return id && !/[\s*]/.test(id) ? id : undefined;
 }
+function catalogConnector(row: ImajinCatalogRow, connector?: string): string | undefined {
+  return connector ?? (typeof row.owned_by === "string" ? row.owned_by.trim() : undefined);
+}
 
 export function projectImajinCatalogRows(
   response: ImajinModelsListResponse | null | undefined,
@@ -195,7 +198,7 @@ export function projectImajinCatalogRows(
     if (!id || seenIds.has(id)) continue;
     seenIds.add(id);
     const metadata = projectCatalogMetadata(row.imajin);
-    const connector = metadata.connector ?? (typeof row.owned_by === "string" ? row.owned_by.trim() : undefined);
+    const connector = catalogConnector(row, metadata.connector);
     const family = connector ? inferenceFamily(connector) : undefined;
     if (connector && !family) {
       logger?.warn(`[imajin-plugin] unknown inference connector ${JSON.stringify(connector.slice(0, 80))}; skipped`);
