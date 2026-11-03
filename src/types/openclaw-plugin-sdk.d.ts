@@ -18,6 +18,8 @@
  */
 /** Read-only model-selection exports verified against openclaw@2026.10.4. */
 declare module "openclaw/plugin-sdk/agent-runtime" {
+  /** Published openclaw@2026.10.9 agent-scoped catalog context resolution. */
+  export function resolveAgentDir(config: unknown, agentId: string): string;
   export interface WakeModelRef {
     provider: string;
     model: string;

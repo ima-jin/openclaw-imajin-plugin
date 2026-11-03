@@ -8,7 +8,7 @@ import { createImajinStatusTool } from "./tools.js";
 
 const following = { modelProviderId: "imajin", modelId: "default" };
 const list = (pick = "a") => ({
-  data: ["a", "b"].map((id) => ({ id, imajin: { connector: "test", picked: id === pick, servable: true } })),
+  data: ["a", "b"].map((id) => ({ id, imajin: { connector: "xai", picked: id === pick, servable: true } })),
 });
 
 async function fixture() {

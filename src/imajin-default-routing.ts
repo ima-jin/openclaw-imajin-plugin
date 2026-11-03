@@ -1,7 +1,7 @@
 /**
- * `imajin/default` is the only floating selector. Explicit imajin/<id> and
- * other providers never enter this hook. Host context fields verified against
- * openclaw@2026.10.4 prepare.runtime / before_model_resolve.
+ * `imajin/default` and unconfigured non-gateway agent defaults follow their
+ * own kernel picks. Explicit selections stay pinned. Host context verified
+ * against openclaw@2026.10.9 before_model_resolve.
  */
 import {
   IMAJIN_DEFAULT_MODEL_ID, IMAJIN_PROVIDER_ID, fetchImajinProxyHealthz,
@@ -18,7 +18,7 @@ export interface ImajinDefaultRoutingStatus {
 }
 
 interface RoutingPolicy { allow?: string[] }
-interface RoutingContext { runId?: string; modelProviderId?: string; modelId?: string }
+interface RoutingContext { agentId?: string; runId?: string; modelProviderId?: string; modelId?: string }
 const followsDefault = (ctx: RoutingContext) =>
   ctx.modelProviderId === IMAJIN_PROVIDER_ID && ctx.modelId === IMAJIN_DEFAULT_MODEL_ID;
 
@@ -34,6 +34,8 @@ function readRoutingPolicy(getConfig: () => unknown): RoutingPolicy | undefined 
 
 export function createImajinDefaultRouter(deps: {
   cache: ImajinCatalogCache;
+  cacheForAgent?: (agentId: string) => Promise<ImajinCatalogCache>;
+  gatewayAgent?: string;
   baseUrl: string;
   getConfig: () => unknown;
   probe?: (baseUrl: string) => Promise<ImajinProxyHealthz>;
@@ -42,6 +44,21 @@ export function createImajinDefaultRouter(deps: {
   // gate must therefore remember failed admission, not let "default" reach a
   // kernel that may itself resolve an unknown id to its first available brain.
   const admissions = new Map<string, boolean>();
+  function tenantDefault(ctx: RoutingContext): boolean {
+    if (!deps.cacheForAgent || !ctx.agentId || ctx.agentId === deps.gatewayAgent) return false;
+    if (ctx.modelProviderId?.startsWith("imajin")) return false;
+    const config = deps.getConfig() as {
+      agents?: { entries?: Record<string, { model?: unknown }>; list?: Array<{ id: string; model?: unknown }>;
+        defaults?: { model?: string | { primary?: string } } };
+    } | undefined;
+    const own = config?.agents?.entries?.[ctx.agentId]
+      ?? config?.agents?.list?.find((entry) => entry.id === ctx.agentId);
+    if (own?.model) return false;
+    const configured = config?.agents?.defaults?.model;
+    const ref = typeof configured === "string" ? configured : configured?.primary;
+    // A deliberate session/wake override is not an inherited default.
+    return !ref || !ctx.modelProviderId || !ctx.modelId || ref === `${ctx.modelProviderId}/${ctx.modelId}`;
+  }
   function admit(ctx: RoutingContext, allowed: boolean): void {
     if (!ctx.runId) return;
     admissions.set(ctx.runId, allowed);
@@ -69,18 +86,27 @@ export function createImajinDefaultRouter(deps: {
       if (ctx.runId) admissions.delete(ctx.runId);
     },
     async beforeModelResolve(_event: unknown, ctx: RoutingContext = {}) {
-      if (!followsDefault(ctx)) return;
+      const automatic = tenantDefault(ctx);
+      if (!followsDefault(ctx) && !automatic) return;
       admit(ctx, false);
-      let state = await deps.cache.get();
+      const cache = deps.cacheForAgent
+        ? await deps.cacheForAgent(ctx.agentId!) : deps.cache;
+      let state = await cache.get();
       await (deps.probe ?? fetchImajinProxyHealthz)(deps.baseUrl);
       // Refresh stale discovery, but never spend through a direct-provider fallback (#150).
-      if (state.outcome === "unreachable") state = await deps.cache.refresh();
-      state = deps.cache.peek() ?? state;
+      if (state.outcome === "unreachable") state = await cache.refresh();
+      state = cache.peek() ?? state;
+      if (deps.cacheForAgent && state.outcome !== "ok" && state.outcome !== "empty") return;
       // Re-read live policy after IO; never bypass a concurrent restriction.
       const policy = readRoutingPolicy(deps.getConfig);
       if (!policy) return;
       const model = state.models.find((entry) => entry.picked);
-      if (!model || !isImajinModelAllowedByPolicy(policy.allow, model.id)) return;
+      if (!model) {
+        // A successful empty discovery means no Imajin route; retain the configured default.
+        if (automatic && state.outcome === "empty") admit(ctx, true);
+        return;
+      }
+      if (!isImajinModelAllowedByPolicy(policy.allow, model.id)) return;
       admit(ctx, true);
       return { providerOverride: IMAJIN_PROVIDER_ID, modelOverride: model.id };
     },

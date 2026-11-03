@@ -73,14 +73,14 @@ describe("projectImajinCatalogRows", () => {
     const models = projectImajinCatalogRows({
       object: "list",
       data: [
-        { id: "dup", imajin: { connector: "first" } },
+        { id: "dup", imajin: { connector: "xai" } },
         { id: "  " },
-        { id: "dup", imajin: { connector: "second" } },
+        { id: "dup", imajin: { connector: "openai" } },
         {} as { id: string },
       ],
     });
     expect(models).toHaveLength(1);
-    expect(models[0]).toMatchObject({ id: "dup", connector: "first" });
+    expect(models[0]).toMatchObject({ id: "dup", connector: "xai" });
   });
 
   it("returns an empty catalog for a malformed/missing body instead of throwing", () => {
@@ -258,7 +258,7 @@ describe("registerImajinProvider", () => {
 
     const registered = registerImajinProvider(api, undefined);
 
-    expect(registerProvider).toHaveBeenCalledTimes(3);
+    expect(registerProvider).toHaveBeenCalledTimes(4);
     const definition = registerProvider.mock.calls[0][0] as Record<string, unknown>;
     expect(definition.id).toBe(IMAJIN_PROVIDER_ID);
     expect(definition.label).toBe("Imajin (kernel seat)");
@@ -281,18 +281,21 @@ describe("registerImajinProvider", () => {
     expect(auth.mode).toBe("api-key");
   });
 
-  it("accepts an agent-only upstream model absent from the gateway catalog", () => {
+  it("prepares a model only from connector metadata, never guessing a protocol from its name", async () => {
     const registerProvider = vi.fn();
-    registerImajinProvider({ registerProvider }, undefined);
-    const definition = registerProvider.mock.calls[0][0] as {
-      resolveDynamicModel: (ctx: { modelId: string }) => unknown;
-    };
-    expect(definition.resolveDynamicModel({ modelId: "org-only-sonnet" })).toMatchObject({
-      id: "org-only-sonnet", provider: "imajin", api: "openai-completions",
-      baseUrl: "http://127.0.0.1:8787/openai/v1",
+    registerImajinProvider({ registerProvider }, undefined, {
+      fetcher: async () => ({ data: [{ id: "org-only-sonnet", owned_by: "anthropic" }] }),
+      logger: { info: vi.fn(), warn: vi.fn() },
     });
-    expect(definition.resolveDynamicModel({ modelId: "invalid model" })).toBeUndefined();
-    expect(definition.resolveDynamicModel({ modelId: "" })).toBeUndefined();
+    const definition = registerProvider.mock.calls[0][0] as {
+      prepareDynamicModel: (ctx: { modelId: string }) => Promise<unknown>;
+    };
+    expect(await definition.prepareDynamicModel({ modelId: "org-only-sonnet" })).toMatchObject({
+      id: "org-only-sonnet", provider: "imajin", api: "anthropic-messages",
+      baseUrl: "http://127.0.0.1:8787/anthropic",
+    });
+    expect(await definition.prepareDynamicModel({ modelId: "invalid model" })).toBeUndefined();
+    expect(await definition.prepareDynamicModel({ modelId: "" })).toBeUndefined();
   });
 
   it("static catalog seed is empty (never a stale/wrong fallback list)", async () => {

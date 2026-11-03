@@ -1,6 +1,14 @@
 # Changelog
 
 ## Unreleased
+- **Agent-signed Anthropic doorway (imajin-ai#3198).** Kernel connector metadata
+  selects OpenAI-compatible or Anthropic-messages passthrough routes in the
+  `imajin/*` catalog. Discovery uses each agent's own app JWT and configured
+  acting identity, with isolated caches and bounded kernel error diagnostics.
+  Unconfigured tenant defaults follow their own kernel pick; main is unchanged.
+  Missing identities and refused routes fail closed. Legacy `imajin-openai` /
+  `imajin-xai` blocks remain supported but may be removed by the operator after
+  catalog verification; the plugin never rewrites host configuration.
 - **Inference subject correction (PR #151).** App-token minting always uses
   the calling agent DID for both `azp` and `sub`; configured `actAs` stays
   solely in `x-acting-as`. Verifier/controller-shaped regressions for
