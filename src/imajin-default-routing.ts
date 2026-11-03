@@ -45,7 +45,7 @@ export function createImajinDefaultRouter(deps: {
   // kernel that may itself resolve an unknown id to its first available brain.
   const admissions = new Map<string, boolean>();
   function tenantDefault(ctx: RoutingContext): boolean {
-    if (!deps.cacheForAgent || !ctx.agentId || ctx.agentId === deps.gatewayAgent) return false;
+    if (!deps.cacheForAgent || !deps.gatewayAgent || !ctx.agentId || ctx.agentId === deps.gatewayAgent) return false;
     if (ctx.modelProviderId?.startsWith("imajin")) return false;
     const config = deps.getConfig() as {
       agents?: { entries?: Record<string, { model?: unknown }>; list?: Array<{ id: string; model?: unknown }>;
@@ -77,7 +77,7 @@ export function createImajinDefaultRouter(deps: {
     },
     beforeAgentRun(_event: unknown, ctx: RoutingContext = {}) {
       const allowed = ctx.runId ? admissions.get(ctx.runId) : undefined;
-      if (allowed === false || (followsDefault(ctx) && allowed !== true)) {
+      if (allowed === false || ((followsDefault(ctx) || tenantDefault(ctx)) && allowed !== true)) {
         return { outcome: "block", reason: "Kernel default model unavailable or denied by live policy",
           message: "Kernel default model unavailable or denied by live policy; check imajin_status and the catalog approval card." };
       }

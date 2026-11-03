@@ -122,6 +122,7 @@ describe("agent-scoped app+jwt discovery", () => {
     await expect(catalogs.forAgent("artifact")).rejects.toThrow("agents.artifact");
     catalogs.clear();
     expect(catalogs.peekGateway().peek()).toBeNull();
+    await expect(main.get()).rejects.toThrow("runtime changed");
   });
   it("CLI uses the explicit gateway signer; agentDir discovery never falls back to it", async () => {
     const { auth } = fixture();
@@ -143,6 +144,16 @@ describe("agent-scoped app+jwt discovery", () => {
     expect(await catalogs.models()).toHaveLength(1);
     await (await catalogs.forAgent("artifact")).refresh();
     await expect(catalogs.models()).rejects.toThrow("denied");
+  });
+  it("mint refusal cannot be classified as a transport outage or reuse a last-good catalog", async () => {
+    const { auth } = fixture();
+    vi.mocked(auth.credential).mockRejectedValue(new Error("private mint detail"));
+    const fetcher = vi.fn();
+    const cache = new ImajinCatalogCache(createAgentModelsFetcher(auth, "main", "https://kernel.invalid", "/models", fetcher),
+      60_000, Date.now, logger());
+    expect(await cache.get()).toMatchObject({ outcome: "auth-error" });
+    expect(fetcher).not.toHaveBeenCalled();
+    expect(cache.peek()?.error).not.toContain("private mint detail");
   });
   it("registers an Anthropic transport and lists Anthropic rows under imajin without config edits", async () => {
     const registerProvider = vi.fn();
@@ -216,5 +227,11 @@ describe("tenant default admission", () => {
     await artifact.refresh();
     expect(await router.beforeModelResolve({}, ctx)).toBeUndefined();
     expect(router.beforeAgentRun({}, ctx)).toMatchObject({ outcome: "block" });
+  });
+  it("a swallowed automatic-routing failure without runId still blocks the built-in provider", async () => {
+    const { router, ctx } = await routing();
+    const missing = { ...ctx, runId: undefined, agentId: "missing" };
+    await expect(router.beforeModelResolve({}, missing)).rejects.toThrow("identity unavailable");
+    expect(router.beforeAgentRun({}, missing)).toMatchObject({ outcome: "block" });
   });
 });

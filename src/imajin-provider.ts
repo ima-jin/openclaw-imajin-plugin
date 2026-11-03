@@ -177,6 +177,12 @@ export interface ImajinRuntimeModel {
  * body (missing/non-array `data`) simply projects to an empty catalog,
  * matching the "degrade to no models" contract.
  */
+function catalogRowId(row: ImajinCatalogRow | null): string | undefined {
+  if (!row || typeof row.id !== "string" || row.imajin?.servable === false) return;
+  const id = row.id.trim();
+  return id && !/[\s*]/.test(id) ? id : undefined;
+}
+
 export function projectImajinCatalogRows(
   response: ImajinModelsListResponse | null | undefined,
   logger?: Pick<ImajinDiscoveryLogger, "warn">,
@@ -185,11 +191,9 @@ export function projectImajinCatalogRows(
   const models: ImajinRuntimeModel[] = [];
   const seenIds = new Set<string>();
   for (const row of rows) {
-    if (!row || typeof row.id !== "string") continue;
-    // The kernel only lists servable rows today; honour an explicit `false`.
-    if (row.imajin?.servable === false) continue;
-    const id = row.id.trim();
-    if (!id || /[\s*]/.test(id) || seenIds.has(id)) continue;
+    const id = catalogRowId(row);
+    if (!id || seenIds.has(id)) continue;
+    seenIds.add(id);
     const metadata = projectCatalogMetadata(row.imajin);
     const connector = metadata.connector ?? (typeof row.owned_by === "string" ? row.owned_by.trim() : undefined);
     const family = connector ? inferenceFamily(connector) : undefined;
@@ -197,7 +201,6 @@ export function projectImajinCatalogRows(
       logger?.warn(`[imajin-plugin] unknown inference connector ${JSON.stringify(connector.slice(0, 80))}; skipped`);
       continue;
     }
-    seenIds.add(id);
     models.push({
       id,
       name: connector ? `${id} (via ${connector})` : id,
@@ -726,8 +729,6 @@ export interface RegisteredImajinProvider {
 
 export interface RegisterImajinProviderOptions extends AgentCatalogOptions {
   getIdentity?: (agentId: string) => AgentIdentity | undefined;
-  /** Authenticated kernel client. Omit on an unconfigured install: discovery then reports `unconfigured`. */
-  client?: ImajinKernelRequester;
   nodeUrl?: string;
   /** Overrides the kernel fetcher (tests). */
   fetcher?: ImajinCatalogFetcher;
@@ -763,6 +764,7 @@ export function registerImajinProvider(
       mode: "api-key",
     }),
     wrapStreamFn: createAgentInferenceWrapper(auth),
+    wrapSimpleCompletionStreamFn: createAgentInferenceWrapper(auth),
   };
 
   api.registerProvider({

@@ -24,9 +24,9 @@ export class AgentCatalogs {
     private readonly modelsPath: string,
     private readonly options: AgentCatalogOptions,
   ) {
-    this.empty = this.cache(options.fetcher ?? (async () => {
-      throw new ImajinDiscoveryError("unconfigured", "Discovery requires a configured agent identity");
-    }));
+    this.empty = this.cache(options.fetcher ?? (() => Promise.reject(
+      new ImajinDiscoveryError("unconfigured", "Discovery requires a configured agent identity"),
+    )));
   }
 
   private cache(fetcher: ImajinCatalogFetcher): ImajinCatalogCache {
@@ -40,7 +40,8 @@ export class AgentCatalogs {
     if (entry?.identity !== identity || entry.selector !== identity.config.actAs) {
       const selector = identity.config.actAs;
       const assertCurrent = () => {
-        if (this.auth.identity(agentId) !== identity || identity.config.actAs !== selector) {
+        if (this.auth.identity(agentId) !== identity || identity.config.actAs !== selector
+          || this.entries.get(agentId)?.identity !== identity) {
           throw new InferenceAuthError(agentId, "identity runtime changed during discovery");
         }
       };
@@ -90,10 +91,10 @@ export class AgentCatalogs {
 
   async refresh(): Promise<void> {
     if (!this.options.agentIds) { await this.empty.refresh(); return; }
-    for (const agentId of this.options.agentIds) {
+    await Promise.all(this.options.agentIds.map(async (agentId) => {
       try { await (await this.forAgent(agentId)).refresh(); }
       catch { (this.options.logger ?? console).warn(`[imajin-plugin] agents.${agentId} discovery identity unavailable`); }
-    }
+    }));
   }
 
   clear(): void { this.entries.clear(); }

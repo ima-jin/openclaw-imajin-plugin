@@ -27,6 +27,9 @@ export function createAgentInferenceWrapper(auth: AgentInferenceAuth) {
     const inner = ctx.streamFn;
     return async (model, context, options) => {
       const identity = auth.identity(agentId);
+      if (options?.client !== undefined) {
+        throw new InferenceAuthError(agentId, "preconfigured provider clients are not permitted");
+      }
       options?.signal?.throwIfAborted();
       let credential = await auth.credential(agentId);
       options?.signal?.throwIfAborted();

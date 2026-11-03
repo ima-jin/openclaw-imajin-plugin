@@ -370,6 +370,12 @@ describe("calling-agent provider wire contract", () => {
   it("missing streamFn fails closed", () => {
     expect(() => createAgentInferenceWrapper(auth)({ agentId: "main" })).toThrow("streamFn");
   });
+  it("a preconfigured SDK client cannot bypass the signed transport", async () => {
+    const wrapped = createAgentInferenceWrapper(auth)({ agentId: "artifact", streamFn: inner });
+    await expect(wrapped(model, {}, { client: { apiKey: "inherited-client-marker" } })).rejects.toThrow("preconfigured provider clients");
+    expect(mints).toEqual([]);
+    expect(requests).toEqual([]);
+  });
   it("invalid actAs fails before mint/transport and does not disclose its value", () => {
     identities.get("artifact")!.config.actAs = "invalid-selector";
     expect(() => call("artifact")).toThrow("agents.artifact");

@@ -72,7 +72,9 @@ export function registerAgentPlugin(api: any, config: {
   const sockets = new Map<string, ImajinWsService>();
   let preparing: Promise<void> | undefined;
   let identityGeneration = 0;
+  let retired = false;
   const prepareIdentities = () => {
+    if (retired) return Promise.reject(new Error("Agent identity runtime is no longer active"));
     if (!config.nodeUrl || !config.agents) return Promise.resolve();
     const generation = identityGeneration;
     preparing ??= identities.prepare(
@@ -95,7 +97,7 @@ export function registerAgentPlugin(api: any, config: {
     getConfig: () => api.runtime?.config?.current?.() ?? api.config ?? {},
   });
   const runtime = new PluginServiceRuntime(api.registrationMode, async (lifecycle, on) => {
-    lifecycle.add(() => { identityGeneration++; provider.clearAuth(); identities.clear(); preparing = undefined; senders.clear(); sockets.clear(); gatewayIdentity = undefined; });
+    lifecycle.add(() => { retired = true; identityGeneration++; provider.clearAuth(); identities.clear(); preparing = undefined; senders.clear(); sockets.clear(); gatewayIdentity = undefined; });
     on("before_model_resolve", defaultRouter.beforeModelResolve, { name: "imajin-default:model" });
     on("before_agent_run", defaultRouter.beforeAgentRun, { name: "imajin-default:gate" });
     on("agent_end", defaultRouter.onAgentEnd, { name: "imajin-default:end" });

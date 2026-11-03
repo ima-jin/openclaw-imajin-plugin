@@ -9,7 +9,7 @@ function kernelErrorDetail(text: string, token: string): string {
     const fields = [error?.code, typeof body?.error === "string" ? body.error : undefined, error?.message]
       .filter((value): value is string => typeof value === "string");
     return fields.join(": ").replaceAll(token, "[redacted]")
-      .replaceAll(/Bearer\s+\S+|[\w-]+\.[\w-]+\.[\w-]+|sk-[\w-]+/gi, "[redacted]")
+      .split(" ").map((part) => part.includes(".") || part.startsWith("sk-") ? "[redacted]" : part).join(" ")
       .replaceAll(/[\r\n]/g, " ").slice(0, 300);
   } catch {
     return "non-JSON error response (body withheld)";
@@ -44,7 +44,9 @@ export function createAgentModelsFetcher(
     if (auth.identity(agentId) !== identity || identity.config.actAs !== selector) {
       throw new InferenceAuthError(agentId, "identity runtime changed during discovery");
     }
-    const text = await response.text();
+    let text: string;
+    try { text = await response.text(); }
+    catch { throw new ImajinDiscoveryError("unreachable", "kernel model discovery body unavailable"); }
     if (!response.ok) {
       const detail = kernelErrorDetail(text, token);
       const kind = response.status === 401 || response.status === 403 ? "auth-error" : "route-error";
