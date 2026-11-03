@@ -1,6 +1,11 @@
 # Changelog
 
 ## Unreleased
+- **Inference subject correction (PR #151).** App-token minting always uses
+  the calling agent DID for both `azp` and `sub`; configured `actAs` stays
+  solely in `x-acting-as`. Verifier/controller-shaped regressions for
+  main→Ryan and artifact→@artifact refuse target-subject tokens without
+  changing kernel authentication.
 - **Calling-agent inference authentication (#150).** `imajin`, `imajin-openai`
   and `imajin-xai` use each caller's sealed identity to mint its own `app+jwt`
   and send its configured `x-acting-as`. Inherited static credentials are

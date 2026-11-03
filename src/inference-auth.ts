@@ -87,8 +87,9 @@ export class AgentInferenceAuth {
   private async mint(agentId: string, identity: AgentIdentity): Promise<InferenceCredential> {
     if (!this.nodeUrl) throw new InferenceAuthError(agentId, "nodeUrl is required");
     const appDid = identity.config.did;
-    // Only this agent's configured assignment. No gateway/main/legacy lookup.
-    const principalDid = identity.config.actAs ?? appDid;
+    // The kernel verifies assignments from the agent's own subject context.
+    // actAs is carried only as x-acting-as by the stream wrapper, never as sub.
+    const principalDid = appDid;
     try {
       const nonce = randomBytes(16).toString("hex");
       const timestamp = new Date(this.now()).toISOString();
@@ -102,10 +103,10 @@ export class AgentInferenceAuth {
       });
       if (!response.ok) {
         await response.body?.cancel();
-        throw new InferenceAuthError(agentId, "app-token mint refused; requires this agent's app registration and principal's app.authorized grant", response.status);
+        throw new InferenceAuthError(agentId, "app-token mint refused; requires this agent's app registration and self-context app.authorized grant", response.status);
       }
       const minted = await response.json() as { token?: unknown; expiresIn?: unknown; scopes?: unknown };
-      return validateMintedCredential(minted, appDid, principalDid, this.now());
+      return validateMintedCredential(minted, appDid, this.now());
     } catch (error) {
       if (error instanceof InferenceAuthError) throw error;
       // Fetch, JSON and secret-provider errors can echo credentials. Never retain causes.
@@ -116,7 +117,7 @@ export class AgentInferenceAuth {
 
 function validateMintedCredential(
   minted: { token?: unknown; expiresIn?: unknown; scopes?: unknown },
-  appDid: string, principalDid: string, now: number,
+  appDid: string, now: number,
 ): InferenceCredential {
   if (typeof minted?.token !== "string" || !/^[\w-]+\.[\w-]+\.[\w-]+$/.test(minted.token)
     || typeof minted.expiresIn !== "number" || !Number.isFinite(minted.expiresIn) || minted.expiresIn <= 0
@@ -128,7 +129,7 @@ function validateMintedCredential(
   const header = JSON.parse(Buffer.from(head, "base64url").toString("utf8"));
   const claims = JSON.parse(Buffer.from(payload, "base64url").toString("utf8"));
   if (header?.typ !== "app+jwt" || header.alg !== "EdDSA"
-    || claims?.azp !== appDid || claims.sub !== principalDid || claims.aud !== AUDIENCE
+    || claims?.azp !== appDid || claims.sub !== appDid || claims.aud !== AUDIENCE
     || typeof claims.exp !== "number" || !Number.isFinite(claims.exp) || claims.exp * 1000 <= now) {
     throw new Error("Invalid agent app token");
   }

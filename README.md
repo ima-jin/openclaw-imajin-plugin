@@ -2111,16 +2111,18 @@ and sends exactly one `Authorization: Bearer <agent app+jwt>`. The configured
 
 Tokens come from `POST {nodeUrl}/auth/api/apps/token`, never the login/session
 flow or service-token sibling. The agent's signer proves possession over
-`appDid:principalDid:nonce:timestamp`. Here `appDid` is the agent's configured
-DID and `principalDid` is its configured assignment (`actAs`, or the agent
-DID itself when no assignment exists). The mint narrows scope to
+`appDid:principalDid:nonce:timestamp`. Both `appDid` and `principalDid` are
+always the calling agent's configured DID, producing `azp = sub = agentDid`.
+`actAs` is only the `x-acting-as` selector; it never becomes the JWT subject
+or the mint's principal. The kernel verifies the agent's current assignment
+to that selector on each inference request. The mint narrows scope to
 `infer:completions` and omits `aud` so the kernel uses `imajin:apps`.
 This requires an active kernel **app registration for that same agent DID**
-and the principal's live **`app.authorized` grant**. Registering an agent or
-adding org controller membership alone does not create that app grant.
+and that agent's live self-context **`app.authorized` grant**. Registering an
+agent or adding org controller membership alone does not create that app grant.
 An unavailable grant/app stops the call with an error naming `agents.<id>`;
 the plugin does not provision grants, discover another principal or borrow
-another app. A self-context agent needs its own authorization; no principal
+another app. Every agent needs its own self-context authorization; no principal
 is guessed from the signed-in human or gateway.
 
 Cache entries are isolated by `(agent DID, actAs, audience)` and signer

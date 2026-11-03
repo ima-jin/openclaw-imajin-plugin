@@ -9,6 +9,7 @@ import { ImajinClient } from "./client.js";
 import type { AgentIdentity } from "./agent-identities.js";
 import { registerImajinProvider, IMAJIN_PROVIDER_IDS } from "./imajin-provider.js";
 import { buildStatusIdentity } from "./status-identity.js";
+import { verifyAssignedAgentRequest } from "./test-fixtures/assigned-agent-verifier.js";
 
 const kernelKey = generateKeyPairSync("ed25519");
 const identities = new Map<string, AgentIdentity>();
@@ -16,7 +17,8 @@ const publicKeys = new Map<string, ReturnType<typeof generateKeyPairSync>["publi
 const encode = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
 function mintJwt(appDid: string, sub: string, exp = Date.now() / 1000 + 600, claims = {}, header = {}) {
   const unsigned = `${encode({ typ: "app+jwt", alg: "EdDSA", ...header })}.${encode({
-    azp: appDid, sub, exp, aud: "imajin:apps", scope: "infer:completions", jti: randomUUID(), ...claims,
+    azp: appDid, sub, exp, iss: "auth.imajin.ai", aud: "imajin:apps", scope: "infer:completions",
+    attestationId: randomUUID(), jti: randomUUID(), ...claims,
   })}`;
   return `${unsigned}.${sign(null, Buffer.from(unsigned), kernelKey.privateKey).toString("base64url")}`;
 }
@@ -51,6 +53,11 @@ describe("calling-agent provider wire contract", () => {
   let mintStatus: number;
   let outputText: string;
   let inner: StreamFn;
+  const controller = (principalDid: string, callerDid: string) => ({
+    valid: [...identities.values()].some((identity) =>
+      identity.config.did === callerDid && identity.config.actAs === principalDid),
+    role: "agent", allowedServices: ["infer"],
+  });
 
   beforeEach(async () => {
     identities.clear(); publicKeys.clear();
@@ -67,6 +74,8 @@ describe("calling-agent provider wire contract", () => {
         const challenge = `${mint.appDid}:${mint.principalDid}:${mint.nonce}:${mint.timestamp}`;
         expect(verify(null, Buffer.from(challenge), publicKeys.get(mint.appDid)!, Buffer.from(mint.signature, "hex"))).toBe(true);
         expect(mint.scope).toBe("infer:completions");
+        expect(mint).not.toHaveProperty("actAs");
+        expect(req.headers["x-acting-as"]).toBeUndefined();
         expect(mint.aud).toBeUndefined();
         expect(mint.nonce.length).toBeGreaterThanOrEqual(16);
         res.statusCode = mintStatus;
@@ -76,6 +85,12 @@ describe("calling-agent provider wire contract", () => {
         return;
       }
       requests.push(req);
+      const verified = verifyAssignedAgentRequest(new Headers(req.headers as Record<string, string>), kernelKey.publicKey, controller);
+      if (verified.status !== 200) {
+        res.statusCode = verified.status;
+        res.end(JSON.stringify({ error: verified.status === 401 ? "invalid_agent_credential" : "Not authorized to act as this group" }));
+        return;
+      }
       const status = statuses.shift() ?? 200;
       res.statusCode = status;
       if (status === 200 && JSON.parse(body).stream) {
@@ -120,6 +135,51 @@ describe("calling-agent provider wire contract", () => {
 
   const call = (id: string, stream?: StreamFn) =>
     createAgentInferenceWrapper(auth)({ agentId: id, streamFn: stream ?? inner })(model, {}, {});
+
+  it.each([
+    { agentId: "main", context: "main→Ryan" },
+    { agentId: "artifact", context: "artifact→@artifact" },
+  ])("$context uses an agent-subject token plus selector; target-subject tokens are refused (#3236)", async ({ agentId }) => {
+    const { did, actAs } = identities.get(agentId)!.config;
+    const targetSubject = mintJwt(did, actAs!);
+    const lookup = vi.fn(controller);
+    expect(verifyAssignedAgentRequest(new Headers({
+      Authorization: `Bearer ${targetSubject}`, "x-acting-as": actAs!,
+    }), kernelKey.publicKey, lookup).status).toBe(403);
+    expect(lookup).toHaveBeenLastCalledWith(actAs, actAs);
+    const rejected = await fetch(`${baseUrl}/openai/v1/chat/completions`, {
+      method: "POST", headers: { Authorization: `Bearer ${targetSubject}`, "x-acting-as": actAs! },
+      body: JSON.stringify({ model: model.id, messages: [] }),
+    });
+    expect(rejected.status).toBe(403);
+    const outcome = await events(call(agentId));
+    expect(outcome.at(-1)?.type).toBe("done");
+    expect(mints.at(-1)?.principalDid).toBe(did);
+    expect(mints.at(-1)?.principalDid).not.toBe(actAs);
+    const request = requests.at(-1)!;
+    const verified = verifyAssignedAgentRequest(new Headers(request.headers as Record<string, string>), kernelKey.publicKey, lookup);
+    expect(verified).toMatchObject({ status: 200, appAuth: { appDid: did, userDid: did, actingAs: actAs } });
+    expect(lookup).toHaveBeenLastCalledWith(actAs, did);
+    expect(request.headers["x-acting-for"]).toBeUndefined();
+  });
+
+  it.each(["main", "artifact"])("%s verifier still refuses invalid signatures, scope and current assignment", async (agentId) => {
+    const { did, actAs } = identities.get(agentId)!.config;
+    const { token } = await auth.credential(agentId);
+    const headers = new Headers({ Authorization: `Bearer ${token}`, "x-acting-as": actAs! });
+    expect(verifyAssignedAgentRequest(headers, kernelKey.publicKey, controller).status).toBe(200);
+    for (const authority of [
+      { valid: false, role: "agent" }, { valid: true, role: "member" },
+      { valid: true, role: "agent", allowedServices: [] },
+    ]) {
+      expect(verifyAssignedAgentRequest(headers, kernelKey.publicKey, () => authority).status).toBe(403);
+    }
+    headers.set("Authorization", `Bearer ${mintJwt(did, did, undefined, { scope: "other" })}`);
+    expect(verifyAssignedAgentRequest(headers, kernelKey.publicKey, controller).status).toBe(403);
+    const [head, claims] = token.split(".");
+    headers.set("Authorization", `Bearer ${head}.${claims}.${Buffer.alloc(64).toString("base64url")}`);
+    expect(verifyAssignedAgentRequest(headers, kernelKey.publicKey, controller).status).toBe(401);
+  });
 
   // Optional peer integration: point at @openclaw/ai's dist directory, never a live kernel.
   it.runIf(Boolean(process.env.IMAJIN_TEST_TRANSPORT_DIR)).each([200, 401, 403])(
@@ -327,7 +387,7 @@ describe("mint validation and expiration", () => {
     const wait = new Promise<void>((resolve) => { release = resolve; });
     const mint = vi.fn(async () => {
       await wait;
-      return Response.json({ token: mintJwt(identity.config.did, identity.config.actAs!), expiresIn: 600, scopes: ["infer:completions"] });
+      return Response.json({ token: mintJwt(identity.config.did, identity.config.did), expiresIn: 600, scopes: ["infer:completions"] });
     });
     const auth = new AgentInferenceAuth("https://kernel.invalid", () => identity, mint);
     const pending = auth.credential("main");
@@ -345,7 +405,7 @@ describe("mint validation and expiration", () => {
   it("refreshes at exp minus 60s using the earlier of JWT and response TTL", async () => {
     let now = Date.now();
     const mint = vi.fn(async () => Response.json({
-      token: mintJwt(identity.config.did, identity.config.actAs!, now / 1000 + 300),
+      token: mintJwt(identity.config.did, identity.config.did, now / 1000 + 300),
       expiresIn: 600, scopes: ["infer:completions"],
     }));
     const auth = new AgentInferenceAuth("https://kernel.invalid/", () => identity, mint, () => now);
@@ -358,7 +418,7 @@ describe("mint validation and expiration", () => {
     { claims: { aud: "other" } }, { claims: { exp: 0 } }, { claims: { exp: "later" } },
     { header: { typ: "session-app+jwt" } }, { header: { alg: "none" } },
   ])("refuses wrong-type/identity/audience/expiration token case %#", async ({ claims, header }) => {
-    const token = mintJwt(identity.config.did, identity.config.actAs!, undefined, claims, header);
+    const token = mintJwt(identity.config.did, identity.config.did, undefined, claims, header);
     const auth = new AgentInferenceAuth("https://kernel.invalid", () => identity, async () => Response.json({
       token, expiresIn: 600, scopes: ["infer:completions"],
     }));
@@ -374,10 +434,16 @@ describe("mint validation and expiration", () => {
     { scopes: ["infer:completions", 1] }, { scopes: "infer:completions" },
   ])("rejects invalid TTL/scopes even with an otherwise valid token case %#", async (override) => {
     const auth = new AgentInferenceAuth("https://kernel.invalid", () => identity, async () => Response.json({
-      token: mintJwt(identity.config.did, identity.config.actAs!), expiresIn: 600,
+      token: mintJwt(identity.config.did, identity.config.did), expiresIn: 600,
       scopes: ["infer:completions"], ...override,
     }));
     await expect(auth.credential("main")).rejects.toThrow("invalid response");
+  });
+  it("refuses a mint response whose subject is actAs rather than the calling agent", async () => {
+    const auth = new AgentInferenceAuth("https://kernel.invalid", () => identity, async () => Response.json({
+      token: mintJwt(identity.config.did, identity.config.actAs!), expiresIn: 600, scopes: ["infer:completions"],
+    }));
+    await expect(auth.credential("main")).rejects.toThrow("agents.main");
   });
   it("hides provider exception values and causes", async () => {
     const protectedValue = randomUUID();
