@@ -8,6 +8,7 @@ import { createAgentInferenceWrapper } from "./inference-stream.js";
 import { ImajinClient } from "./client.js";
 import type { AgentIdentity } from "./agent-identities.js";
 import { registerImajinProvider, IMAJIN_PROVIDER_IDS } from "./imajin-provider.js";
+import { buildStatusIdentity } from "./status-identity.js";
 
 const kernelKey = generateKeyPairSync("ed25519");
 const identities = new Map<string, AgentIdentity>();
@@ -231,6 +232,8 @@ describe("calling-agent provider wire contract", () => {
     const result = await events(call("artifact"));
     expect(result.at(-1)?.type).toBe("error");
     expect(mints).toHaveLength(2); expect(requests).toHaveLength(2);
+    await auth.credential("artifact");
+    expect(mints).toHaveLength(3);
   });
   it.each([403, 500, 503])("passes HTTP %s refusal unretried with its body", async (status) => {
     statuses = [status]; outputText = "membership boundary";
@@ -251,6 +254,13 @@ describe("calling-agent provider wire contract", () => {
     expect(result).not.toContain(credential.token);
     expect(result).toContain("[redacted]");
     expect([log.mock.calls, warn.mock.calls, error.mock.calls]).toEqual([[], [], []]);
+    const identity = identities.get("artifact")!;
+    const status = JSON.stringify(buildStatusIdentity({
+      agentId: "artifact", mode: "map", did: identity.config.did, actAs: identity.config.actAs,
+      client: identity.client, isGatewayAgent: false,
+    }));
+    expect(status).not.toContain(credential.token);
+    expect(status).not.toContain("privateKey");
   });
   it("does not retry after streamed content has begun", async () => {
     const stream: StreamFn = async function* () {
@@ -294,6 +304,39 @@ describe("calling-agent provider wire contract", () => {
 describe("mint validation and expiration", () => {
   let identity: AgentIdentity;
   beforeEach(() => { identity = agent("main", "did:imajin:principal"); });
+  it("isolates configured selector changes and a replaced signer generation", async () => {
+    const mint = vi.fn(async (_url: unknown, init?: RequestInit) => {
+      const body = JSON.parse(init!.body as string);
+      return Response.json({ token: mintJwt(body.appDid, body.principalDid), expiresIn: 600, scopes: ["infer:completions"] });
+    });
+    const auth = new AgentInferenceAuth("https://kernel.invalid", () => identity, mint);
+    const first = await auth.credential("main");
+    identity.config.actAs = "did:imajin:new-org";
+    expect((await auth.credential("main")).token).not.toBe(first.token);
+    identity = agent("main", "did:imajin:new-org");
+    await auth.credential("main");
+    expect(mint).toHaveBeenCalledTimes(3);
+  });
+  it("does not publish an in-flight mint after the runtime cache is cleared", async () => {
+    let release!: () => void;
+    const wait = new Promise<void>((resolve) => { release = resolve; });
+    const mint = vi.fn(async () => {
+      await wait;
+      return Response.json({ token: mintJwt(identity.config.did, identity.config.actAs!), expiresIn: 600, scopes: ["infer:completions"] });
+    });
+    const auth = new AgentInferenceAuth("https://kernel.invalid", () => identity, mint);
+    const pending = auth.credential("main");
+    auth.clear(); release();
+    await expect(pending).rejects.toThrow("runtime changed");
+  });
+  it("missing node URL and signer mismatch refuse without network access", async () => {
+    const mint = vi.fn();
+    const auth = new AgentInferenceAuth(undefined, () => identity, mint);
+    await expect(auth.credential("main")).rejects.toThrow("nodeUrl");
+    identity.signer.did = "did:imajin:wrong";
+    await expect(auth.credential("main")).rejects.toThrow("agents.main");
+    expect(mint).not.toHaveBeenCalled();
+  });
   it("refreshes at exp minus 60s using the earlier of JWT and response TTL", async () => {
     let now = Date.now();
     const mint = vi.fn(async () => Response.json({

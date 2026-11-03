@@ -18,12 +18,11 @@ export function createAssistantMessageEventStream() {
     },
     end() { ended = true; wake?.(); },
     result: () => result,
-    async *[Symbol.asyncIterator]() {
-      while (true) {
-        if (queue.length) { yield queue.shift()!; continue; }
-        if (ended) return;
-        await new Promise<void>((resolve) => { wake = resolve; });
-      }
+    async *[Symbol.asyncIterator](): AsyncGenerator<AssistantMessageEvent> {
+      if (queue.length) yield queue.shift()!;
+      else if (ended) return;
+      else await new Promise<void>((resolve) => { wake = resolve; });
+      yield* this[Symbol.asyncIterator]();
     },
   };
 }

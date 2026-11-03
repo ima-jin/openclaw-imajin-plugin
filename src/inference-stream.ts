@@ -10,7 +10,7 @@ function cleanHeaders(headers: Record<string, string> | undefined): Record<strin
 
 function redact(message: string, token: string): string {
   return message.replaceAll(token, "[redacted]")
-    .replaceAll(/[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, "[redacted]");
+    .replaceAll(/[A-Za-z0-9_.-]+/g, (part) => part.split(".").length >= 3 ? "[redacted]" : part);
 }
 
 function isCredentialRefusal(error: { errorMessage?: string; status?: number }, status?: number): boolean {

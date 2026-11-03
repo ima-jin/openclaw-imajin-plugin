@@ -11,6 +11,12 @@ export class InferenceAuthError extends Error {
   }
 }
 
+function trimTrailingSlashes(value: string): string {
+  let end = value.length;
+  while (end > 0 && value.codePointAt(end - 1) === 47) end--;
+  return value.slice(0, end);
+}
+
 export interface InferenceCredential {
   token: string;
   expiresAt: number;
@@ -56,7 +62,7 @@ export class AgentInferenceAuth {
     }
     // A late 401 must not evict a newer credential minted by another call.
     if (rejectedToken && entry.cached?.token === rejectedToken) entry.cached = undefined;
-    if (entry.cached && entry.cached.expiresAt - REFRESH_SKEW_MS > this.now()) return entry.cached;
+    if ((entry.cached?.expiresAt ?? 0) - REFRESH_SKEW_MS > this.now()) return entry.cached!;
     const current = entry;
     current.pending ??= this.mint(agentId, identity).then((credential) => {
       if (this.identity(agentId) !== identity || this.entries.get(key) !== current) {
@@ -87,7 +93,7 @@ export class AgentInferenceAuth {
       const nonce = randomBytes(16).toString("hex");
       const timestamp = new Date(this.now()).toISOString();
       const signature = await identity.signer.signChallenge(`${appDid}:${principalDid}:${nonce}:${timestamp}`);
-      const response = await this.fetcher(`${this.nodeUrl.replaceAll(/\/+$/g, "")}/auth/api/apps/token`, {
+      const response = await this.fetcher(`${trimTrailingSlashes(this.nodeUrl)}/auth/api/apps/token`, {
         method: "POST",
         redirect: "error",
         headers: { "Content-Type": "application/json" },

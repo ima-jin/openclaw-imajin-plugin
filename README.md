@@ -188,7 +188,7 @@ In `openclaw.json`:
 - **`modelDiscovery`** (optional, #55) — model discovery against the kernel; needs `nodeUrl` + `keypairPath`:
   - **`modelDiscovery.refreshIntervalMs`** — periodic re-discovery interval; default `300000` (5 min), floor `10000`, `0` = start-up discovery only
   - **`modelDiscovery.modelsPath`** — kernel route, default `/infer/v1/models/usable`
-  - **`modelDiscovery.breakGlassModel`** — optional existing direct `provider/model` ref, never a key; the approved default migration can retain the old direct default here. Used only for confirmed kernel/passthrough transport outages, subject to live model policy.
+  - **`modelDiscovery.breakGlassModel`** — deprecated historical direct `provider/model` reference, never a key. Retained for config compatibility but ignored for automatic routing (#150).
 - **`mcpUrl`** (optional, #50) — local passthrough `/mcp` endpoint `imajin_status` probes; defaults to the `inferProxyBaseUrl` root + `/mcp` (`http://127.0.0.1:8787/mcp`); see "Kernel MCP tools" below
 
 ### Turn-usage attestation
@@ -410,9 +410,9 @@ card on **/jin → Operator approvals**. In addition to any allow-list delta,
 `detail.defaultChange` shows the old default and the proposed
 `agents.defaults.model = { primary: "imajin/default", fallbacks: [] }`.
 The old direct default, if it is an exact non-kernel provider/model ref, is
-retained as `modelDiscovery.breakGlassModel` (ref only; auth remains in the
-host's existing protected credential store). An existing explicit emergency
-ref takes precedence. No direct ref is invented for implicit host defaults.
+retained as `modelDiscovery.breakGlassModel` (historical reference only,
+ignored for automatic routing since #150). No direct ref is invented for
+implicit host defaults.
 Ordinary fallback ladders are cleared in this same approved, base-hash-guarded
 patch: auth, billing and model errors must not automatically spend directly.
 Ignore leaves config unchanged; changed before-state requires fresh approval.
@@ -426,22 +426,18 @@ Select `imajin/<id>` in a session to pin that exact model, even if it equals
 the current default; refreshes never rewrite that session. Explicit agent
 model settings and deliberate wake/decision pins also stay unchanged.
 
-For a floating-default turn, the pre-model hook probes the local passthrough's
-`/healthz`. A transport failure (connection/DNS/timeout or HTTP 502/503/504),
-or a discovery transport failure confirmed by a fresh retry, permits the
-optional direct ref. Auth/grant/policy failures, HTTP 402/429, route errors,
-malformed discovery, missing picks and stale `/healthz` history do **not**.
-Both the picked model and emergency ref must satisfy live model policy.
-The next turn rechecks reachability, so the emergency ref never becomes a
-persisted session override. There is no inference replay after partial output;
-an outage first observed during inference fails that attempt rather than
-replaying potentially billed work. Discovery working does not prove
-completions are healthy.
+For a floating-default turn, the pre-model hook probes the passthrough's
+`/healthz` and refreshes stale transport-failed discovery. It never switches
+to a direct provider, even during an outage (#150). The selected Imajin model
+still needs live model policy and calling-agent signing; missing pick/policy
+blocks admission and an unavailable inference transport fails the request.
+There is no inference replay after partial output. Discovery working does
+not prove completions are healthy.
 
 `imajin_status.defaultRouting` reports `selector`, `pickedModel`,
-`fallbackCount`, `lastReason` (`passthrough_unreachable` or
-`kernel_unreachable`) and `lastFallbackAt`. These count routing decisions in
-the current service lifetime; recovery retains the count and last reason.
+`fallbackCount`, `lastReason` and `lastFallbackAt`. The latter three retain
+their shape but are always `0`, `null`, `null` now that automatic direct
+fallback is disabled (#150).
 The existing `healthz.body` separately exposes the passthrough's own counters.
 No credential or raw upstream error is included in the routing reason.
 
@@ -475,8 +471,8 @@ passthrough `INFER_PROXY_AUTH_MODE=agent`, credential-free MCP requests
 (including this plugin's status probe) receive 401. The provider signing
 hook cannot inject credentials into OpenClaw's separate MCP client.
 Do not add a shared token/header or use host-static as an agent-call workaround.
-MCP needs its own per-request caller context and resource audience; the #150
-PR audit tracks that remainder. The host-static bridge described in the
+MCP needs its own per-request caller context and resource audience; native
+sub-issue #152 tracks that remainder. The host-static bridge described in the
 operator rollout is temporary and is not a per-agent acceptance proof.
 
 The kernel's MCP tools (`google_gmail_*`, `google_calendar_*`, `google_drive_*`,
@@ -2141,7 +2137,9 @@ context has no caller. It is not inference authorization: `resolveDynamicModel`
 accepts an explicit `imajin/<id>` absent from the gateway catalog and lets the
 kernel authorize it per call. OpenClaw's explicit model policy still applies.
 Per-agent pickers/catalogs and non-inference principal paths are recorded in
-the PR audit, not silently routed through main.
+the PR audit, not silently routed through main. Native audit remainders under
+#150 are #152 (MCP), #153 (approval-origin attribution), #154 (tenant publishing)
+and #155 (legacy singleton retirement).
 
 Roll out only in the operator's maintenance window with the agent-mode health
 checker from `ima-jin/imajin-ai#3230`. No deployment, gateway restart, config

@@ -131,7 +131,7 @@ export interface ImajinModelDiscoveryConfig {
   refreshIntervalMs?: number;
   /** Kernel route to discover against. Default {@link DEFAULT_KERNEL_MODELS_PATH}. */
   modelsPath?: string;
-  /** Optional provider/model ref used only on a confirmed transport outage. Never a credential. */
+  /** Historical operator reference only; automatic direct-provider fallback is disabled (#150). */
   breakGlassModel?: string;
 }
 

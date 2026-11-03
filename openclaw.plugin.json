@@ -332,8 +332,9 @@
           },
           "breakGlassModel": {
             "type": "string",
+            "deprecated": true,
             "pattern": "^(?![Ii][Mm][Aa][Jj][Ii][Nn][/-])[a-zA-Z0-9][a-zA-Z0-9_-]*/[^\\s*?#:]+$",
-            "description": "Optional existing direct provider/model ref, never a key. The catalog approval card can retain the old default here when switching to imajin/default. Used only when the kernel/passthrough transport is unreachable, never for auth, policy, billing, or model errors. See imajin_status.defaultRouting."
+            "description": "Historical operator reference only, never a key. Retained for config compatibility; ignored for automatic model routing. Imajin calls never fall back to a direct provider (#150)."
           }
         }
       },
