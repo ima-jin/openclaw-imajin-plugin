@@ -9,6 +9,7 @@ export default defineConfig({
     alias: {
       "openclaw/plugin-sdk/plugin-entry": sdkStub,
       "openclaw/plugin-sdk/approval-gateway-runtime": sdkStub,
+      "openclaw/plugin-sdk/llm": fileURLToPath(new URL("./src/test-fixtures/llm-stream.ts", import.meta.url)),
     },
   },
 });

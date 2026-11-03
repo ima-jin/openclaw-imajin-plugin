@@ -3,7 +3,7 @@
   "activation": {
     "onStartup": true
   },
-  "providers": ["imajin"],
+  "providers": ["imajin", "imajin-openai", "imajin-xai"],
   "contracts": {
     "tools": [
       "imajin_identity",

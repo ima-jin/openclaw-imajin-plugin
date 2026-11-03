@@ -37,6 +37,7 @@ vi.mock("./session-command-gateway.js", async (original) => ({
 vi.mock("./imajin-provider.js", async (original) => ({
   ...await original<object>(),
   registerImajinProvider: () => ({
+    clearAuth: vi.fn(),
     baseUrl: "http://proxy.invalid", cache: {}, discovery: {},
     startDiscovery: () => ({ stop: vi.fn() }),
   }),

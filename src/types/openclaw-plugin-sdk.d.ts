@@ -229,6 +229,49 @@ declare module "openclaw/plugin-sdk/core" {
   export function resolveGatewayPort(cfg: unknown, env?: NodeJS.ProcessEnv): number;
 }
 
+/** Minimal stream contract verified against openclaw@2026.10.9 types.openclaw-*.d.ts. */
+declare module "openclaw/plugin-sdk/llm" {
+  export interface AssistantMessage {
+    role: "assistant";
+    content: unknown[];
+    api: string;
+    provider: string;
+    model: string;
+    usage: Record<string, unknown>;
+    stopReason: "stop" | "length" | "toolUse" | "error" | "aborted";
+    timestamp: number;
+    errorMessage?: string;
+    status?: number;
+  }
+  export type AssistantMessageEvent =
+    | { type: "error"; reason: "error" | "aborted"; error: AssistantMessage }
+    | { type: "start"; partial: AssistantMessage }
+    | { type: "done"; reason: string; message: AssistantMessage }
+    | { type: "text_delta" | "text_start" | "text_end" | "thinking_start" | "thinking_delta" | "thinking_end" | "toolcall_start" | "toolcall_delta" | "toolcall_end"; [key: string]: unknown };
+  export interface StreamModel {
+    id: string;
+    provider: string;
+    api: string;
+    headers?: Record<string, string>;
+    [key: string]: unknown;
+  }
+  export interface StreamOptions {
+    apiKey?: string;
+    headers?: Record<string, string>;
+    signal?: AbortSignal;
+    onResponse?: (response: { status: number; headers: Record<string, string> }, model: StreamModel) => void | Promise<void>;
+    [key: string]: unknown;
+  }
+  export interface AssistantMessageEventStream extends AsyncIterable<AssistantMessageEvent> {
+    push(event: AssistantMessageEvent): void;
+    end(result?: AssistantMessage): void;
+    result(): Promise<AssistantMessage>;
+  }
+  export type StreamFn = (model: StreamModel, context: unknown, options?: StreamOptions) =>
+    AsyncIterable<AssistantMessageEvent> | Promise<AsyncIterable<AssistantMessageEvent>>;
+  export function createAssistantMessageEventStream(): AssistantMessageEventStream;
+}
+
 /**
  * Verified openclaw@2026.10.4 session-store-runtime exports:
  * dist/agent-harness-runtime-DZjstJNb.d.ts:6535-6542,8026-8031 and

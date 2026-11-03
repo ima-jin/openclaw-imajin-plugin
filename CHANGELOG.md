@@ -1,7 +1,13 @@
 # Changelog
 
 ## Unreleased
-- Per-agent inference authentication (#150): implementation in progress.
+- **Calling-agent inference authentication (#150).** `imajin`, `imajin-openai`
+  and `imajin-xai` use each caller's sealed identity to mint its own `app+jwt`
+  and send its configured `x-acting-as`. Inherited static credentials are
+  removed. Missing agent identity/context fails closed; a credential 401
+  refreshes once as the same agent, while 403 is not retried. Credentials
+  are cached per identity/selector/audience and retired on service stop.
+  Dynamic `imajin/<id>` models need not appear in the gateway's catalog.
 - Calling-agent identity and source diagnostics in `imajin_status` (#147).
 
 ### Fixed

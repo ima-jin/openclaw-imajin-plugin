@@ -469,6 +469,15 @@ Note completions still depend on the kernel passthrough proxy being healthy
 (`imajin-ai#2453`); discovery working does not by itself prove completions do.
 
 ## Kernel MCP tools (#50)
+**Agent-mode cutover warning (#150):** the instructions below describe the
+historical host-static MCP lane, not calling-agent readiness. With the new
+passthrough `INFER_PROXY_AUTH_MODE=agent`, credential-free MCP requests
+(including this plugin's status probe) receive 401. The provider signing
+hook cannot inject credentials into OpenClaw's separate MCP client.
+Do not add a shared token/header or use host-static as an agent-call workaround.
+MCP needs its own per-request caller context and resource audience; the #150
+PR audit tracks that remainder. The host-static bridge described in the
+operator rollout is temporary and is not a per-agent acceptance proof.
 
 The kernel's MCP tools (`google_gmail_*`, `google_calendar_*`, `google_drive_*`,
 `google_meet_*`, …) reach the agent as ordinary OpenClaw tools through the
@@ -2076,7 +2085,10 @@ the entry, rather than keeping its old signer.
   `gatewayAgent` client (#141), never a tenant's session.
 - **Legacy zero-edit compatibility:** omit `agents` entirely to retain the
   existing top-level `did`, `keypairPath`, `actAs`, `warp` and
-  `wsNotifications.wakeSessionKey` behavior, tools, provider and services.
+  `wsNotifications.wakeSessionKey` behavior, tools and services.
+  **Exception (#150):** inference through all three Imajin providers requires
+  the calling agent's sealed map identity; legacy credentials never authorize
+  model calls. Migrate participating agents before rollout.
   (`wakeSessionKey` lives in `wsNotifications`, not `warp`, on current main.)
   Adding even an empty `agents: {}` switches off legacy identity fallback:
   an absent or invalid agent receives **zero `imajin_*` tools**, including
@@ -2084,6 +2096,58 @@ the entry, rather than keeping its old signer.
   `imajin_status`, if its tool allowlist permits it. Move every participating
   identity into the map; merely retaining top-level credentials does not
   configure `main` in this mode.
+### Calling-agent inference authentication (#150)
+
+`imajin`, `imajin-openai` and `imajin-xai` share one `wrapStreamFn` signing
+hook. OpenClaw must supply the calling `agentId`; there is no agentDir,
+gatewayAgent, main, legacy file, environment-key or shared-key fallback.
+The two config-only providers retain their existing model lists and URLs.
+All three IDs are declared in the manifest so OpenClaw can find their hooks.
+
+Configure each caller at `plugins.entries.imajin.config.agents.<id>` with
+`did`, a sealed `keypair` SecretRef and optional `actAs`. This is separate
+from provider configuration: remove provider static `apiKey` values, or use
+the non-secret `imajin-local-proxy` marker if the host requires a value.
+The wrapper overrides the stream `apiKey`, removes credential and selector
+headers from both model defaults and stream options (case-insensitively),
+and sends exactly one `Authorization: Bearer <agent app+jwt>`. The configured
+`actAs` alone becomes `x-acting-as`; personal context omits the selector.
+
+Tokens come from `POST {nodeUrl}/auth/api/apps/token`, never the login/session
+flow or service-token sibling. The agent's signer proves possession over
+`appDid:principalDid:nonce:timestamp`. Here `appDid` is the agent's configured
+DID and `principalDid` is its configured assignment (`actAs`, or the agent
+DID itself when no assignment exists). The mint narrows scope to
+`infer:completions` and omits `aud` so the kernel uses `imajin:apps`.
+This requires an active kernel **app registration for that same agent DID**
+and the principal's live **`app.authorized` grant**. Registering an agent or
+adding org controller membership alone does not create that app grant.
+An unavailable grant/app stops the call with an error naming `agents.<id>`;
+the plugin does not provision grants, discover another principal or borrow
+another app. A self-context agent needs its own authorization; no principal
+is guessed from the signed-in human or gateway.
+
+Cache entries are isolated by `(agent DID, actAs, audience)` and signer
+generation, reused until the earlier of JWT expiry or mint TTL minus 60s.
+Concurrent mints coalesce. Service stop clears tokens. A 401 explicitly
+identifying `invalid_agent_credential` invalidates only that credential and
+re-mints once as the same caller, before any output is delivered. Another
+401 ends the call. A 403 or other error is not retried; the org selector is
+never stripped. JWTs, signatures and private material are not logged or
+projected into status; credential-bearing error diagnostics are redacted.
+
+Global discovery remains a gateway-scoped catalog read because its SDK
+context has no caller. It is not inference authorization: `resolveDynamicModel`
+accepts an explicit `imajin/<id>` absent from the gateway catalog and lets the
+kernel authorize it per call. OpenClaw's explicit model policy still applies.
+Per-agent pickers/catalogs and non-inference principal paths are recorded in
+the PR audit, not silently routed through main.
+
+Roll out only in the operator's maintenance window with the agent-mode health
+checker from `ima-jin/imajin-ai#3230`. No deployment, gateway restart, config
+edit, live billed completion or host-static compatibility proof is performed
+by this change. The PR contains the complete manual rollout and rollback.
+
 ### Calling-agent status (#147)
 
 `imajin_status` adds `identity` and `sources`; all existing result fields retain
