@@ -69,6 +69,7 @@ export function registerAgentPlugin(api: any, config: {
   // One global catalog, using only the already-resolved gateway identity.
   const provider = registerImajinProvider(api, config, {
     nodeUrl: config.nodeUrl,
+    getIdentity: (agentId) => identities.get(agentId),
     fetcher: async () => {
       try {
         return await createImajinKernelModelsFetcher(getGatewayIdentity()?.client, {
@@ -84,7 +85,7 @@ export function registerAgentPlugin(api: any, config: {
     },
   });
   const runtime = new PluginServiceRuntime(api.registrationMode, async (lifecycle, on) => {
-    lifecycle.add(() => { identities.clear(); senders.clear(); sockets.clear(); gatewayIdentity = undefined; });
+    lifecycle.add(() => { provider.clearAuth(); identities.clear(); senders.clear(); sockets.clear(); gatewayIdentity = undefined; });
     const startDiscovery = () => {
       const discovery = provider.startDiscovery();
       lifecycle.add(() => discovery.stop());

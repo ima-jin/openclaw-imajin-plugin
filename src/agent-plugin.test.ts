@@ -63,6 +63,31 @@ vi.mock("node:fs/promises", async (original) => {
 });
 import plugin from "../index.js";
 
+describe("provider signing lifecycle (#150)", () => {
+  it("uses resolved map identities only and retires captured hooks on stop", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(ImajinClient.prototype, "requestRaw").mockResolvedValue({
+      status: 200, contentType: "application/json", text: JSON.stringify({ data: [] }),
+    });
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { main: agent("main"), artifact: agent("artifact") },
+      modelDiscovery: { refreshIntervalMs: 0 }, loops: { enabled: false }, attestation: { enabled: false },
+    });
+    for (const provider of registry.providers) {
+      expect(() => provider.wrapStreamFn({ agentId: "artifact", streamFn: vi.fn() })).toThrow("agents.artifact");
+    }
+    await registry.start();
+    const provider = registry.providers.find((entry) => entry.id === "imajin-openai");
+    const wrapped = provider.wrapStreamFn({ agentId: "artifact", streamFn: vi.fn() });
+    expect(typeof wrapped).toBe("function");
+    expect(() => provider.wrapStreamFn({ agentId: "absent", streamFn: vi.fn() })).toThrow("agents.absent");
+    await registry.stop();
+    await expect(wrapped({}, {})).rejects.toThrow("agents.artifact");
+  });
+});
+
 function agent(id: string, tools?: string[]): AgentIdentityConfig {
   return {
     did: `did:imajin:${id}`, actAs: `did:imajin:org-${id}`,

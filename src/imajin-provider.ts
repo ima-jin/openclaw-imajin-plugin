@@ -28,14 +28,13 @@
  * <connector>)` when `imajin.connector` metadata is present.
  *
  * ## Auth (no user credential)
- * The proxy authenticates to the kernel with its own app key — there is no
- * user-entered credential for this provider, ever. `IMAJIN_SYNTHETIC_API_KEY`
- * is a non-secret placeholder marker in the same posture as bundled local
- * providers with no real credential (Ollama's `ollama-local` marker,
- * `resolveSyntheticAuth`, `extensions/ollama/index.ts`): the SDK's
- * placeholder/no-key auth mode for this class of provider is `auth: []`
- * (nothing to prompt for) plus `resolveSyntheticAuth` supplying the marker
- * so auth resolution never fails closed on "no API key found".
+ * Every inference call uses the calling agent's sealed identity to obtain
+ * its own kernel app+jwt (#150), plus its configured x-acting-as selector.
+ * The same wrapStreamFn owns imajin, imajin-openai and imajin-xai. The
+ * non-secret IMAJIN_SYNTHETIC_API_KEY only satisfies SDK auth resolution;
+ * the wrapper replaces it and removes inherited credentials before egress.
+ * Missing agentId/identity fails closed, including legacy single-config mode.
+ * Catalog discovery remains a gateway-scoped read, not inference authority.
  *
  * ## Live discovery cache, scheduler + WS-driven refresh
  * `ImajinCatalogCache` intentionally does NOT rely on the SDK's built-in
@@ -66,7 +65,12 @@
  * unsealed) and replaces the catalog.
  */
 
+import { AgentInferenceAuth } from "./inference-auth.js";
+import { createAgentInferenceWrapper } from "./inference-stream.js";
+import type { AgentIdentity } from "./agent-identities.js";
+
 export const IMAJIN_PROVIDER_ID = "imajin";
+export const IMAJIN_PROVIDER_IDS = ["imajin", "imajin-openai", "imajin-xai"] as const;
 export const IMAJIN_DEFAULT_MODEL_ID = "default";
 export const IMAJIN_DEFAULT_MODEL_REF = "imajin/default";
 export const IMAJIN_PROVIDER_LABEL = "Imajin (kernel seat)";
@@ -127,7 +131,7 @@ export interface ImajinModelDiscoveryConfig {
   refreshIntervalMs?: number;
   /** Kernel route to discover against. Default {@link DEFAULT_KERNEL_MODELS_PATH}. */
   modelsPath?: string;
-  /** Optional provider/model ref used only on a confirmed transport outage. Never a credential. */
+  /** Historical operator reference only; automatic direct-provider fallback is disabled (#150). */
   breakGlassModel?: string;
 }
 
@@ -691,6 +695,7 @@ export async function fetchImajinProxyHealthz(baseUrl: string): Promise<ImajinPr
 }
 
 export interface RegisteredImajinProvider {
+  clearAuth(): void;
   cache: ImajinCatalogCache;
   baseUrl: string;
   /** Kernel discovery URL + refresh interval, surfaced by `imajin_status`. */
@@ -700,6 +705,7 @@ export interface RegisteredImajinProvider {
 }
 
 export interface RegisterImajinProviderOptions {
+  getIdentity?: (agentId: string) => AgentIdentity | undefined;
   /** Authenticated kernel client. Omit on an unconfigured install: discovery then reports `unconfigured`. */
   client?: ImajinKernelRequester;
   nodeUrl?: string;
@@ -726,6 +732,16 @@ export function registerImajinProvider(
   const fetcher =
     options.fetcher ?? createImajinKernelModelsFetcher(options.client, { modelsPath });
   const cache = new ImajinCatalogCache(fetcher, DEFAULT_CACHE_TTL_MS, Date.now, options.logger);
+  const auth = new AgentInferenceAuth(options.nodeUrl, options.getIdentity ?? (() => undefined));
+  const signingHooks = {
+    auth: [],
+    resolveSyntheticAuth: () => ({
+      apiKey: IMAJIN_SYNTHETIC_API_KEY,
+      source: "imajin calling-agent signing (non-secret placeholder, never sent)",
+      mode: "api-key",
+    }),
+    wrapStreamFn: createAgentInferenceWrapper(auth),
+  };
 
   api.registerProvider({
     id: IMAJIN_PROVIDER_ID,
@@ -733,15 +749,13 @@ export function registerImajinProvider(
     docsPath: "/providers/imajin",
     // No user-entered credential exists for this provider (see module doc
     // "Auth") — never prompt for one.
-    auth: [],
-    // Local/self-hosted-style synthetic credential (mirrors Ollama's
-    // `resolveSyntheticAuth` posture, `extensions/ollama/index.ts`) so the
-    // generic "no API key found for provider" fail-closed path never fires.
-    resolveSyntheticAuth: () => ({
-      apiKey: IMAJIN_SYNTHETIC_API_KEY,
-      source: "imajin kernel proxy (no user credential — proxy authenticates to the kernel itself)",
-      mode: "api-key",
-    }),
+    ...signingHooks,
+    // The gateway catalog is not an authorization allowlist for another agent.
+    resolveDynamicModel: (ctx: { modelId: string }) => {
+      if (!ctx.modelId || /[\s*?#]/.test(ctx.modelId)) return undefined;
+      const model = projectImajinCatalogRows({ data: [{ id: ctx.modelId }] })[0];
+      return model ? { ...model, provider: IMAJIN_PROVIDER_ID, api: "openai-completions", baseUrl } : undefined;
+    },
     catalog: {
       order: "simple",
       run: async () => {
@@ -757,7 +771,13 @@ export function registerImajinProvider(
     },
   });
 
+  // Literal owners are necessary: config-only providers do not inherit imajin hooks.
+  for (const id of IMAJIN_PROVIDER_IDS.slice(1)) {
+    api.registerProvider({ id, label: `${id} (calling-agent auth)`, ...signingHooks });
+  }
+
   return {
+    clearAuth: () => auth.clear(),
     cache,
     baseUrl,
     discovery: {

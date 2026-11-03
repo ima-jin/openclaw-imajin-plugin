@@ -258,7 +258,7 @@ describe("registerImajinProvider", () => {
 
     const registered = registerImajinProvider(api, undefined);
 
-    expect(registerProvider).toHaveBeenCalledTimes(1);
+    expect(registerProvider).toHaveBeenCalledTimes(3);
     const definition = registerProvider.mock.calls[0][0] as Record<string, unknown>;
     expect(definition.id).toBe(IMAJIN_PROVIDER_ID);
     expect(definition.label).toBe("Imajin (kernel seat)");
@@ -279,6 +279,20 @@ describe("registerImajinProvider", () => {
     const auth = definition.resolveSyntheticAuth();
     expect(auth.apiKey).toBe(IMAJIN_SYNTHETIC_API_KEY);
     expect(auth.mode).toBe("api-key");
+  });
+
+  it("accepts an agent-only upstream model absent from the gateway catalog", () => {
+    const registerProvider = vi.fn();
+    registerImajinProvider({ registerProvider }, undefined);
+    const definition = registerProvider.mock.calls[0][0] as {
+      resolveDynamicModel: (ctx: { modelId: string }) => unknown;
+    };
+    expect(definition.resolveDynamicModel({ modelId: "org-only-sonnet" })).toMatchObject({
+      id: "org-only-sonnet", provider: "imajin", api: "openai-completions",
+      baseUrl: "http://127.0.0.1:8787/openai/v1",
+    });
+    expect(definition.resolveDynamicModel({ modelId: "invalid model" })).toBeUndefined();
+    expect(definition.resolveDynamicModel({ modelId: "" })).toBeUndefined();
   });
 
   it("static catalog seed is empty (never a stale/wrong fallback list)", async () => {

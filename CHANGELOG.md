@@ -1,6 +1,20 @@
 # Changelog
 
 ## Unreleased
+- **Inference subject correction (PR #151).** App-token minting always uses
+  the calling agent DID for both `azp` and `sub`; configured `actAs` stays
+  solely in `x-acting-as`. Verifier/controller-shaped regressions for
+  main→Ryan and artifact→@artifact refuse target-subject tokens without
+  changing kernel authentication.
+- **Calling-agent inference authentication (#150).** `imajin`, `imajin-openai`
+  and `imajin-xai` use each caller's sealed identity to mint its own `app+jwt`
+  and send its configured `x-acting-as`. Inherited static credentials are
+  removed. Missing agent identity/context fails closed; a credential 401
+  refreshes once as the same agent, while 403 is not retried. Credentials
+  are cached per identity/selector/audience and retired on service stop.
+  Dynamic `imajin/<id>` models need not appear in the gateway's catalog.
+  Automatic direct-provider break-glass routing is disabled, including during
+  transport outages; the old config reference is compatibility metadata only.
 - Calling-agent identity and source diagnostics in `imajin_status` (#147).
 
 ### Fixed

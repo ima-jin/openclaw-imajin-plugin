@@ -21,7 +21,7 @@ async function fixture() {
   };
   const probe = vi.fn().mockResolvedValue({ ok: true, status: 200 });
   const router = createImajinDefaultRouter({ cache, baseUrl: "http://proxy.test/openai/v1", probe,
-    getConfig: () => config, now: () => 1234 });
+    getConfig: () => config });
   return { fetcher, cache, config, probe, router };
 }
 
@@ -122,30 +122,30 @@ describe("kernel-picked default (#106)", () => {
   });
 });
 
-describe("observable transport-only break-glass", () => {
-  it.each([undefined, 502, 503, 504])("routes directly only on passthrough transport failure %s and recovers next turn", async (status) => {
+describe("no direct-provider fallback (#150)", () => {
+  it.each([undefined, 502, 503, 504])("keeps the signed Imajin route on passthrough transport failure %s", async (status) => {
     const { router, probe } = await fixture();
     probe.mockResolvedValue({ ok: false, status, error: "untrusted transport details" });
-    expect(await router.beforeModelResolve({}, following)).toEqual({ providerOverride: "direct", modelOverride: "emergency" });
+    expect(await router.beforeModelResolve({}, following)).toEqual({ providerOverride: "imajin", modelOverride: "a" });
     expect(router.status()).toMatchObject({
-      fallbackCount: 1, lastReason: "passthrough_unreachable", lastFallbackAt: new Date(1234).toISOString(),
+      fallbackCount: 0, lastReason: null, lastFallbackAt: null,
     });
     await router.beforeModelResolve({}, following);
-    expect(router.status().fallbackCount).toBe(2);
+    expect(router.status().fallbackCount).toBe(0);
     probe.mockResolvedValue({ ok: true, status: 200 });
     expect(await router.beforeModelResolve({}, following)).toMatchObject({ modelOverride: "a" });
-    expect(router.status().fallbackCount).toBe(2);
+    expect(router.status().fallbackCount).toBe(0);
   });
 
-  it("confirms kernel discovery transport failure, and checks recovery before falling back again", async () => {
+  it("refreshes failed discovery without switching to another provider or identity", async () => {
     const { router, fetcher, cache } = await fixture();
     fetcher.mockRejectedValue(new ImajinDiscoveryError("unreachable", "untrusted network details"));
     await cache.refresh();
-    expect(await router.beforeModelResolve({}, following)).toMatchObject({ providerOverride: "direct" });
-    expect(router.status()).toMatchObject({ fallbackCount: 1, lastReason: "kernel_unreachable" });
+    expect(await router.beforeModelResolve({}, following)).toMatchObject({ providerOverride: "imajin" });
+    expect(router.status()).toMatchObject({ fallbackCount: 0, lastReason: null });
     fetcher.mockResolvedValue(list("b"));
     expect(await router.beforeModelResolve({}, following)).toMatchObject({ providerOverride: "imajin", modelOverride: "b" });
-    expect(router.status().fallbackCount).toBe(1);
+    expect(router.status().fallbackCount).toBe(0);
   });
 
   it.each([400, 401, 403, 404, 402, 409, 429, 500])("never treats reachable HTTP %s as permission to spend directly", async (status) => {
@@ -193,7 +193,7 @@ describe("observable transport-only break-glass", () => {
     expect(await router.beforeModelResolve({}, following)).toBeUndefined();
   });
 
-  it("imajin_status exposes every routed fallback count and a value-free last reason", async () => {
+  it("imajin_status keeps the status shape but never reports a direct fallback", async () => {
     const { router, cache, probe } = await fixture();
     probe.mockResolvedValue({ ok: false });
     await router.beforeModelResolve({}, following);
@@ -202,7 +202,7 @@ describe("observable transport-only break-glass", () => {
     const report = JSON.parse((await tool.execute()).content[0].text);
     expect(report.defaultRouting).toEqual({
       selector: "imajin/default", pickedModel: "imajin/a",
-      fallbackCount: 1, lastReason: "passthrough_unreachable", lastFallbackAt: new Date(1234).toISOString(),
+      fallbackCount: 0, lastReason: null, lastFallbackAt: null,
     });
   });
 });

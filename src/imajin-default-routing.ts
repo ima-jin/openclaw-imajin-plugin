@@ -4,10 +4,10 @@
  * openclaw@2026.10.4 prepare.runtime / before_model_resolve.
  */
 import {
-  IMAJIN_DEFAULT_MODEL_ID, IMAJIN_PROVIDER_ID, fetchImajinProxyHealthz, isDirectModelRef,
-  type ImajinCatalogCache, type ImajinProxyHealthz, type ImajinCatalogCacheState,
+  IMAJIN_DEFAULT_MODEL_ID, IMAJIN_PROVIDER_ID, fetchImajinProxyHealthz,
+  type ImajinCatalogCache, type ImajinProxyHealthz,
 } from "./imajin-provider.js";
-import { isImajinModelAllowedByPolicy, isModelRefAllowedByPolicy } from "./sources/imajin-catalog.js";
+import { isImajinModelAllowedByPolicy } from "./sources/imajin-catalog.js";
 
 export interface ImajinDefaultRoutingStatus {
   selector: "imajin/default";
@@ -17,7 +17,7 @@ export interface ImajinDefaultRoutingStatus {
   lastFallbackAt: string | null;
 }
 
-interface RoutingPolicy { allow?: string[]; breakGlassModel?: string }
+interface RoutingPolicy { allow?: string[] }
 interface RoutingContext { runId?: string; modelProviderId?: string; modelId?: string }
 const followsDefault = (ctx: RoutingContext) =>
   ctx.modelProviderId === IMAJIN_PROVIDER_ID && ctx.modelId === IMAJIN_DEFAULT_MODEL_ID;
@@ -25,26 +25,11 @@ const followsDefault = (ctx: RoutingContext) =>
 function readRoutingPolicy(getConfig: () => unknown): RoutingPolicy | undefined {
   const config = getConfig() as {
     agents?: { defaults?: { modelPolicy?: { allow?: string[] } } };
-    plugins?: { entries?: { imajin?: { config?: { modelDiscovery?: { breakGlassModel?: string } } } } };
   } | undefined;
   if (!config || typeof config !== "object") return;
   const allow = config.agents?.defaults?.modelPolicy?.allow;
   if (allow !== undefined && (!Array.isArray(allow) || allow.some((ref) => typeof ref !== "string"))) return;
-  return { allow, breakGlassModel: config.plugins?.entries?.imajin?.config?.modelDiscovery?.breakGlassModel };
-}
-
-function outageReason(health: ImajinProxyHealthz, state: ImajinCatalogCacheState): string | null {
-  if (!health.ok && (health.status === undefined || [502, 503, 504].includes(health.status))) {
-    return "passthrough_unreachable";
-  }
-  return state.outcome === "unreachable" ? "kernel_unreachable" : null;
-}
-
-function directOverride(policy: RoutingPolicy, reason: string | null) {
-  const direct = policy.breakGlassModel;
-  if (!reason || !isDirectModelRef(direct) || !isModelRefAllowedByPolicy(policy.allow, direct)) return;
-  const slash = direct.indexOf("/");
-  return { providerOverride: direct.slice(0, slash), modelOverride: direct.slice(slash + 1) };
+  return { allow };
 }
 
 export function createImajinDefaultRouter(deps: {
@@ -52,11 +37,7 @@ export function createImajinDefaultRouter(deps: {
   baseUrl: string;
   getConfig: () => unknown;
   probe?: (baseUrl: string) => Promise<ImajinProxyHealthz>;
-  now?: () => number;
 }) {
-  let fallbackCount = 0;
-  let lastReason: string | null = null;
-  let lastFallbackAt: string | null = null;
   // A hook exception is swallowed by host model resolution. The later blocking
   // gate must therefore remember failed admission, not let "default" reach a
   // kernel that may itself resolve an unknown id to its first available brain.
@@ -74,7 +55,7 @@ export function createImajinDefaultRouter(deps: {
       const picked = deps.cache.peek()?.models.find((model) => model.picked);
       return {
         selector: "imajin/default", pickedModel: picked ? `imajin/${picked.id}` : null,
-        fallbackCount, lastReason, lastFallbackAt,
+        fallbackCount: 0, lastReason: null, lastFallbackAt: null,
       };
     },
     beforeAgentRun(_event: unknown, ctx: RoutingContext = {}) {
@@ -91,22 +72,13 @@ export function createImajinDefaultRouter(deps: {
       if (!followsDefault(ctx)) return;
       admit(ctx, false);
       let state = await deps.cache.get();
-      const health = await (deps.probe ?? fetchImajinProxyHealthz)(deps.baseUrl);
-      // Discovery transport failures can outlive an outage; recheck before spending directly.
+      await (deps.probe ?? fetchImajinProxyHealthz)(deps.baseUrl);
+      // Refresh stale discovery, but never spend through a direct-provider fallback (#150).
       if (state.outcome === "unreachable") state = await deps.cache.refresh();
       state = deps.cache.peek() ?? state;
       // Re-read live policy after IO; never bypass a concurrent restriction.
       const policy = readRoutingPolicy(deps.getConfig);
       if (!policy) return;
-      const reason = outageReason(health, state);
-      const emergency = directOverride(policy, reason);
-      if (emergency) {
-        admit(ctx, true);
-        fallbackCount++;
-        lastReason = reason;
-        lastFallbackAt = new Date((deps.now ?? Date.now)()).toISOString();
-        return emergency;
-      }
       const model = state.models.find((entry) => entry.picked);
       if (!model || !isImajinModelAllowedByPolicy(policy.allow, model.id)) return;
       admit(ctx, true);
