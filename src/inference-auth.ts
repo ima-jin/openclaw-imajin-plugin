@@ -77,6 +77,34 @@ export class AgentInferenceAuth {
   clear(): void {
     this.entries.clear();
   }
+  /** Same caller/key/token path as inference; never a gateway session cookie. */
+  async discoverSelf(agentId: string): Promise<unknown> {
+    const identity = this.identity(agentId);
+    try {
+      const credential = await this.credential(agentId);
+      if (this.identity(agentId) !== identity) throw new Error("Identity changed");
+      const response = await this.fetcher(`${trimTrailingSlashes(this.nodeUrl!)}/infer/v1/self`, {
+        method: "GET",
+        redirect: "error",
+        headers: {
+          Authorization: `Bearer ${credential.token}`,
+          "Cache-Control": "no-store",
+          ...(identity.config.actAs ? { "x-acting-as": identity.config.actAs } : {}),
+        },
+        signal: AbortSignal.timeout(20_000),
+      });
+      if (!response.ok) {
+        await response.body?.cancel();
+        throw new InferenceAuthError(agentId, "self-discovery refused", response.status);
+      }
+      const body: unknown = await response.json();
+      if (this.identity(agentId) !== identity) throw new Error("Identity changed");
+      return body;
+    } catch (error) {
+      if (error instanceof InferenceAuthError) throw error;
+      throw new InferenceAuthError(agentId, "self-discovery unavailable");
+    }
+  }
 
   invalidate(agentId: string, token: string): void {
     const identity = this.identity(agentId);

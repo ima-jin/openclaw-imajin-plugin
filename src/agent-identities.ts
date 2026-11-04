@@ -7,7 +7,7 @@ import type { WarpToolConfig } from "./tools.js";
 import { buildStatusIdentity } from "./status-identity.js";
 
 export const AGENT_TOOL_NAMES = [
-  "imajin_status", "imajin_identity", "imajin_attest", "imajin_transact",
+  "imajin_status", "imajin_identity", "imajin_identity_card", "imajin_attest", "imajin_transact",
   "imajin_fair", "imajin_discover", "imajin_media", "imajin_warp",
   "imajin_infer", "imajin_usage", "imajin_vault", "imajin_cloudflare",
   "imajin_chat", "imajin_wake_report",

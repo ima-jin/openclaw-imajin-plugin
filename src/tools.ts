@@ -28,6 +28,7 @@ import { containsLiveSecret, createSecretHandle } from "./vault/secret-handle-st
 import type { StatusIdentity } from "./status-identity.js";
 
 export { createCloudflareTool } from "./cloudflare-tool.js";
+export { createIdentityCardTool } from "./identity-card.js";
 
 type ToolContent = { type: "text"; text: string };
 type ToolResult = {

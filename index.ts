@@ -24,6 +24,7 @@ import { createNotificationInjector, WAKE_RUNTIME_HOOKS, type WsNotificationsCon
 import { createReachEventHandler, isReachFrame } from "./src/reach-events.js";
 import {
   createIdentityTool,
+  createIdentityCardTool,
   createAttestTool,
   createTransactTool,
   createFairTool,
@@ -392,6 +393,13 @@ export default definePluginEntry({
       }),
       { names: ["imajin_status"] },
     );
+    // Legacy config cannot bind a shared host key to an arbitrary caller.
+    api.registerTool((ctx: { agentId?: string }) => createIdentityCardTool({
+      context: ctx, getIdentity: () => undefined,
+      discoverSelf: imajinProvider.discoverSelf,
+      getConfig: () => api.runtime?.config?.current?.(),
+      proxyBaseUrl: imajinProvider.baseUrl,
+    }), { names: ["imajin_identity_card"] });
 
     // Both host service IDs share one idempotent full-mode runtime start.
     api.registerService({ id: "imajin-model-discovery", start: runtime.start, stop: runtime.stop });

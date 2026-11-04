@@ -20,12 +20,16 @@ import {
   createIdentityTool, createAttestTool, createTransactTool, createFairTool,
   createDiscoverTool, createMediaTool, createWarpTool, createInferTool,
   createUsageTool, createVaultTool, createCloudflareTool, createChatTool, createImajinStatusTool,
+  createIdentityCardTool,
 } from "./tools.js";
+import type { CardContext } from "./identity-card-facts.js";
 
-interface AgentToolContext {
-  agentId?: string;
-  sessionKey?: string;
+interface AgentToolContext extends CardContext {
   runId?: string;
+  getRuntimeConfig?: () => unknown;
+  runtimeConfig?: unknown;
+  config?: unknown;
+  assertInvocationCurrent?: () => void;
 }
 
 export interface GatewayAgentIdentity extends AgentIdentity {
@@ -203,6 +207,20 @@ export function registerAgentPlugin(api: any, config: {
       createWarpTool(client, agent.warp), createInferTool(client), createUsageTool(client),
       createVaultTool(client), createCloudflareTool(client),
       createChatTool(new ImajinChat(client, agent.did)),
+      createIdentityCardTool({
+        context: ctx, getIdentity: () => identities.get(ctx.agentId),
+        discoverSelf: provider.discoverSelf, proxyBaseUrl: provider.baseUrl,
+        getConfig: () => ctx.getRuntimeConfig?.() ?? api.runtime?.config?.current?.()
+          ?? ctx.runtimeConfig ?? ctx.config ?? api.config,
+        githubStatus: api.runtime?.gateway?.request
+          ? (agentId) => api.runtime.gateway.request("tools.github.status",
+            { agentId, selectedScope: "agent" }, { timeoutMs: 5_000 })
+          : undefined,
+        assertCurrent: () => {
+          ctx.assertInvocationCurrent?.();
+          if (PluginServiceRuntime.owner() !== runtime) throw new Error("Agent identity runtime is no longer active");
+        },
+      }),
       status,
       createWakeReportTool(ctx, async (context, disclosure) => {
         const sender = senders.get(ctx.agentId!);
