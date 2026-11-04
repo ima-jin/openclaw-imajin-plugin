@@ -417,6 +417,24 @@ describe("fresh wake bridge (#79)", () => {
     expect(horizon.writeStepEvents).toHaveBeenCalledWith(expect.objectContaining({ runIds: ["on"], lastVerdict: "Reviewed; PR awaiting review" }));
   });
 
+  it("injects claim evidence through a read-only adapter, hides exits, and completes without step writeback", async () => {
+    const horizon = {
+      readOpenItems: vi.fn(async () => [
+        { runId: "claimed-step", status: "open" as const, claimedBy: "did:imajin:holder",
+          claimExpiresAt: "2026-11-04T12:15:00Z", kernelState: "claimed", kernelZone: "head" },
+        { runId: "exited-step", status: "closed" as const, kernelState: "exited", kernelZone: "done" },
+      ]),
+    };
+    const injector = create({ ...config, horizonEnabled: true }, { horizon });
+    await injector.inject(frame("read-only"));
+    await posted(1);
+    expect(posts[0].message).toContain('"claimedBy":"did:imajin:holder"');
+    expect(posts[0].message).toContain('"claimExpiresAt":"2026-11-04T12:15:00Z"');
+    expect(posts[0].message).not.toContain("exited-step");
+    await finish(injector, 0);
+    expect(console.warn).not.toHaveBeenCalledWith(expect.stringContaining("horizon step writeback failed"));
+  });
+
   it("falls back to bridge when horizon read or signed-step write fails", async () => {
     const horizon = {
       readOpenItems: vi.fn(async () => { throw new Error("offline"); }),

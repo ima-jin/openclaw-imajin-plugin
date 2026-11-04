@@ -3,8 +3,8 @@ import type { LoopSenderOptions } from "../loop-publisher.js";
 import { saveJson } from "./cursor.js";
 import { deriveStepId, parseHorizon, record, text, type HorizonItem } from "./model.js";
 
-const STATES = ["queued", "claimed", "running", "blocked", "finished", "exited"];
-const ZONES = ["tail", "middle", "near", "head", "past", "done"];
+const STATES = new Set(["queued", "claimed", "running", "blocked", "finished", "exited"]);
+const ZONES = new Set(["tail", "middle", "near", "head", "past", "done"]);
 let warned = false;
 
 interface DerivedStep {
@@ -26,7 +26,7 @@ function step(value: unknown): DerivedStep {
   if (!/^did:[^\s:]+:\S+$/.test(publisher)) throw new Error("invalid kernel publisher");
   const state = text(entry.state);
   const zone = text(entry.zone);
-  if (!STATES.includes(state) || !ZONES.includes(zone)) throw new Error("invalid kernel projection");
+  if (!STATES.has(state) || !ZONES.has(zone)) throw new Error("invalid kernel projection");
   let claim: DerivedStep["claim"];
   if (entry.claim !== undefined) {
     const lease = record(entry.claim);

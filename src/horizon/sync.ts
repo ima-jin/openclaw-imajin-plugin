@@ -4,7 +4,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join, resolve } from "node:path";
 import { createLoopTransport, type LoopSenderOptions } from "../loop-publisher.js";
 import { loadCursor, planDiff, saveCursor, type Cursor } from "./cursor.js";
-import { digest, mapItem, parseHorizon, text, type StepEnvelope, type StepRequest } from "./model.js";
+import { deriveStepId, digest, mapItem, parseHorizon, text, type StepEnvelope, type StepRequest } from "./model.js";
 import { deliveryResult, rejectedStepWarning, safeStepId, saveDeadLetter } from "./outbox.js";
 import { isStale, lookupReceipt } from "./receipts.js";
 import { readBackHorizon } from "./readback.js";
@@ -179,7 +179,7 @@ export function createHorizonSync(options: HorizonSyncOptions) {
       await running;
       const file = parseHorizon(await readFile(filePath, "utf8"));
       return file.items.map(item => ({
-        runId: item.id, issue: item.refs[0],
+        runId: deriveStepId(loopId, options.did, item.id), issue: item.refs[0],
         status: item.zone === "done" ? "closed" : "open",
         claimedBy: item.claimedBy, claimExpiresAt: item.claimExpiresAt,
         kernelState: item.kernelState, kernelZone: item.kernelZone,

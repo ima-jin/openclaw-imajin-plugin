@@ -135,7 +135,7 @@ describe("kernel horizon readback", () => {
     await test.service.sync();
     const before = test.fetchImpl.mock.calls.length;
     const claimed = await test.service.readOpenItems();
-    expect(claimed[0]).toMatchObject({ runId: test.item.id, claimedBy: "did:imajin:claimant",
+    expect(claimed[0]).toMatchObject({ runId: deriveStepId(LOOP, DID, test.item.id), claimedBy: "did:imajin:claimant",
       claimExpiresAt: "2026-11-04T12:15:00Z", kernelState: "claimed", kernelZone: "head", status: "open" });
     expect(test.fetchImpl).toHaveBeenCalledTimes(before);
     const continuity = new WakeBridgeStore();
@@ -196,6 +196,48 @@ describe("kernel horizon readback", () => {
     test.get.mockImplementation(async () => new Response(raw));
     const before = await readFile(test.filePath, "utf8");
     await readBackHorizon(test.options, LOOP, test.filePath);
+    expect(await readFile(test.filePath, "utf8")).toBe(before);
+  });
+
+  it("still reads a claim when upward ingest fails and retains the exact pending outbox", async () => {
+    const test = await setup();
+    const fetchImpl: typeof fetch = async (url, init) => init?.method === "GET"
+      ? test.options.fetchImpl!(url, init) : new Response(null, { status: 503 });
+    const service = createHorizonSync({ ...test.options, fetchImpl,
+      config: { ...context, filePath: test.filePath, stateDir: join(test.filePath, "..", "state") } });
+    await service.sync();
+    expect((await test.read()).items[0].claimedBy).toBe("did:imajin:claimant");
+    expect(JSON.parse(await readFile(service.cursorPath, "utf8")).pending.requests).toHaveLength(1);
+  });
+
+  it("rejects failed authentication, aborted reads and broken response streams without editing the bridge", async () => {
+    const test = await setup();
+    const before = await readFile(test.filePath, "utf8");
+    await readBackHorizon({ ...test.options, client: {
+      authenticatedCookie: async () => { throw new Error("private authentication diagnostic"); },
+    } }, LOOP, test.filePath);
+    expect(test.fetchImpl).not.toHaveBeenCalled();
+    const controller = new AbortController();
+    controller.abort();
+    await readBackHorizon({ ...test.options, signal: controller.signal }, LOOP, test.filePath);
+    expect(test.fetchImpl).not.toHaveBeenCalled();
+    test.get.mockImplementationOnce(async () => new Response(new ReadableStream({
+      start(stream) { stream.error(new Error("private response diagnostic")); },
+    })));
+    await readBackHorizon(test.options, LOOP, test.filePath);
+    expect(await readFile(test.filePath, "utf8")).toBe(before);
+    expect(JSON.stringify(test.logger.warn.mock.calls)).not.toContain("private");
+  });
+
+  it("does not apply a response after the caller is stopped during the read", async () => {
+    const test = await setup();
+    const before = await readFile(test.filePath, "utf8");
+    const controller = new AbortController();
+    test.get.mockImplementationOnce(async () => {
+      controller.abort();
+      return Response.json(test.snapshot());
+    });
+    await readBackHorizon({ ...test.options, signal: controller.signal }, LOOP, test.filePath);
     expect(await readFile(test.filePath, "utf8")).toBe(before);
   });
 
