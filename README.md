@@ -43,8 +43,7 @@ GitHub status uses the SDK's `gateway.request("tools.github.status", ...)`
 when available; denied/unsupported hosts remain Unverified. No `gh` subprocess
 or credential-file read is used.
 
-- **Observed live**: this call obtained the kernel identity or the gateway's
-  GitHub API verification (`stale` results never qualify).
+- **Observed live**: this call obtained the kernel identity.
 - **From config**: resolved provider URL/model metadata or agent channel
   bindings. Routes distinguish direct from the configured passthrough doorway
   without returning URLs, headers, tokens or credential paths.
@@ -52,6 +51,9 @@ or credential-file read is used.
   outbound service identity/egress is not exposed. Their per-field evidence
   still records the kernel's observed configuration and authority, including
   org-held Anthropic, without claiming successful provider use.
+  GitHub's SDK status includes API evidence but can use cached verification
+  without a call-bound verification timestamp, so its row stays Unverified
+  even when the effective account and credential health are available.
 
 The inference row reports the host's `activeModel` when supplied (otherwise
 the agent/default model config). Its `kernelPick` is the freshly discovered

@@ -26,12 +26,12 @@ function githubScope(valid: boolean, source: string | null, bound: boolean): Con
   return bound ? "agent" : "host fallback";
 }
 
-function githubReason(valid: boolean, scope: ConfigScope, live: boolean): string {
+function githubReason(valid: boolean, scope: ConfigScope, apiVerified: boolean): string {
   let prefix = "";
   if (scope === "host fallback") prefix = "host fallback — not own identity; ";
   else if (!valid) prefix = "Agent binding configured; ";
   if (!valid) return prefix + "GitHub status unavailable through this host's plugin gateway SDK";
-  if (live) return prefix + "Gateway status reports a current GitHub API account verification";
+  if (apiVerified) return prefix + "Gateway reports GitHub API verification, but SDK status may be cached and does not prove verification in this call";
   return prefix + "Gateway status is unavailable, stale, or not live-verified";
 }
 
@@ -133,7 +133,7 @@ export function channelRows(config: unknown, ctx: CardContext): ConnectorRow[] {
       details: { channel: publicText(match.channel), accountId: publicText(match.accountId) },
     });
   }).concat(matching.length ? [] : [row("channels", {
-    configured: false, configScope: "agent", selectedScope: "agent",
+    configured: config ? false : null, configScope: "agent", selectedScope: "agent",
     reason: "No explicit channel binding for this agent in the available gateway config",
     details: { currentChannel: publicText(ctx.messageChannel), currentAccountId: publicText(ctx.agentAccountId) },
   })]);
@@ -164,14 +164,14 @@ export function githubRow(config: unknown, ctx: CardContext, response?: unknown)
   const valid = record(response).agentId === ctx.agentId && record(response).selectedScope === "agent"
     && ["agent-override", "system-configured", "system-detected"].includes(effective.source ?? "");
   const scope = githubScope(valid, effective.source, bound);
-  const live = valid && effective.evidence === "github-api" && effective.credentialState === "available"
+  const apiVerified = valid && effective.evidence === "github-api" && effective.credentialState === "available"
     && !effective.stale && effective.account.login !== null;
   return row("GitHub", {
     configured: valid ? effective.credentialKind !== "native" : bound || hasGithubBinding(config),
     configScope: scope, selectedScope: "agent", owner: valid ? effective.account.login : null,
     outboundIdentity: valid ? effective.account.login : null,
-    effective: valid ? scope : null, grade: live ? "Observed live" : "Unverified",
-    reason: githubReason(valid, scope, live),
+    effective: valid ? scope : null, grade: "Unverified",
+    reason: githubReason(valid, scope, apiVerified),
     flagged: scope === "host fallback",
     ...(valid ? { details: {
       selected: { scope: "agent", configured: selected.configured === true,
@@ -185,7 +185,7 @@ export function mcpRow(config: unknown): ConnectorRow {
   const servers = record(record(record(config).mcp).servers);
   const enabled = Object.values(servers).some((entry) => record(entry).enabled !== false);
   return row("MCP", {
-    configured: enabled, configScope: "host fallback", selectedScope: "host fallback",
+    configured: config ? enabled : null, configScope: "host fallback", selectedScope: "host fallback",
     reason: "Gateway MCP registration only; per-request caller identity is not exposed by the SDK",
     details: { serverCount: Object.keys(servers).length },
   });

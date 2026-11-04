@@ -239,6 +239,21 @@ describe("imajin_identity_card", () => {
     };
     expect(await late.call()).toEqual({ error: "Calling-agent signing identity changed" });
   });
+
+  it("preserves multiple cards for the same inference provider with distinct authority and owners", async () => {
+    const { identity, options, call } = setup();
+    const body = discovery(identity);
+    options.discoverSelf.mockResolvedValue({ ...body, connectors: [
+      ...body.connectors,
+      { ...body.connectors[0], authority: "member-grant", billedPrincipal: { did: "did:imajin:second-org" } },
+      { ...body.connectors[0], authority: "delegated", billedPrincipal: { did: "did:imajin:personal-owner" } },
+    ] });
+    const rows = (await call()).payload.rows.filter((entry: any) => entry.connector === "anthropic");
+    expect(rows).toHaveLength(3);
+    expect(rows.map((entry: any) => [entry.configScope, entry.owner])).toEqual([
+      ["org", identity.config.actAs], ["org", "did:imajin:second-org"], ["user", "did:imajin:personal-owner"],
+    ]);
+  });
 });
 
 function githubStatus() {
@@ -251,10 +266,11 @@ function githubStatus() {
 }
 
 describe("gateway fact grades", () => {
-  it("uses live GitHub selected/effective facts, flags fallback and retains public health fields", () => {
+  it("uses SDK GitHub selected/effective facts without treating possibly cached API evidence as observed live", () => {
     expect(githubRow({}, { agentId: "artifact" }, githubStatus())).toMatchObject({
       configScope: "host fallback", selectedScope: "agent", effective: "host fallback",
-      outboundIdentity: "host-user", flagged: true, grade: "Observed live",
+      outboundIdentity: "host-user", flagged: true, grade: "Unverified",
+      reason: expect.stringContaining("does not prove verification in this call"),
       details: { selected: { configured: false, identity: null }, effective: {
         account: { login: "host-user" }, gitAuthor: { name: "Host" }, oauthScopes: ["repo"], credentialState: "available",
       } },
@@ -280,7 +296,7 @@ describe("gateway fact grades", () => {
     status.effective.source = "agent-override";
     status.effective.credentialKind = "managed-oauth";
     expect(githubRow(config, { agentId: "artifact" }, status)).toMatchObject({
-      configured: true, configScope: "agent", grade: "Observed live",
+      configured: true, configScope: "agent", grade: "Unverified",
     });
   });
 

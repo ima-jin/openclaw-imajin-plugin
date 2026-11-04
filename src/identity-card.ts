@@ -67,8 +67,9 @@ async function kernelSnapshot(options: CardOptions, identity: AgentIdentity) {
 type KernelSnapshot = Awaited<ReturnType<typeof kernelSnapshot>>;
 
 function mergeKernelRows(rows: ConnectorRow[], snapshot: KernelSnapshot, mapping: ConnectorRow): void {
+  const gatewayRows = new Map(rows.map((entry) => [entry.connector.toLowerCase(), entry]));
   for (const connector of connectorRows(snapshot.body?.connectors ?? [], mapping)) {
-    const gatewayRow = rows.find((entry) => entry.connector.toLowerCase() === connector.connector.toLowerCase());
+    const gatewayRow = gatewayRows.get(connector.connector.toLowerCase());
     if (gatewayRow) {
       gatewayRow.details = { ...gatewayRow.details, kernel: {
         configured: connector.configured, owner: connector.owner, ...connector.details,

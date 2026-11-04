@@ -167,6 +167,27 @@ describe("calling-agent provider wire contract", () => {
     expect(mints).toHaveLength(1);
     expect(requests).toHaveLength(1);
   });
+  it("personal self-discovery omits act-as and never selects a gateway principal", async () => {
+    identities.set("main", agent("main"));
+    expect(await auth.discoverSelf("main")).toMatchObject({ identity: { did: "did:imajin:main", actAs: null } });
+    expect(requests[0].headers["x-acting-as"]).toBeUndefined();
+    expect(mints[0].principalDid).toBe("did:imajin:main");
+  });
+
+  it.each(["json", "network", "retired"])("self-discovery contains %s failure without retaining protected diagnostics", async (kind) => {
+    const protectedDetail = randomUUID();
+    const originalFetch = globalThis.fetch;
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (url, init) => {
+      if (!String(url).endsWith("/infer/v1/self")) return originalFetch(url, init);
+      if (kind === "network") throw new Error(protectedDetail);
+      if (kind === "retired") identities.delete("main");
+      return new Response(kind === "json" ? protectedDetail : "{}", { status: 200 });
+    });
+    await expect(auth.discoverSelf("main")).rejects.toMatchObject({
+      message: expect.not.stringContaining(protectedDetail),
+    });
+    expect(requests).toHaveLength(0);
+  });
 
   it.each(["", "absent", "__proto__", " other"])("self-discovery rejects invalid caller %# before mint", async (agentId) => {
     await expect(auth.discoverSelf(agentId)).rejects.toThrow("Imajin inference");
