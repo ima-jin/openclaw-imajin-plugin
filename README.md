@@ -9,6 +9,7 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | Tool              | Primitive   | What it does                                                 |
 | ----------------- | ----------- | ------------------------------------------------------------ |
 | `imajin_identity` | Identity    | Look up DIDs, resolve handles, check trust graph connections |
+| `imajin_identity_card` | Identity | Calling-agent signed self-discovery and graded gateway connector facts (imajin-ai#3251) |
 | `imajin_attest`   | Attestation | List and create signed attestations                          |
 | `imajin_transact` | Settlement  | Check MJNx/MJN balances, view transaction history            |
 | `imajin_fair`     | Attribution | Inspect .fair manifests — who made what and who gets paid    |
