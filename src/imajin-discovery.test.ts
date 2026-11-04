@@ -396,7 +396,7 @@ describe("startImajinModelDiscovery (#55 — the reason discovery never ran)", (
     });
     const registerProvider = vi.fn();
     const provider = registerImajinProvider({ registerProvider }, undefined, {
-      client,
+      fetcher: createImajinKernelModelsFetcher(client),
       nodeUrl: "https://kernel.example",
       logger: quietLogger(),
     });
@@ -445,7 +445,7 @@ describe("registerImajinProvider + discovery end to end", () => {
     const provider = registerImajinProvider(
       { registerProvider },
       { inferProxyBaseUrl: "http://127.0.0.1:8787/openai/v1" },
-      { client, nodeUrl: "https://jin.imajin.ai", logger: quietLogger() },
+      { fetcher: createImajinKernelModelsFetcher(client), nodeUrl: "https://jin.imajin.ai", logger: quietLogger() },
     );
 
     await provider.cache.refresh();
@@ -466,7 +466,7 @@ describe("registerImajinProvider + discovery end to end", () => {
     let body: unknown = { object: "list", data: [KERNEL_LIST.data[0]] };
     const client = requester(async () => ({ status: 200, text: JSON.stringify(body) }));
     const provider = registerImajinProvider({ registerProvider: vi.fn() }, undefined, {
-      client,
+      fetcher: createImajinKernelModelsFetcher(client),
       logger: quietLogger(),
     });
     expect((await provider.cache.refresh()).models.map((m) => m.id)).toEqual(["grok-4"]);

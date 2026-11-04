@@ -5,8 +5,8 @@
  * Registers `imajin` as a text/chat `api.registerProvider` provider
  * (`docs/plugins/sdk-provider-plugins.md`) whose catalog is discovered live
  * from the KERNEL (#55): `GET {nodeUrl}/infer/v1/models/usable`, authenticated
- * with the plugin's existing agent-DID challenge-response session (never a
- * static bearer). Completions still flow through the local passthrough proxy
+ * with the calling agent's own app+jwt and configured x-acting-as selector.
+ * Completions flow through the family-specific local passthrough proxy
  * (`inferProxyBaseUrl`, default `http://127.0.0.1:8787/openai/v1`) — that is
  * only the `baseUrl` every discovered `imajin/<id>` model is registered with.
  * (The proxy's own `/openai/v1/models` is not used: it 404s, imajin-ai#2453.)
@@ -34,7 +34,8 @@
  * non-secret IMAJIN_SYNTHETIC_API_KEY only satisfies SDK auth resolution;
  * the wrapper replaces it and removes inherited credentials before egress.
  * Missing agentId/identity fails closed, including legacy single-config mode.
- * Catalog discovery remains a gateway-scoped read, not inference authority.
+ * Catalog discovery is isolated per agent; context-free CLI reads explicitly
+ * select gatewayAgent, never as a fallback for another agent.
  *
  * ## Live discovery cache, scheduler + WS-driven refresh
  * `ImajinCatalogCache` intentionally does NOT rely on the SDK's built-in
@@ -68,6 +69,8 @@
 import { AgentInferenceAuth } from "./inference-auth.js";
 import { createAgentInferenceWrapper } from "./inference-stream.js";
 import type { AgentIdentity } from "./agent-identities.js";
+import { familyBaseUrl, inferenceFamily, type InferenceApi } from "./inference-families.js";
+import { AgentCatalogs, type AgentCatalogOptions, type CatalogContext } from "./agent-catalogs.js";
 
 export const IMAJIN_PROVIDER_ID = "imajin";
 export const IMAJIN_PROVIDER_IDS = ["imajin", "imajin-openai", "imajin-xai"] as const;
@@ -163,6 +166,7 @@ export interface ImajinRuntimeModel {
   connector?: string;
   /** The connector card's current pick. Multiple cards retain kernel order. */
   picked?: boolean;
+  api?: InferenceApi;
 }
 
 /**
@@ -173,21 +177,33 @@ export interface ImajinRuntimeModel {
  * body (missing/non-array `data`) simply projects to an empty catalog,
  * matching the "degrade to no models" contract.
  */
+function catalogRowId(row: ImajinCatalogRow | null): string | undefined {
+  if (!row || typeof row.id !== "string" || row.imajin?.servable === false) return;
+  const id = row.id.trim();
+  return id && !/[\s*]/.test(id) ? id : undefined;
+}
+function catalogConnector(row: ImajinCatalogRow, connector?: string): string | undefined {
+  return connector ?? (typeof row.owned_by === "string" ? row.owned_by.trim() : undefined);
+}
+
 export function projectImajinCatalogRows(
   response: ImajinModelsListResponse | null | undefined,
+  logger?: Pick<ImajinDiscoveryLogger, "warn">,
 ): ImajinRuntimeModel[] {
   const rows = Array.isArray(response?.data) ? (response!.data as ImajinCatalogRow[]) : [];
   const models: ImajinRuntimeModel[] = [];
   const seenIds = new Set<string>();
   for (const row of rows) {
-    if (!row || typeof row.id !== "string") continue;
-    // The kernel only lists servable rows today; honour an explicit `false`.
-    if (row.imajin?.servable === false) continue;
-    const id = row.id.trim();
-    if (!id || /[\s*]/.test(id) || seenIds.has(id)) continue;
+    const id = catalogRowId(row);
+    if (!id || seenIds.has(id)) continue;
     seenIds.add(id);
     const metadata = projectCatalogMetadata(row.imajin);
-    const connector = metadata.connector;
+    const connector = catalogConnector(row, metadata.connector);
+    const family = connector ? inferenceFamily(connector) : undefined;
+    if (connector && !family) {
+      logger?.warn(`[imajin-plugin] unknown inference connector ${JSON.stringify(connector.slice(0, 80))}; skipped`);
+      continue;
+    }
     models.push({
       id,
       name: connector ? `${id} (via ${connector})` : id,
@@ -197,6 +213,8 @@ export function projectImajinCatalogRows(
       contextWindow: DEFAULT_CONTEXT_WINDOW,
       maxTokens: DEFAULT_MAX_TOKENS,
       ...metadata,
+      ...(connector ? { connector } : {}),
+      ...(family ? { api: family.api } : {}),
     });
   }
   return models;
@@ -222,7 +240,7 @@ export function resolveImajinHealthzUrl(baseUrl: string): string {
 // --- Provider config builder ---
 
 export interface ImajinProviderConfig {
-  api: "openai-completions";
+  api: InferenceApi;
   baseUrl: string;
   apiKey: string;
   models: ImajinRuntimeModel[];
@@ -335,6 +353,7 @@ export class ImajinCatalogCache {
     private readonly ttlMs: number = DEFAULT_CACHE_TTL_MS,
     private readonly now: () => number = Date.now,
     private readonly logger: ImajinDiscoveryLogger = consoleLogger,
+    private readonly assertIdentity?: () => void,
   ) {}
 
   /** Forces the next `get()`/`refresh()` to refetch, regardless of remaining TTL. The last good catalog is kept until then. */
@@ -348,10 +367,13 @@ export class ImajinCatalogCache {
   }
 
   async get(): Promise<ImajinCatalogCacheState> {
+    this.assertIdentity?.();
     if (this.state && !this.stale && this.now() - this.state.fetchedAtMs < this.ttlMs) {
       return this.state;
     }
-    return this.refresh();
+    const state = await this.refresh();
+    this.assertIdentity?.();
+    return state;
   }
 
   /**
@@ -379,7 +401,7 @@ export class ImajinCatalogCache {
           "kernel models response is not an OpenAI list (expected an object with a `data` array)",
         );
       }
-      const models = projectImajinCatalogRows(body);
+      const models = projectImajinCatalogRows(body, this.logger);
       const at = this.now();
       this.stale = false;
       this.state = {
@@ -460,7 +482,7 @@ export interface ImajinDiscoveryHandle {
  * coalesce inside the cache.
  */
 export function startImajinModelDiscovery(
-  cache: Pick<ImajinCatalogCache, "refresh">,
+  cache: { refresh(): Promise<unknown> },
   intervalMs: number,
 ): ImajinDiscoveryHandle {
   void cache.refresh();
@@ -697,6 +719,9 @@ export async function fetchImajinProxyHealthz(baseUrl: string): Promise<ImajinPr
 export interface RegisteredImajinProvider {
   clearAuth(): void;
   discoverSelf(agentId: string): Promise<unknown>;
+  cacheForAgent(agentId: string): Promise<ImajinCatalogCache>;
+  peekAgentCache(agentId: string): ImajinCatalogCache;
+  invalidateAgent(agentId: string): void;
   cache: ImajinCatalogCache;
   baseUrl: string;
   /** Kernel discovery URL + refresh interval, surfaced by `imajin_status`. */
@@ -705,10 +730,8 @@ export interface RegisteredImajinProvider {
   startDiscovery(): ImajinDiscoveryHandle;
 }
 
-export interface RegisterImajinProviderOptions {
+export interface RegisterImajinProviderOptions extends AgentCatalogOptions {
   getIdentity?: (agentId: string) => AgentIdentity | undefined;
-  /** Authenticated kernel client. Omit on an unconfigured install: discovery then reports `unconfigured`. */
-  client?: ImajinKernelRequester;
   nodeUrl?: string;
   /** Overrides the kernel fetcher (tests). */
   fetcher?: ImajinCatalogFetcher;
@@ -730,10 +753,12 @@ export function registerImajinProvider(
   const baseUrl = resolveImajinInferProxyBaseUrl(config);
   const modelsPath = resolveImajinKernelModelsPath(config?.modelDiscovery);
   const refreshIntervalMs = resolveDiscoveryRefreshIntervalMs(config?.modelDiscovery);
-  const fetcher =
-    options.fetcher ?? createImajinKernelModelsFetcher(options.client, { modelsPath });
-  const cache = new ImajinCatalogCache(fetcher, DEFAULT_CACHE_TTL_MS, Date.now, options.logger);
   const auth = new AgentInferenceAuth(options.nodeUrl, options.getIdentity ?? (() => undefined));
+  const catalogs = new AgentCatalogs(auth, options.nodeUrl, modelsPath, options);
+  const runtimeModel = (model: ImajinRuntimeModel) => ({
+    ...model, provider: IMAJIN_PROVIDER_ID, api: model.api ?? "openai-completions",
+    baseUrl: familyBaseUrl(baseUrl, model.api ?? "openai-completions"),
+  });
   const signingHooks = {
     auth: [],
     resolveSyntheticAuth: () => ({
@@ -742,6 +767,7 @@ export function registerImajinProvider(
       mode: "api-key",
     }),
     wrapStreamFn: createAgentInferenceWrapper(auth),
+    wrapSimpleCompletionStreamFn: createAgentInferenceWrapper(auth),
   };
 
   api.registerProvider({
@@ -751,18 +777,16 @@ export function registerImajinProvider(
     // No user-entered credential exists for this provider (see module doc
     // "Auth") — never prompt for one.
     ...signingHooks,
-    // The gateway catalog is not an authorization allowlist for another agent.
-    resolveDynamicModel: (ctx: { modelId: string }) => {
-      if (!ctx.modelId || /[\s*?#]/.test(ctx.modelId)) return undefined;
-      const model = projectImajinCatalogRows({ data: [{ id: ctx.modelId }] })[0];
-      return model ? { ...model, provider: IMAJIN_PROVIDER_ID, api: "openai-completions", baseUrl } : undefined;
+    // Never guess the wire protocol or borrow the gateway agent's catalog.
+    prepareDynamicModel: async (ctx: CatalogContext & { modelId: string }) => {
+      const model = (await catalogs.models(ctx)).find((entry) => entry.id === ctx.modelId);
+      return model ? runtimeModel(model) : undefined;
     },
+    normalizeResolvedModel: (ctx: { model: ImajinRuntimeModel }) => runtimeModel(ctx.model),
     catalog: {
       order: "simple",
-      run: async () => {
-        const state = await cache.get();
-        return { provider: buildImajinProviderConfig({ baseUrl, models: state.models }) };
-      },
+      run: async (ctx?: CatalogContext) =>
+        ({ provider: buildImajinProviderConfig({ baseUrl, models: await catalogs.models(ctx) }) }),
     },
     // Static seed is intentionally EMPTY (#36 spec): before the first
     // successful discovery there is nothing to advertise.
@@ -774,18 +798,23 @@ export function registerImajinProvider(
 
   // Literal owners are necessary: config-only providers do not inherit imajin hooks.
   for (const id of IMAJIN_PROVIDER_IDS.slice(1)) {
-    api.registerProvider({ id, label: `${id} (calling-agent auth)`, ...signingHooks });
+    api.registerProvider({
+      id, label: `${id} (calling-agent auth)`, ...signingHooks,
+    });
   }
 
   return {
-    clearAuth: () => auth.clear(),
+    clearAuth: () => { auth.clear(); catalogs.clear(); },
     discoverSelf: (agentId) => auth.discoverSelf(agentId),
-    cache,
+    cacheForAgent: (agentId) => catalogs.forAgent(agentId),
+    peekAgentCache: (agentId) => catalogs.peekAgent(agentId),
+    invalidateAgent: (agentId) => catalogs.invalidate(agentId),
+    get cache() { return catalogs.peekGateway(); },
     baseUrl,
     discovery: {
       modelsUrl: resolveImajinKernelModelsUrl(options.nodeUrl, modelsPath),
       refreshIntervalMs,
     },
-    startDiscovery: () => startImajinModelDiscovery(cache, refreshIntervalMs),
+    startDiscovery: () => startImajinModelDiscovery(catalogs, refreshIntervalMs),
   };
 }

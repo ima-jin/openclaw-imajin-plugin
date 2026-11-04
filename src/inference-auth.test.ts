@@ -310,6 +310,50 @@ describe("calling-agent provider wire contract", () => {
     expect(mints[0].principalDid).toBe("did:imajin:main");
   });
 
+  it.each([
+    ["main", "/anthropic/v1/messages"], ["artifact", "/anthropic/v1/messages"],
+    ["main", "/anthropic/v1/messages/count_tokens"], ["artifact", "/anthropic/v1/messages/count_tokens"],
+  ])("%s signs %s with its own app JWT, stripping inherited secrets but retaining Anthropic headers", async (agentId, path) => {
+    if (agentId === "main") identities.set("main", agent("main"));
+    const headers = {
+      aUtHoRiZaTiOn: "inherited-marker", "X-API-KEY": "inherited-marker", "Api-Key": "inherited-marker",
+      "X-Acting-As": "did:imajin:wrong", "X-Acting-For": "did:imajin:wrong", Cookie: "inherited-marker",
+      "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31",
+    };
+    const transport: StreamFn = async function* (current, _context, options) {
+      const response = await fetch(`${current.baseUrl}${path.slice("/anthropic".length)}`, {
+        method: "POST", headers: { ...current.headers, ...options?.headers },
+        body: JSON.stringify({ model: current.id, messages: [] }),
+      });
+      expect(response.status).toBe(200);
+      yield { type: "done", reason: "stop", message: message() };
+    };
+    const providers: any[] = [];
+    registerImajinProvider({ registerProvider: (definition) => providers.push(definition) }, {
+      inferProxyBaseUrl: `${baseUrl}/openai/v1`,
+    }, {
+      nodeUrl: baseUrl, getIdentity: (id) => identities.get(id),
+      fetcher: async () => ({ data: [{ id: model.id, owned_by: "anthropic" }] }),
+    });
+    const provider = providers.find((entry) => entry.id === "imajin");
+    const discovered = await provider.prepareDynamicModel({ agentId, modelId: model.id });
+    expect(discovered).toMatchObject({
+      provider: "imajin", connector: "anthropic", api: "anthropic-messages", baseUrl: `${baseUrl}/anthropic`,
+    });
+    await events(provider.wrapStreamFn({ agentId, streamFn: transport })(
+      { ...model, ...discovered, headers }, {}, { headers, apiKey: "inherited-marker" },
+    ));
+    const request = requests.at(-1)!;
+    expect(request.url).toBe(path);
+    expect(verifyAssignedAgentRequest(new Headers(request.headers as Record<string, string>), kernelKey.publicKey, controller))
+      .toMatchObject({ status: 200, appAuth: { appDid: `did:imajin:${agentId}`, userDid: `did:imajin:${agentId}` } });
+    expect(request.headers["x-acting-as"]).toBe(agentId === "artifact" ? "did:imajin:org" : undefined);
+    for (const header of ["x-api-key", "api-key", "x-acting-for", "cookie"]) expect(request.headers[header]).toBeUndefined();
+    expect(request.headers["anthropic-version"]).toBe("2023-06-01");
+    expect(request.headers["anthropic-beta"]).toBe("prompt-caching-2024-07-31");
+    expect(JSON.stringify(request.headers)).not.toContain("inherited-marker");
+  });
+
   it("reuses cached credentials and coalesces concurrent mints", async () => {
     await Promise.all([events(call("main")), events(call("main"))]);
     await events(call("main"));
@@ -332,6 +376,12 @@ describe("calling-agent provider wire contract", () => {
   });
   it("missing streamFn fails closed", () => {
     expect(() => createAgentInferenceWrapper(auth)({ agentId: "main" })).toThrow("streamFn");
+  });
+  it("a preconfigured SDK client cannot bypass the signed transport", async () => {
+    const wrapped = createAgentInferenceWrapper(auth)({ agentId: "artifact", streamFn: inner });
+    await expect(wrapped(model, {}, { client: { apiKey: "inherited-client-marker" } })).rejects.toThrow("preconfigured provider clients");
+    expect(mints).toEqual([]);
+    expect(requests).toEqual([]);
   });
   it("invalid actAs fails before mint/transport and does not disclose its value", () => {
     identities.get("artifact")!.config.actAs = "invalid-selector";

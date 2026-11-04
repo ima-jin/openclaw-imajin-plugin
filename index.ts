@@ -352,7 +352,6 @@ export default definePluginEntry({
       api,
       { inferProxyBaseUrl: config?.inferProxyBaseUrl, modelDiscovery: config?.modelDiscovery },
       {
-        client: config?.keypairPath ? client : undefined,
         nodeUrl: config?.nodeUrl,
       },
     );

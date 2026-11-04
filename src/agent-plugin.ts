@@ -7,9 +7,9 @@ import { createNotificationInjector, WAKE_RUNTIME_HOOKS } from "./notification-i
 import { createReachEventHandler, isReachFrame } from "./reach-events.js";
 import { PluginServiceRuntime } from "./plugin-service-runtime.js";
 import {
-  registerImajinProvider, createImajinKernelModelsFetcher, resolveImajinKernelModelsPath,
-  isImajinCatalogInvalidationScope, ImajinDiscoveryError, type ImajinModelDiscoveryConfig,
+  registerImajinProvider, isImajinCatalogInvalidationScope, type ImajinModelDiscoveryConfig,
 } from "./imajin-provider.js";
+import { createImajinDefaultRouter } from "./imajin-default-routing.js";
 import { resolveImajinMcpUrl } from "./kernel-mcp.js";
 import { createWakeReportTool, type WakeDisclosureSender } from "./wake-report-tool.js";
 import { registerGatewayPublishing } from "./gateway-publishing.js";
@@ -70,26 +70,37 @@ export function registerAgentPlugin(api: any, config: {
   const getGatewayIdentity = () => gatewayIdentity;
   const senders = new Map<string, WakeDisclosureSender>();
   const sockets = new Map<string, ImajinWsService>();
-  // One global catalog, using only the already-resolved gateway identity.
+  let preparing: Promise<void> | undefined;
+  let identityGeneration = 0;
+  let retired = false;
+  const prepareIdentities = () => {
+    if (retired) return Promise.reject(new Error("Agent identity runtime is no longer active"));
+    if (!config.nodeUrl || !config.agents) return Promise.resolve();
+    const generation = identityGeneration;
+    preparing ??= identities.prepare(
+      config.nodeUrl, config.agents, api.runtime?.config?.current?.() ?? api.config ?? {},
+      resolveAgentSigner, () => generation === identityGeneration,
+    );
+    return preparing;
+  };
   const provider = registerImajinProvider(api, config, {
     nodeUrl: config.nodeUrl,
     getIdentity: (agentId) => identities.get(agentId),
-    fetcher: async () => {
-      try {
-        return await createImajinKernelModelsFetcher(getGatewayIdentity()?.client, {
-          modelsPath: resolveImajinKernelModelsPath(config.modelDiscovery),
-        })();
-      } catch (err) {
-        // Auth/provider failures may contain protected upstream response data.
-        const failure = err instanceof ImajinDiscoveryError ? err : undefined;
-        throw new ImajinDiscoveryError(
-          failure?.kind ?? "unreachable", "Gateway model discovery unavailable", failure?.httpStatus,
-        );
-      }
-    },
+    gatewayAgent: config.gatewayAgent,
+    agentIds: Object.keys(config.agents ?? {}),
+    prepareIdentities,
+    logger: console,
+  });
+  const defaultRouter = createImajinDefaultRouter({
+    cache: provider.cache, cacheForAgent: provider.cacheForAgent,
+    gatewayAgent: config.gatewayAgent, baseUrl: provider.baseUrl,
+    getConfig: () => api.runtime?.config?.current?.() ?? api.config ?? {},
   });
   const runtime = new PluginServiceRuntime(api.registrationMode, async (lifecycle, on) => {
-    lifecycle.add(() => { provider.clearAuth(); identities.clear(); senders.clear(); sockets.clear(); gatewayIdentity = undefined; });
+    lifecycle.add(() => { retired = true; identityGeneration++; provider.clearAuth(); identities.clear(); preparing = undefined; senders.clear(); sockets.clear(); gatewayIdentity = undefined; });
+    on("before_model_resolve", defaultRouter.beforeModelResolve, { name: "imajin-default:model" });
+    on("before_agent_run", defaultRouter.beforeAgentRun, { name: "imajin-default:gate" });
+    on("agent_end", defaultRouter.onAgentEnd, { name: "imajin-default:end" });
     const startDiscovery = () => {
       const discovery = provider.startDiscovery();
       lifecycle.add(() => discovery.stop());
@@ -106,10 +117,7 @@ export function registerAgentPlugin(api: any, config: {
       startDiscovery();
       return;
     }
-    await identities.prepare(
-      config.nodeUrl, config.agents, api.runtime?.config?.current?.() ?? api.config ?? {},
-      resolveAgentSigner, () => lifecycle.active,
-    );
+    await prepareIdentities();
     if (!lifecycle.active) return;
     const selected = typeof config.gatewayAgent === "string" ? identities.get(config.gatewayAgent) : undefined;
     if (!selected) warnGateway("missing or unresolvable gatewayAgent");
@@ -160,9 +168,8 @@ export function registerAgentPlugin(api: any, config: {
         if (isReachFrame(frame)) {
           void reach.handle(frame).catch(() => console.warn("[imajin-plugin] agent reach delivery failed"));
         } else if (isNotificationFrame(frame)) {
-          if (identity === selected && isImajinCatalogInvalidationScope(frame.scope)) {
-            provider.cache.invalidate();
-            void provider.cache.refresh();
+          if (isImajinCatalogInvalidationScope(frame.scope)) {
+            provider.invalidateAgent(agentId);
           }
           void injector.inject(frame).catch(() => console.warn("[imajin-plugin] agent notification delivery failed"));
         }
@@ -178,7 +185,7 @@ export function registerAgentPlugin(api: any, config: {
     if (!diagnostic) return null;
     const identity = identities.get(ctx.agentId);
     const status = createImajinStatusTool({
-      baseUrl: provider.baseUrl, cache: provider.cache, discovery: provider.discovery,
+      baseUrl: provider.baseUrl, cache: provider.peekAgentCache(ctx.agentId!), discovery: provider.discovery,
       mcpUrl: resolveImajinMcpUrl(config, provider.baseUrl), nodeUrl: config.nodeUrl,
       getConfig: () => api.runtime?.config?.current?.(),
       getIdentity: () => identities.status(
@@ -238,6 +245,9 @@ export function registerAgentPlugin(api: any, config: {
     }
   }
   for (const hook of LOOP_LIFECYCLE_HOOKS) runtime.registerHook(api, hook, `imajin-loops:${hook}`);
+  runtime.registerHook(api, "before_model_resolve", "imajin-default:model", -100);
+  runtime.registerHook(api, "before_agent_run", "imajin-default:gate");
+  runtime.registerHook(api, "agent_end", "imajin-default:end");
   runtime.registerHook(api, "session_start", "imajin-gateway:horizon");
   runtime.registerHook(api, "agent_end", "turn-usage-attestation");
   api.registerService({ id: "imajin-ws", start: runtime.start, stop: runtime.stop });

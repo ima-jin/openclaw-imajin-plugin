@@ -2214,12 +2214,11 @@ re-mints once as the same caller, before any output is delivered. Another
 never stripped. JWTs, signatures and private material are not logged or
 projected into status; credential-bearing error diagnostics are redacted.
 
-Global discovery remains a gateway-scoped catalog read because its SDK
-context has no caller. It is not inference authorization: `resolveDynamicModel`
-accepts an explicit `imajin/<id>` absent from the gateway catalog and lets the
-kernel authorize it per call. OpenClaw's explicit model policy still applies.
-Per-agent pickers/catalogs and non-inference principal paths are recorded in
-the PR audit, not silently routed through main. Native audit remainders under
+Discovery now uses each agent's own app JWT and configured `actAs`, just like
+inference. Agent-scoped SDK catalogs identify their signer through `agentDir`;
+context-free CLI catalogs explicitly use and log `gatewayAgent` as signer.
+Unknown agent directories and unavailable identities fail closed, never through
+main. OpenClaw's explicit model policy still applies. Non-inference audit remainders under
 #150 are #152 (MCP), #153 (approval-origin attribution), #154 (tenant publishing)
 and #155 (legacy singleton retirement).
 
@@ -2320,20 +2319,51 @@ Zero-cost turns remain visible. Failed publishes are dropped with value-free
 warnings, without retries or failing the turn. Legacy mode keeps its original
 internal endpoint and publisher behavior unchanged.
 
-### Map-mode model discovery (#141)
+### Agent-signed Anthropic doorway (imajin-ai#3198)
 
-The global `imajin/*` catalog uses the existing `getGatewayIdentity()` client:
-the selected entry's sealed signer, DID session and `actAs`, resolved once at
-service startup, never re-resolved per catalog fetch or tenant. Top-level
-`modelDiscovery` settings (route and refresh interval) and `inferProxyBaseUrl`
-keep their existing meaning. Discovery starts after identity resolution,
-refreshes periodically and lazily, and responds to catalog invalidation
-notifications only on the selected gateway socket. Stop/replacement retires
-the scheduler and the client reference.
+In map mode, `GET {nodeUrl}/infer/v1/models/usable` uses the calling agent's
+kernel `app+jwt` in `Authorization: Bearer` and its configured `x-acting-as`.
+It no longer uses the gateway's session cookie or `X-Acting-For`. Cache entries
+are isolated by agent, signer generation and selector; each agent's connector
+notifications refresh only its own catalog. Startup discovery waits for sealed
+identity resolution. CLI discovery can resolve sealed identities lazily without
+starting gateway sockets or editing configuration. A context-free catalog
+requires explicit `gatewayAgent` and prints the selected signer; a supplied
+agent directory must match exactly one configured agent.
 
-Without a valid resolved `gatewayAgent`, discovery remains `unconfigured`
-and makes no authenticated request, even if tenant identities or legacy
-top-level credentials exist. Tenant tools and sockets keep their own sessions;
-they cannot supply, borrow, or trigger refresh with the gateway discovery
-session. Publishing the global catalog grants no tenant approvals or session
-command authority. Legacy configuration without `agents` is unchanged.
+The `imajin/*` catalog takes its wire protocol from kernel connector metadata,
+not model-name prefixes. The single table in `src/inference-families.ts` maps
+OpenAI-compatible connectors to `openai-completions` at
+`http://127.0.0.1:8787/openai/v1`, and Anthropic to `anthropic-messages` at
+`http://127.0.0.1:8787/anthropic`. The SDK's per-model API plus
+`normalizeResolvedModel` selects the correct URL within the mixed catalog.
+Unknown connector families are skipped and logged rather than guessed.
+
+Both `/anthropic/v1/messages` and `/anthropic/v1/messages/count_tokens` use
+agent credentials; inherited authorization, API-key, acting-as, acting-for
+and cookie headers are removed first. `anthropic-version` and `anthropic-beta`
+pass through. Unavailable identities fail closed, never borrowing an environment
+key, another agent or the built-in Anthropic provider. Discovery refusals log
+bounded kernel error code/message fields with credential redaction.
+
+An agent without an explicit model, other than `gatewayAgent`, follows its own
+kernel connector pick through `imajin/<model>`. Main keeps its configured model.
+A successful empty agent catalog leaves its configured model alone; an identity,
+discovery or policy refusal blocks the pending automatic route. Explicit agent
+models and session selections distinct from the configured default stay pinned.
+There is no session-level act-as switch.
+
+**Migration:** `imajin/*` is the only family route. Legacy `imajin-openai` /
+`imajin-xai` allow-list refs retire through the existing `imajin-catalog`
+approval-card path after their canonical replacements are allowed and lanes are
+repointed (see **Operator-approved live allow-list** above). This is not a
+legacy-provider support promise. Provider-block cleanup remains an operator
+choice; the plugin never deletes, migrates or rewrites those blocks or any host
+configuration.
+
+**Live proof still required:** with the branch build loaded on the gateway,
+capture `openclaw models list --provider imajin`, the Artifact turn's resolved
+provider/model, a correlated passthrough/kernel usage record identifying
+`/anthropic`, Artifact's signer DID and `@artifact` acting principal, and
+unchanged before/after SHA-256 of `~/.openclaw/openclaw.json`. Tests are not a
+substitute for this operator proof.

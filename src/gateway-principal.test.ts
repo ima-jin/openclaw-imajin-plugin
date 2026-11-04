@@ -38,6 +38,7 @@ vi.mock("./imajin-provider.js", async (original) => ({
   ...await original<object>(),
   registerImajinProvider: () => ({
     clearAuth: vi.fn(),
+    peekAgentCache: () => ({}),
     baseUrl: "http://proxy.invalid", cache: {}, discovery: {},
     startDiscovery: () => ({ stop: vi.fn() }),
   }),

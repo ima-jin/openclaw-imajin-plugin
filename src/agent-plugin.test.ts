@@ -16,6 +16,9 @@ const mocks = vi.hoisted(() => ({
   }>,
 }));
 vi.mock("openclaw/plugin-sdk/plugin-entry", () => ({ definePluginEntry: (entry: unknown) => entry }));
+vi.mock("openclaw/plugin-sdk/agent-runtime", () => ({
+  resolveAgentDir: (_config: unknown, id: string) => `/agents/${id}/agent`,
+}));
 vi.mock("./agent-identities.js", async (original) => ({
   ...await original<object>(), resolveAgentSigner: mocks.signer,
 }));
@@ -195,15 +198,19 @@ describe("identity card registration and calling-agent isolation", () => {
   });
 });
 
-describe("gateway model discovery (#141)", () => {
-  const models = { data: [{ id: "picked-model", imajin: { connector: "test", picked: true } }] };
+describe("agent-signed model discovery (imajin-ai#3198)", () => {
+  const models = { data: [{ id: "picked-model", imajin: { connector: "anthropic", picked: true } }] };
 
   beforeEach(() => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(AgentInferenceAuth.prototype, "credential").mockImplementation(async (id) =>
+      ({ token: `fixture-${id}`, expiresAt: Date.now() + 600_000 }));
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json(models)));
   });
 
-  it.each(["store", "exec"] as const)("uses only the selected %s-backed gateway session; tenant tools keep their own session", async (source) => {
+  it.each(["store", "exec"] as const)("CLI resolves the %s-backed gateway signer lazily; discovery and tenant tools keep distinct auth", async (source) => {
     const main = agent("main");
     main.keypair.source = source;
     const wire: Array<{ path: string; body: any; headers: any }> = [];
@@ -226,25 +233,26 @@ describe("gateway model discovery (#141)", () => {
       inferProxyBaseUrl: "http://proxy.invalid/openai/v1",
     });
     const catalog = registry.providers[0].catalog;
-    expect((await catalog.run()).provider.models).toEqual([]);
-    expect(wire).toEqual([]);
+    expect((await catalog.run()).provider.models[0].api).toBe("anthropic-messages");
+    expect(mocks.sockets).toEqual([]);
     await registry.start();
     await vi.waitFor(() => expect(wire.some((row) => row.path === "/custom/models")).toBe(true));
     const discovered = (await catalog.run()).provider;
     expect(discovered.models.map((model: any) => `imajin/${model.id}`)).toEqual(["imajin/picked-model", "imajin/default"]);
     expect(discovered.baseUrl).toBe("http://proxy.invalid/openai/v1");
     const discovery = wire.find((row) => row.path === "/custom/models")!;
-    expect(discovery.headers).toMatchObject({
-      Cookie: "session=did:imajin:main", "X-Agent-DID": main.did, "X-Acting-For": main.actAs,
-    });
-    expect(wire.filter((row) => row.path.endsWith("/challenge")).map((row) => row.body.did)).toEqual([main.did]);
+    expect(discovery.headers).toEqual({ Authorization: "Bearer fixture-main", "x-acting-as": main.actAs });
+    expect(wire.filter((row) => row.path.endsWith("/challenge"))).toEqual([]);
+    expect(console.info).toHaveBeenCalledWith(expect.stringContaining("signer: agents.main"));
     const tenantTool = registry.agentTools({ agentId: "tenant" }).find((tool) => tool.name === "imajin_identity");
     await tenantTool.execute("lookup", { action: "lookup", query: "did:imajin:lookup" });
     expect(wire.find((row) => row.path.includes("/lookup/"))!.headers).toMatchObject({
       Cookie: "session=did:imajin:tenant", "X-Agent-DID": "did:imajin:tenant",
       "X-Acting-For": "did:imajin:org-tenant",
     });
-    expect(wire.filter((row) => row.path === "/custom/models")).toHaveLength(1);
+    expect(wire.filter((row) => row.path === "/custom/models")).toHaveLength(3);
+    const tenantCatalog = await catalog.run({ agentDir: "/agents/tenant/agent" });
+    expect(tenantCatalog.provider.models[0].api).toBe("anthropic-messages");
     expect(mocks.signer).toHaveBeenCalledTimes(2);
   });
 
@@ -257,9 +265,8 @@ describe("gateway model discovery (#141)", () => {
       modelDiscovery: { refreshIntervalMs: 0 },
     });
     await registry.start();
-    expect((await registry.providers[0].catalog.run()).provider.models).toEqual([]);
+    await expect(registry.providers[0].catalog.run()).rejects.toThrow();
     expect(request).not.toHaveBeenCalled();
-    expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("(unconfigured)"));
   });
 
   it("does not borrow a healthy tenant client when the selected gateway signer fails", async () => {
@@ -274,30 +281,32 @@ describe("gateway model discovery (#141)", () => {
     });
     await registry.start();
     expect(registry.agentTools({ agentId: "tenant" })).toHaveLength(AGENT_TOOL_NAMES.length);
-    expect((await registry.providers[0].catalog.run()).provider.models).toEqual([]);
+    await expect(registry.providers[0].catalog.run()).rejects.toThrow("agents.main");
     expect(request).not.toHaveBeenCalled();
     expect(vi.mocked(console.warn).mock.calls.flat().join(" ")).not.toContain("protected provider detail");
   });
 
-  it.each([401, 403, 500])("does not retry HTTP %s as a tenant or log upstream response data", async (status) => {
-    const request = vi.spyOn(ImajinClient.prototype, "requestRaw").mockResolvedValue({
-      status, contentType: "application/json", text: "protected upstream detail",
-    });
+  it.each([401, 403, 500])("HTTP %s preserves each agent's signer without fallback and logs only safe kernel fields", async (status) => {
+    const request = vi.spyOn(ImajinClient.prototype, "requestRaw");
+    const fetcher = vi.fn(async () => Response.json({
+      error: "membership_required", detail: "protected upstream detail",
+    }, { status }));
+    vi.stubGlobal("fetch", fetcher);
     const registry = register({
       nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
       agents: { main: agent("main"), tenant: agent("tenant") }, modelDiscovery: { refreshIntervalMs: 0 },
     });
     await registry.start();
-    expect((await registry.providers[0].catalog.run()).provider.models).toEqual([]);
-    expect(request).toHaveBeenCalledOnce();
+    if (status === 500) expect((await registry.providers[0].catalog.run()).provider.models).toEqual([]);
+    else await expect(registry.providers[0].catalog.run()).rejects.toThrow("membership_required");
+    await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
+    expect(request).not.toHaveBeenCalled();
     expect(vi.mocked(console.warn).mock.calls.flat().join(" ")).not.toContain("protected upstream detail");
   });
 
-  it("refreshes once globally, accepts invalidation only from the gateway, and retires discovery on replacement/stop", async () => {
+  it("refreshes per agent, accepts tenant invalidation, and retires discovery on replacement/stop", async () => {
     vi.useFakeTimers();
-    const request = vi.spyOn(ImajinClient.prototype, "requestRaw").mockResolvedValue({
-      status: 200, contentType: "application/json", text: JSON.stringify(models),
-    });
+    const request = vi.mocked(fetch);
     const config = {
       nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
       agents: { main: agent("main"), tenant: agent("tenant") }, modelDiscovery: { refreshIntervalMs: 10_000 },
@@ -305,35 +314,58 @@ describe("gateway model discovery (#141)", () => {
     const registry = register(config);
     await registry.start();
     await registry.providers[0].catalog.run();
-    expect(request).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(request).toHaveBeenCalledTimes(2);
     const frame = { type: "notification", id: "catalog", scope: "connector.models.changed", title: "Changed" };
     mocks.sockets[1].frame?.(frame);
     await vi.advanceTimersByTimeAsync(0);
-    expect(request).toHaveBeenCalledOnce();
+    expect(request).toHaveBeenCalledTimes(3);
     mocks.sockets[0].frame?.(frame);
     await vi.advanceTimersByTimeAsync(0);
-    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenCalledTimes(4);
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(request).toHaveBeenCalledTimes(3);
+    expect(request).toHaveBeenCalledTimes(6);
     const metadata = register(config, "tool-discovery");
     await metadata.start();
     await metadata.providers[0].catalog.run();
-    expect(request).toHaveBeenCalledTimes(3);
-    expect(mocks.signer).toHaveBeenCalledTimes(2);
-    const replacement = register({ ...config, gatewayAgent: undefined });
+    expect(request).toHaveBeenCalledTimes(7);
+    expect(mocks.signer).toHaveBeenCalledTimes(4);
+    const replacement = register({ ...config, agents: {}, gatewayAgent: undefined });
     await replacement.start();
     await vi.advanceTimersByTimeAsync(60_001);
-    await registry.providers[0].catalog.run();
-    expect(request).toHaveBeenCalledTimes(3);
+    await expect(registry.providers[0].catalog.run()).rejects.toThrow("no longer active");
+    expect(request).toHaveBeenCalledTimes(7);
     await replacement.stop();
     await vi.advanceTimersByTimeAsync(60_001);
-    await replacement.providers[0].catalog.run();
-    expect(request).toHaveBeenCalledTimes(3);
+    await expect(replacement.providers[0].catalog.run()).rejects.toThrow("gatewayAgent");
+    expect(request).toHaveBeenCalledTimes(7);
     expect(mocks.signer).toHaveBeenCalledTimes(4);
+  });
+
+  it("registered tenant-default hooks select the caller's Anthropic model without editing host config", async () => {
+    const config = {
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { main: agent("main"), artifact: agent("artifact") },
+      modelDiscovery: { refreshIntervalMs: 0 }, loops: { enabled: false }, attestation: { enabled: false },
+    };
+    const before = JSON.stringify(config);
+    const registry = register(config);
+    await registry.start();
+    const ctx = { agentId: "artifact", runId: "artifact-turn", modelProviderId: "anthropic", modelId: "direct" };
+    const results = await Promise.all(registry.emit("before_model_resolve", {}, ctx));
+    expect(results).toContainEqual({ providerOverride: "imajin", modelOverride: "picked-model" });
+    const mainResults = await Promise.all(registry.emit("before_model_resolve", {}, { ...ctx, agentId: "main", runId: "main-turn" }));
+    expect(mainResults.every((result) => result === undefined)).toBe(true);
+    const model = await registry.providers[0].prepareDynamicModel({
+      agentDir: "/agents/artifact/agent", modelId: "picked-model",
+    });
+    expect(model).toMatchObject({ api: "anthropic-messages", baseUrl: "http://127.0.0.1:8787/anthropic" });
+    expect(JSON.stringify(config)).toBe(before);
   });
 });
 describe("per-agent plugin registration", () => {
   function statusTransport() {
+    vi.spyOn(AgentInferenceAuth.prototype, "credential").mockRejectedValue(new Error("test discovery unavailable"));
     vi.spyOn(ImajinClient.prototype, "requestRaw").mockResolvedValue({
       status: 200, contentType: "application/json", text: JSON.stringify({ data: [] }),
     });
@@ -382,7 +414,7 @@ describe("per-agent plugin registration", () => {
       expect(JSON.stringify(report)).not.toContain(protectedValue);
     }
     expect(mocks.signer).toHaveBeenCalledTimes(2);
-    expect(ImajinClient.prototype.requestRaw).toHaveBeenCalledTimes(1); // startup discovery only
+    expect(ImajinClient.prototype.requestRaw).not.toHaveBeenCalled(); // discovery never uses a session
     expect(fetch).toHaveBeenCalledTimes(4); // one existing health + MCP probe per call
     await registry.stop();
   });
@@ -438,7 +470,7 @@ describe("per-agent plugin registration", () => {
     expect(mocks.signer).not.toHaveBeenCalled();
   });
 
-  it("reports a missing legacy keypair as a warning rather than failing status", async () => {
+  it("legacy discovery stays unconfigured without attempting a missing file identity", async () => {
     statusTransport();
     vi.mocked(ImajinClient.prototype.requestRaw).mockRestore();
     vi.spyOn(console, "warn").mockImplementation(() => {});
@@ -450,9 +482,10 @@ describe("per-agent plugin registration", () => {
     const report = await tool.execute();
     expect(report.details.identity).toMatchObject({
       mode: "legacy", did: "did:imajin:legacy",
-      auth: { ok: false, error: "Authentication failed" },
-      warnings: ["Identity authentication unavailable"],
+      auth: null,
+      warnings: [],
     });
+    expect(report.details.lastDiscovery.outcome).toBe("unconfigured");
   });
   it("fails closed for unknown agents even with a complete main identity configured", async () => {
     const registry = register({
