@@ -50,6 +50,7 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_cloudflare` | Cloudflare | DNS-only writes, classification, proxy/cache previews and human-approved proposals, settings/SSL, custom hostnames and signed history through kernel-only zone grants; never fetches a Cloudflare token (#98) |
 
 ### Calling-agent identity card (imajin-ai#3251)
+GitHub live-verification work (#163) must use a supported host SDK call; cached status alone never proves Observed live.
 
 Call `imajin_identity_card` with no arguments. It returns data in the existing
 agent-signed `{from, type, timestamp, payload, signature}` envelope, not a chat
