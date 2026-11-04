@@ -93,6 +93,13 @@ describe("calling-agent provider wire contract", () => {
       }
       const status = statuses.shift() ?? 200;
       res.statusCode = status;
+      if (req.url === "/infer/v1/self") {
+        res.end(JSON.stringify(status === 200 ? {
+          identity: { did: verified.appAuth?.appDid, actAs: verified.appAuth?.actingAs ?? null },
+          connectors: [], usableModels: [],
+        } : { error: outputText }));
+        return;
+      }
       if (status === 200 && JSON.parse(body).stream) {
         res.setHeader("Content-Type", "text/event-stream");
         res.end(`data: ${JSON.stringify({
@@ -135,6 +142,37 @@ describe("calling-agent provider wire contract", () => {
 
   const call = (id: string, stream?: StreamFn) =>
     createAgentInferenceWrapper(auth)({ agentId: id, streamFn: stream ?? inner })(model, {}, {});
+  it.each(["main", "artifact"])("%s self-discovery uses own app-token, never a session cookie or another agent", async (agentId) => {
+    const identity = identities.get(agentId)!;
+    const snapshot = await auth.discoverSelf(agentId);
+    expect(snapshot).toMatchObject({ identity: { did: identity.config.did, actAs: identity.config.actAs } });
+    expect(mints).toHaveLength(1);
+    expect(mints[0]).toMatchObject({ appDid: identity.config.did, principalDid: identity.config.did });
+    const request = requests.at(-1)!;
+    expect(request.method).toBe("GET");
+    expect(request.url).toBe("/infer/v1/self");
+    expect(request.headers["x-acting-as"]).toBe(identity.config.actAs);
+    expect(request.headers["cache-control"]).toBe("no-store");
+    expect(request.headers.cookie).toBeUndefined();
+    expect(request.headers["x-acting-for"]).toBeUndefined();
+    const token = (await auth.credential(agentId)).token;
+    expect(request.headers.authorization).toBe(`Bearer ${token}`);
+    expect(mints).toHaveLength(1);
+  });
+
+  it.each([401, 403, 404, 429, 503])("self-discovery HTTP %s stays status-only with no retry/fallback", async (status) => {
+    outputText = randomUUID();
+    statuses = [status];
+    await expect(auth.discoverSelf("artifact")).rejects.toMatchObject({ status, message: expect.not.stringContaining(outputText) });
+    expect(mints).toHaveLength(1);
+    expect(requests).toHaveLength(1);
+  });
+
+  it.each(["", "absent", "__proto__", " other"])("self-discovery rejects invalid caller %# before mint", async (agentId) => {
+    await expect(auth.discoverSelf(agentId)).rejects.toThrow("Imajin inference");
+    expect(mints).toHaveLength(0);
+    expect(requests).toHaveLength(0);
+  });
 
   it.each([
     { agentId: "main", context: "main→Ryan" },

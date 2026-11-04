@@ -5,6 +5,7 @@ import { AGENT_TOOL_NAMES, type AgentIdentityConfig } from "./agent-identities.j
 import { beginRegistration } from "./registration-lifecycle.js";
 import { ImajinClient } from "./client.js";
 import { randomUUID } from "node:crypto";
+import { AgentInferenceAuth } from "./inference-auth.js";
 
 const mocks = vi.hoisted(() => ({
   signer: vi.fn(),
@@ -96,13 +97,13 @@ function agent(id: string, tools?: string[]): AgentIdentityConfig {
   };
 }
 
-function register(config: any, registrationMode = "full") {
+function register(config: any, registrationMode = "full", runtime?: unknown) {
   const tools: any[] = [];
   const services: any[] = [];
   const providers: any[] = [];
   const hooks: Array<{ name: string; handler: (...args: any[]) => unknown }> = [];
   plugin.register({
-    pluginConfig: config, registrationMode, config: { secrets: {} },
+    pluginConfig: config, registrationMode, config: { secrets: {} }, runtime,
     registerProvider: (provider: any) => providers.push(provider),
     registerTool: (tool: any) => tools.push(tool),
     registerService: (service: any) => services.push(service),
@@ -130,6 +131,68 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe("identity card registration and calling-agent isolation", () => {
+  beforeEach(() => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(ImajinClient.prototype, "requestRaw").mockResolvedValue({
+      status: 200, contentType: "application/json", text: JSON.stringify({ data: [] }),
+    });
+  });
+
+  it("registers no-arg cards for each agent with its signer, own kernel request, channel and GitHub scope", async () => {
+    const discover = vi.spyOn(AgentInferenceAuth.prototype, "discoverSelf").mockImplementation(async (id) => ({
+      identity: { did: `did:imajin:${id}`, handle: id, kind: "agent", tier: "hard", actAs: `did:imajin:org-${id}` },
+      connectors: [], usableModels: [],
+    }));
+    const gateway = vi.fn(async (_method, params) => ({
+      agentId: params.agentId, selectedScope: "agent", selected: { configured: false },
+      effective: { source: "system-detected", credentialKind: "native", credentialState: "available",
+        evidence: "github-api", account: { login: "host-user" } },
+    }));
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { main: agent("main"), artifact: agent("artifact") },
+      modelDiscovery: { refreshIntervalMs: 0 }, loops: { enabled: false }, attestation: { enabled: false },
+    }, "full", { gateway: { request: gateway } });
+    await registry.start();
+    for (const agentId of ["main", "artifact"]) {
+      const tool = registry.agentTools({
+        agentId, sessionKey: `agent:${agentId}:telegram:direct:example`,
+        activeModel: { provider: "imajin", modelId: "claude-test" },
+        getRuntimeConfig: () => ({ bindings: [{ agentId, match: { channel: "telegram", accountId: `${agentId}-bot` } }] }),
+      }).find((tool) => tool.name === "imajin_identity_card");
+      expect(tool.parameters).toEqual({ type: "object", properties: {}, additionalProperties: false });
+      const card = (await tool.execute()).details;
+      expect(card.from).toBe(`did:imajin:${agentId}`);
+      expect(card.payload.identity.did).toBe(card.from);
+      expect(card.payload.rows.find((row: any) => row.connector === "channels").outboundIdentity).toBe(`${agentId}-bot`);
+      expect(card.signature).toContain(`fake:${card.from}:`);
+      expect(discover).toHaveBeenLastCalledWith(agentId);
+      expect(gateway).toHaveBeenLastCalledWith("tools.github.status",
+        { agentId, selectedScope: "agent" }, { timeoutMs: 5_000 });
+    }
+    expect(registry.agentTools({ agentId: "absent" })).toEqual([]);
+    await registry.stop();
+  });
+
+  it("respects tool allowlists and never uses legacy or gateway credentials for a missing identity", async () => {
+    const registry = register({
+      nodeUrl: "https://kernel.invalid",
+      agents: { main: agent("main", []), artifact: agent("artifact", ["imajin_identity_card"]) },
+      did: "did:imajin:legacy", keypairPath: "/must-not-read", modelDiscovery: { refreshIntervalMs: 0 },
+    });
+    await registry.start();
+    expect(registry.agentTools({ agentId: "main" })).toEqual([]);
+    expect(registry.agentTools({ agentId: "artifact" }).map((tool) => tool.name)).toEqual(["imajin_identity_card"]);
+    expect(registry.agentTools({})).toEqual([]);
+    await registry.stop();
+    const legacy = register({ nodeUrl: "https://kernel.invalid", did: "did:imajin:legacy" });
+    const tool = legacy.agentTools({ agentId: "artifact" }).find((tool) => tool.name === "imajin_identity_card");
+    expect((await tool.execute()).details).toEqual({ error: "Calling-agent signing identity unavailable" });
+  });
 });
 
 describe("gateway model discovery (#141)", () => {

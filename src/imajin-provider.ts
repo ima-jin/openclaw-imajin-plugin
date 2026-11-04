@@ -696,6 +696,7 @@ export async function fetchImajinProxyHealthz(baseUrl: string): Promise<ImajinPr
 
 export interface RegisteredImajinProvider {
   clearAuth(): void;
+  discoverSelf(agentId: string): Promise<unknown>;
   cache: ImajinCatalogCache;
   baseUrl: string;
   /** Kernel discovery URL + refresh interval, surfaced by `imajin_status`. */
@@ -778,6 +779,7 @@ export function registerImajinProvider(
 
   return {
     clearAuth: () => auth.clear(),
+    discoverSelf: (agentId) => auth.discoverSelf(agentId),
     cache,
     baseUrl,
     discovery: {
