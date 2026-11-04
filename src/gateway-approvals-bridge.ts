@@ -1455,6 +1455,11 @@ export class GatewayApprovalsBridge {
             summary: tracked.summary,
             detail: {
               ...current.detail,
+              // Old persisted cards retain their exact original digest during
+              // rollout. Use only the locally staged legacy field, never a
+              // kernel echo or an execution destination. New cards omit it.
+              ...(tracked.sourceId === "gateway-exec" && tracked.detail?.sessionKey !== undefined
+                ? { sessionKey: tracked.detail.sessionKey } : {}),
               ...(tracked.detail?.bridge !== undefined ? { bridge: tracked.detail.bridge } : {}),
             },
             sourceRevision: current.sourceRevision,

@@ -1,6 +1,36 @@
 # @openclaw/imajin-plugin
+Release ordering (#161): ship the clean loop/exec publisher before deploying imajin-ai PR #3265 so newly started loops retain native command authority; keep the session-to-loop map private to the harness.
 
 OpenClaw plugin for the [Imajin](https://jin.imajin.ai) sovereign identity and settlement network.
+
+## Kernel boundary rollout (#161)
+
+Lifecycle refs publish only `issue`, `pr`, and `runId`. Exec approval detail
+never publishes `sessionKey`; the source's private owner ref and the
+session-to-loop map remain local. Native binding and command targeting use
+signed `approvalId` + `loopId`, not kernel-echoed session addressing.
+New cards are hashed and signed over their exact public wire shape. Existing
+persisted cards retain their original hash (including any locally staged
+legacy detail) for both drift checks and the operator countersignature;
+that legacy field is never republished or used to choose an execution target.
+
+Deploy this plugin before kernel PR #3265. A legacy signed start whose ref is
+stripped cannot retain its exact origin proof and fails native command
+authority closed. Clean new starts preserve their proof across the boundary.
+Coordinate deployments closely: the old kernel still requires the exec detail
+field and rejects new public-only exec cards until PR #3265 deploys. The
+bridge's existing publish-failure denial remains fail-closed during that window;
+there is no legacy-field fallback. Existing history is not rewritten.
+
+Compatibility verification uses the unchanged, installed kernel checkout from
+PR #3265 at `1c3d2874791eaf9ded6b95f6590931e65aa73caf`. Set
+`IMAJIN_KERNEL_ROOT` to that checkout, then run
+`pnpm vitest run --config compat/vitest.config.ts --reporter=dot --silent`.
+This runs its original `publisher-command-boundary.test.ts` and a plugin-side
+cross-boundary fixture against real kernel ingest, ref projection, command
+authority, exec detail validation and native binding intake. Only database,
+bus, entitlement and resolver seams are faked; personal/org principals,
+foreign issuers and tampered proofs are covered. No kernel file is changed.
 
 ## What it does
 
@@ -1008,8 +1038,8 @@ was down is never replayed); the bridge's per-`proposalId` dedup keeps that to
 one card.
 
 **Card contract and publish failures (#52).** The kernel rejects a
-`gateway-exec:command` card with `400` unless `detail.host`, `cwd`, `agentId`
-and `sessionKey` are all non-empty strings (`validateExecCommandDetail`,
+`gateway-exec:command` card with `400` unless `detail.host`, `cwd`, and `agentId`
+are all non-empty strings (`validateExecCommandDetail`,
 `ima-jin/imajin-ai`). OpenClaw sends `cwd: null` for an exec with no explicit
 workdir and may omit the agent/session binding, which used to be forwarded as
 `null` → `400` → the failure was only logged and the exec waited until its own

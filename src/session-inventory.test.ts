@@ -149,6 +149,12 @@ describe("top-level session inventory", () => {
     await third.inventory.refresh();
     await third.inventory.idle();
     expect(third.requests.filter((r) => r.payload.output || r.type === "loop.finished")).toHaveLength(0);
+    for (const boot of [first, second, third]) {
+      expect(JSON.stringify(boot.requests)).not.toContain("sessionKey");
+      for (const start of boot.requests.filter((request) => request.type === "loop.started")) {
+        expect(boot.tracker.resolveLoop(start.payload.loopId)?.sessionKey).toBeDefined();
+      }
+    }
   });
 
   it("starts a separate watermark for a new native sessionId on an already backfilled key", async () => {
@@ -189,7 +195,8 @@ describe("top-level session inventory", () => {
     for (const start of starts) {
       expect(start.payload).toMatchObject({ kind: "openclaw.session", agentId: "main", parentLoopId: null, blockedOnYou: false });
       expect(start.payload).not.toHaveProperty("sessionKey");
-      expect(start.payload.refs.sessionKey).toBeDefined();
+      expect(start.payload.refs).not.toHaveProperty("sessionKey");
+      expect(h.tracker.resolveLoop(start.payload.loopId)?.sessionKey).toBeDefined();
     }
     expect(h.requests.filter((r) => r.payload.output).slice(0, 3).map((r) => r.payload.output?.kind))
       .toEqual(["text", "tool_call", "tool_result"]);

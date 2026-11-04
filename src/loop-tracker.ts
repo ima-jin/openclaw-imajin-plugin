@@ -33,6 +33,7 @@
 
 import {
   deriveLoopId,
+  sanitizeRefs,
   sanitizeSummary,
   type LoopKind,
   type LoopLifecycleType,
@@ -126,7 +127,8 @@ export interface CronReconciledEvent {
 interface OpenLoop {
   loopId: string;
   kind: LoopKind;
-  refs: LoopRefs;
+  /** Private harness refs; only sanitizeRefs(refs) may leave the tracker. */
+  refs: LoopRefs & { sessionKey?: string };
   parentLoopId: string | null;
   label: string;
   /** Learnt from hooks even when initially registered by session key. */
@@ -263,7 +265,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
       loopId: loop.loopId,
       kind: loop.kind,
       parentLoopId: loop.parentLoopId,
-      refs: loop.refs,
+      refs: sanitizeRefs(loop.refs),
       state,
       summary: sanitizeSummary(summary),
       ...(output ? { output } : {}),
@@ -335,7 +337,7 @@ export function createLoopTracker(options: LoopTrackerOptions): LoopTracker {
     jobId: string,
     job: CronJobSnapshot | undefined,
     runKey: number | undefined,
-    refs: LoopRefs,
+    refs: OpenLoop["refs"],
   ): OpenLoop => {
     const kind: LoopKind = isKeeper(job, jobId) ? "openclaw.keeper" : "openclaw.automation";
     return {

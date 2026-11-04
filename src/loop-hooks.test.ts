@@ -135,7 +135,9 @@ describe("registerLoopLifecycle — end to end", () => {
     expect(requests[1]!.payload.parentLoopId).toBe(requests[0]!.payload.loopId);
     expect(requests[0]!.payload.loopId).toBe(deriveLoopId(DID, "openclaw.session", "s1"));
     // session_end took the session key from ctx when the event omitted it
-    expect(requests[5]!.payload.refs).toEqual({ sessionKey: MAIN });
+    expect(requests[5]!.payload.refs).toEqual({});
+    expect(JSON.stringify(requests)).not.toContain("sessionKey");
+    expect(JSON.stringify(requests)).not.toContain(MAIN);
   });
 
   it("cron_reconciled lists cron jobs and closes orphaned runs", async () => {
