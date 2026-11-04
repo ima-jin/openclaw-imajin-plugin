@@ -195,6 +195,50 @@ describe("imajin_identity_card", () => {
     expect(text).not.toContain(path);
     expect(text).not.toContain("Authorization");
   });
+
+  it("keeps unrelated direct inference separate from org-held kernel connector mapping", async () => {
+    const test = setup();
+    test.options.context.activeModel = { provider: "direct", modelId: "external-model" };
+    Object.assign(test.config.models.providers, { direct: { baseUrl: "https://provider.invalid" } });
+    const { rows } = (await test.call()).payload;
+    expect(rows.find((entry: any) => entry.connector === "inference")).toMatchObject({
+      provider: "direct", route: "direct", grade: "From config",
+    });
+    expect(rows.find((entry: any) => entry.connector === "anthropic")).toMatchObject({
+      provider: "imajin", route: "passthrough", grade: "Unverified", configScope: "org",
+    });
+  });
+
+  it("merges known connector metadata without duplicating gateway rows and retains extra connectors", async () => {
+    const { identity, options, call } = setup();
+    const body = discovery(identity);
+    const metadata = body.connectors[1];
+    options.discoverSelf.mockResolvedValue({ ...body, connectors: [
+      ...body.connectors, { ...metadata, provider: "github" }, { ...metadata, provider: "mcp" },
+      { ...metadata, provider: "custom", configured: false },
+    ] });
+    const { rows } = (await call()).payload;
+    for (const name of ["GitHub", "MCP"]) {
+      expect(rows.filter((entry: any) => entry.connector.toLowerCase() === name.toLowerCase())).toHaveLength(1);
+      expect(rows.find((entry: any) => entry.connector === name).details.kernel).toMatchObject({ configured: true });
+    }
+    expect(rows.find((entry: any) => entry.connector === "custom")).toMatchObject({ configured: false, grade: "Unverified" });
+  });
+
+  it("contains a revoked invocation and replacement during signing without returning a stale card", async () => {
+    const test = setup();
+    const options = { ...test.options, assertCurrent: vi.fn(() => { throw new Error(randomUUID()); }) };
+    expect((await createIdentityCardTool(options).execute()).details).toEqual({ error: "Identity card unavailable" });
+    expect(test.options.discoverSelf).not.toHaveBeenCalled();
+    const late = setup();
+    const signOriginal = late.identity.signer.signChallenge;
+    late.identity.signer.signChallenge = async (message) => {
+      const signature = await signOriginal(message);
+      late.options.getIdentity.mockReturnValue(undefined);
+      return signature;
+    };
+    expect(await late.call()).toEqual({ error: "Calling-agent signing identity changed" });
+  });
 });
 
 function githubStatus() {

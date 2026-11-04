@@ -64,6 +64,68 @@ async function kernelSnapshot(options: CardOptions, identity: AgentIdentity) {
   }
 }
 
+type KernelSnapshot = Awaited<ReturnType<typeof kernelSnapshot>>;
+
+function mergeKernelRows(rows: ConnectorRow[], snapshot: KernelSnapshot, mapping: ConnectorRow): void {
+  for (const connector of connectorRows(snapshot.body?.connectors ?? [], mapping)) {
+    const gatewayRow = rows.find((entry) => entry.connector.toLowerCase() === connector.connector.toLowerCase());
+    if (gatewayRow) {
+      gatewayRow.details = { ...gatewayRow.details, kernel: {
+        configured: connector.configured, owner: connector.owner, ...connector.details,
+      } };
+    } else {
+      rows.push(connector);
+    }
+  }
+  for (const name of ["Warp", "Anthropic"]) {
+    if (!rows.some((entry) => entry.connector.toLowerCase() === name.toLowerCase())) {
+      rows.push(row(name, { reason: snapshot.body ? "Not advertised by kernel self-discovery" : snapshot.reason,
+        details: { status: snapshot.status } }));
+    }
+  }
+}
+
+function buildCard(options: CardOptions, identity: AgentIdentity, config: unknown, snapshot: KernelSnapshot, github: unknown) {
+  const inference = inferenceRow(config, options.context, options.proxyBaseUrl);
+  // Registered kernel connectors map through imajin, not an unrelated direct provider.
+  const mapping = inferenceRow(config, {
+    agentId: options.context.agentId, activeModel: { provider: "imajin" },
+  }, options.proxyBaseUrl);
+  const picked = snapshot.body?.usableModels.find((model: unknown) => record(model).picked === true);
+  inference.details = { ...inference.details, kernelPick: picked ? {
+    model: publicText(record(picked).id), connector: publicText(record(picked).connector),
+    owner: publicText(record(picked).credentialDid),
+    evidence: "Kernel catalog pick, not observed provider egress",
+  } : null };
+  const rows = [
+    row("Imajin kernel", {
+      configured: true, configScope: "agent", selectedScope: "agent",
+      owner: snapshot.body ? identity.config.actAs ?? identity.config.did : null,
+      outboundIdentity: snapshot.body ? identity.config.did : null,
+      effective: snapshot.body ? "agent" : null,
+      grade: snapshot.body ? "Observed live" : "Unverified",
+      reason: snapshot.reason, details: { status: snapshot.status },
+    }),
+    inference, mcpRow(config), githubRow(config, options.context, github),
+    ...channelRows(config, options.context),
+  ];
+  mergeKernelRows(rows, snapshot, mapping);
+  const principal = record(snapshot.body?.identity);
+  return {
+    kind: "imajin.identity-card",
+    agentId: options.context.agentId,
+    identity: {
+      did: publicText(principal.did), handle: publicText(principal.handle), kind: publicText(principal.kind),
+      tier: publicText(principal.tier), actAs: publicText(principal.actAs),
+      grade: snapshot.body ? "Observed live" : "Unverified", reason: snapshot.reason,
+    },
+    rows: rows.map((entry) => ({
+      ...entry,
+      flagged: entry.flagged || (entry.outboundIdentity !== null && entry.outboundIdentity !== identity.config.did)
+        || (entry.selectedScope !== null && entry.effective !== null && entry.selectedScope !== entry.effective),
+    })),
+  };
+}
 /** Data only: no chat card, receipts, credential reads, config writes or shell. */
 export function createIdentityCardTool(options: CardOptions) {
   return {
@@ -87,61 +149,7 @@ export function createIdentityCardTool(options: CardOptions) {
         const snapshot = await kernelSnapshot(options, identity);
         let github: unknown;
         try { github = await options.githubStatus?.(agentId); } catch { /* Never return RPC exception details. */ }
-        const inference = inferenceRow(config, options.context, options.proxyBaseUrl);
-        // Kernel connectors are exposed by the registered imajin provider; a direct
-        // active provider does not prove it is using any of these sealed cards.
-        const kernelMapping = inferenceRow(config, {
-          agentId, activeModel: { provider: "imajin" },
-        }, options.proxyBaseUrl);
-        const picked = snapshot.body?.usableModels.find((model: unknown) => record(model).picked === true);
-        inference.details = { ...inference.details, kernelPick: picked ? {
-          model: publicText(record(picked).id), connector: publicText(record(picked).connector),
-          owner: publicText(record(picked).credentialDid),
-          evidence: "Kernel catalog pick, not observed provider egress",
-        } : null };
-        const rows = [
-          row("Imajin kernel", {
-            configured: true, configScope: "agent", selectedScope: "agent",
-            owner: snapshot.body ? identity.config.actAs ?? identity.config.did : null,
-            outboundIdentity: snapshot.body ? identity.config.did : null,
-            effective: snapshot.body ? "agent" : null,
-            grade: snapshot.body ? "Observed live" : "Unverified",
-            reason: snapshot.reason, details: { status: snapshot.status },
-          }),
-          inference, mcpRow(config), githubRow(config, options.context, github),
-          ...channelRows(config, options.context),
-        ];
-        for (const connector of connectorRows(snapshot.body?.connectors ?? [], kernelMapping)) {
-          const gatewayRow = rows.find((entry) => entry.connector.toLowerCase() === connector.connector.toLowerCase());
-          if (gatewayRow) {
-            gatewayRow.details = { ...gatewayRow.details, kernel: {
-              configured: connector.configured, owner: connector.owner, ...connector.details,
-            } };
-          } else {
-            rows.push(connector);
-          }
-        }
-        for (const name of ["Warp", "Anthropic"]) {
-          if (!rows.some((entry) => entry.connector.toLowerCase() === name.toLowerCase())) {
-            rows.push(row(name, { reason: snapshot.body ? "Not advertised by kernel self-discovery" : snapshot.reason,
-              details: { status: snapshot.status } }));
-          }
-        }
-        const principal = record(snapshot.body?.identity);
-        const payload = {
-          kind: "imajin.identity-card",
-          agentId,
-          identity: {
-            did: publicText(principal.did), handle: publicText(principal.handle), kind: publicText(principal.kind),
-            tier: publicText(principal.tier), actAs: publicText(principal.actAs),
-            grade: snapshot.body ? "Observed live" : "Unverified", reason: snapshot.reason,
-          },
-          rows: rows.map((entry) => ({
-            ...entry,
-            flagged: entry.flagged || (entry.outboundIdentity !== null && entry.outboundIdentity !== identity.config.did)
-              || (entry.selectedScope !== null && entry.effective !== null && entry.selectedScope !== entry.effective),
-          })),
-        };
+        const payload = buildCard(options, identity, config, snapshot, github);
         options.assertCurrent?.();
         if (options.getIdentity() !== identity) return result({ error: "Calling-agent signing identity changed" });
         const signed = await signMessage(payload, { did: identity.config.did, type: "agent", signer: identity.signer });

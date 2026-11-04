@@ -19,6 +19,53 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_warp`     | Warp        | Dispatch/inspect Warp cloud agents; `list_runs` takes `compact: true` to drop `statusMessage` + artifact `data` per run (plugin-side, kernel call unchanged) for wide spend/volume pulls (#72) |
 | `imajin_cloudflare` | Cloudflare | DNS-only writes, classification, proxy/cache previews and human-approved proposals, settings/SSL, custom hostnames and signed history through kernel-only zone grants; never fetches a Cloudflare token (#98) |
 
+### Calling-agent identity card (imajin-ai#3251)
+
+Call `imajin_identity_card` with no arguments. It returns data in the existing
+agent-signed `{from, type, timestamp, payload, signature}` envelope, not a chat
+card or a receipt. `details` and text contain the same complete envelope.
+The key is the calling agent's resolved sealed signer; legacy shared-key
+configuration cannot establish that binding and returns a safe unavailable
+result. Existing identity/status tools are unchanged.
+
+`payload.identity` comes from `GET /infer/v1/self` under that agent's own
+app token and configured `x-acting-as`. The token uses the same authentication
+capability as provider inference; no gateway session key is sent to the kernel.
+The current kernel response has no signature of its own.
+
+Rows include kernel, inference, MCP, GitHub, Warp, Anthropic, channel bindings
+for this agent, and every additional kernel-advertised connector. Each has
+configuration, scope, owner, outbound identity, provider/route, selected versus
+effective scope, grade and reason. Unknown values are `null`, not guessed.
+An outbound identity different from the agent DID is flagged; GitHub host
+fallback is always flagged, including when its effective account is unknown.
+GitHub status uses the SDK's `gateway.request("tools.github.status", ...)`
+when available; denied/unsupported hosts remain Unverified. No `gh` subprocess
+or credential-file read is used.
+
+- **Observed live**: this call obtained the kernel identity or the gateway's
+  GitHub API verification (`stale` results never qualify).
+- **From config**: resolved provider URL/model metadata or agent channel
+  bindings. Routes distinguish direct from the configured passthrough doorway
+  without returning URLs, headers, tokens or credential paths.
+- **Unverified**: missing facts, kernel errors, and connector rows whose
+  outbound service identity/egress is not exposed. Their per-field evidence
+  still records the kernel's observed configuration and authority, including
+  org-held Anthropic, without claiming successful provider use.
+
+The inference row reports the host's `activeModel` when supplied (otherwise
+the agent/default model config). Its `kernelPick` is the freshly discovered
+catalog pick, explicitly not proof of the model that completed inference.
+Kernel connector rows map to the registered `imajin` provider; an unrelated
+direct active provider never proves use of an org-held connector.
+Kernel 401/403/404/429/503 or transport failure leaves signed gateway facts
+available and marks kernel facts Unverified with status-only diagnostics.
+
+Live acceptance remains an operator step after **both** the v0.8.32 kernel
+release containing imajin-ai PR #3253 and the plugin release containing this
+tool: Artifact-Jin calls it from its own Telegram session. No release version
+is assigned by this feature PR.
+
 ### Warp usage units (#111)
 
 `imajin_warp` `get_run` and `list_runs`, in both full and `compact: true` output,

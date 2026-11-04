@@ -17,6 +17,23 @@ export interface ConnectorRow {
   flagged: boolean;
   details?: Record<string, unknown>;
 }
+function hasGithubBinding(config: unknown): boolean {
+  return Object.keys(record(record(record(config).tools).github)).length > 0;
+}
+
+function githubScope(valid: boolean, source: string | null, bound: boolean): ConfigScope {
+  if (valid) return source === "agent-override" ? "agent" : "host fallback";
+  return bound ? "agent" : "host fallback";
+}
+
+function githubReason(valid: boolean, scope: ConfigScope, live: boolean): string {
+  let prefix = "";
+  if (scope === "host fallback") prefix = "host fallback — not own identity; ";
+  else if (!valid) prefix = "Agent binding configured; ";
+  if (!valid) return prefix + "GitHub status unavailable through this host's plugin gateway SDK";
+  if (live) return prefix + "Gateway status reports a current GitHub API account verification";
+  return prefix + "Gateway status is unavailable, stale, or not live-verified";
+}
 
 export function record(value: unknown): Record<string, any> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : {};
@@ -56,30 +73,45 @@ export interface CardContext {
   messageChannel?: string;
   agentAccountId?: string;
 }
+function primaryModel(value: unknown): unknown {
+  return typeof value === "string" ? value : record(value).primary;
+}
+
+function configuredAgent(config: unknown, agentId?: string) {
+  return record(record(record(record(config).agents).entries)[agentId ?? ""]);
+}
+
+function providerRoute(base: unknown, proxy: string): ConnectorRow["route"] {
+  if (typeof base !== "string") return null;
+  try {
+    if (!["http:", "https:"].includes(new URL(base).protocol)) return null;
+    return sameDoorway(base, proxy) ? "passthrough" : "direct";
+  } catch {
+    return null;
+  }
+}
+
+function modelParts(ref: unknown): { provider?: string; modelId?: string } {
+  if (typeof ref !== "string" || !ref.includes("/")) return {};
+  const separator = ref.indexOf("/");
+  return { provider: ref.slice(0, separator), modelId: ref.slice(separator + 1) };
+}
 
 export function inferenceRow(config: unknown, ctx: CardContext, proxy: string): ConnectorRow {
   const host = record(config);
-  const agent = record(record(record(host.agents).entries)[ctx.agentId!]);
-  const agentModel = typeof agent.model === "string" ? agent.model : record(agent.model).primary;
-  const defaults = record(record(host.agents).defaults);
-  const defaultModel = typeof defaults.model === "string" ? defaults.model : record(defaults.model).primary;
-  const ref = ctx.activeModel?.modelRef ?? agentModel ?? defaultModel;
-  const provider = publicText(ctx.activeModel?.provider ?? (typeof ref === "string" ? ref.split("/")[0] : null));
-  const model = publicText(ctx.activeModel?.modelId ?? (typeof ref === "string" ? ref.slice(ref.indexOf("/") + 1) : null));
+  const agentModel = primaryModel(configuredAgent(config, ctx.agentId).model);
+  const fallback = primaryModel(record(record(host.agents).defaults).model);
+  const parts = modelParts(ctx.activeModel?.modelRef ?? agentModel ?? fallback);
+  const provider = publicText(ctx.activeModel?.provider ?? parts.provider);
+  const model = publicText(ctx.activeModel?.modelId ?? parts.modelId);
   const providers = record(record(host.models).providers);
   const base = record(providers[provider ?? ""]).baseUrl
     ?? (provider === "imajin" ? proxy : undefined);
-  let route: ConnectorRow["route"] = null;
-  try {
-    if (typeof base === "string" && ["http:", "https:"].includes(new URL(base).protocol)) {
-      route = sameDoorway(base, proxy) ? "passthrough" : "direct";
-    }
-  } catch { /* Invalid config is not route evidence. */ }
+  const route = providerRoute(base, proxy);
+  const scope = agentModel ? "agent" : "host fallback";
   return row("inference", {
     configured: provider !== null && model !== null,
-    configScope: agentModel ? "agent" : "host fallback",
-    selectedScope: agentModel ? "agent" : "host fallback",
-    provider, route, effective: agentModel ? "agent" : "host fallback",
+    configScope: scope, selectedScope: scope, effective: scope, provider, route,
     grade: provider && model && route ? "From config" : "Unverified",
     reason: route ? "Host-selected model and resolved provider configuration; not proof of provider egress"
       : "Resolved provider URL or active model unavailable; route not inferred from provider name",
@@ -126,27 +158,20 @@ function githubFacts(value: unknown) {
 }
 
 export function githubRow(config: unknown, ctx: CardContext, response?: unknown): ConnectorRow {
-  const host = record(config);
-  const agent = record(record(record(host.agents).entries)[ctx.agentId!]);
-  const bound = Object.keys(record(record(agent.tools).github)).length > 0;
+  const bound = hasGithubBinding(configuredAgent(config, ctx.agentId));
   const selected = record(record(response).selected);
   const effective = githubFacts(record(response).effective);
   const valid = record(response).agentId === ctx.agentId && record(response).selectedScope === "agent"
     && ["agent-override", "system-configured", "system-detected"].includes(effective.source ?? "");
-  const scope = valid ? (effective.source === "agent-override" ? "agent" : "host fallback")
-    : (bound ? "agent" : "host fallback");
+  const scope = githubScope(valid, effective.source, bound);
   const live = valid && effective.evidence === "github-api" && effective.credentialState === "available"
     && !effective.stale && effective.account.login !== null;
   return row("GitHub", {
-    configured: valid ? effective.credentialKind !== "native" : bound || Object.keys(record(record(host.tools).github)).length > 0,
+    configured: valid ? effective.credentialKind !== "native" : bound || hasGithubBinding(config),
     configScope: scope, selectedScope: "agent", owner: valid ? effective.account.login : null,
     outboundIdentity: valid ? effective.account.login : null,
     effective: valid ? scope : null, grade: live ? "Observed live" : "Unverified",
-    reason: valid ? (scope === "host fallback" ? "host fallback — not own identity; " : "")
-      + (live ? "Gateway status reports a current GitHub API account verification"
-        : "Gateway status is unavailable, stale, or not live-verified")
-      : (bound ? "Agent binding configured; " : "host fallback — not own identity; ")
-        + "GitHub status unavailable through this host's plugin gateway SDK",
+    reason: githubReason(valid, scope, live),
     flagged: scope === "host fallback",
     ...(valid ? { details: {
       selected: { scope: "agent", configured: selected.configured === true,
