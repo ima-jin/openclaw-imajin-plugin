@@ -1,4 +1,5 @@
 # Harness horizon sync
+Inbound claim and exit readback is tracked in plugin issue #133.
 
 The opt-in horizon publisher pushes local queue facts to an existing owning
 loop through the signed `/api/loops` rail. The kernel never reads the harness,
