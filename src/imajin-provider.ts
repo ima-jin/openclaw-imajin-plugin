@@ -73,7 +73,7 @@ import { familyBaseUrl, inferenceFamily, type InferenceApi } from "./inference-f
 import { AgentCatalogs, type AgentCatalogOptions, type CatalogContext } from "./agent-catalogs.js";
 
 export const IMAJIN_PROVIDER_ID = "imajin";
-export const IMAJIN_PROVIDER_IDS = ["imajin", "imajin-openai", "imajin-xai", "imajin-anthropic"] as const;
+export const IMAJIN_PROVIDER_IDS = ["imajin", "imajin-openai", "imajin-xai"] as const;
 export const IMAJIN_DEFAULT_MODEL_ID = "default";
 export const IMAJIN_DEFAULT_MODEL_REF = "imajin/default";
 export const IMAJIN_PROVIDER_LABEL = "Imajin (kernel seat)";
@@ -755,8 +755,8 @@ export function registerImajinProvider(
   const refreshIntervalMs = resolveDiscoveryRefreshIntervalMs(config?.modelDiscovery);
   const auth = new AgentInferenceAuth(options.nodeUrl, options.getIdentity ?? (() => undefined));
   const catalogs = new AgentCatalogs(auth, options.nodeUrl, modelsPath, options);
-  const runtimeModel = (model: ImajinRuntimeModel, provider: string = IMAJIN_PROVIDER_ID) => ({
-    ...model, provider, api: model.api ?? "openai-completions",
+  const runtimeModel = (model: ImajinRuntimeModel) => ({
+    ...model, provider: IMAJIN_PROVIDER_ID, api: model.api ?? "openai-completions",
     baseUrl: familyBaseUrl(baseUrl, model.api ?? "openai-completions"),
   });
   const signingHooks = {
@@ -800,15 +800,6 @@ export function registerImajinProvider(
   for (const id of IMAJIN_PROVIDER_IDS.slice(1)) {
     api.registerProvider({
       id, label: `${id} (calling-agent auth)`, ...signingHooks,
-      ...(id === "imajin-anthropic" ? {
-        prepareDynamicModel: async (ctx: CatalogContext & { modelId: string }) => {
-          const model = (await catalogs.models(ctx)).find((entry) =>
-            entry.id === ctx.modelId && entry.api === "anthropic-messages");
-          return model ? runtimeModel(model, id) : undefined;
-        },
-        normalizeResolvedModel: (ctx: { model: ImajinRuntimeModel }) =>
-          runtimeModel({ ...ctx.model, api: "anthropic-messages" }, id),
-      } : {}),
     });
   }
 

@@ -6,9 +6,11 @@
   `imajin/*` catalog. Discovery uses each agent's own app JWT and configured
   acting identity, with isolated caches and bounded kernel error diagnostics.
   Unconfigured tenant defaults follow their own kernel pick; main is unchanged.
-  Missing identities and refused routes fail closed. Legacy `imajin-openai` /
-  `imajin-xai` blocks remain supported but may be removed by the operator after
-  catalog verification; the plugin never rewrites host configuration.
+  Missing identities and refused routes fail closed. `imajin/*` is the only
+  family route; legacy `imajin-openai` / `imajin-xai` allow-list refs retire
+  through the existing catalog-card approval path, without a legacy-provider
+  support promise. Provider-block cleanup remains an operator choice; the
+  plugin never rewrites host configuration.
 - **Inference subject correction (PR #151).** App-token minting always uses
   the calling agent DID for both `azp` and `sub`; configured `actAs` stays
   solely in `x-acting-as`. Verifier/controller-shaped regressions for

@@ -2337,7 +2337,6 @@ OpenAI-compatible connectors to `openai-completions` at
 `http://127.0.0.1:8787/openai/v1`, and Anthropic to `anthropic-messages` at
 `http://127.0.0.1:8787/anthropic`. The SDK's per-model API plus
 `normalizeResolvedModel` selects the correct URL within the mixed catalog.
-`imajin-anthropic` owns the same signing wrapper for explicit family routing.
 Unknown connector families are skipped and logged rather than guessed.
 
 Both `/anthropic/v1/messages` and `/anthropic/v1/messages/count_tokens` use
@@ -2354,10 +2353,13 @@ discovery or policy refusal blocks the pending automatic route. Explicit agent
 models and session selections distinct from the configured default stay pinned.
 There is no session-level act-as switch.
 
-**Migration:** hand-wired `imajin-openai` / `imajin-xai` provider blocks are no
-longer needed for discovered models. They remain supported and agent-signed;
-the operator may remove them after verifying the new catalog. The plugin never
-deletes, migrates or rewrites those blocks or any host configuration.
+**Migration:** `imajin/*` is the only family route. Legacy `imajin-openai` /
+`imajin-xai` allow-list refs retire through the existing `imajin-catalog`
+approval-card path after their canonical replacements are allowed and lanes are
+repointed (see **Operator-approved live allow-list** above). This is not a
+legacy-provider support promise. Provider-block cleanup remains an operator
+choice; the plugin never deletes, migrates or rewrites those blocks or any host
+configuration.
 
 **Live proof still required:** with the branch build loaded on the gateway,
 capture `openclaw models list --provider imajin`, the Artifact turn's resolved

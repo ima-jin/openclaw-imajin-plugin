@@ -321,7 +321,7 @@ describe("calling-agent provider wire contract", () => {
       "anthropic-version": "2023-06-01", "anthropic-beta": "prompt-caching-2024-07-31",
     };
     const transport: StreamFn = async function* (current, _context, options) {
-      const response = await fetch(`${baseUrl}${path}`, {
+      const response = await fetch(`${current.baseUrl}${path.slice("/anthropic".length)}`, {
         method: "POST", headers: { ...current.headers, ...options?.headers },
         body: JSON.stringify({ model: current.id, messages: [] }),
       });
@@ -329,12 +329,19 @@ describe("calling-agent provider wire contract", () => {
       yield { type: "done", reason: "stop", message: message() };
     };
     const providers: any[] = [];
-    registerImajinProvider({ registerProvider: (definition) => providers.push(definition) }, undefined, {
+    registerImajinProvider({ registerProvider: (definition) => providers.push(definition) }, {
+      inferProxyBaseUrl: `${baseUrl}/openai/v1`,
+    }, {
       nodeUrl: baseUrl, getIdentity: (id) => identities.get(id),
+      fetcher: async () => ({ data: [{ id: model.id, owned_by: "anthropic" }] }),
     });
-    const provider = providers.find((entry) => entry.id === "imajin-anthropic");
+    const provider = providers.find((entry) => entry.id === "imajin");
+    const discovered = await provider.prepareDynamicModel({ agentId, modelId: model.id });
+    expect(discovered).toMatchObject({
+      provider: "imajin", connector: "anthropic", api: "anthropic-messages", baseUrl: `${baseUrl}/anthropic`,
+    });
     await events(provider.wrapStreamFn({ agentId, streamFn: transport })(
-      { ...model, api: "anthropic-messages", headers }, {}, { headers, apiKey: "inherited-marker" },
+      { ...model, ...discovered, headers }, {}, { headers, apiKey: "inherited-marker" },
     ));
     const request = requests.at(-1)!;
     expect(request.url).toBe(path);

@@ -258,7 +258,7 @@ describe("registerImajinProvider", () => {
 
     const registered = registerImajinProvider(api, undefined);
 
-    expect(registerProvider).toHaveBeenCalledTimes(4);
+    expect(registerProvider).toHaveBeenCalledTimes(3);
     const definition = registerProvider.mock.calls[0][0] as Record<string, unknown>;
     expect(definition.id).toBe(IMAJIN_PROVIDER_ID);
     expect(definition.label).toBe("Imajin (kernel seat)");

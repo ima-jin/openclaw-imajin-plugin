@@ -155,7 +155,7 @@ describe("agent-scoped app+jwt discovery", () => {
     expect(fetcher).not.toHaveBeenCalled();
     expect(cache.peek()?.error).not.toContain("private mint detail");
   });
-  it("registers an Anthropic transport and lists Anthropic rows under imajin without config edits", async () => {
+  it("routes Anthropic rows only through canonical imajin without config edits", async () => {
     const registerProvider = vi.fn();
     registerImajinProvider({ registerProvider }, undefined, {
       fetcher: async () => list("anthropic", "sonnet"), logger: logger(),
@@ -165,11 +165,13 @@ describe("agent-scoped app+jwt discovery", () => {
     expect(catalog.provider.models[0]).toMatchObject({ id: "sonnet", api: "anthropic-messages" });
     expect(providers[0].normalizeResolvedModel({ model: catalog.provider.models[0] }))
       .toMatchObject({ api: "anthropic-messages", baseUrl: "http://127.0.0.1:8787/anthropic" });
-    const anthropic = providers.find((entry) => entry.id === "imajin-anthropic");
-    expect(await anthropic.prepareDynamicModel({ modelId: "sonnet" }))
-      .toMatchObject({ provider: "imajin-anthropic", api: "anthropic-messages", baseUrl: "http://127.0.0.1:8787/anthropic" });
-    expect(await anthropic.prepareDynamicModel({ modelId: "unknown" })).toBeUndefined();
-    expect(() => anthropic.wrapStreamFn({ agentId: "missing", streamFn: vi.fn() })).toThrow("agents.missing");
+    expect(providers.map((entry) => entry.id)).toEqual(["imajin", "imajin-openai", "imajin-xai"]);
+    expect(providers.map((entry) => entry.id)).not.toContain("imajin-anthropic");
+    const canonical = providers.find((entry) => entry.id === "imajin");
+    expect(await canonical.prepareDynamicModel({ modelId: "sonnet" }))
+      .toMatchObject({ provider: "imajin", connector: "anthropic", api: "anthropic-messages", baseUrl: "http://127.0.0.1:8787/anthropic" });
+    expect(await canonical.prepareDynamicModel({ modelId: "unknown" })).toBeUndefined();
+    expect(() => canonical.wrapStreamFn({ agentId: "missing", streamFn: vi.fn() })).toThrow("agents.missing");
   });
 });
 
