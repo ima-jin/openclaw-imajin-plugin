@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtemp } from "node:fs/promises";
+import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as ed from "@noble/ed25519";
@@ -19,7 +19,7 @@ const sessionKey = "agent:main:private-local-destination";
 const bridges: GatewayApprovalsBridge[] = [];
 afterEach(() => { for (const bridge of bridges.splice(0)) bridge.dispose(); });
 
-async function setup(principal: string, legacy = false) {
+async function setup(principal: string, legacy = false, persisted = false) {
   const agentKey = randomBytes(32);
   const operatorKey = randomBytes(32);
   const publicKey = Buffer.from(await ed.getPublicKeyAsync(operatorKey)).toString("hex");
@@ -40,8 +40,8 @@ async function setup(principal: string, legacy = false) {
   const scope = { nodeUrl: "https://kernel.test", agentDid, operatorDid: principal };
   const file = join(await mkdtemp(join(tmpdir(), "plugin-wire-")), "state.json");
   const store = new ApprovalsStateStore(file, scope);
-  if (legacy) {
-    const detail = { ...request.detail, sessionKey };
+  if (legacy || persisted) {
+    const detail = { ...request.detail, ...(legacy ? { sessionKey } : {}) };
     const digest = buildDigestFields({ ...request, source: source.id, detail });
     store.proposals.set(record.id, {
       sourceId: source.id, owner: request.owner, kind: request.kind, summary: request.summary,
@@ -102,7 +102,7 @@ describe.each(["did:imajin:personal", "did:imajin:org"])("exec wire under %s", (
   });
 
   it.each([false, true])("replays a restarted card (legacy=%s) without a kernel session echo", async (legacy) => {
-    const h = await setup(principal, legacy);
+    const h = await setup(principal, legacy, true);
     await h.bridge.reconcile();
     const frame = await h.decision();
     const http = { requestRaw: vi.fn(async () => ({
@@ -116,7 +116,8 @@ describe.each(["did:imajin:personal", "did:imajin:org"])("exec wire under %s", (
     expect(h.client.resolve).toHaveBeenCalledWith(h.record.id, "allow-once");
     await h.bridge.handleKernelDecision(frame);
     expect(h.client.resolve).toHaveBeenCalledOnce();
-    if (legacy) expect(h.kernel.publishApprovalRequested).not.toHaveBeenCalled();
+    expect(h.kernel.publishApprovalRequested).not.toHaveBeenCalled();
+    expect(cursorStore.get()).toBe("1");
   });
 
   it.each(["hash", "command", "cwd", "expiry", "issuer", "countersignature"])(
@@ -133,4 +134,11 @@ describe.each(["did:imajin:personal", "did:imajin:org"])("exec wire under %s", (
       expect(h.client.resolve).not.toHaveBeenCalled();
     },
   );
+});
+
+it("documents publisher-first release ordering and the private harness map", async () => {
+  const readme = await readFile(new URL("../README.md", import.meta.url), "utf-8");
+  expect(readme).toContain("ship the clean loop/exec publisher before deploying imajin-ai PR #3265");
+  expect(readme).toContain("newly started loops retain native command authority");
+  expect(readme).toContain("keep the session-to-loop map private to the harness");
 });

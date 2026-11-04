@@ -149,6 +149,12 @@ describe("top-level session inventory", () => {
     await third.inventory.refresh();
     await third.inventory.idle();
     expect(third.requests.filter((r) => r.payload.output || r.type === "loop.finished")).toHaveLength(0);
+    for (const boot of [first, second, third]) {
+      expect(JSON.stringify(boot.requests)).not.toContain("sessionKey");
+      for (const start of boot.requests.filter((request) => request.type === "loop.started")) {
+        expect(boot.tracker.resolveLoop(start.payload.loopId)?.sessionKey).toBeDefined();
+      }
+    }
   });
 
   it("starts a separate watermark for a new native sessionId on an already backfilled key", async () => {

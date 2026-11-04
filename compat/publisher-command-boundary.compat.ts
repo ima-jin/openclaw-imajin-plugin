@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as ed from "@noble/ed25519";
-import { canonicalize } from "../src/approval-bridge.js";
+import { canonicalize, signMessage } from "../src/approval-bridge.js";
 import { createLoopSender, type LoopIngestRequest } from "../src/loop-publisher.js";
 import { createLoopTracker } from "../src/loop-tracker.js";
 import { GatewayApprovalsBridge } from "../src/gateway-approvals-bridge.js";
 import { createGatewayExecSource } from "../src/sources/gateway-exec.js";
+import { canonicalize as kernelCanonicalize } from "@imajin/auth";
 
 // Same seams as PR #3265's publisher-command-boundary.test.ts. Ingest,
 // recognized-ref projection, origin authority and binding intake are REAL.
@@ -30,14 +31,11 @@ vi.mock("kernel/loops/surface-lease", () => ({
   projectSurfaceLease: vi.fn().mockResolvedValue(null), loopObservationId: () => "plugin-origin",
 }));
 
-// @ts-expect-error Alias supplied by this compatibility suite's config.
 import { ingestLoopEvent } from "kernel/loops/ingest";
-// @ts-expect-error Alias supplied by this compatibility suite's config.
 import { kernelLoopRefs } from "kernel/loops/types";
-// @ts-expect-error Alias supplied by this compatibility suite's config.
 import { resolveSessionCommandTarget } from "kernel/jin/session-command-authority";
-// @ts-expect-error Alias supplied by this compatibility suite's config.
 import { ingestSessionCommandFrame } from "kernel/jin/session-command-intake";
+import { validateExecCommandDetail } from "kernel/notify/exec-command-approvals";
 
 const agent = "did:imajin:agent";
 const key = randomBytes(32);
@@ -52,7 +50,7 @@ beforeEach(() => {
   vi.resetAllMocks();
   mocks.sql.mockResolvedValue([{ loop_id: "loop" }]);
   mocks.authorize.mockResolvedValue({ authorized: true });
-  mocks.resolver.mockImplementation(async (did: string) => did === agent ? { publicKey } : null);
+  mocks.resolver.mockImplementation((did: string) => Promise.resolve(did === agent ? { publicKey } : null));
   mocks.service.mockResolvedValue(["did:imajin:personal", "did:imajin:org"]);
   mocks.append.mockResolvedValue(true);
   mocks.getEvent.mockResolvedValue(null);
@@ -68,9 +66,9 @@ describe.each(["did:imajin:personal", "did:imajin:org"])("exact plugin / kernel 
     const requests: LoopIngestRequest[] = [];
     const sender = createLoopSender({
       did: agent, principal, signer, nodeUrl: "https://kernel.test",
-      fetchImpl: vi.fn(async (_url, init) => {
+      fetchImpl: vi.fn((_url, init) => {
         requests.push(JSON.parse(String(init?.body)));
-        return new Response("{}", { status: 201 });
+        return Promise.resolve(new Response("{}", { status: 201 }));
       }),
     });
     const tracker = createLoopTracker({ did: agent, emit: sender.publish });
@@ -93,10 +91,10 @@ describe.each(["did:imajin:personal", "did:imajin:org"])("exact plugin / kernel 
     const h = await origin();
     expect(await resolveSessionCommandTarget(h.request.payload.loopId, principal)).toBe(agent);
     const source = createGatewayExecSource({
-      list: async () => [{
+      list: vi.fn().mockResolvedValue([{
         id: "approval", createdAtMs: Date.now(), expiresAtMs: Date.now() + 60_000,
         request: { command: "printf approved", sessionKey: "agent:main:local" },
-      }],
+      }]),
       onRequested: () => {}, onFinished: () => {}, resolve: vi.fn(),
     }, { agentDid: agent });
     const bind = vi.fn(async (attestation) => {
@@ -112,7 +110,18 @@ describe.each(["did:imajin:personal", "did:imajin:org"])("exact plugin / kernel 
     const bridge = new GatewayApprovalsBridge(
       { agentDid: agent, operatorDid: principal, agentSigner: signer },
       new Map([[source.id, source]]),
-      { publishApprovalRequested: vi.fn(async () => {}), publishMismatch: vi.fn() },
+      {
+        publishApprovalRequested: vi.fn((wire) => {
+          const { contentHash, signature, signerDid, ...fields } = wire;
+          expect(signature).toMatch(/^[a-f0-9]{128}$/);
+          expect(signerDid).toBe(agent);
+          expect(validateExecCommandDetail(wire.detail).ok).toBe(true);
+          expect(wire.detail).not.toHaveProperty("sessionKey");
+          expect(contentHash).toBe(`sha256:${createHash("sha256").update(kernelCanonicalize(fields)).digest("hex")}`);
+          return Promise.resolve();
+        }),
+        publishMismatch: vi.fn(),
+      },
       { info: vi.fn(), warn: vi.fn(), error: vi.fn() }, undefined, undefined,
       { loopTracker: h.tracker, publishApprovalBinding: bind, loopBlockSweepIntervalMs: 0 },
     );
@@ -131,6 +140,10 @@ describe.each(["did:imajin:personal", "did:imajin:org"])("exact plugin / kernel 
       proofs: [{ type: h.request.type, issuer: "did:imajin:foreign", proof: h.published.publisherProof }],
     });
     await expect(resolveSessionCommandTarget(h.request.payload.loopId, principal)).rejects.toThrow();
+    const attestation = await signMessage({
+      approvalId: "approval", loopId: h.request.payload.loopId, principalDid: principal, agentDid: agent,
+    }, { did: agent, signer, type: "agent" });
+    await expect(ingestSessionCommandFrame(agent, { type: "loop.approval.bound", attestation })).rejects.toThrow();
     expect(mocks.append).not.toHaveBeenCalled();
   });
 });

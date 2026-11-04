@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { canonicalize } from "./approval-bridge.js";
 import {
   MAX_SUMMARY_LENGTH,
+  LOOP_LIFECYCLE_TYPES,
   createLoopSender,
   createLoopTransport,
   deriveLoopId,
@@ -150,6 +151,24 @@ describe("sanitizeSummary / sanitizeRefs", () => {
 });
 
 describe("createLoopSender", () => {
+  it.each(LOOP_LIFECYCLE_TYPES)("signs %s over public refs only, even with a legacy caller", async (type) => {
+    const fetchMock = okFetch();
+    const sender = createLoopSender({
+      nodeUrl: NODE_URL, did: DID, principal: PRINCIPAL, keypairPath: "/k.json", fetchImpl: fetchMock,
+    });
+    sender.publish(transition({ type, refs: { sessionKey: "private-session", runId: "run" } as never }));
+    await sender.idle();
+    const [request] = bodies(fetchMock);
+    expect(request.payload.refs).toEqual({ runId: "run" });
+    expect(JSON.stringify(request)).not.toContain("sessionKey");
+    expect(JSON.stringify(request)).not.toContain("private-session");
+    const ed = await ed25519();
+    expect(await ed.verifyAsync(
+      hexToBytes(request.signature.sig),
+      new TextEncoder().encode(canonicalize({ type, payload: request.payload })),
+      hexToBytes(request.signature.keyId),
+    )).toBe(true);
+  });
   it("POSTs the kernel envelope to /api/loops, signed over canonicalize({type,payload})", async () => {
     const fetchMock = okFetch();
     const sender = createLoopSender({
