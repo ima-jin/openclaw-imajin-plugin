@@ -14,7 +14,7 @@
  *   { type, payload, publisherDid, signature: { keyId, alg: "ed25519", sig } }
  *
  *   payload = { loopId, kind, principal, parentLoopId, refs, state, summary, at, output?, ...metadata }
- *   refs    = { issue?, pr?, runId?, sessionKey? }   (any other key => 400)
+ *   refs    = { issue?, pr?, runId? }   (harness session addressing stays local)
  *   sig     = Ed25519 over canonicalize({ type, payload })  (hex)
  *   keyId   = hex Ed25519 public key currently registered for publisherDid
  *
@@ -62,7 +62,6 @@ export interface LoopRefs {
   issue?: string;
   pr?: string;
   runId?: string;
-  sessionKey?: string;
 }
 
 /** A transition before the sender stamps principal + timestamp onto it. */
@@ -129,7 +128,7 @@ const FAILURE_LOG_INTERVAL_MS = 60_000;
  * Deterministic loop id: `<kind>:<sha256(publisherDid, kind, ...parts)[0..32]>`.
  * Derived from the OpenClaw identifiers (sessionKey / sessionId / runId / job
  * id) but never equal to them — a session key is a gateway concept, not a
- * kernel one; it only appears in `refs.sessionKey`. The publisher DID is part
+ * kernel one; the session-to-loop map stays private to the harness. The publisher DID is part
  * of the hash so two gateways that reuse a key (`agent:main:main`) cannot
  * collide on one kernel.
  */
@@ -175,7 +174,7 @@ export function sanitizeSummary(text: string, fallback = "loop transition"): str
 /** Caps and drops empty refs so the kernel's non-empty-string rule always holds. */
 export function sanitizeRefs(refs: LoopRefs): LoopRefs {
   const out: LoopRefs = {};
-  for (const key of ["issue", "pr", "runId", "sessionKey"] as const) {
+  for (const key of ["issue", "pr", "runId"] as const) {
     const value = refs[key];
     if (typeof value === "string" && value.length > 0) {
       out[key] = value.slice(0, MAX_REF_LENGTH);

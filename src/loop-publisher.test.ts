@@ -138,14 +138,14 @@ describe("sanitizeSummary / sanitizeRefs", () => {
     expect(sanitizeSummary("   ")).toBe("loop transition");
   });
 
-  it("keeps only the four ref keys the kernel accepts, non-empty", () => {
+  it("keeps only public ref keys, dropping legacy harness refs and empty values", () => {
     const refs = sanitizeRefs({
       sessionKey: "agent:main:main",
       runId: "",
       issue: undefined,
       extra: "nope",
     } as never);
-    expect(refs).toEqual({ sessionKey: "agent:main:main" });
+    expect(refs).toEqual({});
   });
 });
 
@@ -165,7 +165,7 @@ describe("createLoopSender", () => {
       transition({
         type: "loop.progress",
         parentLoopId: "openclaw.session:parent",
-        refs: { sessionKey: "agent:main:main", runId: "run-1" },
+        refs: { sessionKey: "agent:main:main", runId: "run-1" } as never,
         state: "running",
         summary: "turn ended (ok)",
       }),
@@ -184,7 +184,7 @@ describe("createLoopSender", () => {
       kind: "openclaw.session",
       principal: PRINCIPAL,
       parentLoopId: "openclaw.session:parent",
-      refs: { sessionKey: "agent:main:main", runId: "run-1" },
+      refs: { runId: "run-1" },
       state: "running",
       summary: "turn ended (ok)",
       at: "2026-09-27T10:00:00.000Z",

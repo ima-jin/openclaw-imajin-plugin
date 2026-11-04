@@ -115,7 +115,7 @@ describe("local loop target registry", () => {
     tracker.onSubagentProgress({ childSessionKey: CHILD, phase: "started" });
     tracker.onSubagentEnded({ targetSessionKey: CHILD, outcome: "ok" });
     expect(events.at(-1)).toMatchObject({
-      loopId: child.loopId, parentLoopId: root.loopId, refs: { sessionKey: CHILD, runId: "run" },
+      loopId: child.loopId, parentLoopId: root.loopId, refs: { runId: "run" },
     });
     expect(tracker.resolveLoop(child.loopId)).toBeUndefined();
     tracker.onSubagentSpawned({ childSessionKey: CHILD });
@@ -203,7 +203,8 @@ describe("local loop target registry", () => {
     expect(Object.keys(healthy.events[0]!).sort()).toEqual([
       "kind", "loopId", "parentLoopId", "refs", "state", "summary", "type",
     ]);
-    expect(healthy.events[0]!.refs).toEqual({ sessionKey: MAIN });
+    expect(healthy.events[0]!.refs).toEqual({});
+    expect(healthy.tracker.lookupSession(MAIN)?.sessionKey).toBe(MAIN);
     expect(healthy.events[0]).not.toHaveProperty("sessionKey");
     expect(healthy.events[0]).not.toHaveProperty("agentDid");
   });
@@ -222,7 +223,7 @@ describe("openclaw.session", () => {
       expect(e.loopId).toBe(loopId);
       expect(e.kind).toBe("openclaw.session");
       expect(e.parentLoopId).toBeNull();
-      expect(e.refs).toEqual({ sessionKey: MAIN });
+      expect(e.refs).toEqual({});
     }
     expect(events.map((e) => e.state)).toEqual(["running", "running", "succeeded"]);
     expect(events[1]!.summary).toBe("turn ended (ok, 1200ms)");
@@ -347,7 +348,7 @@ describe("openclaw.subagent", () => {
     for (const e of sub) {
       expect(e.kind).toBe("openclaw.subagent");
       expect(e.loopId).toBe(subagentId(CHILD));
-      expect(e.refs).toEqual({ sessionKey: CHILD, runId: "run-9" });
+      expect(e.refs).toEqual({ runId: "run-9" });
       expect(e.parentLoopId).toBe(sessionId("sess-1"));
     }
     expect(sub[0]!.summary).toBe("subagent started: discover");
@@ -522,10 +523,11 @@ describe("openclaw.automation / openclaw.keeper (cron)", () => {
     expect(events[1]!.state).toBe(state);
   });
 
-  it("refs carry the run's session key and run id", () => {
+  it("refs carry only the run id while the private map retains the session key", () => {
     const { tracker, events } = setup();
     tracker.onCronChanged({ action: "started", jobId: "j", runAtMs: 1, sessionKey: "agent:main:cron:j", runId: "run-7" });
-    expect(events[0]!.refs).toEqual({ sessionKey: "agent:main:cron:j", runId: "run-7" });
+    expect(events[0]!.refs).toEqual({ runId: "run-7" });
+    expect(tracker.lookupRef({ jobId: "j" })?.sessionKey).toBe("agent:main:cron:j");
   });
 
   it("a finished with no seen start derives the same id from runAtMs", () => {
@@ -698,7 +700,7 @@ describe("loop.blocked / unblocked (any loop kind)", () => {
       "loop.blocked|openclaw.subagent|blocked",
       "loop.progress|openclaw.subagent|running",
     ]);
-    expect(events[1]!.refs).toEqual({ sessionKey: CHILD, runId: "r" });
+    expect(events[1]!.refs).toEqual({ runId: "r" });
   });
 
   it("automation (by cron job id)", () => {

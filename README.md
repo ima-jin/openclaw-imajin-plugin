@@ -1009,8 +1009,8 @@ was down is never replayed); the bridge's per-`proposalId` dedup keeps that to
 one card.
 
 **Card contract and publish failures (#52).** The kernel rejects a
-`gateway-exec:command` card with `400` unless `detail.host`, `cwd`, `agentId`
-and `sessionKey` are all non-empty strings (`validateExecCommandDetail`,
+`gateway-exec:command` card with `400` unless `detail.host`, `cwd`, and `agentId`
+are all non-empty strings (`validateExecCommandDetail`,
 `ima-jin/imajin-ai`). OpenClaw sends `cwd: null` for an exec with no explicit
 workdir and may omit the agent/session binding, which used to be forwarded as
 `null` → `400` → the failure was only logged and the exec waited until its own

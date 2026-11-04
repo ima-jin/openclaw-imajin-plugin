@@ -21,7 +21,6 @@ const KERNEL_REQUIRED_STRING_FIELDS = [
   "host",
   "cwd",
   "agentId",
-  "sessionKey",
   "requestedBy",
   "approvalId",
   "expiresAt",
@@ -83,6 +82,7 @@ describe("gateway-exec card satisfies the kernel's exec detail contract (#52)", 
     expect(kernelValidateExecDetail(card.detail ?? {})).toBeNull();
     // The verbatim command is never altered by the fallbacks.
     expect(card.detail?.command).toBe("echo hi");
+    expect(card.detail).not.toHaveProperty("sessionKey");
   });
 
   it("does not invent values: real fields pass through untouched", async () => {
@@ -94,7 +94,9 @@ describe("gateway-exec card satisfies the kernel's exec detail contract (#52)", 
     };
     const { client } = makeClient([record]);
     const [card] = await createGatewayExecSource(client, { agentDid: AGENT_DID }).list();
-    expect(card.detail).toMatchObject({ host: "node-7", cwd: "/srv", agentId: "ops", sessionKey: "agent:ops:1" });
+    expect(card.detail).toMatchObject({ host: "node-7", cwd: "/srv", agentId: "ops" });
+    expect(card.detail).not.toHaveProperty("sessionKey");
+    expect(card.owner).toEqual({ sessionKey: "agent:ops:1" });
   });
 
   it("the bridge publishes a card the kernel accepts for a sparse request (end to end, kernel mock enforces the contract)", async () => {

@@ -211,9 +211,9 @@ const MAX_SUMMARY_LENGTH = 2000;
 /**
  * Shown when the Gateway omits a context field. The kernel (`ima-jin/imajin-ai`
  * `validateExecCommandDetail`) 400s a `gateway-exec:command` card unless
- * `host`, `cwd`, `agentId` and `sessionKey` are all NON-EMPTY strings, and
+ * `host`, `cwd` and `agentId` are all NON-EMPTY strings, and
  * OpenClaw legitimately sends `cwd: null` (no explicit workdir) and may omit
- * agent/session binding — so a null/empty value is rendered as this literal
+ * agent binding — so a null/empty value is rendered as this literal
  * instead of being forwarded as `null` (#52: the 400 meant no card ever
  * appeared). It is a visible "not provided" marker, never a guessed value.
  */
@@ -248,7 +248,8 @@ function isValidRecord(record: unknown): record is GatewayExecApprovalRecord {
 /**
  * Builds the `ApprovalSourceRequest` for one exec approval record. `detail`
  * matches `ima-jin/imajin-ai#2221`'s schema verbatim: `{command, host, cwd,
- * agentId, sessionKey, requestedBy, approvalId, expiresAt}`. `command` is
+ * agentId, requestedBy, approvalId, expiresAt}`. Session addressing is kept
+ * only in the local owner ref, never in detail or its new wire hash. `command` is
  * NEVER truncated here (unlike Skill Workshop's `description`/`diffSummary`)
  * — the whole point of an exec approval is that the operator sees the EXACT
  * command; the Gateway itself already guarantees `request.command` fits the
@@ -271,7 +272,6 @@ function toApprovalSourceRequest(
       host: nonEmptyOr(host, "gateway"),
       cwd: nonEmptyOr(cwd, EXEC_DETAIL_UNSPECIFIED),
       agentId: nonEmptyOr(agentId, EXEC_DETAIL_UNSPECIFIED),
-      sessionKey: nonEmptyOr(sessionKey, EXEC_DETAIL_UNSPECIFIED),
       requestedBy: opts.agentDid,
       approvalId: record.id,
       expiresAt: new Date(record.expiresAtMs).toISOString(),

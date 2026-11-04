@@ -77,13 +77,14 @@ describe("createGatewayExecSource", () => {
       host: "gateway",
       cwd: "/home/agent/project",
       agentId: "main",
-      sessionKey: "agent:main:telegram:direct:123",
       requestedBy: AGENT_DID,
       approvalId: "exec-approval-1",
       expiresAt: new Date(record.expiresAtMs).toISOString(),
     });
     // Chains and multiline structure survive intact — never sanitized/rewritten here.
     expect(requests[0].detail?.command).toBe("rm -rf /tmp/build && echo done\nls -la");
+    expect(requests[0].owner).toEqual({ sessionKey: record.request.sessionKey });
+    expect(requests[0].detail).not.toHaveProperty("sessionKey");
   });
 
   it("list() defaults host to \"gateway\" when the record omits it", async () => {
