@@ -1,0 +1,20 @@
+{
+  "loop": { "loopId": "loop:horizon", "principal": "did:imajin:ryan" },
+  "events": [],
+  "horizon": {
+    "depth": 1,
+    "targetDepth": 12,
+    "steps": [{
+      "stepId": "horizon:ff551c5ba4ec8e4239d79d65b5cdf797",
+      "publisher": "did:imajin:jin",
+      "stepKind": "code",
+      "intention": "Ship the horizon",
+      "rank": 0,
+      "exitConditions": [{ "id": "issue_closed", "kind": "issue_closed" }],
+      "conditions": [{ "declaration": { "id": "issue_closed", "kind": "issue_closed" }, "satisfied": false, "evidence": null }],
+      "openExitConditions": ["issue_closed"],
+      "state": "queued",
+      "zone": "near"
+    }]
+  }
+}

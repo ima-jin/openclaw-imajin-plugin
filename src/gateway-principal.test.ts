@@ -16,9 +16,12 @@ import * as approvals from "./gateway-approvals-bridge.js";
 import type { WsServiceConfig } from "./ws-service.js";
 import type { SystemAgentApprovalRequestRecord } from "./sources/system-agent.js";
 import { deriveLoopId } from "./loop-publisher.js";
+import { deriveStepId } from "./horizon/model.js";
+import type { HorizonWakeAdapter } from "./wake-bridge.js";
 
 const mocks = vi.hoisted(() => ({
   resolve: vi.fn(), system: vi.fn(), exec: vi.fn(), loopback: vi.fn(),
+  horizons: [] as Array<HorizonWakeAdapter | undefined>,
   sockets: [] as Array<{
     config: WsServiceConfig; frame?: (frame: any) => void; connected?: () => Promise<void>;
     send: ReturnType<typeof vi.fn>; stop: ReturnType<typeof vi.fn>;
@@ -45,9 +48,10 @@ vi.mock("./imajin-provider.js", async (original) => ({
 }));
 vi.mock("./notification-injector.js", () => ({
   WAKE_RUNTIME_HOOKS: [],
-  createNotificationInjector: () => ({
-    inject: vi.fn(), dispose: vi.fn(), reportWake: vi.fn(), runtimeHooks: {},
-  }),
+  createNotificationInjector: (_api: unknown, _config: unknown, deps: { horizon?: HorizonWakeAdapter }) => {
+    mocks.horizons.push(deps.horizon);
+    return { inject: vi.fn(), dispose: vi.fn(), reportWake: vi.fn(), runtimeHooks: {} };
+  },
 }));
 vi.mock("./reach-events.js", () => ({
   isReachFrame: () => false,
@@ -104,6 +108,7 @@ describe("map-mode gateway principal (#139)", () => {
   beforeEach(async () => {
     vi.clearAllMocks();
     mocks.sockets.length = 0;
+    mocks.horizons.length = 0;
     for (const method of ["log", "warn", "error"] as const) vi.spyOn(console, method).mockImplementation(() => {});
     [main, tenant, kernel] = await Promise.all([key(), key(), key()]);
     dir = await mkdtemp(join(tmpdir(), "gateway-principal-"));
@@ -407,6 +412,42 @@ describe("map-mode gateway principal (#139)", () => {
     const count = publishes().length;
     await registration.emit("agent_end", {}, { sessionKey: "agent:main:main" });
     expect(publishes()).toHaveLength(count);
+  });
+
+  it.each(["personal", "org"])("readback is gateway-only and uses its %s principal after trusted loop binding", async acting => {
+    if (acting === "personal") agents.main.actAs = main.did;
+    const principal = agents.main.actAs!;
+    const config = await horizonConfig();
+    const stepId = deriveStepId(config.loopId, main.did, "140");
+    const acquiredAt = new Date().toISOString();
+    const expiresAt = new Date(Date.now() + 900_000).toISOString();
+    const originalFetch = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation(async (url, init) => {
+      if (init?.method !== "GET" || !String(url).includes("/api/loops/")) return originalFetch(url, init);
+      const headers = init.headers as Record<string, string>;
+      expect(headers.Cookie).toBe(`session=${main.did}`);
+      expect(headers["X-Acting-For"]).toBe(acting === "org" ? principal : undefined);
+      return Response.json({
+        loop: { loopId: config.loopId, principal },
+        horizon: { steps: [{
+          stepId, publisher: main.did, state: "claimed", zone: "head",
+          claim: { leaseId: `step:${stepId}`, holderDid: tenant.did,
+            acquiredAt, expiresAt },
+        }] },
+      });
+    });
+    const registration = register({ approvals: undefined, sessionCommands: undefined, horizon: config });
+    await registration.start();
+    expect(mocks.horizons[0]).toBeDefined();
+    expect(mocks.horizons[1]).toBeUndefined();
+    await expect(mocks.horizons[0]!.readOpenItems({ runIds: [] })).rejects.toThrow("Gateway horizon unavailable");
+    await registration.emit("session_start", { sessionId: "session" }, { sessionKey: "agent:tenant:main" });
+    await expect(mocks.horizons[0]!.readOpenItems({ runIds: [] })).rejects.toThrow("Gateway horizon unavailable");
+    await registration.emit("session_start", { sessionId: "session" }, { sessionKey: "agent:main:main" });
+    await vi.waitFor(async () => expect((await mocks.horizons[0]!.readOpenItems({ runIds: [] }))[0])
+      .toMatchObject({ runId: stepId, claimedBy: tenant.did, kernelState: "claimed" }));
+    await registration.stop();
+    await expect(mocks.horizons[0]!.readOpenItems({ runIds: [] })).rejects.toThrow("Gateway horizon unavailable");
   });
 
   it.each(["wrong-loop", "missing-file", "disabled"])("horizon refuses %s configuration", async (failure) => {

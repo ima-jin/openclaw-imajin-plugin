@@ -1,0 +1,8 @@
+[
+  { "name": "network", "throws": true },
+  { "name": "unauthenticated", "status": 401 },
+  { "name": "forbidden", "status": 403 },
+  { "name": "not found", "status": 404 },
+  { "name": "server error", "status": 500 },
+  { "name": "unavailable", "status": 503 }
+]

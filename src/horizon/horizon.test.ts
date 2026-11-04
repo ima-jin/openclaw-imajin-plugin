@@ -48,7 +48,15 @@ async function setup(overrides: Partial<HorizonSyncOptions> = {}) {
   const write = async (items: HorizonItem[]) => writeFile(filePath, JSON.stringify({ depthTarget: 12, items }));
   await write([item()]);
   const create = (custom: Partial<HorizonSyncOptions> = {}) => {
-    const service = createHorizonSync({ ...options, ...custom });
+    const configured = { ...options, ...custom };
+    const service = createHorizonSync({
+      ...configured,
+      fetchImpl: (url, init) => init?.method === "GET"
+        ? Promise.resolve(Response.json({
+          loop: { loopId: context.loopId, principal: configured.principal ?? configured.did }, horizon: { steps: [] },
+        }))
+        : configured.fetchImpl!(url, init),
+    });
     services.push(service);
     return service;
   };

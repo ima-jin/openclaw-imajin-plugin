@@ -149,7 +149,7 @@ async function startPluginRuntime(
     void sessionGateway.start().catch(() => console.warn("[imajin-sessions] Gateway inventory unavailable"));
   }
 
-  registerHorizonSync({
+  const horizonSync = registerHorizonSync({
     registerService: ({ start, stop }) => {
       lifecycle.add(() => { void stop(); });
       start();
@@ -159,6 +159,7 @@ async function startPluginRuntime(
     did: config.did,
     keypairPath: config.keypairPath,
     principal: config.actAs,
+    client,
     config: config.horizon,
   });
 
@@ -189,6 +190,7 @@ async function startPluginRuntime(
     } = createNotificationInjector(api, config.wsNotifications, {
       sendFrame: (frame) => wsService.send(frame),
       keypairPath: config.keypairPath,
+      horizon: horizonSync,
     });
     lifecycle.add(disposeInjector);
     for (const [hook, handler] of Object.entries(wakeRuntimeHooks)) {

@@ -2,7 +2,8 @@
 
 The opt-in horizon publisher pushes local queue facts to an existing owning
 loop through the signed `/api/loops` rail. The kernel never reads the harness,
-gateway, sessions or transcripts. Inbound `/jin` claims are a separate feature.
+gateway, sessions or transcripts. Each sync also pulls the kernel's derived
+claims and exits back into the local bridge.
 
 The wire contract is `docs/loops-rail-contract.md` from merged kernel PRs #2909 and #3000 (receipt lookup, imajin-ai#2931).
 Zones are kernel projections, never published fields.
@@ -191,6 +192,48 @@ automatically replayed or treated as acceptance.
 
 ## Verification and wake seam
 
+### Kernel readback (#133)
+
+Contract confirmed against live `https://jin.imajin.ai/jin/api/spec` and kernel
+main on 2026-11-04: `HorizonStep.publisher`, `HorizonClaim` and
+`GET /api/loops/{loopId}?includeExited=true`. The single GET includes the live
+`claim.holderDid` / `claim.expiresAt` and terminal projections; no surface write
+or second lease read is necessary. The existing challenge-response session is
+reused, with `X-Acting-For` set to the configured principal when it differs from
+the publishing DID. The GET does not publish `step.claimed`.
+
+Only a step whose `publisher` is this harness DID and whose deterministic
+`stepId` matches a local item is applied. Readback stores `claimedBy`,
+`claimExpiresAt`, `kernelState` and `kernelZone`. Released/expired leases clear
+the claim fields; an item leaving a claim returns to local `near` unless already
+past/done. A kernel `state: exited` or `zone: past | done` moves the local item
+to `done` and clears its claim. Other kernel zones are retained as evidence,
+not copied into the local queue's zone. Local zone/depth never author a claim.
+
+Derived completion does not become a new signed completion/closure observation
+on a later tick or restart. Explicit bridge `closed`, release, deployment and
+attestation observations still follow the independent upward mapping. Unchanged
+readback writes neither bridge nor cursor and publishes no events. Updates use
+atomic replacement, preserve unrelated root/item fields, and re-read the file
+after the GET so edits made while the request was pending are retained.
+
+Network, HTTP (including 401/403 and 5xx), malformed, oversized and scope-mismatched
+reads leave the bridge untouched. One fixed read-failure warning is emitted per
+process, without server bodies or raw errors. Upward sync runs independently;
+even an upward delivery failure does not suppress the read attempt. Missing
+remote steps are not inferred to be released or exited.
+
+The `readOpenItems` wake adapter reads this local snapshot without network calls
+or publishing. It returns claim/exit fields, with terminal records marked
+`status: closed`; wake continuity preserves those fields and hides completed
+items. It is wired in legacy mode and only to the selected gateway agent in map
+mode, after the existing local-loop ownership check. Enable the existing
+`wsNotifications.horizonEnabled` opt-in to use it. It has no wake step writer.
+
+`src/horizon/readback.test.ts` uses claimed, expired, exited and read-failure
+fixtures, including personal/acting-as-org contexts, foreign scope/publisher
+rejection, response validation, idempotence, restart, and wake seam coverage.
+
 Run `pnpm run typecheck` and
 `pnpm exec vitest run --maxWorkers=2 --minWorkers=1`.
 The horizon suite covers file mapping, rank changes, exit facts, exact
@@ -202,10 +245,9 @@ mismatches, invalid responses, partial batch recovery and cursor-write failure.
 
 Read `loops_get` / `GET /api/loops/{loopId}` under the owning principal. Inspect
 `horizon.steps` and `events[].payload.publisherProof` for the actual publisher,
-signature, ranks and unsatisfied exit conditions. `include_exited: true`
+signature, ranks and unsatisfied exit conditions. `includeExited=true`
 includes fully exited steps for audit.
 
-`createHorizonSync(...).sync()` is an explicit one-way resync seam for a future
-wake adapter. #79 / PR #80 is still independent; no wake or wsNotifications file
-is modified here. A wake verdict is not closure/release/deployment evidence.
-Inbound claim application and lease policy remain #2879/#2880, not this service.
+`createHorizonSync(...).sync()` explicitly runs upward sync and readback.
+A wake verdict is not closure/release/deployment evidence; the read-only wake
+adapter never turns a verdict into step observations or lease policy.

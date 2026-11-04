@@ -152,7 +152,7 @@ describe("WakeBridgeStore", () => {
     await store.merge(await adapter.readOpenItems({ runIds: ["run-a"] }));
     const outcome = { runIds: ["run-a"], lastVerdict: "reviewed", expectedPr: "pr-80" };
     await store.recordOutcome(outcome);
-    await adapter.writeStepEvents(outcome);
+    await adapter.writeStepEvents?.(outcome);
     expect(adapter.readOpenItems).toHaveBeenCalledWith({ runIds: ["run-a"] });
     expect(adapter.writeStepEvents).toHaveBeenCalledWith(outcome);
     expect(store.buildPrompt()).toContain('"lastVerdict":"reviewed"');

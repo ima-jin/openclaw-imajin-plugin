@@ -133,9 +133,10 @@ export function registerAgentPlugin(api: any, config: {
       sockets.set(agentId, ws);
       lifecycle.add(() => ws.stop());
       let gatewayFeatures: ReturnType<typeof registerGatewayFeatures> | undefined;
+      let horizon: ReturnType<typeof registerGatewayPublishing>;
       if (identity === selected) {
         gatewayIdentity = { ...identity, agentId, ws };
-        registerGatewayPublishing(getGatewayIdentity()!, { ...config, nodeUrl: config.nodeUrl }, lifecycle, on);
+        horizon = registerGatewayPublishing(getGatewayIdentity()!, { ...config, nodeUrl: config.nodeUrl }, lifecycle, on);
         gatewayFeatures = registerGatewayFeatures(api, {
           nodeUrl: config.nodeUrl,
           did: identity.config.did, actAs: identity.config.actAs, signer: identity.signer,
@@ -146,6 +147,7 @@ export function registerAgentPlugin(api: any, config: {
       }
       const injector = createNotificationInjector(api, notifications, {
         identityScope: agentId, sendFrame: (frame) => ws.send(frame),
+        horizon,
       });
       lifecycle.add(injector.dispose);
       senders.set(agentId, injector.reportWake);

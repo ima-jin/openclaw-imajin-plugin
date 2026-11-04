@@ -1,7 +1,7 @@
 /**
  * Plugin-owned wake continuity, not a transcript or a Horizon implementation.
- * Only allowlisted scalar evidence survives here. Remote loops_get/horizon reads
- * and signed step events belong to a future injected HorizonWakeAdapter.
+ * Only allowlisted scalar evidence survives here. The injected horizon adapter
+ * supplies harness readback; optional signed step writers remain independent.
  */
 import { randomUUID } from "node:crypto";
 import { constants } from "node:fs";
@@ -26,6 +26,10 @@ export interface WakeBridgeRecord {
   expectedPr?: string;
   lastVerdict?: string;
   status: "open" | "closed";
+  claimedBy?: string;
+  claimExpiresAt?: string;
+  kernelState?: string;
+  kernelZone?: string;
 }
 
 /**
@@ -43,7 +47,7 @@ export interface WakeBridgeOutcome {
 
 export interface HorizonWakeAdapter {
   readOpenItems(input: { runIds: readonly string[] }): Promise<readonly WakeBridgeRecord[]>;
-  writeStepEvents(outcome: WakeBridgeOutcome): Promise<void>;
+  writeStepEvents?(outcome: WakeBridgeOutcome): Promise<void>;
 }
 
 type Evidence = Record<string, unknown>;
@@ -82,6 +86,10 @@ function record(value: unknown): WakeBridgeRecord | undefined {
     expectedPr: text(item.expectedPr, WAKE_BRIDGE_FIELD_BYTES.expectedPr),
     lastVerdict: text(item.lastVerdict, WAKE_BRIDGE_FIELD_BYTES.lastVerdict),
     status: item.status,
+    claimedBy: text(item.claimedBy, 512),
+    claimExpiresAt: text(item.claimExpiresAt, 64),
+    kernelState: text(item.kernelState, 32),
+    kernelZone: text(item.kernelZone, 32),
   };
 }
 
@@ -222,6 +230,10 @@ export class WakeBridgeStore {
     const merged = { ...previous, ...Object.fromEntries(
       Object.entries(item).filter(([, value]) => value !== undefined),
     ) } as WakeBridgeRecord;
+    if (item.kernelState && !item.claimedBy) {
+      delete merged.claimedBy;
+      delete merged.claimExpiresAt;
+    }
     this.records = capped([
       ...this.records.filter((entry) => entry.runId !== item.runId),
       merged,
