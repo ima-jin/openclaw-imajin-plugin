@@ -932,7 +932,7 @@ export function createNotificationInjector(
       if (event.wakeWatchdog !== true) {
         await pendingWakeStore.delete(batch.batchId.slice(`imajin-wake:${identityPrefix}`.length));
       }
-      if (horizon) {
+      if (horizon?.writeStepEvents) {
         await withWakeDeadline(horizon.writeStepEvents(outcome)).catch(() => {
           console.warn("[imajin-ws] horizon step writeback failed; outcome retained in bridge");
         });

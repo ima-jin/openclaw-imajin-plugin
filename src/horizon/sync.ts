@@ -7,6 +7,8 @@ import { loadCursor, planDiff, saveCursor, type Cursor } from "./cursor.js";
 import { digest, mapItem, parseHorizon, text, type StepEnvelope, type StepRequest } from "./model.js";
 import { deliveryResult, rejectedStepWarning, safeStepId, saveDeadLetter } from "./outbox.js";
 import { isStale, lookupReceipt } from "./receipts.js";
+import { readBackHorizon } from "./readback.js";
+import type { WakeBridgeRecord } from "../wake-bridge.js";
 
 export interface HorizonConfig {
   enabled?: boolean;
@@ -116,42 +118,49 @@ export function createHorizonSync(options: HorizonSyncOptions) {
     await saveCursor(cursorPath, complete);
     return complete;
   }
+  async function publish(items: ReturnType<typeof mapItem>[]): Promise<void> {
+    let cursor = await loadCursor(cursorPath, scope);
+    // Validate immutable changes against the pending target before retrying it.
+    planDiff(items, { ...cursor, steps: cursor.pending?.steps ?? cursor.steps });
+    cursor = await drain(cursor);
+    if (stopped) return;
+    const plan = planDiff(items, cursor);
+    const missingOutcome = items.some(item => item.facts.closed && !plan.steps[item.stepId]?.update.issue);
+    if (missingOutcome && now() - lastIncompleteWarning >= 60_000) {
+      lastIncompleteWarning = now();
+      log.warn("[imajin-horizon] closure has no issue OUTCOME; kernel past projection needs explicit outcome or gap(kernel) #2931 resolved");
+    }
+    if (!plan.events.length) return;
+    const at = Math.max(now(), cursor.lastAt + 1);
+    const requests: StepRequest[] = await Promise.all(plan.events.map(async fact => {
+      const payload: StepEnvelope = {
+        loopId, kind: "openclaw.horizon", principal, parentLoopId: null,
+        refs: fact.item.refs, stepId: fact.item.stepId,
+        state: fact.type === "step.queued" ? "queued" : "observed",
+        summary: "harness horizon observation", at: new Date(at).toISOString(),
+        ...fact.data,
+      };
+      if (Buffer.byteLength(JSON.stringify(payload)) > 16_000) throw new Error("step metadata too large");
+      return transport.sign(fact.type, payload);
+    }));
+    cursor = { ...cursor, pending: { requests, steps: plan.steps, at } };
+    await saveCursor(cursorPath, cursor); // write ahead of the very first network call
+    await drain(cursor);
+  }
   async function tick(): Promise<void> {
-    // Parse AND map every item before publishing anything, even an earlier outbox.
-    const file = parseHorizon(await readFile(filePath, "utf8"));
-    const items = file.items.map((item, rank) => mapItem(item, rank, { loopId, did: options.did, repository }));
-    await mkdir(stateDir, { recursive: true, mode: 0o700 });
     await withLock(cursorPath, async () => {
-      let cursor = await loadCursor(cursorPath, scope);
-      // Validate immutable changes against the pending target before retrying it.
-      planDiff(items, { ...cursor, steps: cursor.pending?.steps ?? cursor.steps });
-      cursor = await drain(cursor);
-      if (stopped) return;
-      const plan = planDiff(items, cursor);
-      const missingOutcome = items.some(item => item.facts.closed && !plan.steps[item.stepId]?.update.issue);
-      if (missingOutcome && now() - lastIncompleteWarning >= 60_000) {
-        lastIncompleteWarning = now();
-        log.warn("[imajin-horizon] closure has no issue OUTCOME; kernel past projection needs explicit outcome or gap(kernel) #2931 resolved");
+      // Parse AND map every item before publishing anything, even an earlier outbox.
+      const file = parseHorizon(await readFile(filePath, "utf8"));
+      const items = file.items.map((item, rank) => mapItem(item, rank, { loopId, did: options.did, repository }));
+      await mkdir(stateDir, { recursive: true, mode: 0o700 });
+      try {
+        await publish(items);
+      } finally {
+        if (!stopped) await readBackHorizon(options, loopId, filePath);
       }
-      if (!plan.events.length) return;
-      const at = Math.max(now(), cursor.lastAt + 1);
-      const requests: StepRequest[] = await Promise.all(plan.events.map(async fact => {
-        const payload: StepEnvelope = {
-          loopId, kind: "openclaw.horizon", principal, parentLoopId: null,
-          refs: fact.item.refs, stepId: fact.item.stepId,
-          state: fact.type === "step.queued" ? "queued" : "observed",
-          summary: "harness horizon observation", at: new Date(at).toISOString(),
-          ...fact.data,
-        };
-        if (Buffer.byteLength(JSON.stringify(payload)) > 16_000) throw new Error("step metadata too large");
-        return transport.sign(fact.type, payload);
-      }));
-      cursor = { ...cursor, pending: { requests, steps: plan.steps, at } };
-      await saveCursor(cursorPath, cursor); // write ahead of the very first network call
-      await drain(cursor);
     });
   }
-  /** Public one-way seam for a future wake horizon-read hook; never applies claims. */
+  /** Public resync seam; inbound projections never author signed claims. */
   function sync(): Promise<void> {
     if (stopped) return Promise.resolve();
     rerun = true;
@@ -165,6 +174,17 @@ export function createHorizonSync(options: HorizonSyncOptions) {
   }
   return {
     sync,
+    /** Wake reads the same claim/exit evidence as the local harness. No wake writes. */
+    async readOpenItems(): Promise<readonly WakeBridgeRecord[]> {
+      await running;
+      const file = parseHorizon(await readFile(filePath, "utf8"));
+      return file.items.map(item => ({
+        runId: item.id, issue: item.refs[0],
+        status: item.zone === "done" ? "closed" : "open",
+        claimedBy: item.claimedBy, claimExpiresAt: item.claimExpiresAt,
+        kernelState: item.kernelState, kernelZone: item.kernelZone,
+      }));
+    },
     cursorPath,
     deadLetterPath,
     start(): void {

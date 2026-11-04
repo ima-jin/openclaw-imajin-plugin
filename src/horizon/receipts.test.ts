@@ -49,7 +49,11 @@ async function fixture() {
   });
   const options: HorizonSyncOptions = {
     nodeUrl: "https://kernel.test", did: "did:imajin:publisher", principal: "did:imajin:operator",
-    keypairPath, logger, fetchImpl: fetchImpl as typeof fetch, now: () => START,
+    keypairPath, logger, fetchImpl: (url, init) => init?.method === "GET"
+      ? Promise.resolve(Response.json({
+        loop: { loopId: "loop:horizon", principal: "did:imajin:operator" }, horizon: { steps: [] },
+      }))
+      : fetchImpl(url, init), now: () => START,
     config: { loopId: "loop:horizon", repository: "ima-jin/imajin-ai", filePath, stateDir: join(directory, "state") },
   };
   const first = createHorizonSync(options);

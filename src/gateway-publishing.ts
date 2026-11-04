@@ -59,7 +59,7 @@ export function registerGatewayPublishing(
   config: PublishingConfig,
   lifecycle: RegistrationLifecycle,
   on: RuntimeHookRegister,
-): void {
+) {
   const { agentId, signer, client } = identity;
   const { did, actAs } = identity.config;
   const ownedCronJobs = new Set<string>();
@@ -108,4 +108,10 @@ export function registerGatewayPublishing(
       },
     });
   }, { name: "imajin-gateway:horizon" });
+  return {
+    readOpenItems: async () => {
+      if (!lifecycle.active || !horizon) throw new Error("Gateway horizon unavailable");
+      return horizon.readOpenItems();
+    },
+  };
 }

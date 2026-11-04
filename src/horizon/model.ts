@@ -31,6 +31,11 @@ export interface HorizonItem {
   release?: { issue: string; mergeCommit: string; tag: string };
   deployment?: { tag: string; environment: "prod" };
   attestation?: string;
+  /** Readback evidence only; never becomes a signed step fact. */
+  claimedBy?: string;
+  claimExpiresAt?: string;
+  kernelState?: string;
+  kernelZone?: string;
 }
 export interface HorizonFile {
   depthTarget: number;
@@ -173,7 +178,8 @@ function sharpening(item: HorizonItem, rank: number, issue?: string): Record<str
 }
 function completionFacts(item: HorizonItem, issue?: string): Record<string, StepFact> {
   const facts: Record<string, StepFact> = {};
-  if (item.zone === "past" || item.zone === "done" || item.closed) {
+  const derivedCompletion = item.kernelState === "exited" || ["past", "done"].includes(item.kernelZone ?? "");
+  if ((!derivedCompletion && (item.zone === "past" || item.zone === "done")) || item.closed) {
     facts.finished = { type: "step.finished", data: {} };
     if ((item.stepKind ?? "code") === "code" && issue) facts.closed = {
       type: "step.observed",
