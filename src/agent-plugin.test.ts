@@ -214,9 +214,11 @@ describe("registered self_authorize action (#168)", () => {
       if (path === "/api/auth/authorize") consents.push({ did, options });
       return { status: 200, contentType: "application/json", text: JSON.stringify({ data: [] }) };
     });
-    const discover = vi.spyOn(AgentInferenceAuth.prototype, "discoverModels").mockResolvedValue({
-      data: [{ id: "artifact-model" }],
-    });
+    const credential = vi.spyOn(AgentInferenceAuth.prototype, "credential").mockImplementation(async (id) =>
+      ({ token: `fixture-${id}`, expiresAt: Date.now() + 600_000 }));
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      data: [{ id: "artifact-model", imajin: { connector: "openai" } }],
+    })));
     const registry = register({
       nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
       agents: { main: agent("main"), artifact: agent("artifact") },
@@ -224,6 +226,7 @@ describe("registered self_authorize action (#168)", () => {
     });
     await registry.start();
     expect(consents).toEqual([]);
+    credential.mockClear();
     const tool = (id: string) => registry.agentTools({ agentId: id, sessionKey: `agent:${id}:main` })
       .find((tool) => tool.name === "imajin_identity");
     const main = tool("main");
@@ -233,7 +236,7 @@ describe("registered self_authorize action (#168)", () => {
     expect(consents[0]).toMatchObject({
       did: "did:imajin:artifact", options: { method: "POST", onBehalfOf: "self", body: { appId: "app_artifact" } },
     });
-    expect(discover).toHaveBeenCalledWith("artifact", "/infer/v1/models/usable");
+    expect(credential.mock.calls.map(([id]) => id)).toEqual(["artifact"]);
     request.mockClear();
     expect((await tool("artifact").execute("test", { action: "self_authorize", agentId: "main" })).details)
       .toMatchObject({ error: true });

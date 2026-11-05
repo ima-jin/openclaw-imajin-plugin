@@ -77,7 +77,7 @@ describe("explicit agent self-authorization", () => {
         return Response.json({ token, expiresIn: 600, scopes });
       }
       if (path === "/infer/v1/models/usable") return Response.json({
-        data: [{ id: "agent-model", imajin: { picked: true, servable: true } }],
+        data: [{ id: "agent-model", imajin: { connector: "openai", picked: true, servable: true } }],
       });
       throw new Error("Unexpected request");
     }));
@@ -254,23 +254,24 @@ describe("explicit agent self-authorization", () => {
     expect(wire).toEqual([]);
   });
 
-  it("consent recovers a 403 mint and stale catalog immediately, using artifact's app token and org selector", async () => {
-    let authorized = false;
-    const fetcher = vi.fn(async () => {
-      if (!authorized) throw new ImajinDiscoveryError("auth-error", "no_live_grant", 403);
-      return { data: [{ id: "gateway-model" }] };
-    });
+  it("consent recovers artifact's 403 mint and stale catalog immediately without refreshing main", async () => {
     const provider = registerImajinProvider({ registerProvider: () => {} }, undefined, {
-      nodeUrl: "https://kernel.invalid", getIdentity: (id) => identities.get(id), fetcher, logger,
+      nodeUrl: "https://kernel.invalid", getIdentity: (id) => identities.get(id),
+      gatewayAgent: "main", agentIds: ["main", "artifact"], logger,
     });
     const auth = new AgentInferenceAuth("https://kernel.invalid", (id) => identities.get(id));
     await expect(auth.credential("artifact")).rejects.toMatchObject({ status: 403 });
-    expect((await provider.cache.get()).outcome).toBe("auth-error");
-    options.rediscover = async (id) => { authorized = true; return provider.refreshAfterAuthorization(id); };
+    const cache = await provider.cacheForAgent("artifact");
+    const mainCache = await provider.cacheForAgent("main");
+    expect((await cache.get()).outcome).toBe("auth-error");
+    expect((await mainCache.get()).outcome).toBe("auth-error");
+    const mainRequests = wire.filter((request) => request.body?.appDid === "did:imajin:main").length;
+    options.rediscover = provider.refreshAfterAuthorization;
     expect(await createSelfAuthorizer(options)()).toMatchObject({ authorized: true, discovery: "ok", models: ["imajin/agent-model"] });
     expect((await auth.credential("artifact")).token).toBeTruthy();
-    expect(provider.cache.peek()).toMatchObject({ outcome: "ok", models: [{ id: "gateway-model" }] });
-    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(cache.peek()).toMatchObject({ outcome: "ok", models: [{ id: "agent-model" }] });
+    expect(mainCache.peek()).toMatchObject({ outcome: "auth-error" });
+    expect(wire.filter((request) => request.body?.appDid === "did:imajin:main")).toHaveLength(mainRequests);
     const discovery = wire.find((request) => request.path === "/infer/v1/models/usable")!;
     expect(discovery.headers.get("x-acting-as")).toBe("did:imajin:org-artifact");
     expect(discovery.headers.has("cookie")).toBe(false);

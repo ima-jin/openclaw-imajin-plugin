@@ -2224,10 +2224,10 @@ records `app.authorized` with issuer = subject = the agent DID and reuses an
 identical scope-set grant on repeated calls. The callback code is discarded.
 Only that agent's cached inference token is evicted; its next app-token mint
 and usable-model discovery run immediately with its normal `x-acting-as`.
-The result lists its `imajin/*` models, and the separate gateway catalog is
-also forced to refresh, including after a cached auth failure, without restart.
-The shared catalog remains gateway-scoped; it is not a per-agent picker or
-inference authority. Existing model policy still applies.
+The result lists its `imajin/*` models, and its per-agent catalog is forced
+to refresh, including after a cached auth failure, without restart.
+Another agent's token and last-good catalog remain untouched. Existing
+model policy still applies.
 
 If consent succeeds but model discovery is unavailable, the result retains
 `authorized: true` with `discovery: "retry-required"`; retry the explicit action

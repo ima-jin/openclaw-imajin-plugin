@@ -77,27 +77,19 @@ export class AgentInferenceAuth {
   clear(): void {
     this.entries.clear();
   }
-  /** Same caller/key/token path as inference; never a gateway session cookie. */
-  async discoverSelf(agentId: string): Promise<unknown> {
-    return this.discoverResource(agentId, "/infer/v1/self");
-  }
-
-  async discoverModels(agentId: string, path: string): Promise<unknown> {
-    return this.discoverResource(agentId, path);
-  }
-
   /** Evict only the consenting agent, including any old in-flight mint. */
   forget(agentId: string): void {
     const identity = this.identity(agentId);
     this.entries.delete(JSON.stringify([identity.config.did, identity.config.actAs ?? null, AUDIENCE]));
   }
 
-  private async discoverResource(agentId: string, path: string): Promise<unknown> {
+  /** Same caller/key/token path as inference; never a gateway session cookie. */
+  async discoverSelf(agentId: string): Promise<unknown> {
     const identity = this.identity(agentId);
     try {
       const credential = await this.credential(agentId);
       if (this.identity(agentId) !== identity) throw new Error("Identity changed");
-      const response = await this.fetcher(`${trimTrailingSlashes(this.nodeUrl!)}${path}`, {
+      const response = await this.fetcher(`${trimTrailingSlashes(this.nodeUrl!)}/infer/v1/self`, {
         method: "GET",
         redirect: "error",
         headers: {
