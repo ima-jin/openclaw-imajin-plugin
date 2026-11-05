@@ -198,6 +198,54 @@ describe("identity card registration and calling-agent isolation", () => {
   });
 });
 
+describe("registered self_authorize action (#168)", () => {
+  it("never auto-consents; operator targeting uses artifact's client, and tenants cannot target main", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const consents: Array<{ did?: string; options: any }> = [];
+    const request = vi.spyOn(ImajinClient.prototype, "requestRaw").mockImplementation(async function (this: ImajinClient, path, options) {
+      const did = this.identityStatus().did;
+      if (path.startsWith("/api/registry/apps")) return {
+        status: 200, contentType: "application/json", text: JSON.stringify({ apps: [{
+          id: `app_${did!.split(":").at(-1)}`, appDid: did, status: "active",
+          requestedScopes: ["infer:completions", "infer:usage-read"],
+        }] }),
+      };
+      if (path === "/api/auth/authorize") consents.push({ did, options });
+      return { status: 200, contentType: "application/json", text: JSON.stringify({ data: [] }) };
+    });
+    const credential = vi.spyOn(AgentInferenceAuth.prototype, "credential").mockImplementation(async (id) =>
+      ({ token: `fixture-${id}`, expiresAt: Date.now() + 600_000 }));
+    vi.stubGlobal("fetch", vi.fn(async () => Response.json({
+      data: [{ id: "artifact-model", imajin: { connector: "openai" } }],
+    })));
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { main: agent("main"), artifact: agent("artifact") },
+      modelDiscovery: { refreshIntervalMs: 0 }, loops: { enabled: false }, attestation: { enabled: false },
+    });
+    await registry.start();
+    expect(consents).toEqual([]);
+    credential.mockClear();
+    const tool = (id: string) => registry.agentTools({ agentId: id, sessionKey: `agent:${id}:main` })
+      .find((tool) => tool.name === "imajin_identity");
+    const main = tool("main");
+    expect((await main.execute("test", { action: "self_authorize", agentId: "artifact" })).details)
+      .toMatchObject({ agentId: "artifact", did: "did:imajin:artifact", authorized: true, models: ["imajin/artifact-model"] });
+    expect(consents).toHaveLength(1);
+    expect(consents[0]).toMatchObject({
+      did: "did:imajin:artifact", options: { method: "POST", onBehalfOf: "self", body: { appId: "app_artifact" } },
+    });
+    expect(credential.mock.calls.map(([id]) => id)).toEqual(["artifact"]);
+    request.mockClear();
+    expect((await tool("artifact").execute("test", { action: "self_authorize", agentId: "main" })).details)
+      .toMatchObject({ error: true });
+    expect(request).not.toHaveBeenCalled();
+    await registry.stop();
+    expect(() => main.execute("test", { action: "self_authorize" })).toThrow("no longer active");
+  });
+});
+
 describe("agent-signed model discovery (imajin-ai#3198)", () => {
   const models = { data: [{ id: "picked-model", imajin: { connector: "anthropic", picked: true } }] };
 

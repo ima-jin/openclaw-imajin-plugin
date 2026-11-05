@@ -361,6 +361,13 @@ export class ImajinCatalogCache {
     this.stale = true;
   }
 
+  /** An old pre-consent attempt must finish before the forced recovery fetch. */
+  async invalidateAndRefresh(): Promise<ImajinCatalogCacheState> {
+    if (this.inFlight) await this.inFlight;
+    this.invalidate();
+    return this.refresh();
+  }
+
   /** The last resolved state, if any, without forcing a fetch (used by status/doctor and the approvals source). */
   peek(): ImajinCatalogCacheState | null {
     return this.state;
@@ -722,6 +729,7 @@ export interface RegisteredImajinProvider {
   cacheForAgent(agentId: string): Promise<ImajinCatalogCache>;
   peekAgentCache(agentId: string): ImajinCatalogCache;
   invalidateAgent(agentId: string): void;
+  refreshAfterAuthorization(agentId: string): Promise<string[]>;
   cache: ImajinCatalogCache;
   baseUrl: string;
   /** Kernel discovery URL + refresh interval, surfaced by `imajin_status`. */
@@ -810,6 +818,15 @@ export function registerImajinProvider(
     peekAgentCache: (agentId) => catalogs.peekAgent(agentId),
     invalidateAgent: (agentId) => catalogs.invalidate(agentId),
     get cache() { return catalogs.peekGateway(); },
+    refreshAfterAuthorization: async (agentId) => {
+      auth.forget(agentId);
+      const cache = await catalogs.forAgent(agentId);
+      const state = await cache.invalidateAndRefresh();
+      if (state.outcome !== "ok" && state.outcome !== "empty") {
+        throw new Error("Agent model discovery unavailable after consent");
+      }
+      return state.models.map((model) => `${IMAJIN_PROVIDER_ID}/${model.id}`);
+    },
     baseUrl,
     discovery: {
       modelsUrl: resolveImajinKernelModelsUrl(options.nodeUrl, modelsPath),

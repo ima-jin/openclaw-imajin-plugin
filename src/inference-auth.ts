@@ -77,6 +77,12 @@ export class AgentInferenceAuth {
   clear(): void {
     this.entries.clear();
   }
+  /** Evict only the consenting agent, including any old in-flight mint. */
+  forget(agentId: string): void {
+    const identity = this.identity(agentId);
+    this.entries.delete(JSON.stringify([identity.config.did, identity.config.actAs ?? null, AUDIENCE]));
+  }
+
   /** Same caller/key/token path as inference; never a gateway session cookie. */
   async discoverSelf(agentId: string): Promise<unknown> {
     const identity = this.identity(agentId);

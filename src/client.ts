@@ -909,7 +909,8 @@ export class ImajinClient {
    */
   async requestRaw(
     path: string,
-    opts?: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown; onBehalfOf?: string },
+    opts?: { method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE"; body?: unknown; onBehalfOf?: string;
+      redirect?: "error"; signal?: AbortSignal },
   ): Promise<{ status: number; contentType: string; text: string }> {
     const headers = await this.authHeaders({ onBehalfOf: opts?.onBehalfOf });
     const method = opts?.method ?? "GET";
@@ -918,6 +919,8 @@ export class ImajinClient {
     const res = await fetch(`${this.baseUrl}${path}`, {
       method,
       headers,
+      ...(opts?.redirect ? { redirect: opts.redirect } : {}),
+      ...(opts?.signal ? { signal: opts.signal } : {}),
       ...(hasBody ? { body: JSON.stringify(opts?.body) } : {}),
     });
     return {
