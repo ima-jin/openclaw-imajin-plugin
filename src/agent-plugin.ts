@@ -23,6 +23,7 @@ import {
   createIdentityCardTool,
 } from "./tools.js";
 import type { CardContext } from "./identity-card-facts.js";
+import { createSelfAuthorizer } from "./self-authorize.js";
 
 interface AgentToolContext extends CardContext {
   runId?: string;
@@ -211,7 +212,16 @@ export function registerAgentPlugin(api: any, config: {
     }
     const { client, config: agent } = identity;
     const tools = [
-      createIdentityTool(client), createAttestTool(client), createTransactTool(client),
+      createIdentityTool(client, createSelfAuthorizer({
+        callerId: ctx.agentId, sessionKey: ctx.sessionKey,
+        operatorAgentId: config.gatewayAgent ?? "main",
+        getIdentity: (agentId) => identities.get(agentId),
+        assertCurrent: () => {
+          ctx.assertInvocationCurrent?.();
+          if (PluginServiceRuntime.owner() !== runtime) throw new Error("Agent identity runtime is no longer active");
+        },
+        rediscover: provider.refreshAfterAuthorization,
+      })), createAttestTool(client), createTransactTool(client),
       createFairTool(client), createDiscoverTool(client), createMediaTool(client),
       createWarpTool(client, agent.warp), createInferTool(client), createUsageTool(client),
       createVaultTool(client), createCloudflareTool(client),

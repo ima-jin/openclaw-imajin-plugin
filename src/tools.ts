@@ -26,6 +26,7 @@ import { buildUsageReport, formatDay, parseDay, resolveUsageRange } from "./usag
 import { ackGrant, fetchGrantValue, listGrantsMine, VaultError } from "./vault/kernel-contract.js";
 import { containsLiveSecret, createSecretHandle } from "./vault/secret-handle-store.js";
 import type { StatusIdentity } from "./status-identity.js";
+import { SelfAuthorizeError } from "./self-authorize.js";
 
 export { createCloudflareTool } from "./cloudflare-tool.js";
 export { createIdentityCardTool } from "./identity-card.js";
@@ -101,25 +102,30 @@ function truncateResults(data: unknown[], max = 20): unknown[] {
 
 // --- Tool definitions ---
 
-export function createIdentityTool(client: ImajinClient) {
+export function createIdentityTool(client: ImajinClient, selfAuthorize?: (agentId?: string) => Promise<unknown>) {
   return {
     name: "imajin_identity",
     label: "Imajin Identity",
     description:
       "Look up identities on the Imajin network. Actions: lookup (by handle/name/DID), " +
       "connections (list a DID's trust graph connections; requires its session or " +
-      "connections:read delegation, not public access to arbitrary DIDs).",
+      "connections:read delegation, not public access to arbitrary DIDs), " +
+      "self_authorize (explicitly consent to the calling agent's registered app; optional agentId, operator/main only for another agent).",
     parameters: {
       type: "object" as const,
       properties: {
         action: {
           type: "string" as const,
-          enum: ["lookup", "connections"],
+          enum: ["lookup", "connections", "self_authorize"],
           description: "Action to perform",
         },
         query: {
           type: "string" as const,
           description: "Handle, name, or DID to look up",
+        },
+        agentId: {
+          type: "string" as const,
+          description: "self_authorize target; defaults to the calling agent. Only operator/main may target another agent.",
         },
         onBehalfOf: {
           type: "string" as const,
@@ -127,23 +133,34 @@ export function createIdentityTool(client: ImajinClient) {
             'DID to act on behalf of (agent delegation), or "self" to act as the agent itself with no delegation (#1545). The agent must have role:agent membership on the target DID.',
         },
       },
-      required: ["action", "query"],
+      required: ["action"],
     },
     async execute(
       _id: string,
-      params: { action: string; query: string; onBehalfOf?: string },
+      params: { action: string; query?: string; agentId?: string; onBehalfOf?: string },
     ): Promise<ToolResult> {
+      if (params.action === "self_authorize") {
+        if (params.onBehalfOf !== undefined) return errorResult("self_authorize does not accept onBehalfOf; consent is always as the target agent");
+        if (!selfAuthorize) return errorResult("self_authorize requires a configured per-agent sealed signing identity");
+        try {
+          return jsonResult(await selfAuthorize(params.agentId));
+        } catch (error) {
+          return errorResult(error instanceof SelfAuthorizeError ? error.message : "Agent self-authorization unavailable");
+        }
+      }
       if (params.onBehalfOf && params.onBehalfOf !== "self" && !validateDid(params.onBehalfOf)) {
         return errorResult(`Invalid DID format for onBehalfOf: ${params.onBehalfOf}`);
       }
       try {
         switch (params.action) {
           case "lookup": {
+            if (!params.query) return errorResult("lookup requires 'query'");
             const identity = await client.lookupIdentity(params.query);
             if (!identity) return textResult(`No identity found for: ${params.query}`);
             return jsonResult(identity);
           }
           case "connections": {
+            if (!params.query) return errorResult("connections requires 'query'");
             const connections = await client.getConnections(params.query, params.onBehalfOf);
             if (!connections.length) return textResult(`No connections found for: ${params.query}`);
             return jsonResult(connections);

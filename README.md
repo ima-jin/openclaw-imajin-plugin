@@ -1,5 +1,4 @@
 # @openclaw/imajin-plugin
-Agent self-consent work is tracked in #168.
 Release ordering (#161): ship the clean loop/exec publisher before deploying imajin-ai PR #3265 so newly started loops retain native command authority; keep the session-to-loop map private to the harness.
 
 OpenClaw plugin for the [Imajin](https://jin.imajin.ai) sovereign identity and settlement network.
@@ -2201,10 +2200,42 @@ to that selector on each inference request. The mint narrows scope to
 This requires an active kernel **app registration for that same agent DID**
 and that agent's live self-context **`app.authorized` grant**. Registering an
 agent or adding org controller membership alone does not create that app grant.
-An unavailable grant/app stops the call with an error naming `agents.<id>`;
-the plugin does not provision grants, discover another principal or borrow
-another app. Every agent needs its own self-context authorization; no principal
-is guessed from the signed-in human or gateway.
+
+**Per-agent setup, after app registration (#168):** explicitly invoke
+`imajin_identity` with `{"action":"self_authorize"}` from that agent. The
+configured operator/gateway agent (`gatewayAgent`, or `main` when omitted)
+can instead pass `{"action":"self_authorize","agentId":"artifact"}` to
+authorize an existing configured agent. Other agents can consent only to
+their own app. The target's sealed signer and session are always used, never
+the caller's signer. No startup hook, token mint or inference call auto-consents.
+
+The registration must use that agent's DID and include `infer:completions`
+(normally also `infer:usage-read`). The plugin resolves its exact `appDid`
+from the paginated `/api/registry/apps?owner=me` list in the target's configured
+acting context (so org-owned apps use `actAs`), then the public list if needed.
+The current registry spec has no app-DID lookup. Internal apps must be visible
+to the configured acting owner; otherwise the safe error points to
+`/auth/developer/apps`. No app is created, no id is guessed and no admin
+credentials are borrowed.
+
+Consent posts the registered scopes to `/api/auth/authorize` as **the target
+agent itself**, suppressing delegation even when `actAs` is an org. The kernel
+records `app.authorized` with issuer = subject = the agent DID and reuses an
+identical scope-set grant on repeated calls. The callback code is discarded.
+Only that agent's cached inference token is evicted; its next app-token mint
+and usable-model discovery run immediately with its normal `x-acting-as`.
+The result lists its `imajin/*` models, and the separate gateway catalog is
+also forced to refresh, including after a cached auth failure, without restart.
+The shared catalog remains gateway-scoped; it is not a per-agent picker or
+inference authority. Existing model policy still applies.
+
+If consent succeeds but model discovery is unavailable, the result retains
+`authorized: true` with `discovery: "retry-required"`; retry the explicit action
+to refresh without duplicating the grant. Kernel refusals are status-only;
+keys, cookies, tokens, callback codes and raw upstream errors never enter
+results. An unavailable grant/app still stops inference with an error naming
+`agents.<id>`; inference never discovers another principal or borrows another
+app. Every agent needs its own self-context authorization.
 
 Cache entries are isolated by `(agent DID, actAs, audience)` and signer
 generation, reused until the earlier of JWT expiry or mint TTL minus 60s.
