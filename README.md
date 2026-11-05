@@ -50,7 +50,7 @@ Gives your OpenClaw agent access to the Imajin network through five tools mappin
 | `imajin_cloudflare` | Cloudflare | DNS-only writes, classification, proxy/cache previews and human-approved proposals, settings/SSL, custom hostnames and signed history through kernel-only zone grants; never fetches a Cloudflare token (#98) |
 
 ### Calling-agent identity card (imajin-ai#3251)
-GitHub live-verification work (#163) must use a supported host SDK call; cached status alone never proves Observed live.
+GitHub grant-time verification (#163) never claims Observed live; call-bound verification is deferred to #167.
 
 Call `imajin_identity_card` with no arguments. It returns data in the existing
 agent-signed `{from, type, timestamp, payload, signature}` envelope, not a chat
@@ -75,6 +75,12 @@ when available; denied/unsupported hosts remain Unverified. No `gh` subprocess
 or credential-file read is used.
 
 - **Observed live**: this call obtained the kernel identity.
+- **Verified when access was granted**: GitHub SDK status reports `github-api`
+  evidence, an available credential and account, and is not marked stale.
+  The identity was verified when access was granted, not in this call; cached
+  API evidence is not live verification. The GitHub row's `verifiedAtMs` carries
+  the status's numeric verification time when exposed, otherwise `null`; it
+  never substitutes the card time or credential expiry.
 - **From config**: resolved provider URL/model metadata or agent channel
   bindings. Routes distinguish direct from the configured passthrough doorway
   without returning URLs, headers, tokens or credential paths.
@@ -82,9 +88,9 @@ or credential-file read is used.
   outbound service identity/egress is not exposed. Their per-field evidence
   still records the kernel's observed configuration and authority, including
   org-held Anthropic, without claiming successful provider use.
-  GitHub's SDK status includes API evidence but can use cached verification
-  without a call-bound verification timestamp, so its row stays Unverified
-  even when the effective account and credential health are available.
+  GitHub remains Unverified when status is unavailable, stale, revoked,
+  unbound or lacks API verification. Host fallback remains flagged as not
+  the agent's own identity, including for grant-time verified accounts.
 
 The inference row reports the host's `activeModel` when supplied (otherwise
 the agent/default model config). Its `kernelPick` is the freshly discovered

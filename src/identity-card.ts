@@ -132,7 +132,7 @@ export function createIdentityCardTool(options: CardOptions) {
   return {
     name: "imajin_identity_card",
     label: "Imajin Identity Card",
-    description: "One calling-agent signed identity card: kernel self-discovery, connector authority, gateway provider/route, channel bindings and GitHub selected versus effective identity. Grades never imply unobserved egress.",
+    description: "One calling-agent signed identity card: kernel self-discovery, connector authority, gateway provider/route, channel bindings and GitHub selected versus effective identity. GitHub API evidence is graded Verified when access was granted, not verified in this call. Grades never imply unobserved egress.",
     parameters: { type: "object" as const, properties: {}, additionalProperties: false },
     async execute(_id?: string, params: unknown = {}) {
       try {

@@ -1,6 +1,6 @@
 import { redactWakeText } from "./wake-redaction.js";
 
-export type Grade = "Observed live" | "From config" | "Unverified";
+export type Grade = "Observed live" | "Verified when access was granted" | "From config" | "Unverified";
 export type ConfigScope = "agent" | "org" | "host fallback" | "user";
 export interface ConnectorRow {
   connector: string;
@@ -15,6 +15,7 @@ export interface ConnectorRow {
   grade: Grade;
   reason: string;
   flagged: boolean;
+  verifiedAtMs?: number | null;
   details?: Record<string, unknown>;
 }
 function hasGithubBinding(config: unknown): boolean {
@@ -31,7 +32,7 @@ function githubReason(valid: boolean, scope: ConfigScope, apiVerified: boolean):
   if (scope === "host fallback") prefix = "host fallback — not own identity; ";
   else if (!valid) prefix = "Agent binding configured; ";
   if (!valid) return prefix + "GitHub status unavailable through this host's plugin gateway SDK";
-  if (apiVerified) return prefix + "Gateway reports GitHub API verification, but SDK status may be cached and does not prove verification in this call";
+  if (apiVerified) return prefix + "GitHub identity was verified when access was granted, not in this call; gateway status may be cached";
   return prefix + "Gateway status is unavailable, stale, or not live-verified";
 }
 
@@ -154,6 +155,8 @@ function githubFacts(value: unknown) {
       ? facts.accessExpiresAtMs : null,
     oauthScopes: Array.isArray(facts.oauthScopes) ? facts.oauthScopes.map(publicText).filter(Boolean) : [],
     stale: facts.stale === true,
+    verifiedAtMs: typeof facts.verifiedAtMs === "number" && Number.isFinite(facts.verifiedAtMs) && facts.verifiedAtMs >= 0
+      ? facts.verifiedAtMs : null,
   };
 }
 
@@ -170,7 +173,8 @@ export function githubRow(config: unknown, ctx: CardContext, response?: unknown)
     configured: valid ? effective.credentialKind !== "native" : bound || hasGithubBinding(config),
     configScope: scope, selectedScope: "agent", owner: valid ? effective.account.login : null,
     outboundIdentity: valid ? effective.account.login : null,
-    effective: valid ? scope : null, grade: "Unverified",
+    effective: valid ? scope : null, grade: apiVerified ? "Verified when access was granted" : "Unverified",
+    verifiedAtMs: apiVerified ? effective.verifiedAtMs : null,
     reason: githubReason(valid, scope, apiVerified),
     flagged: scope === "host fallback",
     ...(valid ? { details: {
