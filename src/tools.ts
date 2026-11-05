@@ -102,6 +102,31 @@ function truncateResults(data: unknown[], max = 20): unknown[] {
 
 // --- Tool definitions ---
 
+async function identitySelfAuthorize(
+  authorize: ((agentId?: string) => Promise<unknown>) | undefined,
+  params: { agentId?: string; onBehalfOf?: string },
+): Promise<ToolResult> {
+  if (params.onBehalfOf !== undefined) return errorResult("self_authorize does not accept onBehalfOf; consent is always as the target agent");
+  if (!authorize) return errorResult("self_authorize requires a configured per-agent sealed signing identity");
+  try {
+    return jsonResult(await authorize(params.agentId));
+  } catch (error) {
+    return errorResult(error instanceof SelfAuthorizeError ? error.message : "Agent self-authorization unavailable");
+  }
+}
+
+async function identityLookup(client: ImajinClient, query?: string): Promise<ToolResult> {
+  if (!query) return errorResult("lookup requires 'query'");
+  const identity = await client.lookupIdentity(query);
+  return identity ? jsonResult(identity) : textResult(`No identity found for: ${query}`);
+}
+
+async function identityConnections(client: ImajinClient, query?: string, onBehalfOf?: string): Promise<ToolResult> {
+  if (!query) return errorResult("connections requires 'query'");
+  const connections = await client.getConnections(query, onBehalfOf);
+  return connections.length ? jsonResult(connections) : textResult(`No connections found for: ${query}`);
+}
+
 export function createIdentityTool(client: ImajinClient, selfAuthorize?: (agentId?: string) => Promise<unknown>) {
   return {
     name: "imajin_identity",
@@ -140,13 +165,7 @@ export function createIdentityTool(client: ImajinClient, selfAuthorize?: (agentI
       params: { action: string; query?: string; agentId?: string; onBehalfOf?: string },
     ): Promise<ToolResult> {
       if (params.action === "self_authorize") {
-        if (params.onBehalfOf !== undefined) return errorResult("self_authorize does not accept onBehalfOf; consent is always as the target agent");
-        if (!selfAuthorize) return errorResult("self_authorize requires a configured per-agent sealed signing identity");
-        try {
-          return jsonResult(await selfAuthorize(params.agentId));
-        } catch (error) {
-          return errorResult(error instanceof SelfAuthorizeError ? error.message : "Agent self-authorization unavailable");
-        }
+        return identitySelfAuthorize(selfAuthorize, params);
       }
       if (params.onBehalfOf && params.onBehalfOf !== "self" && !validateDid(params.onBehalfOf)) {
         return errorResult(`Invalid DID format for onBehalfOf: ${params.onBehalfOf}`);
@@ -154,16 +173,10 @@ export function createIdentityTool(client: ImajinClient, selfAuthorize?: (agentI
       try {
         switch (params.action) {
           case "lookup": {
-            if (!params.query) return errorResult("lookup requires 'query'");
-            const identity = await client.lookupIdentity(params.query);
-            if (!identity) return textResult(`No identity found for: ${params.query}`);
-            return jsonResult(identity);
+            return await identityLookup(client, params.query);
           }
           case "connections": {
-            if (!params.query) return errorResult("connections requires 'query'");
-            const connections = await client.getConnections(params.query, params.onBehalfOf);
-            if (!connections.length) return textResult(`No connections found for: ${params.query}`);
-            return jsonResult(connections);
+            return await identityConnections(client, params.query, params.onBehalfOf);
           }
           default:
             return errorResult(`Unknown action: ${params.action}`);

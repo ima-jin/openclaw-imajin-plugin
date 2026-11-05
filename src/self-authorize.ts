@@ -17,7 +17,7 @@ const MAX_PAGES = 100;
 
 function registration(value: unknown, did: string): Registration {
   const app = value as Partial<Registration> | null;
-  if (!app || app.appDid !== did || typeof app.id !== "string" || !/^app_[\w-]+$/.test(app.id)
+  if (app?.appDid !== did || typeof app.id !== "string" || !/^app_[\w-]+$/.test(app.id)
     || app.status !== "active" || !Array.isArray(app.requestedScopes)
     || !app.requestedScopes.every((scope) => typeof scope === "string" && /^[a-z][a-z0-9_-]*:[a-z][a-z0-9:_-]*$/.test(scope))) {
     throw new SelfAuthorizeError("Invalid or inactive app registration; check /auth/developer/apps");
@@ -32,25 +32,36 @@ function checkStatus(status: number, operation: string): void {
   }
 }
 
+async function registrationPage(client: ImajinClient, did: string, owner: boolean, page: number) {
+  const response = await client.requestRaw(
+    `/api/registry/apps?${owner ? "owner=me&" : ""}limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`,
+    { redirect: "error", signal: AbortSignal.timeout(20_000) },
+  );
+  checkStatus(response.status, "app lookup");
+  const body = JSON.parse(response.text) as { apps?: unknown };
+  if (!body || !Array.isArray(body.apps)) throw new SelfAuthorizeError("Invalid kernel app list response");
+  const matches = body.apps.filter((app) => app?.appDid === did);
+  if (matches.length > 1) throw new SelfAuthorizeError("Ambiguous app registration; check /auth/developer/apps");
+  return { app: matches.length === 1 ? registration(matches[0], did) : undefined,
+    hasMore: body.apps.length >= PAGE_SIZE };
+}
+
+async function scanRegistrations(client: ImajinClient, did: string, owner: boolean) {
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const result = await registrationPage(client, did, owner, page);
+    if (result.app) return result.app;
+    if (!result.hasMore) return undefined;
+  }
+  throw new SelfAuthorizeError("App lookup limit reached; check /auth/developer/apps");
+}
+
 /** No appDid read filter exists in the registry spec. Never guess an app id. */
 async function findRegistration(client: ImajinClient, did: string): Promise<Registration> {
   // Owner reads use configured actAs (including org owners), not the raw session DID.
   // Public reads cover apps registered by another owner; internal apps require owner access.
   for (const owner of [true, false]) {
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const response = await client.requestRaw(
-        `/api/registry/apps?${owner ? "owner=me&" : ""}limit=${PAGE_SIZE}&offset=${page * PAGE_SIZE}`,
-        { redirect: "error", signal: AbortSignal.timeout(20_000) },
-      );
-      checkStatus(response.status, "app lookup");
-      const body = JSON.parse(response.text) as { apps?: unknown };
-      if (!body || !Array.isArray(body.apps)) throw new SelfAuthorizeError("Invalid kernel app list response");
-      const matches = body.apps.filter((app) => app?.appDid === did);
-      if (matches.length > 1) throw new SelfAuthorizeError("Ambiguous app registration; check /auth/developer/apps");
-      if (matches.length === 1) return registration(matches[0], did);
-      if (body.apps.length < PAGE_SIZE) break;
-      if (page === MAX_PAGES - 1) throw new SelfAuthorizeError("App lookup limit reached; check /auth/developer/apps");
-    }
+    const app = await scanRegistrations(client, did, owner);
+    if (app) return app;
   }
   throw new SelfAuthorizeError(SETUP);
 }

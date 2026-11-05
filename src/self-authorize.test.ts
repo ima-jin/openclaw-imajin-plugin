@@ -1,4 +1,5 @@
 import { generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
+import { readFile } from "node:fs/promises";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ImajinClient } from "./client.js";
 import type { AgentIdentity } from "./agent-identities.js";
@@ -186,6 +187,39 @@ describe("explicit agent self-authorization", () => {
     expect(grants.size).toBe(0); expect(rediscover).not.toHaveBeenCalled();
   });
 
+  it("falls back to the documented public list when the acting owner list has no match", async () => {
+    const original = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation((url, init) => String(url).includes("owner=me")
+      ? Promise.resolve(Response.json({ apps: [] })) : original(url, init));
+    await createSelfAuthorizer(options)();
+    expect(wire.some((request) => request.path === "/api/registry/apps?limit=100&offset=0")).toBe(true);
+    expect(grants.size).toBe(1);
+  });
+
+  it("bounded pagination never mutates when lookup is incomplete", async () => {
+    appRows = Array.from({ length: 100 }, () => ({ appDid: "did:imajin:other" }));
+    const original = vi.mocked(fetch).getMockImplementation()!;
+    vi.mocked(fetch).mockImplementation((url, init) => String(url).includes("/api/registry/apps")
+      ? Promise.resolve(Response.json({ apps: appRows })) : original(url, init));
+    await expect(createSelfAuthorizer(options)()).rejects.toThrow("lookup limit");
+    expect(grants.size).toBe(0); expect(rediscover).not.toHaveBeenCalled();
+  });
+
+  it.each(["network", "json", "signer"])("contains %s diagnostics without exposing protected values", async (failure) => {
+    if (failure === "signer") {
+      vi.mocked(identities.get("artifact")!.signer.signChallenge).mockRejectedValue(new Error(protectedDetail));
+    } else {
+      const original = vi.mocked(fetch).getMockImplementation()!;
+      vi.mocked(fetch).mockImplementation((url, init) => {
+        if (!String(url).includes("/api/registry/apps")) return original(url, init);
+        if (failure === "network") throw new Error(protectedDetail);
+        return Promise.resolve(new Response(protectedDetail));
+      });
+    }
+    await expect(createSelfAuthorizer(options)()).rejects.toThrow("self-authorization unavailable");
+    expect(grants.size).toBe(0); expect(rediscover).not.toHaveBeenCalled();
+  });
+
   it("malformed and ambiguous lists fail safely before mutation", async () => {
     appRows.push(appRows[1]);
     await expect(createSelfAuthorizer(options)()).rejects.toThrow("Ambiguous");
@@ -242,6 +276,28 @@ describe("explicit agent self-authorization", () => {
     expect(discovery.headers.has("cookie")).toBe(false);
     const claims = JSON.parse(Buffer.from(discovery.headers.get("authorization")!.split(".")[1], "base64url").toString());
     expect(claims).toMatchObject({ sub: "did:imajin:artifact", azp: "did:imajin:artifact" });
+  });
+
+  it("documents explicit self-consent after app registration in per-agent setup", async () => {
+    const readme = await readFile(new URL("../README.md", import.meta.url), "utf8");
+    const section = readme.slice(readme.indexOf("### Calling-agent inference authentication"));
+    expect(section).toContain("Per-agent setup, after app registration (#168)");
+    expect(section).toContain('{"action":"self_authorize","agentId":"artifact"}');
+    expect(section).toContain("No startup hook");
+  });
+
+  it.each([200, 201])("HTTP %s discards callback codes and never follows the returned redirect", async (httpStatus) => {
+    status = httpStatus;
+    const result = await createSelfAuthorizer(options)();
+    expect(result.authorized).toBe(true);
+    expect(JSON.stringify(result)).not.toContain(protectedDetail);
+    expect(vi.mocked(fetch).mock.calls.every(([url]) => new URL(String(url)).host === "kernel.invalid")).toBe(true);
+    for (const [url, init] of vi.mocked(fetch).mock.calls) {
+      if (String(url).includes("/api/registry/apps") || String(url).endsWith("/api/auth/authorize")) {
+        expect(init?.redirect).toBe("error");
+        expect(init?.signal).toBeInstanceOf(AbortSignal);
+      }
+    }
   });
 
   it("evicts only the consenting agent's cached token", async () => {
