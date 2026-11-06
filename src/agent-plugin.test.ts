@@ -136,6 +136,125 @@ afterEach(async () => {
   vi.restoreAllMocks();
 });
 
+describe("identity discovery admission across entry points (#170)", () => {
+  const entryPoints = ["auto-routing", "model.primary", "sessions_send", "openclaw agent"] as const;
+  const discoveryStates = [
+    "connection_not_loaded", "connection_unavailable", "network", "ok", "empty", "malformed",
+  ] as const;
+  type DiscoveryState = typeof discoveryStates[number];
+
+  async function routingFixture(entryPoint: typeof entryPoints[number], state: DiscoveryState, actAs?: string) {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "info").mockImplementation(() => {});
+    vi.spyOn(AgentInferenceAuth.prototype, "credential").mockResolvedValue({
+      token: "fixture-artifact", expiresAt: Date.now() + 600_000,
+    });
+    const fetcher = vi.fn(async (url: string | URL | Request) => {
+      if (!String(url).endsWith("/infer/v1/models/usable")) return Response.json({ ok: true });
+      if (state === "network") throw new Error("private transport detail");
+      if (state === "connection_not_loaded" || state === "connection_unavailable") {
+        return Response.json({ error: { code: state, message: "Kernel connection refused" } }, { status: 403 });
+      }
+      if (state === "malformed") return Response.json({ unexpected: [] });
+      return Response.json({ data: state === "empty" ? [] : [
+        { id: "claude-sonnet-5-5", owned_by: "anthropic", imajin: { picked: true } },
+      ] });
+    });
+    vi.stubGlobal("fetch", fetcher);
+    const hostConfig = { agents: {
+      defaults: { model: "anthropic/claude-sonnet-5-5", modelPolicy: { allow: ["imajin/*"] } },
+      list: entryPoint === "auto-routing" ? [] : [
+        { id: "artifact", model: { primary: "anthropic/claude-sonnet-5-5" } },
+      ],
+    } };
+    const registry = register({
+      nodeUrl: "https://kernel.invalid", gatewayAgent: "main",
+      agents: { artifact: { ...agent("artifact"), actAs } },
+      modelDiscovery: { refreshIntervalMs: 0 }, loops: { enabled: false }, attestation: { enabled: false },
+    }, "full", { config: { current: () => hostConfig } });
+    await registry.start();
+    const ctx = {
+      agentId: "artifact", runId: entryPoint === "openclaw agent" ? undefined : randomUUID(),
+      sessionKey: "agent:artifact:main",
+    };
+    const resolve = () => Promise.all(registry.emit("before_model_resolve", {}, {
+      ...ctx, modelProviderId: "anthropic", modelId: "claude-sonnet-5-5",
+    }));
+    const gate = async () => {
+      const decisions = await Promise.all(registry.emit("before_agent_run", { prompt: "test", messages: [] }, ctx));
+      return decisions.find((decision: any) => decision?.outcome === "block");
+    };
+    return { registry, fetcher, resolve, gate, ctx };
+  }
+
+  it.each(entryPoints.flatMap((entryPoint) => discoveryStates.flatMap((state) =>
+    [undefined, "did:imajin:artifact-org"].map((actAs) => ({ entryPoint, state, actAs })))))
+  ("$entryPoint: $state, acting as $actAs", async ({ entryPoint, state, actAs }) => {
+    const { registry, fetcher, resolve, gate } = await routingFixture(entryPoint, state, actAs);
+    await resolve();
+    const blocked = await gate();
+    if (state === "ok") {
+      expect(blocked).toBeUndefined();
+    } else {
+      expect(blocked).toMatchObject({ outcome: "block", message: expect.stringContaining("agents.artifact") });
+      if (state.startsWith("connection_")) {
+        expect(blocked).toMatchObject({ message: expect.stringContaining(state) });
+        expect(blocked).toMatchObject({ message: expect.stringContaining("403") });
+      }
+      expect(JSON.stringify(blocked)).not.toContain("private transport detail");
+    }
+    const discovery = fetcher.mock.calls.find(([url]) => String(url).endsWith("/infer/v1/models/usable"));
+    expect(discovery).toBeDefined();
+    const init = (discovery as unknown as [string, RequestInit])[1];
+    expect(init.headers).toEqual({ Authorization: "Bearer fixture-artifact",
+      ...(actAs ? { "x-acting-as": actAs } : {}) });
+    await registry.stop();
+  });
+
+  it("blocks direct execution without an earlier model-resolution hook or runId", async () => {
+    const { registry, gate } = await routingFixture("openclaw agent", "connection_not_loaded");
+    expect(await gate()).toMatchObject({
+      outcome: "block", message: expect.stringContaining("connection_not_loaded"),
+    });
+    await registry.stop();
+  });
+
+  it("does not reuse a successful admission or last-good catalog after a refusal", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    const { registry, fetcher, resolve, gate } = await routingFixture("model.primary", "ok");
+    await resolve();
+    expect(await gate()).toBeUndefined();
+    fetcher.mockImplementation(async () => Response.json({
+      code: "connection_unavailable",
+    }, { status: 403 }));
+    // Expire the discovery TTL without changing the configured agent or run.
+    vi.setSystemTime(Date.now() + 61_000);
+    expect(await gate()).toMatchObject({
+      outcome: "block", message: expect.stringContaining("connection_unavailable"),
+    });
+    await registry.stop();
+  });
+
+  it("leaves a personal main agent without an imajin identity unchanged during discovery refusal", async () => {
+    const { registry } = await routingFixture("model.primary", "connection_not_loaded");
+    const ctx = { agentId: "main", runId: randomUUID(), sessionKey: "agent:main:main",
+      modelProviderId: "anthropic", modelId: "claude-sonnet-5-5" };
+    expect((await Promise.all(registry.emit("before_model_resolve", {}, ctx))).every((result) => result === undefined)).toBe(true);
+    expect((await Promise.all(registry.emit("before_agent_run", {}, ctx))).every((result) => result === undefined)).toBe(true);
+    await registry.stop();
+  });
+
+  it("blocks an identity-configured agent even when its sealed signer cannot be loaded", async () => {
+    mocks.signer.mockRejectedValue(new Error("private signer detail"));
+    const { registry, gate } = await routingFixture("model.primary", "ok");
+    const blocked = await gate();
+    expect(blocked).toMatchObject({ outcome: "block", message: expect.stringContaining("agents.artifact") });
+    expect(JSON.stringify(blocked)).not.toContain("private signer detail");
+    await registry.stop();
+  });
+});
+
 describe("identity card registration and calling-agent isolation", () => {
   beforeEach(() => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
