@@ -22,6 +22,11 @@ interface RoutingContext { agentId?: string; runId?: string; modelProviderId?: s
 const followsDefault = (ctx: RoutingContext) =>
   ctx.modelProviderId === IMAJIN_PROVIDER_ID && ctx.modelId === IMAJIN_DEFAULT_MODEL_ID;
 
+function block(reason: string) {
+  return { outcome: "block" as const, reason,
+    message: `${reason}; check imajin_status and the catalog approval card.` };
+}
+
 function readRoutingPolicy(getConfig: () => unknown): RoutingPolicy | undefined {
   const config = getConfig() as {
     agents?: { defaults?: { modelPolicy?: { allow?: string[] } } };
@@ -65,10 +70,6 @@ export function createImajinDefaultRouter(deps: {
     if (!ctx.runId) return;
     admissions.set(ctx.runId, allowed);
     if (admissions.size > 500) admissions.delete(admissions.keys().next().value!);
-  }
-  function block(reason: string) {
-    return { outcome: "block" as const, reason,
-      message: `${reason}; check imajin_status and the catalog approval card.` };
   }
   function defaultAdmission(ctx: RoutingContext) {
     const allowed = ctx.runId ? admissions.get(ctx.runId) : undefined;
