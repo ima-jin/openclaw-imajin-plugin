@@ -221,6 +221,7 @@ describe("identity discovery admission across entry points (#170)", () => {
   });
 
   it("does not reuse a successful admission or last-good catalog after a refusal", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
     const { registry, fetcher, resolve, gate } = await routingFixture("model.primary", "ok");
     await resolve();
     expect(await gate()).toBeUndefined();
@@ -228,8 +229,7 @@ describe("identity discovery admission across entry points (#170)", () => {
       code: "connection_unavailable",
     }, { status: 403 }));
     // Expire the discovery TTL without changing the configured agent or run.
-    const now = Date.now();
-    vi.spyOn(Date, "now").mockReturnValue(now + 61_000);
+    vi.setSystemTime(Date.now() + 61_000);
     expect(await gate()).toMatchObject({
       outcome: "block", message: expect.stringContaining("connection_unavailable"),
     });

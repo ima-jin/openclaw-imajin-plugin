@@ -27,6 +27,50 @@ async function fixture() {
 
 afterEach(() => vi.unstubAllGlobals());
 
+describe("identity-configured discovery gate (#170)", () => {
+  it.each(["catalog-missing", "identity-unavailable"] as const)(
+    "blocks %s without exposing private exceptions", async (failure) => {
+      const { cache } = await fixture();
+      const router = createImajinDefaultRouter({
+        cache, baseUrl: "http://proxy.test", getConfig: () => ({}), hasIdentity: () => true,
+        cacheForAgent: failure === "catalog-missing" ? undefined : async () => {
+          throw new Error("private identity material");
+        },
+      });
+      const decision = await router.beforeAgentRun({}, { agentId: "artifact" });
+      expect(decision).toMatchObject({ outcome: "block", message: expect.stringContaining("agents.artifact") });
+      expect(JSON.stringify(decision)).not.toContain("private identity material");
+    });
+
+  it("does not let a deliberate override admit a configured gateway identity after discovery refusal", async () => {
+    const { cache, fetcher } = await fixture();
+    fetcher.mockRejectedValue(new ImajinDiscoveryError("auth-error", "connection_not_loaded", 403));
+    await cache.refresh();
+    const router = createImajinDefaultRouter({
+      cache, cacheForAgent: async () => cache, hasIdentity: (id) => id === "artifact",
+      gatewayAgent: "artifact", baseUrl: "http://proxy.test", getConfig: () => ({}),
+    });
+    const ctx = { ...following, agentId: "artifact", runId: "override-run" };
+    router.preserveExplicitOverride(ctx);
+    expect(await router.beforeAgentRun({}, ctx)).toMatchObject({
+      outcome: "block", message: expect.stringContaining("connection_not_loaded"),
+    });
+  });
+
+  it("does not discover or reroute an unconfigured non-gateway personal agent", async () => {
+    const { cache, config } = await fixture();
+    const cacheForAgent = vi.fn(async () => cache);
+    const router = createImajinDefaultRouter({
+      cache, cacheForAgent, hasIdentity: (id) => id === "artifact",
+      gatewayAgent: "gateway", baseUrl: "http://proxy.test", getConfig: () => config,
+    });
+    const ctx = { agentId: "main", modelProviderId: "anthropic", modelId: "claude-sonnet-5-5" };
+    expect(await router.beforeModelResolve({}, ctx)).toBeUndefined();
+    expect(await router.beforeAgentRun({}, ctx)).toBeUndefined();
+    expect(cacheForAgent).not.toHaveBeenCalled();
+  });
+});
+
 describe("kernel-picked default (#106)", () => {
   it("follows the next successful refresh without writing gateway config or pinning a session", async () => {
     const { router, config, fetcher, cache } = await fixture();

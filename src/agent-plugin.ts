@@ -94,6 +94,7 @@ export function registerAgentPlugin(api: any, config: {
   });
   const defaultRouter = createImajinDefaultRouter({
     cache: provider.cache, cacheForAgent: provider.cacheForAgent,
+    hasIdentity: (agentId) => Object.hasOwn(config.agents ?? {}, agentId),
     gatewayAgent: config.gatewayAgent, baseUrl: provider.baseUrl,
     getConfig: () => api.runtime?.config?.current?.() ?? api.config ?? {},
   });
