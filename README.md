@@ -1,4 +1,5 @@
 # @openclaw/imajin-plugin
+Provider auth tracking: #172 covers synthetic auth preflight for non-default agents without local auth profiles.
 Release ordering (#161): ship the clean loop/exec publisher before deploying imajin-ai PR #3265 so newly started loops retain native command authority; keep the session-to-loop map private to the harness.
 
 OpenClaw plugin for the [Imajin](https://jin.imajin.ai) sovereign identity and settlement network.
