@@ -22,6 +22,11 @@ interface RoutingContext { agentId?: string; runId?: string; modelProviderId?: s
 const followsDefault = (ctx: RoutingContext) =>
   ctx.modelProviderId === IMAJIN_PROVIDER_ID && ctx.modelId === IMAJIN_DEFAULT_MODEL_ID;
 
+function block(reason: string) {
+  return { outcome: "block" as const, reason,
+    message: `${reason}; check imajin_status and the catalog approval card.` };
+}
+
 function readRoutingPolicy(getConfig: () => unknown): RoutingPolicy | undefined {
   const config = getConfig() as {
     agents?: { defaults?: { modelPolicy?: { allow?: string[] } } };
@@ -35,6 +40,7 @@ function readRoutingPolicy(getConfig: () => unknown): RoutingPolicy | undefined 
 export function createImajinDefaultRouter(deps: {
   cache: ImajinCatalogCache;
   cacheForAgent?: (agentId: string) => Promise<ImajinCatalogCache>;
+  hasIdentity?: (agentId: string) => boolean;
   gatewayAgent?: string;
   baseUrl: string;
   getConfig: () => unknown;
@@ -46,6 +52,7 @@ export function createImajinDefaultRouter(deps: {
   const admissions = new Map<string, boolean>();
   function tenantDefault(ctx: RoutingContext): boolean {
     if (!deps.cacheForAgent || !deps.gatewayAgent || !ctx.agentId || ctx.agentId === deps.gatewayAgent) return false;
+    if (deps.hasIdentity && !deps.hasIdentity(ctx.agentId)) return false;
     if (ctx.modelProviderId?.startsWith("imajin")) return false;
     const config = deps.getConfig() as {
       agents?: { entries?: Record<string, { model?: unknown }>; list?: Array<{ id: string; model?: unknown }>;
@@ -64,6 +71,30 @@ export function createImajinDefaultRouter(deps: {
     admissions.set(ctx.runId, allowed);
     if (admissions.size > 500) admissions.delete(admissions.keys().next().value!);
   }
+  function defaultAdmission(ctx: RoutingContext) {
+    const allowed = ctx.runId ? admissions.get(ctx.runId) : undefined;
+    if (allowed === false || ((followsDefault(ctx) || tenantDefault(ctx)) && allowed !== true)) {
+      return block("Kernel default model unavailable or denied by live policy");
+    }
+  }
+  async function identityAdmission(agentId: string, ctx: RoutingContext) {
+    // Explicit model.primary, session and CLI selections can skip automatic
+    // routing entirely. Admission must consult the caller's own discovery,
+    // not a remembered routing success or the last-good models on a failure.
+    const prefix = `Imajin agents.${agentId} kernel discovery`;
+    try {
+      if (!deps.cacheForAgent) return block(`${prefix} unavailable: agent catalog missing`);
+      const state = await (await deps.cacheForAgent(agentId)).get();
+      if (state.outcome !== "ok") {
+        const status = state.httpStatus === undefined ? "" : ` HTTP ${state.httpStatus}`;
+        return block(`${prefix} refused (${state.outcome}${status}): ${state.error ?? "no usable kernel route"}`);
+      }
+      return defaultAdmission(ctx);
+    } catch {
+      // Identity/secret-provider exceptions may contain private material.
+      return block(`${prefix} unavailable: agent identity or discovery runtime unavailable`);
+    }
+  }
   return {
     preserveExplicitOverride(ctx: RoutingContext = {}) {
       if (followsDefault(ctx)) admit(ctx, true);
@@ -76,11 +107,8 @@ export function createImajinDefaultRouter(deps: {
       };
     },
     beforeAgentRun(_event: unknown, ctx: RoutingContext = {}) {
-      const allowed = ctx.runId ? admissions.get(ctx.runId) : undefined;
-      if (allowed === false || ((followsDefault(ctx) || tenantDefault(ctx)) && allowed !== true)) {
-        return { outcome: "block", reason: "Kernel default model unavailable or denied by live policy",
-          message: "Kernel default model unavailable or denied by live policy; check imajin_status and the catalog approval card." };
-      }
+      if (ctx.agentId && deps.hasIdentity?.(ctx.agentId)) return identityAdmission(ctx.agentId, ctx);
+      return defaultAdmission(ctx);
     },
     onAgentEnd(_event: unknown, ctx: RoutingContext = {}) {
       if (ctx.runId) admissions.delete(ctx.runId);

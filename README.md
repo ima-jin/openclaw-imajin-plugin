@@ -2,6 +2,7 @@
 Release ordering (#161): ship the clean loop/exec publisher before deploying imajin-ai PR #3265 so newly started loops retain native command authority; keep the session-to-loop map private to the harness.
 
 OpenClaw plugin for the [Imajin](https://jin.imajin.ai) sovereign identity and settlement network.
+Agents with an Imajin identity must fail closed when kernel discovery refuses or is unavailable, never fall back to a built-in provider.
 
 ## Kernel boundary rollout (#161)
 
