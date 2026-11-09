@@ -188,12 +188,41 @@ describe("imajin_identity_card", () => {
     options.discoverSelf.mockResolvedValue(body);
     options.githubStatus.mockResolvedValue({
       ...githubStatus(), token: secret, credentialPath: path,
-      effective: { ...githubStatus().effective, token: secret, credentialPath: path, account: { login: "org-bot", token: secret } },
+      effective: { ...githubStatus().effective, token: secret, credentialPath: path, verifiedAtMs: secret,
+        account: { login: "org-bot", token: secret } },
     });
-    const text = JSON.stringify(await call());
-    expect(text).not.toContain(secret);
-    expect(text).not.toContain(path);
-    expect(text).not.toContain("Authorization");
+    const logs = (["log", "info", "warn", "error", "debug"] as const).map((method) =>
+      vi.spyOn(console, method).mockImplementation(() => {}));
+    try {
+      for (const sdkFails of [false, true]) {
+        if (sdkFails) options.githubStatus.mockRejectedValue(new Error(secret));
+        const text = JSON.stringify(await call());
+        expect(text).not.toContain(secret);
+        expect(text).not.toContain(path);
+        expect(text).not.toContain("Authorization");
+      }
+      for (const log of logs) expect(log).not.toHaveBeenCalled();
+    } finally {
+      for (const log of logs) log.mockRestore();
+    }
+  });
+
+  it.each([undefined, "did:imajin:artifact-org"])("signs grant-time GitHub evidence without forwarding session context %s", async (actAs) => {
+    const { identity, options, call } = setup(agent(actAs));
+    const status = githubStatus();
+    Object.assign(status.effective, { source: "agent-override", verifiedAtMs: 1_790_000_000_000 });
+    options.githubStatus.mockResolvedValue(status);
+    const card = await call();
+    expect(card.payload.rows.find((entry: any) => entry.connector === "GitHub")).toMatchObject({
+      owner: "host-user", outboundIdentity: "host-user", configScope: "agent", flagged: true,
+      grade: "Verified when access was granted", verifiedAtMs: 1_790_000_000_000,
+      reason: expect.stringContaining("not in this call"),
+    });
+    expect(options.githubStatus.mock.calls).toEqual([["artifact"]]);
+    expect(options.discoverSelf.mock.calls).toEqual([["artifact"]]);
+    expect(JSON.stringify(card)).not.toContain(options.context.sessionKey);
+    expect(await verifyMessage(card, identity.signer.publicKey!)).toBe(true);
+    expect(createIdentityCardTool(options).description).toContain("Verified when access was granted");
   });
 
   it("keeps unrelated direct inference separate from org-held kernel connector mapping", async () => {
@@ -266,26 +295,42 @@ function githubStatus() {
 }
 
 describe("gateway fact grades", () => {
-  it("uses SDK GitHub selected/effective facts without treating possibly cached API evidence as observed live", () => {
+  it.each([undefined, null, "2026-11-04T20:35:00Z", {}, Number.NaN, Number.POSITIVE_INFINITY, -1, 0, 1_790_000_000_000])(
+    "projects only a valid numeric grant verification time: %s", (verifiedAtMs) => {
+      const status = githubStatus();
+      Object.assign(status.effective, { verifiedAtMs });
+      const github = githubRow({}, { agentId: "artifact" }, status);
+      expect(github.grade).toBe("Verified when access was granted");
+      expect(github.verifiedAtMs).toBe(verifiedAtMs === 0 || verifiedAtMs === 1_790_000_000_000 ? verifiedAtMs : null);
+    },
+  );
+  it("grades API evidence at grant time without treating possibly cached verification as observed live", () => {
     expect(githubRow({}, { agentId: "artifact" }, githubStatus())).toMatchObject({
       configScope: "host fallback", selectedScope: "agent", effective: "host fallback",
-      outboundIdentity: "host-user", flagged: true, grade: "Unverified",
-      reason: expect.stringContaining("does not prove verification in this call"),
+      outboundIdentity: "host-user", flagged: true, grade: "Verified when access was granted", verifiedAtMs: null,
+      reason: expect.stringContaining("host fallback — not own identity; GitHub identity was verified when access was granted, not in this call"),
       details: { selected: { configured: false, identity: null }, effective: {
         account: { login: "host-user" }, gitAuthor: { name: "Host" }, oauthScopes: ["repo"], credentialState: "available",
       } },
     });
   });
 
-  it.each(["stale", "no-api", "unavailable", "other-agent", "wrong-scope"])("never upgrades unsupported GitHub evidence: %s", (kind) => {
+  it.each(["stale", "no-api", "unavailable", "revoked", "unbound", "no-account", "unknown-source", "other-agent", "wrong-scope"])("never upgrades unsupported GitHub evidence: %s", (kind) => {
     const status = githubStatus();
+    Object.assign(status.effective, { verifiedAtMs: 1_790_000_000_000 });
     if (kind === "stale") Object.assign(status.effective, { stale: true });
     if (kind === "no-api") status.effective.evidence = "none";
     if (kind === "unavailable") status.effective.credentialState = "unavailable";
+    if (kind === "revoked") status.effective.credentialState = "revoked";
+    if (kind === "unbound") status.effective.source = "none";
+    if (kind === "no-account") status.effective.account.login = "";
+    if (kind === "unknown-source") status.effective.source = "unknown";
     if (kind === "other-agent") status.agentId = "other";
     if (kind === "wrong-scope") status.selectedScope = "system";
     const github = githubRow({}, { agentId: "artifact" }, status);
     expect(github.grade).toBe("Unverified");
+    expect(github.verifiedAtMs).toBeNull();
+    expect(github.reason).toBeTruthy();
     if (kind === "other-agent" || kind === "wrong-scope") expect(github.outboundIdentity).toBeNull();
   });
 
@@ -296,7 +341,7 @@ describe("gateway fact grades", () => {
     status.effective.source = "agent-override";
     status.effective.credentialKind = "managed-oauth";
     expect(githubRow(config, { agentId: "artifact" }, status)).toMatchObject({
-      configured: true, configScope: "agent", grade: "Unverified",
+      configured: true, configScope: "agent", grade: "Verified when access was granted",
     });
   });
 
