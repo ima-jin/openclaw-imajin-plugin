@@ -2,7 +2,7 @@
   "name": "@openclaw/imajin-plugin",
   "version": "0.1.0",
   "private": true,
-  "description": "OpenClaw plugin for Imajin network — identity, attestation, attribution, settlement, discovery",
+  "description": "identity and authority for AI agents. OpenClaw plugin for Imajin (alpha).",
   "type": "module",
   "bin": {
     "imajin-vault": "./bin/imajin-vault.mjs"
